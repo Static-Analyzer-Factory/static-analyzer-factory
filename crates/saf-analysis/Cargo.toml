@@ -1,0 +1,40 @@
+[package]
+name = "saf-analysis"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Analysis passes for the Static Analyzer Factory: CFG, callgraph, PTA, value flow"
+
+[dependencies]
+saf-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+z3 = { version = "0.19", features = ["bundled"], optional = true }
+bitvec = "1"
+biodivine-lib-bdd = "0.5"
+smallvec = { workspace = true }
+indexmap = { workspace = true }
+im-rc = { workspace = true }
+roaring = { workspace = true }
+rustc-hash = { workspace = true }
+rayon = "1.10"
+
+[features]
+default = ["z3-solver"]
+experimental = []
+z3-solver = ["dep:z3"]
+# Gate heavy, rarely-used analysis modules:
+analysis-mta = []
+analysis-cegar = []
+analysis-invariants = []
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+proptest = "1.5"
+insta = { version = "1.41", features = ["json"] }
+saf-frontends = { workspace = true, features = ["llvm-18"] }
+saf-test-utils = { path = "../saf-test-utils" }
+tempfile = { workspace = true }

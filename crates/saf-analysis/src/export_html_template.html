@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SAF Property Graph</title>
+<script src="https://unpkg.com/cytoscape@3/dist/cytoscape.min.js"></script>
+<script src="https://unpkg.com/dagre@0.8/dist/dagre.min.js"></script>
+<script src="https://unpkg.com/cytoscape-dagre@2/cytoscape-dagre.js"></script>
+<script src="https://unpkg.com/webcola@3/WebCola/cola.min.js"></script>
+<script src="https://unpkg.com/cytoscape-cola@2/cytoscape-cola.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: Helvetica, Arial, sans-serif; overflow: hidden; }
+#toolbar {
+  background: #1e1e2e; color: #cdd6f4; padding: 8px 16px;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  font-size: 13px; z-index: 10; position: relative;
+}
+#toolbar label { font-weight: 600; }
+#toolbar select, #toolbar input, #toolbar button {
+  background: #313244; color: #cdd6f4; border: 1px solid #45475a;
+  border-radius: 4px; padding: 4px 8px; font-size: 13px;
+}
+#toolbar button { cursor: pointer; }
+#toolbar button:hover { background: #45475a; }
+#search { width: 180px; }
+#edge-filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#edge-filters label { font-weight: normal; cursor: pointer; display: flex; align-items: center; gap: 3px; }
+#edge-filters input[type="checkbox"] { accent-color: #89b4fa; }
+#cy { width: 100%; height: calc(100vh - 44px); background: #f5f5f5; }
+#tooltip {
+  position: absolute; display: none; background: #1e1e2e; color: #cdd6f4;
+  border: 1px solid #45475a; border-radius: 6px; padding: 8px 12px;
+  font-size: 12px; max-width: 400px; z-index: 100; pointer-events: none;
+  white-space: pre-wrap; word-break: break-all;
+}
+.info { color: #a6adc8; font-style: italic; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <label for="layout-select">Layout:</label>
+  <select id="layout-select"></select>
+  <button id="fit-btn">Zoom to Fit</button>
+  <label for="search">Search:</label>
+  <input id="search" type="text" placeholder="Search by name..." />
+  <span id="edge-filters"></span>
+  <span class="info" id="graph-info"></span>
+</div>
+<div id="cy"></div>
+<div id="tooltip"></div>
+
+<script>
+var GRAPH_DATA = /*GRAPH_DATA*/null;
+
+(function() {
+  if (!GRAPH_DATA) { document.getElementById('cy').innerHTML = '<p style="padding:20px">No graph data.</p>'; return; }
+
+  var labelColors = {
+    'Function': { bg: '#89b4fa', shape: 'rectangle' },
+    'Block':    { bg: '#9399b2', shape: 'rectangle' },
+    'Value':    { bg: '#a6e3a1', shape: 'ellipse' },
+    'Location': { bg: '#fab387', shape: 'diamond' },
+    'MemPhi':   { bg: '#cba6f7', shape: 'diamond' },
+    'Type':     { bg: '#94e2d5', shape: 'hexagon' },
+    'Thread':   { bg: '#f5c2e7', shape: 'rectangle' },
+    'Entry':    { bg: '#74c7ec', shape: 'round-rectangle' },
+    'Exit':     { bg: '#f38ba8', shape: 'round-rectangle' }
+  };
+  var edgeColors = {
+    'CALLS': '#89b4fa', 'FLOWS_TO': '#a6e3a1', 'POINTS_TO': '#fab387',
+    'DEFINES': '#cba6f7', 'USES': '#94e2d5', 'SUCCEEDS': '#9399b2',
+    'TAINT': '#f38ba8', 'MEM_FLOW': '#f5c2e7'
+  };
+  var defaultEdgeColor = '#585b70';
+
+  function nodeLabel(n) {
+    if (n.properties && n.properties.name) return n.properties.name;
+    if (n.labels && n.labels.length > 0) return n.labels[0];
+    return n.id.length > 12 ? n.id.substring(0, 12) + '...' : n.id;
+  }
+
+  function nodeStyle(n) {
+    for (var i = 0; i < (n.labels || []).length; i++) {
+      if (labelColors[n.labels[i]]) return labelColors[n.labels[i]];
+    }
+    return { bg: '#bac2de', shape: 'ellipse' };
+  }
+
+  var elements = [];
+  (GRAPH_DATA.nodes || []).forEach(function(n) {
+    var s = nodeStyle(n);
+    elements.push({
+      data: {
+        id: n.id, label: nodeLabel(n),
+        bg: s.bg, shape: s.shape,
+        labels: (n.labels || []).join(', '),
+        props: n.properties || {}
+      }
+    });
+  });
+
+  var edgeTypes = {};
+  (GRAPH_DATA.edges || []).forEach(function(e, i) {
+    edgeTypes[e.edge_type] = true;
+    elements.push({
+      data: {
+        id: 'e' + i, source: e.src, target: e.dst,
+        edgeType: e.edge_type,
+        color: edgeColors[e.edge_type] || defaultEdgeColor,
+        props: e.properties || {}
+      }
+    });
+  });
+
+  var cy = cytoscape({
+    container: document.getElementById('cy'),
+    elements: elements,
+    style: [
+      { selector: 'node', style: {
+        'label': 'data(label)', 'background-color': 'data(bg)', 'shape': 'data(shape)',
+        'text-valign': 'center', 'text-halign': 'center',
+        'font-size': '11px', 'font-family': 'Helvetica, Arial, sans-serif',
+        'color': '#1e1e2e', 'text-wrap': 'ellipsis', 'text-max-width': '120px',
+        'width': 'label', 'height': 'label', 'padding': '10px',
+        'border-width': 1, 'border-color': '#45475a',
+        'min-width': '40px', 'min-height': '30px'
+      }},
+      { selector: 'edge', style: {
+        'width': 2, 'line-color': 'data(color)', 'target-arrow-color': 'data(color)',
+        'target-arrow-shape': 'triangle', 'curve-style': 'bezier',
+        'label': 'data(edgeType)', 'font-size': '9px', 'font-family': 'Helvetica, Arial, sans-serif',
+        'color': '#585b70', 'text-rotation': 'autorotate', 'text-margin-y': '-8px'
+      }},
+      { selector: 'node.highlighted', style: {
+        'border-width': 3, 'border-color': '#f38ba8'
+      }},
+      { selector: 'node.neighbor', style: {
+        'border-width': 2, 'border-color': '#fab387'
+      }},
+      { selector: 'edge.highlighted', style: {
+        'width': 4, 'line-color': '#f38ba8', 'target-arrow-color': '#f38ba8'
+      }},
+      { selector: 'node.search-match', style: {
+        'border-width': 3, 'border-color': '#a6e3a1', 'border-style': 'dashed'
+      }},
+      { selector: '.hidden', style: { 'display': 'none' } }
+    ]
+  });
+
+  // Default layout selection
+  var graphType = GRAPH_DATA.graph_type || '';
+  var defaultLayout = 'cose';
+  if (['cfg', 'callgraph', 'icfg'].indexOf(graphType) >= 0) defaultLayout = 'dagre';
+  if (['valueflow', 'svfg'].indexOf(graphType) >= 0) defaultLayout = 'cola';
+
+  var layouts = ['dagre', 'cola', 'cose'];
+  var layoutSelect = document.getElementById('layout-select');
+  layouts.forEach(function(name) {
+    var opt = document.createElement('option');
+    opt.value = name; opt.textContent = name;
+    if (name === defaultLayout) opt.selected = true;
+    layoutSelect.appendChild(opt);
+  });
+
+  function runLayout(name) {
+    var opts = { name: name, animate: false };
+    if (name === 'dagre') { opts.rankDir = 'TB'; opts.nodeSep = 40; opts.rankSep = 60; }
+    if (name === 'cola') { opts.maxSimulationTime = 2000; opts.nodeSpacing = 30; }
+    cy.layout(opts).run();
+  }
+
+  runLayout(defaultLayout);
+
+  layoutSelect.addEventListener('change', function() { runLayout(this.value); });
+  document.getElementById('fit-btn').addEventListener('click', function() { cy.fit(null, 20); });
+
+  // Edge type filter
+  var filterContainer = document.getElementById('edge-filters');
+  if (Object.keys(edgeTypes).length > 1) {
+    var span = document.createElement('span');
+    span.textContent = 'Edges: ';
+    span.style.fontWeight = '600';
+    filterContainer.appendChild(span);
+    Object.keys(edgeTypes).sort().forEach(function(et) {
+      var lbl = document.createElement('label');
+      var cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = true; cb.dataset.edgeType = et;
+      cb.addEventListener('change', function() {
+        cy.edges('[edgeType = "' + et + '"]').toggleClass('hidden', !this.checked);
+      });
+      lbl.appendChild(cb);
+      lbl.appendChild(document.createTextNode(' ' + et));
+      filterContainer.appendChild(lbl);
+    });
+  }
+
+  // Search
+  var searchInput = document.getElementById('search');
+  searchInput.addEventListener('input', function() {
+    cy.nodes().removeClass('search-match');
+    var q = this.value.trim().toLowerCase();
+    if (!q) return;
+    cy.nodes().forEach(function(n) {
+      if ((n.data('label') || '').toLowerCase().indexOf(q) >= 0) {
+        n.addClass('search-match');
+      }
+    });
+  });
+
+  // Graph info
+  document.getElementById('graph-info').textContent =
+    GRAPH_DATA.graph_type + ' | ' + GRAPH_DATA.nodes.length + ' nodes, ' + GRAPH_DATA.edges.length + ' edges';
+
+  // Tooltip
+  var tooltip = document.getElementById('tooltip');
+  function showTooltip(evt, text) {
+    tooltip.textContent = text;
+    tooltip.style.display = 'block';
+    tooltip.style.left = (evt.renderedPosition.x + 15) + 'px';
+    tooltip.style.top = (evt.renderedPosition.y + 50) + 'px';
+  }
+  cy.on('mouseover', 'node', function(evt) {
+    var d = evt.target.data();
+    var lines = ['ID: ' + d.id, 'Labels: ' + d.labels];
+    var p = d.props || {};
+    Object.keys(p).sort().forEach(function(k) { lines.push(k + ': ' + JSON.stringify(p[k])); });
+    showTooltip(evt, lines.join('\n'));
+  });
+  cy.on('mouseover', 'edge', function(evt) {
+    var d = evt.target.data();
+    var lines = ['Type: ' + d.edgeType, 'From: ' + d.source, 'To: ' + d.target];
+    var p = d.props || {};
+    Object.keys(p).sort().forEach(function(k) { lines.push(k + ': ' + JSON.stringify(p[k])); });
+    showTooltip(evt, lines.join('\n'));
+  });
+  cy.on('mouseout', 'node, edge', function() { tooltip.style.display = 'none'; });
+
+  // Click to highlight neighbors
+  cy.on('tap', 'node', function(evt) {
+    cy.elements().removeClass('highlighted neighbor');
+    var node = evt.target;
+    node.addClass('highlighted');
+    node.neighborhood('node').addClass('neighbor');
+    node.connectedEdges().addClass('highlighted');
+  });
+  cy.on('tap', function(evt) {
+    if (evt.target === cy) { cy.elements().removeClass('highlighted neighbor'); }
+  });
+})();
+</script>
+</body>
+</html>
