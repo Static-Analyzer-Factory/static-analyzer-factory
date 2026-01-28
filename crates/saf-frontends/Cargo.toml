@@ -1,0 +1,27 @@
+[package]
+name = "saf-frontends"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Frontend trait and implementations (LLVM, AIR JSON) for the Static Analyzer Factory"
+
+[features]
+default = ["llvm-18"]
+llvm-17 = ["dep:inkwell", "inkwell/llvm17-0"]
+llvm-18 = ["dep:inkwell", "inkwell/llvm18-1"]
+
+[dependencies]
+saf-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+inkwell = { workspace = true, optional = true }
+rustc-hash = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+insta = { workspace = true }
+tempfile = { workspace = true }

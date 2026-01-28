@@ -1,0 +1,84 @@
+{
+  "frontend_id": "air-json",
+  "schema_version": "0.1.0",
+  "module": {
+    "name": "constants",
+    "globals": [
+      {
+        "name": "CONST_INT",
+        "is_constant": true,
+        "init": {
+          "kind": "int",
+          "value": 42,
+          "bits": 32
+        }
+      },
+      {
+        "name": "CONST_FLOAT",
+        "is_constant": true,
+        "init": {
+          "kind": "float",
+          "value": 3.14159,
+          "bits": 64
+        }
+      },
+      {
+        "name": "CONST_STRING",
+        "is_constant": true,
+        "init": {
+          "kind": "string",
+          "value": "Hello, World!"
+        }
+      },
+      {
+        "name": "CONST_NULL",
+        "is_constant": true,
+        "init": {
+          "kind": "null"
+        }
+      },
+      {
+        "name": "CONST_AGGREGATE",
+        "is_constant": true,
+        "init": {
+          "kind": "aggregate",
+          "elements": [
+            {"kind": "int", "value": 1, "bits": 32},
+            {"kind": "int", "value": 2, "bits": 32},
+            {"kind": "int", "value": 3, "bits": 32}
+          ]
+        }
+      },
+      {
+        "name": "ZERO_INIT",
+        "is_constant": false,
+        "init": {
+          "kind": "zero_init"
+        }
+      },
+      {
+        "name": "UNDEF_VAL",
+        "is_constant": false,
+        "init": {
+          "kind": "undef"
+        }
+      }
+    ],
+    "functions": [
+      {
+        "name": "use_constants",
+        "params": [],
+        "blocks": [
+          {
+            "label": "entry",
+            "instructions": [
+              {
+                "op": "ret"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

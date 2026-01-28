@@ -1,0 +1,30 @@
+{
+  "schema_version": "0.1.0",
+  "frontend_id": "air-json",
+  "module": {
+    "id": "0x00000000000000000000000000000002",
+    "name": "lib",
+    "functions": [
+      {
+        "id": "0x00000000000000000000000000000020",
+        "name": "helper",
+        "params": [],
+        "blocks": [
+          {
+            "id": "0x00000000000000000000000000000200",
+            "label": "entry",
+            "instructions": [
+              {
+                "id": "0x00000000000000000000000000002000",
+                "op": "ret"
+              }
+            ]
+          }
+        ],
+        "entry_block": "0x00000000000000000000000000000200",
+        "is_declaration": false
+      }
+    ],
+    "globals": []
+  }
+}

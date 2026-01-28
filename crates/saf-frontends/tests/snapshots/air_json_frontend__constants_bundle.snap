@@ -1,0 +1,117 @@
+---
+source: crates/saf-frontends/tests/air_json_frontend.rs
+assertion_line: 249
+expression: bundle
+---
+{
+  "frontend_id": "air-json",
+  "schema_version": "0.1.0",
+  "module": {
+    "id": "0x98135c46d3b05387899c590f323aac01",
+    "name": "constants",
+    "functions": [
+      {
+        "id": "0xb37763af63ffa9cdc323e8ce845ce378",
+        "name": "use_constants",
+        "blocks": [
+          {
+            "id": "0xbb0add98dd6cfc0c2a787361edaab5b6",
+            "label": "entry",
+            "instructions": [
+              {
+                "id": "0xd1a6fa2da7d2f3117dd9565b1876fde1",
+                "op": "ret"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "globals": [
+      {
+        "id": "0xbdc2492bc1aebc1384cab5fe064deb9e",
+        "obj": "0x2efcc7e2efc6ae43175f8e4591e9ad8d",
+        "name": "CONST_INT",
+        "init": {
+          "kind": "int",
+          "value": 42,
+          "bits": 32
+        },
+        "is_constant": true
+      },
+      {
+        "id": "0x0a850c460f7af880a49f1bcdd6d635ba",
+        "obj": "0x58e4c7430f6b68869cca4f87162c0bfa",
+        "name": "CONST_FLOAT",
+        "init": {
+          "kind": "float",
+          "value": 3.14159,
+          "bits": 64
+        },
+        "is_constant": true
+      },
+      {
+        "id": "0x54d867dfeb58347fcf6d145dbecb7566",
+        "obj": "0xddf279fbb5a3c4d10881b13edc12f902",
+        "name": "CONST_STRING",
+        "init": {
+          "kind": "string",
+          "value": "Hello, World!"
+        },
+        "is_constant": true
+      },
+      {
+        "id": "0x8024c91b62504da0412a237b9827d42b",
+        "obj": "0x7281d00c29c12e53aee72d49b047aa84",
+        "name": "CONST_NULL",
+        "init": {
+          "kind": "null"
+        },
+        "is_constant": true
+      },
+      {
+        "id": "0x70be0e1771d22a9ba0e9acf81fe52456",
+        "obj": "0x7265a78d4f97f4392af5fb00037ff414",
+        "name": "CONST_AGGREGATE",
+        "init": {
+          "kind": "aggregate",
+          "elements": [
+            {
+              "kind": "int",
+              "value": 1,
+              "bits": 32
+            },
+            {
+              "kind": "int",
+              "value": 2,
+              "bits": 32
+            },
+            {
+              "kind": "int",
+              "value": 3,
+              "bits": 32
+            }
+          ]
+        },
+        "is_constant": true
+      },
+      {
+        "id": "0xcba190bb4dd59a52e07f14beaed32701",
+        "obj": "0xdefd2b48a7b2c86f2140d5215d14dcc7",
+        "name": "ZERO_INIT",
+        "init": {
+          "kind": "zero_init"
+        }
+      },
+      {
+        "id": "0xd8f2ce6e48e684338d150219a483e65a",
+        "obj": "0x0a3db57ff5a1c9b9a25fa259fc0e5647",
+        "name": "UNDEF_VAL",
+        "init": {
+          "kind": "undef"
+        }
+      }
+    ],
+    "target_pointer_width": 8
+  }
+}

@@ -1,0 +1,32 @@
+---
+source: crates/saf-frontends/tests/air_json_frontend.rs
+assertion_line: 49
+expression: bundle
+---
+{
+  "frontend_id": "air-json",
+  "schema_version": "0.1.0",
+  "module": {
+    "id": "0xb28b7ff4b97067d259e59011b435dde1",
+    "name": "minimal",
+    "functions": [
+      {
+        "id": "0x960a2a2e155c7e64c968a6465904b109",
+        "name": "main",
+        "blocks": [
+          {
+            "id": "0x1b12e719354130387247242e21f9d83b",
+            "label": "entry",
+            "instructions": [
+              {
+                "id": "0x4795cda536aa5f7030954435995f2a7f",
+                "op": "ret"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "target_pointer_width": 8
+  }
+}

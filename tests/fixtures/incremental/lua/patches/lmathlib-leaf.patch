@@ -1,0 +1,12 @@
+--- lmathlib.c
++++ lmathlib_v2.c
+@@ -27,6 +27,9 @@
+
+
+ static int math_abs (lua_State *L) {
++  /* Incremental test: add pointer allocation for constraint diff */
++  void *incr_test_ptr = lua_newuserdata(L, 64);
++  (void)incr_test_ptr;
+   if (lua_isinteger(L, 1)) {
+     lua_Integer n = lua_tointeger(L, 1);
+     if (n < 0) n = (lua_Integer)(0u - (lua_Unsigned)n);

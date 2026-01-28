@@ -1,0 +1,13 @@
+--- lobject.c
++++ lobject_v2.c
+@@ -306,6 +306,10 @@
+
+
+ size_t luaO_str2num (const char *s, TValue *o) {
++  /* Incremental test: add pointer indirection for constraint cascade */
++  typedef size_t (*str2num_hook_t)(const char *, TValue *);
++  static str2num_hook_t hook = NULL;
++  if (hook) return hook(s, o);
+   lua_Integer i; lua_Number n;
+   const char *e;
+   if ((e = l_str2int(s, &i)) != NULL) {  /* try as an integer */

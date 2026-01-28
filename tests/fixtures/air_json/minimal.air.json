@@ -1,0 +1,23 @@
+{
+  "frontend_id": "air-json",
+  "schema_version": "0.1.0",
+  "module": {
+    "name": "minimal",
+    "functions": [
+      {
+        "name": "main",
+        "params": [],
+        "blocks": [
+          {
+            "label": "entry",
+            "instructions": [
+              {
+                "op": "ret"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
