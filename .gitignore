@@ -1,0 +1,81 @@
+# Rust
+/target/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.so
+.venv/
+dist/
+*.egg-info/
+
+# Node.js
+node_modules/
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Project
+.cache/
+.z3-trace
+.env
+
+# Maturin build output (PyO3 wheel builds)
+/target-maturin/
+
+# Playwright MCP console logs and screenshots
+.playwright-mcp/
+test-results/
+
+# Visualization output directory
+output/
+
+# mdBook build output
+docs/book/build/
+
+# Docs E2E test artifacts
+docs/e2e/screenshots/
+docs/e2e/test-results/
+
+# Site build output
+site/dist/
+_site/
+
+# Generated LLVM IR (tutorials compile these at runtime)
+*.ll
+!tests/fixtures/**/*.ll
+
+# Generated tutorial output files (created at runtime)
+tutorials/**/*.sarif.json
+tutorials/**/cfg.json
+tutorials/**/callgraph.json
+tutorials/**/defuse.json
+tutorials/**/valueflow.json
+
+# PTABen compiled bitcode (compiled at runtime via `make compile-ptaben`)
+tests/benchmarks/ptaben/.compiled/
+# PTABen benchmark results (generated via --json)
+tests/benchmarks/ptaben/results.json
+
+# SV-COMP compiled bitcode and cache
+tests/benchmarks/sv-benchmarks/.compiled/
+tests/benchmarks/sv-benchmarks/.task-cache/
+
+# CruxBC benchmark data (only README.md is tracked; .bc source comes from ptaben submodule)
+tests/benchmarks/cruxbc/.compiled/
+tests/benchmarks/cruxbc/*.json
+tests/benchmarks/cruxbc/*.txt
+tests/benchmarks/cruxbc/multi-run/
+.claude/
+
+# Incremental analysis benchmarks (generated on-demand)
+tests/benchmarks/incremental/cpython/
+tests/benchmarks/incremental/results.json
+tests/benchmarks/incremental/*/.compiled/
+
+# Git worktrees
+.worktrees/

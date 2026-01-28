@@ -1,0 +1,8 @@
+[submodule "tests/benchmarks/ptaben"]
+	path = tests/benchmarks/ptaben
+	url = https://github.com/SVF-tools/Test-Suite
+	ignore = dirty
+[submodule "tests/benchmarks/sv-benchmarks"]
+	path = tests/benchmarks/sv-benchmarks
+	url = https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks.git
+	ignore = dirty

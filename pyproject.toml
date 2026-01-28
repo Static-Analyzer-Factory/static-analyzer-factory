@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.7"]
+build-backend = "maturin"
+
+[project]
+name = "saf"
+version = "0.1.0"
+description = "Static Analyzer Factory — Python SDK"
+requires-python = ">=3.12"
+license = "MIT OR Apache-2.0"
+
+[tool.maturin]
+python-source = "python"
+module-name = "saf._saf"
+manifest-path = "crates/saf-python/Cargo.toml"
+features = ["pyo3/extension-module", "llvm-18"]
+
+[project.optional-dependencies]
+viz = ["graphviz>=0.20", "networkx>=3.0"]
+notebook = ["ipycytoscape>=1.3"]

@@ -1,0 +1,57 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/saf-core",
+  "crates/saf-frontends",
+  "crates/saf-analysis",
+  "crates/saf-cli",
+  "crates/saf-python",
+  "crates/saf-test-utils",
+  "crates/saf-bench",
+  "crates/saf-wasm",
+  "crates/saf-trace",
+  "crates/saf-datalog",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+saf-core = { path = "crates/saf-core" }
+saf-frontends = { path = "crates/saf-frontends", default-features = false }
+saf-analysis = { path = "crates/saf-analysis", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+blake3 = "1.8"
+petgraph = "0.8"
+thiserror = "2.0"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+inkwell = { version = "0.8", default-features = false }
+pyo3 = { version = "0.23", features = ["abi3-py312"] }
+tempfile = "3"
+pretty_assertions = "1"
+insta = { version = "1.40", features = ["json"] }
+serde_yaml = "0.9"
+glob = "0.3"
+regex = "1"
+smallvec = "1"
+indexmap = "2"
+im-rc = "15"
+roaring = "0.10"
+rustc-hash = "2"
+toml = "0.8"
+
+# --- Build profiles for faster development ---
+
+# Reduce debug info for faster linking (still get file:line in backtraces)
+[profile.dev]
+debug = "line-tables-only"
+
+# Optimize third-party deps even in dev mode (compiled once, run faster)
+[profile.dev.package."*"]
+opt-level = 2

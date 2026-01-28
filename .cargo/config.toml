@@ -1,0 +1,6 @@
+[target.'cfg(all())']
+rustflags = [
+  "-Wclippy::pedantic",
+  "-Aclippy::module_name_repetitions",
+  "-Aclippy::must_use_candidate",
+]
