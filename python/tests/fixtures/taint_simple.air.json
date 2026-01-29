@@ -1,0 +1,103 @@
+{
+  "frontend_id": "air-json",
+  "schema_version": "0.1.0",
+  "module": {
+    "name": "taint_simple",
+    "functions": [
+      {
+        "name": "main",
+        "params": [
+          {
+            "name": "input",
+            "id": "0x00000000000000000000000000000001",
+            "index": 0
+          }
+        ],
+        "blocks": [
+          {
+            "label": "entry",
+            "id": "0x00000000000000000000000000001000",
+            "instructions": [
+              {
+                "id": "0x00000000000000000000000000002001",
+                "op": "copy",
+                "operands": ["0x00000000000000000000000000000001"],
+                "dst": "0x00000000000000000000000000000010",
+                "span": {
+                  "file_id": 1,
+                  "byte_start": 100,
+                  "byte_end": 120,
+                  "line_start": 5,
+                  "col_start": 5,
+                  "line_end": 5,
+                  "col_end": 25
+                },
+                "symbol": {
+                  "display_name": "tainted_data"
+                }
+              },
+              {
+                "id": "0x00000000000000000000000000002002",
+                "op": "call_direct",
+                "callee": "0x00000000000000000000000000000100",
+                "operands": ["0x00000000000000000000000000000010"],
+                "dst": "0x00000000000000000000000000000020",
+                "span": {
+                  "file_id": 1,
+                  "byte_start": 130,
+                  "byte_end": 160,
+                  "line_start": 6,
+                  "col_start": 5,
+                  "line_end": 6,
+                  "col_end": 35
+                },
+                "symbol": {
+                  "display_name": "call_dangerous_sink"
+                }
+              },
+              {
+                "id": "0x00000000000000000000000000002003",
+                "op": "ret",
+                "operands": []
+              }
+            ]
+          }
+        ],
+        "entry_block": "0x00000000000000000000000000001000",
+        "span": {
+          "file_id": 1,
+          "byte_start": 0,
+          "byte_end": 200,
+          "line_start": 1,
+          "col_start": 1,
+          "line_end": 10,
+          "col_end": 1
+        },
+        "symbol": {
+          "display_name": "main"
+        }
+      },
+      {
+        "name": "dangerous_sink",
+        "id": "0x00000000000000000000000000000100",
+        "is_declaration": true,
+        "params": [
+          {
+            "name": "data",
+            "id": "0x00000000000000000000000000000101",
+            "index": 0
+          }
+        ],
+        "blocks": []
+      }
+    ],
+    "globals": [],
+    "source_files": [
+      {
+        "id": 1,
+        "path": "test.c",
+        "checksum": null
+      }
+    ]
+  }
+}

@@ -1,0 +1,135 @@
+{
+  "frontend_id": "air-json",
+  "schema_version": "0.1.0",
+  "module": {
+    "name": "taint_sanitizer",
+    "functions": [
+      {
+        "name": "main",
+        "params": [
+          {
+            "name": "user_input",
+            "id": "0x00000000000000000000000000000001",
+            "index": 0
+          }
+        ],
+        "blocks": [
+          {
+            "label": "entry",
+            "id": "0x00000000000000000000000000001000",
+            "instructions": [
+              {
+                "id": "0x00000000000000000000000000002001",
+                "op": "copy",
+                "operands": ["0x00000000000000000000000000000001"],
+                "dst": "0x00000000000000000000000000000010",
+                "span": {
+                  "file_id": 1,
+                  "byte_start": 100,
+                  "byte_end": 120,
+                  "line_start": 5,
+                  "col_start": 5,
+                  "line_end": 5,
+                  "col_end": 25
+                },
+                "symbol": {
+                  "display_name": "data_copy"
+                }
+              },
+              {
+                "id": "0x00000000000000000000000000002002",
+                "op": "call_direct",
+                "callee": "0x00000000000000000000000000000200",
+                "operands": ["0x00000000000000000000000000000010"],
+                "dst": "0x00000000000000000000000000000020",
+                "span": {
+                  "file_id": 1,
+                  "byte_start": 130,
+                  "byte_end": 160,
+                  "line_start": 6,
+                  "col_start": 5,
+                  "line_end": 6,
+                  "col_end": 35
+                },
+                "symbol": {
+                  "display_name": "sanitize_call"
+                }
+              },
+              {
+                "id": "0x00000000000000000000000000002003",
+                "op": "call_direct",
+                "callee": "0x00000000000000000000000000000100",
+                "operands": ["0x00000000000000000000000000000010"],
+                "dst": "0x00000000000000000000000000000030",
+                "span": {
+                  "file_id": 1,
+                  "byte_start": 170,
+                  "byte_end": 200,
+                  "line_start": 7,
+                  "col_start": 5,
+                  "line_end": 7,
+                  "col_end": 35
+                },
+                "symbol": {
+                  "display_name": "dangerous_call"
+                }
+              },
+              {
+                "id": "0x00000000000000000000000000002004",
+                "op": "ret",
+                "operands": []
+              }
+            ]
+          }
+        ],
+        "entry_block": "0x00000000000000000000000000001000",
+        "span": {
+          "file_id": 1,
+          "byte_start": 0,
+          "byte_end": 250,
+          "line_start": 1,
+          "col_start": 1,
+          "line_end": 12,
+          "col_end": 1
+        },
+        "symbol": {
+          "display_name": "main"
+        }
+      },
+      {
+        "name": "sanitize_input",
+        "id": "0x00000000000000000000000000000200",
+        "is_declaration": true,
+        "params": [
+          {
+            "name": "input",
+            "id": "0x00000000000000000000000000000201",
+            "index": 0
+          }
+        ],
+        "blocks": []
+      },
+      {
+        "name": "dangerous_sink",
+        "id": "0x00000000000000000000000000000100",
+        "is_declaration": true,
+        "params": [
+          {
+            "name": "data",
+            "id": "0x00000000000000000000000000000101",
+            "index": 0
+          }
+        ],
+        "blocks": []
+      }
+    ],
+    "globals": [],
+    "source_files": [
+      {
+        "id": 1,
+        "path": "test_sanitizer.c",
+        "checksum": null
+      }
+    ]
+  }
+}

@@ -1,0 +1,25 @@
+[package]
+name = "saf-python"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Python bindings (PyO3) for the Static Analyzer Factory"
+
+[lib]
+name = "_saf"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+llvm-17 = ["saf-frontends/llvm-17"]
+llvm-18 = ["saf-frontends/llvm-18"]
+
+[dependencies]
+saf-core = { workspace = true }
+saf-frontends = { workspace = true }
+saf-analysis = { workspace = true, features = ["z3-solver"] }
+saf-datalog = { path = "../saf-datalog" }
+pyo3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
