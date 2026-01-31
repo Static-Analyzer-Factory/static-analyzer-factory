@@ -1,0 +1,122 @@
+Start testing: Sep 05 06:46 UTC
+----------------------------------------------------------
+1151/1157 Testing: diff-perf-cruxbc-small/test_cases_bc/crux-bc/dc.bc
+1151/1157 Test: diff-perf-cruxbc-small/test_cases_bc/crux-bc/dc.bc
+Command: "/home/runner/work/SVF/SVF/Test-Suite/diff_tests/difftest.py" "wpa -vfspta -dump-vfg -dump-json=ir.json" "wpa -vfspta -read-json" "/home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/dc.bc" "ir.json"
+Directory: /home/runner/work/SVF/SVF/Release-build/bin
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/dc.bc" start time: Sep 05 06:46 UTC
+Output:
+----------------------------------------------------------
+Executing command: ./wpa -vfspta -dump-vfg -dump-json=ir.json /home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/dc.bc
+Executing command: ./wpa -vfspta -read-json ir.json
+<end of output>
+Test time =   2.13 sec
+----------------------------------------------------------
+Test Passed.
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/dc.bc" end time: Sep 05 06:46 UTC
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/dc.bc" time elapsed: 00:00:02
+----------------------------------------------------------
+
+1152/1157 Testing: diff-perf-cruxbc-small/test_cases_bc/crux-bc/bc.bc
+1152/1157 Test: diff-perf-cruxbc-small/test_cases_bc/crux-bc/bc.bc
+Command: "/home/runner/work/SVF/SVF/Test-Suite/diff_tests/difftest.py" "wpa -vfspta -dump-vfg -dump-json=ir.json" "wpa -vfspta -read-json" "/home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/bc.bc" "ir.json"
+Directory: /home/runner/work/SVF/SVF/Release-build/bin
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/bc.bc" start time: Sep 05 06:46 UTC
+Output:
+----------------------------------------------------------
+Executing command: ./wpa -vfspta -dump-vfg -dump-json=ir.json /home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/bc.bc
+Executing command: ./wpa -vfspta -read-json ir.json
+<end of output>
+Test time =   4.29 sec
+----------------------------------------------------------
+Test Passed.
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/bc.bc" end time: Sep 05 06:46 UTC
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/bc.bc" time elapsed: 00:00:04
+----------------------------------------------------------
+
+1153/1157 Testing: diff-perf-cruxbc-small/test_cases_bc/crux-bc/libbz2.so.bc
+1153/1157 Test: diff-perf-cruxbc-small/test_cases_bc/crux-bc/libbz2.so.bc
+Command: "/home/runner/work/SVF/SVF/Test-Suite/diff_tests/difftest.py" "wpa -vfspta -dump-vfg -dump-json=ir.json" "wpa -vfspta -read-json" "/home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/libbz2.so.bc" "ir.json"
+Directory: /home/runner/work/SVF/SVF/Release-build/bin
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/libbz2.so.bc" start time: Sep 05 06:46 UTC
+Output:
+----------------------------------------------------------
+Executing command: ./wpa -vfspta -dump-vfg -dump-json=ir.json /home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/libbz2.so.bc
+Executing command: ./wpa -vfspta -read-json ir.json
+<end of output>
+Test time =   5.90 sec
+----------------------------------------------------------
+Test Passed.
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/libbz2.so.bc" end time: Sep 05 06:46 UTC
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/libbz2.so.bc" time elapsed: 00:00:05
+----------------------------------------------------------
+
+1154/1157 Testing: diff-perf-cruxbc-small/test_cases_bc/crux-bc/bunzip2.bc
+1154/1157 Test: diff-perf-cruxbc-small/test_cases_bc/crux-bc/bunzip2.bc
+Command: "/home/runner/work/SVF/SVF/Test-Suite/diff_tests/difftest.py" "wpa -vfspta -dump-vfg -dump-json=ir.json" "wpa -vfspta -read-json" "/home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/bunzip2.bc" "ir.json"
+Directory: /home/runner/work/SVF/SVF/Release-build/bin
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/bunzip2.bc" start time: Sep 05 06:46 UTC
+Output:
+----------------------------------------------------------
+Executing command: ./wpa -vfspta -dump-vfg -dump-json=ir.json /home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/bunzip2.bc
+Executing command: ./wpa -vfspta -read-json ir.json
+<end of output>
+Test time =   7.18 sec
+----------------------------------------------------------
+Test Passed.
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/bunzip2.bc" end time: Sep 05 06:46 UTC
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/bunzip2.bc" time elapsed: 00:00:07
+----------------------------------------------------------
+
+1155/1157 Testing: diff-perf-cruxbc-small/test_cases_bc/crux-bc/htop.bc
+1155/1157 Test: diff-perf-cruxbc-small/test_cases_bc/crux-bc/htop.bc
+Command: "/home/runner/work/SVF/SVF/Test-Suite/diff_tests/difftest.py" "wpa -vfspta -dump-vfg -dump-json=ir.json" "wpa -vfspta -read-json" "/home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/htop.bc" "ir.json"
+Directory: /home/runner/work/SVF/SVF/Release-build/bin
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/htop.bc" start time: Sep 05 06:46 UTC
+Output:
+----------------------------------------------------------
+Executing command: ./wpa -vfspta -dump-vfg -dump-json=ir.json /home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/htop.bc
+Executing command: ./wpa -vfspta -read-json ir.json
+<end of output>
+Test time =  23.25 sec
+----------------------------------------------------------
+Test Passed.
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/htop.bc" end time: Sep 05 06:47 UTC
+"diff-perf-cruxbc-small/test_cases_bc/crux-bc/htop.bc" time elapsed: 00:00:23
+----------------------------------------------------------
+
+1156/1157 Testing: diff-perf-cruxbc-big/test_cases_bc/crux-bc/libcurl.so.bc
+1156/1157 Test: diff-perf-cruxbc-big/test_cases_bc/crux-bc/libcurl.so.bc
+Command: "/home/runner/work/SVF/SVF/Test-Suite/diff_tests/difftest.py" "wpa -ander -dump-json=ir.json" "wpa -ander -read-json" "/home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/libcurl.so.bc" "ir.json"
+Directory: /home/runner/work/SVF/SVF/Release-build/bin
+"diff-perf-cruxbc-big/test_cases_bc/crux-bc/libcurl.so.bc" start time: Sep 05 06:47 UTC
+Output:
+----------------------------------------------------------
+Executing command: ./wpa -ander -dump-json=ir.json /home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/libcurl.so.bc
+Executing command: ./wpa -ander -read-json ir.json
+<end of output>
+Test time = 118.12 sec
+----------------------------------------------------------
+Test Passed.
+"diff-perf-cruxbc-big/test_cases_bc/crux-bc/libcurl.so.bc" end time: Sep 05 06:49 UTC
+"diff-perf-cruxbc-big/test_cases_bc/crux-bc/libcurl.so.bc" time elapsed: 00:01:58
+----------------------------------------------------------
+
+1157/1157 Testing: diff-perf-cruxbc-big/test_cases_bc/crux-bc/bash.bc
+1157/1157 Test: diff-perf-cruxbc-big/test_cases_bc/crux-bc/bash.bc
+Command: "/home/runner/work/SVF/SVF/Test-Suite/diff_tests/difftest.py" "wpa -ander -dump-json=ir.json" "wpa -ander -read-json" "/home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/bash.bc" "ir.json"
+Directory: /home/runner/work/SVF/SVF/Release-build/bin
+"diff-perf-cruxbc-big/test_cases_bc/crux-bc/bash.bc" start time: Sep 05 06:49 UTC
+Output:
+----------------------------------------------------------
+Executing command: ./wpa -ander -dump-json=ir.json /home/runner/work/SVF/SVF/Test-Suite/test_cases_bc/crux-bc/bash.bc
+Executing command: ./wpa -ander -read-json ir.json
+<end of output>
+Test time =  75.97 sec
+----------------------------------------------------------
+Test Passed.
+"diff-perf-cruxbc-big/test_cases_bc/crux-bc/bash.bc" end time: Sep 05 06:50 UTC
+"diff-perf-cruxbc-big/test_cases_bc/crux-bc/bash.bc" time elapsed: 00:01:15
+----------------------------------------------------------
+
+End testing: Sep 05 06:50 UTC

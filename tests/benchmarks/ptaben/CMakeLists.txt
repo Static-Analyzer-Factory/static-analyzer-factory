@@ -1,0 +1,548 @@
+# object type inference tests  (ctest -R objtype -VV)
+set(cmd "wpa -type -stat=false")
+file(GLOB type_infer_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/objtype_tests/*.bc*")
+string(REPLACE " " ";" commandtemp ${cmd})
+set(command ${commandtemp})
+# loops over each file creating a test
+foreach(filename ${type_infer_files})
+  add_test(
+          NAME objtype/${filename}
+          COMMAND ${command} ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endforeach()
+
+# graphdb-wpa object type inference tests (write + read)
+# Usage: ctest -R graphdb-objtype_tests -VV
+set(graphdb_objtype_write_cmd "graphdb-wpa -type -stat=false -write2db")
+set(graphdb_objtype_read_cmd  "graphdb-wpa -type -stat=false -read-from-db")
+file(GLOB type_infer_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/objtype_tests/*.bc*")
+string(REPLACE " " ";" commandtemp ${cmd})
+set(command ${commandtemp})
+foreach(filename ${type_infer_files})
+  if (TARGET graphdb-wpa)
+    add_test(
+      NAME graphdb-objtype_tests/${filename}
+      COMMAND bash -c
+        "${CMAKE_BINARY_DIR}/bin/${graphdb_objtype_write_cmd} '${CMAKE_CURRENT_SOURCE_DIR}/${filename}' \
+         && ${CMAKE_BINARY_DIR}/bin/${graphdb_objtype_read_cmd} '${CMAKE_CURRENT_SOURCE_DIR}/${filename}'"
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+  else()
+    message(WARNING "Skipping graphdb-objtype_tests because graphdb-wpa binary not found")
+  endif()
+endforeach()
+
+# graphdb-wpa tests (write + read)
+# graphdb-wpa tests (ctest -R graphdb-wpa_tests -VV)
+list(APPEND graphdb_folders
+  basic_c_tests
+  basic_cpp_tests
+  fs_tests
+  vfs_tests
+)
+
+list(APPEND graphdb_write_commands
+  "graphdb-wpa -ander -write2db"
+  "graphdb-wpa -ander -write2db"
+  "graphdb-wpa -fspta -write2db"
+  "graphdb-wpa -vfspta -write2db"
+)
+
+list(APPEND graphdb_read_commands
+  "graphdb-wpa -ander -read-from-db"
+  "graphdb-wpa -ander -read-from-db"
+  "graphdb-wpa -fspta -read-from-db"
+  "graphdb-wpa -vfspta -read-from-db"
+)
+
+list(LENGTH graphdb_folders graphdb_len1)
+math(EXPR graphdb_len2 "${graphdb_len1} - 1")
+
+# loops over each command in commands list
+foreach(i RANGE ${graphdb_len2})
+  # gets the command and folder of index i
+  list(GET graphdb_folders ${i} folder)
+  list(GET graphdb_write_commands ${i} write_cmd)
+  list(GET graphdb_read_commands ${i} read_cmd)
+  # creates a list of each file in folder
+  file(GLOB files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/${folder}/*.bc*")
+
+  # loops over each file creating a test
+  foreach(filename ${files})
+    if (${filename} MATCHES ".pre.bc" OR ${filename} MATCHES ".pre.svf.bc" OR ${filename} MATCHES ".svf.bc")
+      continue()
+    endif()
+
+    # Combine commands: use bash -c to execute write && read
+    if (TARGET graphdb-wpa)
+      add_test(
+        NAME graphdb-wpa_tests/${filename}
+        COMMAND bash -c
+              "${CMAKE_BINARY_DIR}/bin/${write_cmd} '${CMAKE_CURRENT_SOURCE_DIR}/${filename}' && ${CMAKE_BINARY_DIR}/bin/${read_cmd} '${CMAKE_CURRENT_SOURCE_DIR}/${filename}'"
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+      )
+  endif()
+  endforeach()
+endforeach()
+
+
+# wpa tests (ctest -R wpa_tests -VV)
+# folder and commands list act in parallel. e.g. for index 0 command "wpa -ander -stat=false" will be run on basic_c_tests folder.
+list(
+  APPEND
+  wpa_folders
+  basic_c_tests
+  basic_cpp_tests
+  fs_tests
+  vfs_tests
+)
+
+list(
+  APPEND
+  commands
+  "wpa -ander"
+  "wpa -ander"
+  "wpa -fspta"
+  "wpa -vfspta"
+)
+
+list(LENGTH wpa_folders wpa_len1)
+math(EXPR wpa_len2 "${wpa_len1} - 1")
+
+# loops over each command in commands list
+foreach(i RANGE ${wpa_len2})
+  # gets the command and folder of index i
+  list(GET wpa_folders ${i} folder)
+  list(GET commands ${i} cmd)
+  # creates a list of each file in folder
+  file(GLOB files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/${folder}/*.bc*")
+  string(REPLACE " " ";" commandtemp ${cmd})
+  set(command ${commandtemp})
+  # loops over each file creating a test
+  foreach(filename ${files})
+    if (${filename} MATCHES ".pre.bc" OR ${filename} MATCHES ".pre.svf.bc" OR ${filename} MATCHES ".svf.bc")
+      continue()
+    endif()
+    add_test(
+      NAME wpa_tests/${filename}
+      COMMAND ${command} ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+  endforeach()
+endforeach()
+
+
+# dvf and mta tests (ctest -R dvf_tests -VV)
+list(
+  APPEND
+  dvf_folders
+  fs_tests
+  cs_tests
+  mta
+)
+
+list(
+  APPEND
+  dvf_commands
+  "dvf -dfs -print-pts=false"
+  "dvf -cxt -print-pts=false"
+  "mta"
+)
+
+list(LENGTH dvf_folders dvf_len1)
+math(EXPR dvf_len2 "${dvf_len1} - 1")
+
+# loops over each command in commands list
+foreach(i RANGE ${dvf_len2})
+  # gets the command and folder of index i
+  list(GET dvf_folders ${i} folder)
+  list(GET dvf_commands ${i} cmd)
+  # creates a list of each file in folder
+  file(GLOB files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/${folder}/*.bc*")
+  string(REPLACE " " ";" commandtemp ${cmd})
+  set(command ${commandtemp})
+  # loops over each file creating a test
+  foreach(filename ${files})
+    if (${filename} MATCHES ".pre.bc" OR ${filename} MATCHES ".pre.svf.bc" OR ${filename} MATCHES ".svf.bc")
+      continue()
+    endif()
+    add_test(
+      NAME dvf_tests/${filename}
+      COMMAND ${command} ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+  endforeach()
+endforeach()
+# graphdb dvf and mta tests (write + read)
+# Usage: ctest -R graphdb-dvf_tests -VV
+list(APPEND graphdb_dvf_folders
+  fs_tests
+  cs_tests
+  mta
+)
+list(APPEND graphdb_dvf_binaries
+  "graphdb-dvf"   # for fs_tests
+  "graphdb-dvf"   # for cs_tests
+  "graphdb-mta"   # for mta
+)
+list(APPEND graphdb_dvf_args
+  "-dfs -print-pts=false"   # for fs_tests
+  "-cxt -print-pts=false"   # for cs_tests
+  ""                        # for mta
+)
+list(LENGTH graphdb_dvf_folders dvf_len1)
+math(EXPR dvf_len2 "${dvf_len1} - 1")
+
+foreach(i RANGE ${dvf_len2})
+  list(GET graphdb_dvf_folders  ${i} folder)
+  list(GET graphdb_dvf_binaries ${i} binary)
+  list(GET graphdb_dvf_args     ${i} args)
+
+  file(GLOB files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
+       "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/${folder}/*.bc*")
+
+  foreach(filename ${files})
+    if (${filename} MATCHES ".pre.bc" OR
+        ${filename} MATCHES ".pre.svf.bc" OR
+        ${filename} MATCHES ".svf.bc")
+      continue()
+    endif()
+
+    if (TARGET ${binary})
+      set(write_cmd "${binary} ${args} -write2db")
+      set(read_cmd  "${binary} ${args} -read-from-db")
+
+      add_test(
+        NAME graphdb-dvf_tests/${folder}/${filename}
+        COMMAND bash -c
+          "${CMAKE_BINARY_DIR}/bin/${write_cmd} '${CMAKE_CURRENT_SOURCE_DIR}/${filename}' \
+           && ${CMAKE_BINARY_DIR}/bin/${read_cmd} '${CMAKE_CURRENT_SOURCE_DIR}/${filename}'"
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+      )
+    else()
+      message(WARNING "Skipping graphdb-dvf_tests for ${folder} because target '${binary}' not found")
+    endif()
+  endforeach()
+endforeach()
+
+# differential_tests fspta-vfspta  (ctest -R diff_tests-fs -VV)
+file(GLOB files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/fs_tests/*.bc*")
+foreach(filename ${files})
+  add_test(
+    NAME diff_tests-fs/fspta-vfspta/${filename}
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/diff_tests/difftest.py
+      "wpa -fspta -opt-svfg=false"
+      "wpa -vfspta -opt-svfg=false"
+      ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endforeach()
+
+
+
+# differential_tests anderson (ctest -R diff_tests-ander -VV) and (ctest -R diff_tests-wr-ander -VV) and (ctest -R diff_tests-wr-svfg -VV)
+list(
+  APPEND
+  diff_tests_anderson_folders
+  basic_c_tests
+  basic_cpp_tests
+  complex_tests
+  fs_tests
+)
+foreach(folder ${diff_tests_anderson_folders})
+  file(GLOB files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/${folder}/*.bc*")
+  foreach(filename ${files})
+    if (${filename} MATCHES ".pre.bc" OR ${filename} MATCHES ".pre.svf.bc" OR ${filename} MATCHES ".svf.bc")
+      continue()
+    endif()
+
+    add_test(
+      NAME diff_tests-ander/ander-nander/${filename}
+      COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/diff_tests/difftest.py
+        "wpa -ander -alias-check=false"
+        "wpa -nander -alias-check=false"
+        ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    
+    # read and write ander
+    # change file extension to .pre.bc
+    string(REGEX REPLACE "[.]bc$" ".pre.svf.bc" readFile ${CMAKE_CURRENT_SOURCE_DIR}/${filename})
+    add_test(
+      NAME diff_tests-wr-ander/ander-read-write/${filename}
+      COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/diff_tests/difftest.py
+        "svf-ex -ander -alias-check=false -dump-icfg -print-pts -write-ander=ir_annotator"
+        "svf-ex -ander -alias-check=false -dump-icfg -print-pts -read-ander=ir_annotator"
+        ${CMAKE_CURRENT_SOURCE_DIR}/${filename} ${readFile}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    
+  endforeach()
+endforeach()
+
+# differential_tests read_write_svfg with crux-bc (ctest -R diff_tests-wr-svfg-cruxbc -VV)
+list(
+  APPEND
+  diff_tests_cruxbc
+  bc
+  dc
+  xxd
+  libbz2.so
+  bzip2recover
+)
+foreach(file ${diff_tests_cruxbc})
+  file(GLOB filename RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/crux-bc/${file}.bc")
+  if(${filename})
+    add_test(
+      NAME diff_tests-wr-svfg-cruxbc/read_write_svfg_crux/${filename}
+      COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/diff_tests/difftest.py
+        "wpa -ander -svfg -alias-check=false -write-svfg=read_write_file"
+        "wpa -ander -svfg -alias-check=false -read-svfg=read_write_file"
+        ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+      WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/${CMAKE_BUILD_TYPE}-build/bin
+    )
+  endif()
+endforeach()
+
+# graphdb-saber mem_leak tests (write + read)
+# Usage: ctest -R graphdb-saber_tests -VV
+# This test suite runs graphdb-saber on the same mem_leak cases as saber,
+# executing both write2db and read-from-db phases. A test passes only if both succeed.
+set(graphdb_saber_write_cmd "graphdb-saber -leak -valid-tests -stat=false -write2db")
+set(graphdb_saber_read_cmd  "graphdb-saber -leak -valid-tests -stat=false -read-from-db")
+file(GLOB mem_leak_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/mem_leak/*.bc*")
+string(REPLACE " " ";" commandtemp ${cmd})
+set(command ${commandtemp})
+# loops over each file creating a test
+foreach(filename ${mem_leak_files})
+  if (TARGET graphdb-saber)
+      add_test(
+        NAME graphdb-saber_tests/${filename}
+        COMMAND bash -c
+          "${CMAKE_BINARY_DIR}/bin/${graphdb_saber_write_cmd} '${CMAKE_CURRENT_SOURCE_DIR}/${filename}' && ${CMAKE_BINARY_DIR}/bin/${graphdb_saber_read_cmd} '${CMAKE_CURRENT_SOURCE_DIR}/${filename}'"
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+      )
+  endif()
+endforeach()
+
+# saber mem_leak tests  (ctest -R mem_leak -VV)
+set(cmd "saber -leak -valid-tests -stat=false")
+file(GLOB mem_leak_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/mem_leak/*.bc*")
+string(REPLACE " " ";" commandtemp ${cmd})
+set(command ${commandtemp})
+# loops over each file creating a test
+foreach(filename ${mem_leak_files})
+  add_test(
+      NAME mem_leak/${filename}
+      COMMAND ${command} ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endforeach()
+
+# graphdb-saber double_free test (write + read)
+# Usage: ctest -R graphdb-saber_double_free_test -VV
+# This test suite runs graphdb-saber on the same mem_leak cases as saber,
+# executing both write2db and read-from-db phases. A test passes only if both succeed.
+set(graphdb_saber_double_free_write_cmd "graphdb-saber -dfree -valid-tests -stat=false  -write2db")
+set(graphdb_saber_double_free_read_cmd  "graphdb-saber -dfree -valid-tests -stat=false -read-from-db")
+file(GLOB doublefree_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/double_free/*.bc*")
+string(REPLACE " " ";" commandtemp ${cmd})
+set(command ${commandtemp})
+# loops over each file creating a test
+foreach(filename ${doublefree_files})
+  if (TARGET graphdb-saber)
+      add_test(
+        NAME graphdb-saber_double_free_test/${filename}
+        COMMAND bash -c
+          "${CMAKE_BINARY_DIR}/bin/${graphdb_saber_double_free_write_cmd} '${CMAKE_CURRENT_SOURCE_DIR}/${filename}' && ${CMAKE_BINARY_DIR}/bin/${graphdb_saber_double_free_read_cmd} '${CMAKE_CURRENT_SOURCE_DIR}/${filename}'"
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+      )
+  else()
+    message(WARNING "Skipping graphdb-saber because binary not found")
+  endif()
+endforeach()
+
+# saber double_free tests (ctest -R double_free -VV)
+set(cmd "saber -dfree -valid-tests -stat=false")
+file(GLOB doublefree_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/double_free/*.bc*")
+string(REPLACE " " ";" commandtemp ${cmd})
+set(command ${commandtemp})
+# loops over each file creating a test
+foreach(filename ${doublefree_files})
+  add_test(
+          NAME double_free/${filename}
+          COMMAND ${command} ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endforeach()
+
+# cfl tests (ctest -R cfl_tests -VV)
+list(
+  APPEND
+  cfl_test_bc_folders
+  basic_c_tests
+  basic_cpp_tests
+)
+foreach(folder ${cfl_test_bc_folders})
+  set(POCRcmd "cfl -grammar=${PROJECT_SOURCE_DIR}/svf/include/CFL/grammar/PAGGrammar.txt -stat=false -pocr-alias")
+  if(${folder} STREQUAL basic_c_tests )
+    set(HYBRIDcmd "cfl -grammar=${PROJECT_SOURCE_DIR}/svf/include/CFL/grammar/PAGGrammar.txt -stat=false -pocr-hybrid")
+    set(PEGcmd "cfl -grammar=${PROJECT_SOURCE_DIR}/svf/include/CFL/grammar/PEGGrammar.txt -peg-transfer -stat=false")
+    set(VFGcmd "cfl -grammar=${PROJECT_SOURCE_DIR}/svf/include/CFL/grammar/VFGGrammar.txt -cflsvfg -stat=false")
+    set(cmd "cfl -grammar=${PROJECT_SOURCE_DIR}/svf/include/CFL/grammar/PAGGrammar.txt -stat=false")
+    string(REPLACE " " ";" HYBRIDcommandtemp ${HYBRIDcmd})
+    string(REPLACE " " ";" PEGcommandtemp ${PEGcmd})
+    string(REPLACE " " ";" VFGcommandtemp ${VFGcmd})
+    string(REPLACE " " ";" commandtemp ${cmd})
+    set(HYBRIDcommand ${HYBRIDcommandtemp})
+    set(PEGcommand ${PEGcommandtemp})
+    set(VFGcommand ${VFGcommandtemp})
+    set(command ${commandtemp})
+  endif()
+  file(GLOB cfl_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/${folder}/*.bc*")
+  string(REPLACE " " ";" POCRcommandtemp ${POCRcmd})
+  set(POCRcommand ${POCRcommandtemp})
+  # loops over each file creating a test
+  foreach(filename ${cfl_files})
+  add_test(
+    NAME cfl_tests/${filename}POCR
+    COMMAND ${POCRcommand} ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/${CMAKE_BUILD_TYPE}-build/bin
+  )
+  if(${folder} STREQUAL basic_c_tests )
+    add_test(
+      NAME cfl_tests/${filename}HYBRID
+      COMMAND ${HYBRIDcommand} ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    add_test(
+      NAME cfl_tests/${filename}PEG
+      COMMAND ${PEGcommand} ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    add_test(
+      NAME cfl_tests/${filename}VFG
+      COMMAND ${VFGcommand} ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    add_test(
+      NAME cfl_tests/${filename}
+      COMMAND ${command} ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  endif()
+  endforeach()
+endforeach()
+
+# Crux bc Small: Filesystem & Performance regression testing
+# Run with: (ctest -R diff-perf-cruxbc-small -VV)
+set(diff_tests_cruxbc_small
+  dc bc libbz2.so bunzip2 htop)
+set(cmdw "wpa -vfspta -dump-vfg")
+string(REPLACE " " ";" commandtempw ${cmdw})
+set(commandw ${commandtempw})
+foreach(file ${diff_tests_cruxbc_small})
+  file(GLOB filename RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/crux-bc/${file}.bc")
+  add_test(
+    NAME diff-perf-cruxbc-small/${filename}
+#    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/diff_tests/difftest.py
+#      "wpa -vfspta -dump-vfg -dump-json=ir.json"
+#      "wpa -vfspta -read-json"
+#      ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+#      "ir.json"
+    COMMAND ${commandw} ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endforeach()
+
+# Crux bc Big: Filesystem & Performance regression testing
+# Run with (ctest -R diff-perf-cruxbc-big -VV)
+set(diff_tests_cruxbc_big libcurl.so bash)
+set(cmdw "wpa -ander")
+string(REPLACE " " ";" commandtempw ${cmdw})
+set(commandw ${commandtempw})
+foreach(file ${diff_tests_cruxbc_big})
+  file(GLOB filename RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/crux-bc/${file}.bc")
+  add_test(
+    NAME diff-perf-cruxbc-big/${filename}
+#    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/diff_tests/difftest.py
+#      "wpa -ander -dump-json=ir.json"
+#      "wpa -ander -read-json"
+#      ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+#      "ir.json"
+    COMMAND ${commandw} ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endforeach()
+
+# loops over ae_assert_files and run "ae $bc_file"
+file(GLOB ae_assert_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/ae_assert_tests/*.bc")
+
+foreach(filename ${ae_assert_files})
+  add_test(
+          NAME ae_assert_tests/${filename}
+          COMMAND ae ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endforeach()
+
+# loops over ae_overflow_files and run "ae -overflow $bc_file"
+file(GLOB ae_overflow_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/ae_overflow_tests/*.bc")
+
+foreach(filename ${ae_overflow_files})
+  add_test(
+          NAME ae_overflow_tests/${filename}
+          COMMAND ae -overflow -field-limit=1024 ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+          NAME ae_recursion_tests/${filename}-widen-narrow
+          COMMAND ae -overflow -handle-recur=widen-narrow -field-limit=1024 ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endforeach()
+
+# loops over ae_nullptr_deref_files and run "ae -null-deref $bc_file"
+file(GLOB ae_nullptr_deref_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/ae_nullptr_deref_tests/*.bc")
+
+foreach(filename ${ae_nullptr_deref_files})
+  add_test(
+          NAME ae_nullptr_deref_tests/${filename}
+          COMMAND ae -null-deref ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endforeach()
+
+# loops over ae_recursion_files and run "ae -overflow $bc_file" under 3 recursion modes
+file(GLOB ae_recursion_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/test_cases_bc/ae_recursion_tests/*.bc")
+
+foreach(filename ${ae_recursion_files})
+  add_test(
+          NAME ae_recursion_tests/${filename}-widen-narrow
+          COMMAND ae -overflow -handle-recur=widen-narrow -field-limit=1024 -widen-delay=10 ${CMAKE_CURRENT_SOURCE_DIR}/${filename}
+          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endforeach()
+
+
+## symbolic abstraction tests  (ctest -R symabs -VV)
+set(cmd "ae  -symabs")
+string(REPLACE " " ";" commandtemp ${cmd})
+set(command ${commandtemp})
+add_test(
+        NAME symabs
+        COMMAND ${command}
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+## symbolic abstraction tests  (ctest -R aetest -VV)
+set(cmd "ae  -aetest")
+string(REPLACE " " ";" commandtemp ${cmd})
+set(command ${commandtemp})
+add_test(
+        NAME aetest
+        COMMAND ${command}
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+

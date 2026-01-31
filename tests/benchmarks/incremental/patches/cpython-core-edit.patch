@@ -1,0 +1,14 @@
+--- a/Objects/object.c
++++ b/Objects/object.c
+@@ -1,6 +1,12 @@
+ void
+ _Py_Dealloc(PyObject *op)
+ {
++    /* Incremental test: pointer indirection for constraint cascade */
++    typedef void (*dealloc_hook_t)(PyObject *);
++    static dealloc_hook_t hook = NULL;
++    if (hook) { hook(op); return; }
++
+     PyTypeObject *type = Py_TYPE(op);
+     destructor dealloc = type->tp_dealloc;
+ #ifdef Py_DEBUG

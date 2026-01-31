@@ -1,0 +1,1624 @@
+diff --git a/src/ae_overflow_tests/std_testcase.h b/src/ae_overflow_tests/std_testcase.h
+index a9e9015..dc1219d 100644
+--- a/src/ae_overflow_tests/std_testcase.h
++++ b/src/ae_overflow_tests/std_testcase.h
+@@ -83,6 +83,16 @@ extern void UNSAFE_BUFACCESS(void* data, int size);
+ 
+ #endif /* end ifndef __cplusplus */
+ 
++/* Buffer access oracles for ae_overflow_tests - available for both C and C++ */
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern void SAFE_BUFACCESS(void* data, int size);
++extern void UNSAFE_BUFACCESS(void* data, int size);
++#ifdef __cplusplus
++}
++#endif
++
+ /* rand only returns 15 bits, so we xor 3 calls together to get the full result (13 bits overflow, but that is okay) */
+ // shifting signed values might overflow and be undefined
+ #define URAND31() (((unsigned)rand()<<30) ^ ((unsigned)rand()<<15) ^ rand())
+diff --git a/src/complex_tests/cond-swap.c b/src/complex_tests/cond-swap.c
+index 175ed15..4a1f5df 100644
+--- a/src/complex_tests/cond-swap.c
++++ b/src/complex_tests/cond-swap.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ void swap(char **a, char **b, int flag) {
+    char * c;
+    if (flag == 1) {
+@@ -22,6 +24,10 @@ int main (){
+     swap (&p1, &p2, 0);
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap-array.c b/src/complex_tests/swap-array.c
+index cc63859..7303a86 100644
+--- a/src/complex_tests/swap-array.c
++++ b/src/complex_tests/swap-array.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ void swap(char **a, char **b) {
+    char * c;
+    c = *a;
+@@ -17,6 +19,10 @@ int main (){
+     swap (&p1[0], &p1[1]);
+     pa = p1[1];
+     pb = p1[0];
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap-funcptr.c b/src/complex_tests/swap-funcptr.c
+index 72586ce..a55535c 100644
+--- a/src/complex_tests/swap-funcptr.c
++++ b/src/complex_tests/swap-funcptr.c
+@@ -1,4 +1,6 @@
+-void (*p)(char **, char **); 
++#include "aliascheck.h"
++
++void (*p)(char **, char **);
+ 
+ void swap(char **a, char **b) {
+    char * c;
+@@ -12,7 +14,7 @@ int main (){
+     char * pa, * pb;
+     char b[20];
+     char a[20];
+- 
++
+     p1 = a;
+     p2 = b;
+ 
+@@ -22,6 +24,10 @@ int main (){
+ 
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap-funcptr1.c b/src/complex_tests/swap-funcptr1.c
+index e5b269c..cbb98ef 100644
+--- a/src/complex_tests/swap-funcptr1.c
++++ b/src/complex_tests/swap-funcptr1.c
+@@ -1,4 +1,6 @@
+-void (*p)(char **, char **); 
++#include "aliascheck.h"
++
++void (*p)(char **, char **);
+ 
+ void swap(char **a, char **b) {
+    char * c;
+@@ -16,7 +18,7 @@ int main (){
+     char * pa, * pb;
+     char b[20];
+     char a[20];
+- 
++
+     p1 = a;
+     p2 = b;
+ 
+@@ -26,6 +28,10 @@ int main (){
+ 
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap-funcptr2.c b/src/complex_tests/swap-funcptr2.c
+index e5b269c..cbb98ef 100644
+--- a/src/complex_tests/swap-funcptr2.c
++++ b/src/complex_tests/swap-funcptr2.c
+@@ -1,4 +1,6 @@
+-void (*p)(char **, char **); 
++#include "aliascheck.h"
++
++void (*p)(char **, char **);
+ 
+ void swap(char **a, char **b) {
+    char * c;
+@@ -16,7 +18,7 @@ int main (){
+     char * pa, * pb;
+     char b[20];
+     char a[20];
+- 
++
+     p1 = a;
+     p2 = b;
+ 
+@@ -26,6 +28,10 @@ int main (){
+ 
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap-global.c b/src/complex_tests/swap-global.c
+index 3165738..ff1bd02 100644
+--- a/src/complex_tests/swap-global.c
++++ b/src/complex_tests/swap-global.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ char * p1, * p2;
+ void swap(char **a, char **b) {
+    char * c;
+@@ -17,6 +19,10 @@ int main (){
+     swap (&p1, &p2);
+     pa = p1;
+     pb = p2;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap-global1.c b/src/complex_tests/swap-global1.c
+index 758ef48..037c740 100644
+--- a/src/complex_tests/swap-global1.c
++++ b/src/complex_tests/swap-global1.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ char * p1, * p2;
+ void swap() {
+    char * c;
+@@ -17,6 +19,10 @@ int main (){
+     swap ();
+     pa = p1;
+     pb = p2;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap-global2.c b/src/complex_tests/swap-global2.c
+index e7dca56..30bb77e 100644
+--- a/src/complex_tests/swap-global2.c
++++ b/src/complex_tests/swap-global2.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ char * p1, * p2;
+ void swap() {
+    char * c;
+@@ -21,6 +23,10 @@ int main (){
+     f();
+     pa = p1;
+     pb = p2;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap-heap.c b/src/complex_tests/swap-heap.c
+index e6d5b6d..c235b3b 100644
+--- a/src/complex_tests/swap-heap.c
++++ b/src/complex_tests/swap-heap.c
+@@ -1,4 +1,6 @@
+-void * malloc(unsigned);
++#include "aliascheck.h"
++
++
+ char ga[20];
+ void swap(char **a, char **b) {
+    char * c;
+@@ -26,6 +28,6 @@ int main (){
+     swap(&p1, &p2);
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, pb);
++}
+diff --git a/src/complex_tests/swap-heap1.c b/src/complex_tests/swap-heap1.c
+index 0d8e043..f8c8e8d 100644
+--- a/src/complex_tests/swap-heap1.c
++++ b/src/complex_tests/swap-heap1.c
+@@ -1,4 +1,6 @@
+-void * malloc(unsigned);
++#include "aliascheck.h"
++
++
+ char ga[20];
+ void swap(char **a, char **b) {
+    char * c;
+@@ -27,6 +29,6 @@ int main (){
+     swap(&p1, &p2);
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, pb);
++}
+diff --git a/src/complex_tests/swap-heap2.c b/src/complex_tests/swap-heap2.c
+index 9e9f177..113e9a4 100644
+--- a/src/complex_tests/swap-heap2.c
++++ b/src/complex_tests/swap-heap2.c
+@@ -1,4 +1,6 @@
+-void * malloc(unsigned);
++#include "aliascheck.h"
++
++
+ char ga[20];
+ void swap(char **a, char **b) {
+    char * c;
+@@ -30,6 +32,8 @@ int main (){
+     swap (&p1, &p2);
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, pb);
++    MAYALIAS(pa, ga);
++    MAYALIAS(pb, ga);
++}
+diff --git a/src/complex_tests/swap-heap3.c b/src/complex_tests/swap-heap3.c
+index 9e9f177..113e9a4 100644
+--- a/src/complex_tests/swap-heap3.c
++++ b/src/complex_tests/swap-heap3.c
+@@ -1,4 +1,6 @@
+-void * malloc(unsigned);
++#include "aliascheck.h"
++
++
+ char ga[20];
+ void swap(char **a, char **b) {
+    char * c;
+@@ -30,6 +32,8 @@ int main (){
+     swap (&p1, &p2);
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, pb);
++    MAYALIAS(pa, ga);
++    MAYALIAS(pb, ga);
++}
+diff --git a/src/complex_tests/swap-heap4.c b/src/complex_tests/swap-heap4.c
+index b111592..bad211b 100644
+--- a/src/complex_tests/swap-heap4.c
++++ b/src/complex_tests/swap-heap4.c
+@@ -1,4 +1,6 @@
+-void * malloc(unsigned);
++#include "aliascheck.h"
++
++
+ char ga[20];
+ void swap(char **a, char **b) {
+    char * c;
+@@ -33,6 +35,6 @@ int main (){
+ 
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, pb);
++}
+diff --git a/src/complex_tests/swap-indirect.c b/src/complex_tests/swap-indirect.c
+index 9530b1f..e228ce7 100644
+--- a/src/complex_tests/swap-indirect.c
++++ b/src/complex_tests/swap-indirect.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ void swap(char ***a, char ***b) {
+     char **a1, **b1;
+     char *c;
+@@ -29,6 +31,9 @@ int main (){
+     t2= *pb;
+     *t2 = 0;
+ 
++    MAYALIAS(t1, a);
++    MAYALIAS(t1, b);
++    MAYALIAS(t2, a);
++    MAYALIAS(t2, b);
++    NOALIAS(a, b);
+ }
+-
+-
+diff --git a/src/complex_tests/swap-indirect1.c b/src/complex_tests/swap-indirect1.c
+index 860177f..ae479d8 100644
+--- a/src/complex_tests/swap-indirect1.c
++++ b/src/complex_tests/swap-indirect1.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ void swap1(char **a, char **b) {
+     char *c;
+    c = *a;
+@@ -29,6 +31,9 @@ int main (){
+     t2= *pb;
+     *t2 = 0;
+ 
++    MAYALIAS(t1, a);
++    MAYALIAS(t1, b);
++    MAYALIAS(t2, a);
++    MAYALIAS(t2, b);
++    NOALIAS(a, b);
+ }
+-
+-
+diff --git a/src/complex_tests/swap-indirect2.c b/src/complex_tests/swap-indirect2.c
+index 254830f..ea7c456 100644
+--- a/src/complex_tests/swap-indirect2.c
++++ b/src/complex_tests/swap-indirect2.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ void swap1(char **a, char **b) {
+     char *c;
+    c = *a;
+@@ -34,6 +36,9 @@ int main (){
+     t2= *pb;
+     *t2 = 0;
+ 
++    MAYALIAS(t1, a);
++    MAYALIAS(t1, b);
++    MAYALIAS(t2, a);
++    MAYALIAS(t2, b);
++    NOALIAS(a, b);
+ }
+-
+-
+diff --git a/src/complex_tests/swap-recursion.c b/src/complex_tests/swap-recursion.c
+index 60b243a..0425c07 100644
+--- a/src/complex_tests/swap-recursion.c
++++ b/src/complex_tests/swap-recursion.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ static int n;
+ void swap(char **a, char **b);
+ void swap1(char **a, char **b) {
+@@ -9,7 +11,7 @@ void swap(char **a, char **b) {
+    c = *a;
+    *a = * b;
+    *b = c;
+-   
++
+    n --;
+    if (n > 0) swap1(a, b);
+ }
+@@ -27,6 +29,10 @@ int main (){
+     swap (&p1, &p2);
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap-struct.c b/src/complex_tests/swap-struct.c
+index 0a0b446..794e949 100644
+--- a/src/complex_tests/swap-struct.c
++++ b/src/complex_tests/swap-struct.c
+@@ -1,27 +1,33 @@
+- void swap(char **a, char **b) {
+-   char * c;
+-   c = *a;
+-   *a = * b;
+-   *b = c;
++#include "aliascheck.h"
++
++void swap(char **a, char **b) {
++  char * c;
++  c = *a;
++  *a = * b;
++  *b = c;
+ }
+ 
+ struct ptrstruct{
+     char * p1;
+     char *p2;
+-}; 
++};
+ 
+ int main (){
+     struct ptrstruct PSt;
+     char * pa, * pb;
+     char b[20];
+     char a[20];
+- 
++
+     PSt.p1 = a;
+     PSt.p2 = b;
+ 
+     swap (&PSt.p1, &PSt.p2);
+     pa = PSt.p2;
+     pb = PSt.p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap-struct1.c b/src/complex_tests/swap-struct1.c
+index a2a0bdf..913e3c9 100644
+--- a/src/complex_tests/swap-struct1.c
++++ b/src/complex_tests/swap-struct1.c
+@@ -1,7 +1,9 @@
++#include "aliascheck.h"
++
+ struct ptrstruct{
+     char * p1;
+     char *p2;
+-}; 
++};
+ 
+ void swap(struct ptrstruct * P) {
+    char * c;
+@@ -10,20 +12,22 @@ void swap(struct ptrstruct * P) {
+    P->p2 = c;
+ }
+ 
+- 
+-
+ int main (){
+     struct ptrstruct PSt;
+     char * pa, * pb;
+     char b[20];
+     char a[20];
+- 
++
+     PSt.p1 = a;
+     PSt.p2 = b;
+ 
+     swap (&PSt);
+     pa = PSt.p2;
+     pb = PSt.p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap-structindirect.c b/src/complex_tests/swap-structindirect.c
+index f2256de..f93ce55 100644
+--- a/src/complex_tests/swap-structindirect.c
++++ b/src/complex_tests/swap-structindirect.c
+@@ -1,8 +1,10 @@
++#include "aliascheck.h"
++
+ struct ptrstruct{
+     int temp;
+     char * p1;
+     char *p2;
+-}; 
++};
+ 
+ void swap(struct ptrstruct ** pstruct) {
+    struct ptrstruct *P = *pstruct;
+@@ -12,21 +14,23 @@ void swap(struct ptrstruct ** pstruct) {
+    P->p2 = c;
+ }
+ 
+- 
+-
+ int main (){
+     struct ptrstruct PSt;
+     struct ptrstruct * pstruct = &PSt;
+     char * pa, * pb;
+     char b[20];
+     char a[20];
+- 
++
+     PSt.p1 = a;
+     PSt.p2 = b;
+ 
+     swap (&pstruct);
+     pa = PSt.p2;
+     pb = PSt.p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap.c b/src/complex_tests/swap.c
+index dff9113..578318e 100644
+--- a/src/complex_tests/swap.c
++++ b/src/complex_tests/swap.c
+@@ -1,8 +1,10 @@
+- void swap(char **a, char **b) {
+-   char * c;
+-   c = *a;
+-   *a = * b;
+-   *b = c;
++#include "aliascheck.h"
++
++void swap(char **a, char **b) {
++  char * c;
++  c = *a;
++  *a = * b;
++  *b = c;
+ }
+ 
+ int main (){
+@@ -10,13 +12,17 @@ int main (){
+     char * pa, * pb;
+     char b[20];
+     char a[20];
+- 
++
+     p1 = a;
+     p2 = b;
+ 
+     swap (&p1, &p2);
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap1.c b/src/complex_tests/swap1.c
+index cc20cc7..ef4a5f6 100644
+--- a/src/complex_tests/swap1.c
++++ b/src/complex_tests/swap1.c
+@@ -1,8 +1,10 @@
+- void swap(char **a, char **b) {
+-   char * c;
+-   c = *a;
+-   *a = * b;
+-   *b = c;
++#include "aliascheck.h"
++
++void swap(char **a, char **b) {
++  char * c;
++  c = *a;
++  *a = * b;
++  *b = c;
+ }
+ 
+ void f(char **a, char **b) {
+@@ -14,7 +16,7 @@ int main (){
+     char * pa, * pb;
+     char b[20];
+     char a[20];
+- 
++
+     p1 = a;
+     p2 = b;
+ 
+@@ -22,6 +24,10 @@ int main (){
+     f (&p2, &p1);
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap4-context.c b/src/complex_tests/swap4-context.c
+index e9ec13b..2e7fcbd 100644
+--- a/src/complex_tests/swap4-context.c
++++ b/src/complex_tests/swap4-context.c
+@@ -1,6 +1,8 @@
++#include "aliascheck.h"
++
+     char b[20];
+     char a[20];
+- 
++
+ 
+ void swap(char **a, char **b) {
+    char * c;
+@@ -37,6 +39,10 @@ int main (){
+     g (&p1, &p2);
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap4-context1.c b/src/complex_tests/swap4-context1.c
+index 4e4025f..a809f43 100644
+--- a/src/complex_tests/swap4-context1.c
++++ b/src/complex_tests/swap4-context1.c
+@@ -1,6 +1,8 @@
++#include "aliascheck.h"
++
+     char b[20];
+     char a[20];
+- 
++
+ 
+ void swap(char **a, char **b) {
+    char * c;
+@@ -58,6 +60,10 @@ int main (){
+     g (&p2, &p1);
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap4-contextindirect.c b/src/complex_tests/swap4-contextindirect.c
+index eb54411..c996186 100644
+--- a/src/complex_tests/swap4-contextindirect.c
++++ b/src/complex_tests/swap4-contextindirect.c
+@@ -1,6 +1,8 @@
++#include "aliascheck.h"
++
+     char b[20];
+     char a[20];
+-  
++
+ 
+ void swap1(char **a, char **b) {
+     char * c;
+@@ -37,7 +39,7 @@ int main (){
+     char ** p1, ** p2;
+     char * pa, * pb;
+     char * pa1, *pb1;
+- 
++
+     pa = a;
+     pb = b;
+ 
+@@ -52,6 +54,10 @@ int main (){
+ 
+     pa1 = *p2;
+     pb1 = *p1;
+-}
+-
+ 
++    MAYALIAS(pa1, a);
++    MAYALIAS(pa1, b);
++    MAYALIAS(pb1, a);
++    MAYALIAS(pb1, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/swap4.c b/src/complex_tests/swap4.c
+index 26b04ea..5bc788c 100644
+--- a/src/complex_tests/swap4.c
++++ b/src/complex_tests/swap4.c
+@@ -1,6 +1,8 @@
++#include "aliascheck.h"
++
+     char b[20];
+     char a[20];
+-  
++
+ void swap(char **a, char **b) {
+    char * c;
+    c = *a;
+@@ -11,7 +13,7 @@ void swap(char **a, char **b) {
+ int main (){
+     char * p1, *p2;
+     char * pa, * pb;
+- 
++
+     p1 = a;
+     p2 = b;
+ 
+@@ -21,6 +23,10 @@ int main (){
+     swap (&p1, &p2);
+     pa = p2;
+     pb = p1;
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/test-clone.c b/src/complex_tests/test-clone.c
+index 3612fe6..4f60fab 100644
+--- a/src/complex_tests/test-clone.c
++++ b/src/complex_tests/test-clone.c
+@@ -1,5 +1,5 @@
++#include "aliascheck.h"
+ 
+-extern void * malloc(unsigned);
+ 
+ char * ptrs[10];
+ void  my_malloc(unsigned idx, unsigned length) {
+@@ -11,7 +11,7 @@ void  my_malloc(unsigned idx, unsigned length) {
+ char * my_malloc1(unsigned idx, unsigned lenght) {
+     static char * a = 0;
+ 
+-    if (a != 0) 
++    if (a != 0)
+         free(a);
+     a = malloc(idx);
+     return a;
+@@ -22,8 +22,8 @@ unsigned malloc2(unsigned idx, unsigned length){
+     unsigned curidx;
+     my_malloc(idx, length);
+     my_malloc1(idx+1, length);
+-    curidx = idx +2; 
+-    if (curidx < 8) 
++    curidx = idx +2;
++    if (curidx < 8)
+         return malloc2(curidx, length);
+     return curidx;
+ }
+@@ -32,5 +32,3 @@ int main () {
+ 
+     malloc2(1, 10);
+ }
+-
+-
+diff --git a/src/complex_tests/test-clone1.c b/src/complex_tests/test-clone1.c
+index ec142b9..6d26fc2 100644
+--- a/src/complex_tests/test-clone1.c
++++ b/src/complex_tests/test-clone1.c
+@@ -1,5 +1,5 @@
++#include "aliascheck.h"
+ 
+-extern void * malloc(unsigned);
+ 
+ char * ptrs[10];
+ void  my_malloc(unsigned idx, unsigned length) {
+@@ -25,8 +25,8 @@ unsigned malloc2(unsigned idx, unsigned length){
+     unsigned curidx;
+     my_malloc(idx, length);
+     my_malloc1(idx+1, length);
+-    curidx = idx +2; 
+-    if (curidx < 8) 
++    curidx = idx +2;
++    if (curidx < 8)
+         return malloc2(curidx, length);
+     return curidx;
+ }
+@@ -35,5 +35,3 @@ int main () {
+ 
+     malloc2(1, 10);
+ }
+-
+-
+diff --git a/src/complex_tests/test-cond.c b/src/complex_tests/test-cond.c
+index f9f4cb0..be73120 100644
+--- a/src/complex_tests/test-cond.c
++++ b/src/complex_tests/test-cond.c
+@@ -1,10 +1,11 @@
++#include "aliascheck.h"
++
+ char g1;
+ char g2;
+ 
+ int cond();
+ 
+ void f1(char **p) {
+-        //char *tmp = *p;
+         if (cond()) *p = &g2;
+ }
+ 
+@@ -12,4 +13,12 @@ char *f2() {
+         char *p = &g1;
+             f1(&p);
+                 return p;
+-} 
++}
++
++int main() {
++    char *r = f2();
++    MAYALIAS(r, &g1);
++    MAYALIAS(r, &g2);
++    NOALIAS(&g1, &g2);
++    return 0;
++}
+diff --git a/src/complex_tests/test-globalstruct.c b/src/complex_tests/test-globalstruct.c
+index afc1dc2..322d498 100644
+--- a/src/complex_tests/test-globalstruct.c
++++ b/src/complex_tests/test-globalstruct.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ int g1;
+ int g2;
+ 
+@@ -9,4 +11,9 @@ const struct {
+ int f() {
+     int *p = obj.p1;
+     return *p;
+-} 
++}
++
++int main() {
++    f();
++    return 0;
++}
+diff --git a/src/complex_tests/test-indirect.c b/src/complex_tests/test-indirect.c
+index 4eadf14..619e7ee 100644
+--- a/src/complex_tests/test-indirect.c
++++ b/src/complex_tests/test-indirect.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ void D(char ***ppp) { ***ppp = 0; }
+ 
+ void C(char ***ppp) { ***ppp = 0; }
+@@ -10,4 +12,11 @@ void A() {
+   char **pp = &p;
+   B(&pp);
+   C(&pp);
+-} 
++  MUSTALIAS(p, &c);
++  MUSTALIAS(pp, &p);
++}
++
++int main() {
++    A();
++    return 0;
++}
+diff --git a/src/complex_tests/test-indirect1.c b/src/complex_tests/test-indirect1.c
+index 3076d37..bab6b90 100644
+--- a/src/complex_tests/test-indirect1.c
++++ b/src/complex_tests/test-indirect1.c
+@@ -1,3 +1,4 @@
++#include "aliascheck.h"
+ 
+ #include <stdlib.h>
+ 
+@@ -20,4 +21,13 @@ int f4() {
+         int *p;
+             f2(&p);
+                 return *p;
+-} 
++}
++
++int main() {
++    int *p;
++    f2(&p);
++    MAYALIAS(p, &g1);
++    MAYALIAS(p, &g2);
++    NOALIAS(&g1, &g2);
++    return 0;
++}
+diff --git a/src/complex_tests/test-linklist.c b/src/complex_tests/test-linklist.c
+index 4b686ae..7dd8acc 100644
+--- a/src/complex_tests/test-linklist.c
++++ b/src/complex_tests/test-linklist.c
+@@ -1,5 +1,4 @@
+-extern void * malloc(unsigned);
+-extern void free (void *);
++#include "aliascheck.h"
+ 
+ struct list {
+     int flag;
+@@ -32,7 +31,7 @@ struct list * construct (unsigned idx) {
+ struct list * addlist (struct list * l, struct list * elem) {
+     struct list * head = l;
+     struct list * t;
+-    while (t = head->next) 
++    while (t = head->next)
+         head = t;
+ 
+     head->next = elem;
+@@ -45,10 +44,12 @@ void main () {
+     head = construct (10);
+     head1 = construct (2);
+ 
+-    if (head->flag == 5) 
++    if (head->flag == 5)
+         head1 = head;
+ 
+     head = addlist(head, head1);
+ 
++    MAYALIAS(head, head1);
++
+     destroy (head);
+ }
+diff --git a/src/complex_tests/test-linklist1.c b/src/complex_tests/test-linklist1.c
+index f47722f..441f53a 100644
+--- a/src/complex_tests/test-linklist1.c
++++ b/src/complex_tests/test-linklist1.c
+@@ -1,5 +1,4 @@
+-extern void * malloc(unsigned);
+-extern void free (void *);
++#include "aliascheck.h"
+ 
+ struct list {
+     int flag;
+@@ -29,7 +28,7 @@ struct list * randomwalk (struct list * head) {
+     struct list * cur = head;
+ 
+     for (;cur->flag != 0; cur=cur->next) {
+-        if (cur->flag > 3) 
++        if (cur->flag > 3)
+             cur = cur->prev;
+     }
+     return cur;
+@@ -41,4 +40,6 @@ void main () {
+     head = construct (10);
+ 
+     head1 = randomwalk (head);
++
++    MAYALIAS(head, head1);
+ }
+diff --git a/src/complex_tests/test-path.c b/src/complex_tests/test-path.c
+index c139b7e..bae5104 100644
+--- a/src/complex_tests/test-path.c
++++ b/src/complex_tests/test-path.c
+@@ -1,4 +1,6 @@
+-extern char * malloc(int);
++#include "aliascheck.h"
++
++
+ char * h() {
+    char * a = malloc(20);
+    return a;
+@@ -27,8 +29,5 @@ int main (){
+     else  {
+        pb = f(flag);
+     }
+-    * pa = 0;
+-    * pb = 1;
++    MAYALIAS(pa, pb);
+ }
+-
+-
+diff --git a/src/complex_tests/test-recursive.c b/src/complex_tests/test-recursive.c
+index 6a6c5ea..e88f74f 100644
+--- a/src/complex_tests/test-recursive.c
++++ b/src/complex_tests/test-recursive.c
+@@ -1,10 +1,11 @@
++#include "aliascheck.h"
++
+ struct list {
+     unsigned field;
+     struct list * next;
+     struct list * prev;
+ };
+ 
+-extern void * malloc(unsigned);
+ struct list * construct (struct list * head, unsigned i) {
+     if (i > 0) {
+         struct list * tmp = malloc(sizeof(struct list));
+@@ -16,7 +17,7 @@ struct list * construct (struct list * head, unsigned i) {
+         return construct (tmp, i--);
+ 
+ 
+-    } 
++    }
+     return head;
+ }
+ 
+@@ -30,6 +31,7 @@ int main () {
+     head->prev = 0;
+ 
+     head = construct (head, 10);
+-}
+-
+ 
++    MAYALIAS(head, head->next);
++    MAYALIAS(head, head->prev);
++}
+diff --git a/src/complex_tests/test-recursive0.c b/src/complex_tests/test-recursive0.c
+index 7d54c9c..03e8e24 100644
+--- a/src/complex_tests/test-recursive0.c
++++ b/src/complex_tests/test-recursive0.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ struct list {
+     struct list * prev;
+ };
+@@ -9,7 +11,7 @@ struct list * construct (struct list * head) {
+        head->prev = tmp;
+        return construct (tmp);
+ 
+-    } 
++    }
+     return head;
+ }
+ int main () {
+@@ -18,7 +20,6 @@ int main () {
+     head->prev = 0;
+ 
+     head = construct (head);
+-    head = head->prev;
++    struct list * n = head->prev;
++    MAYALIAS(head, n);
+ }
+-
+-
+diff --git a/src/complex_tests/test-recursive1.c b/src/complex_tests/test-recursive1.c
+index 87ccdc4..c075f5f 100644
+--- a/src/complex_tests/test-recursive1.c
++++ b/src/complex_tests/test-recursive1.c
+@@ -1,10 +1,11 @@
++#include "aliascheck.h"
++
+ struct list {
+     unsigned field;
+     struct list * next;
+     struct list * prev;
+ };
+ 
+-extern void * malloc(unsigned);
+ struct list * construct (struct list * head, unsigned i) {
+     if (i > 0) {
+         struct list * tmp = malloc(sizeof(struct list));
+@@ -16,23 +17,23 @@ struct list * construct (struct list * head, unsigned i) {
+         return construct (tmp, i--);
+ 
+ 
+-    } 
++    }
+     return head;
+ }
+ 
+ struct list * walklist (struct list * input) {
+     struct list * head = input;
+     struct list * curr;
+-    while (head->prev != 0) 
++    while (head->prev != 0)
+         head = head->prev;
+ 
+     while (head->next) {
+         curr = head;
+         curr->field ++;
+ 
+-        if (curr->field > 5) 
++        if (curr->field > 5)
+             head = head->next;
+-        else 
++        else
+             head = head->prev;
+         head->prev = walklist (head);
+         head->next = curr;
+@@ -50,7 +51,7 @@ int main () {
+     head->prev = 0;
+ 
+     head = construct (head, 10);
+-    head = walklist(head);   
+-}
+-
++    head = walklist(head);
+ 
++    MAYALIAS(head, head->next);
++}
+diff --git a/src/complex_tests/test-recursive2.c b/src/complex_tests/test-recursive2.c
+index a3534ef..a7c5d82 100644
+--- a/src/complex_tests/test-recursive2.c
++++ b/src/complex_tests/test-recursive2.c
+@@ -1,10 +1,11 @@
++#include "aliascheck.h"
++
+ struct list {
+     unsigned field;
+     struct list * next;
+     struct list * prev;
+ };
+ 
+-extern void * malloc(unsigned);
+ struct list * construct1(struct list * head, unsigned);
+ struct list * construct (struct list * head, unsigned i) {
+     if (i > 0) {
+@@ -17,7 +18,7 @@ struct list * construct (struct list * head, unsigned i) {
+         return construct (tmp, i--);
+ 
+ 
+-    } 
++    }
+     return construct1(head, 10);
+ }
+ 
+@@ -34,16 +35,16 @@ struct list * construct1 (struct list * head, unsigned i) {
+ struct list * walklist (struct list * input) {
+     struct list * head = input;
+     struct list * curr;
+-    while (head->prev != 0) 
++    while (head->prev != 0)
+         head = head->prev;
+ 
+     while (head->next) {
+         curr = head;
+         curr->field ++;
+ 
+-        if (curr->field > 5) 
++        if (curr->field > 5)
+             head = head->next;
+-        else 
++        else
+             head = head->prev;
+         head->prev = walklist (head);
+         head->next = curr;
+@@ -62,6 +63,6 @@ int main () {
+ 
+     head = construct (head, 10);
+     head = walklist (head);
+-}
+-
+ 
++    MAYALIAS(head, head->next);
++}
+diff --git a/src/complex_tests/test-recursiveglobal.c b/src/complex_tests/test-recursiveglobal.c
+index 82dab89..8216d33 100644
+--- a/src/complex_tests/test-recursiveglobal.c
++++ b/src/complex_tests/test-recursiveglobal.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ char *p;
+ 
+ char accessA(unsigned i) {
+@@ -12,8 +14,8 @@ void recursion(unsigned i) {
+ int main () {
+     unsigned i = 0;
+     unsigned a[10];
+-    p = a;
++    p = (char *)a;
+     recursion(0);
+-}
+-
+ 
++    MAYALIAS(p, (void*)a);
++}
+diff --git a/src/complex_tests/test-recursiveglobal1.c b/src/complex_tests/test-recursiveglobal1.c
+index ff4d367..7b1de2e 100644
+--- a/src/complex_tests/test-recursiveglobal1.c
++++ b/src/complex_tests/test-recursiveglobal1.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ char *p;
+ char *q;
+ 
+@@ -24,6 +26,10 @@ int main () {
+     q = b;
+ 
+     recursion(10);
+-}
+-
+ 
++    MAYALIAS(p, a);
++    MAYALIAS(p, b);
++    MAYALIAS(q, a);
++    MAYALIAS(q, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/test-recursiveglobal2.c b/src/complex_tests/test-recursiveglobal2.c
+index 2078b1f..aceefa6 100644
+--- a/src/complex_tests/test-recursiveglobal2.c
++++ b/src/complex_tests/test-recursiveglobal2.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ char *p;
+ char *q;
+ 
+@@ -28,6 +30,10 @@ int main () {
+     q = b;
+ 
+     recursion(10);
+-}
+-
+ 
++    MAYALIAS(p, a);
++    MAYALIAS(p, b);
++    MAYALIAS(q, a);
++    MAYALIAS(q, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/test.c b/src/complex_tests/test.c
+index d76381c..1d9aef5 100644
+--- a/src/complex_tests/test.c
++++ b/src/complex_tests/test.c
+@@ -1,4 +1,5 @@
+-extern void * malloc(unsigned);
++#include "aliascheck.h"
++
+ 
+ 
+ typedef struct{
+@@ -19,21 +20,23 @@ int i;
+ 
+ void save(basestruct ** var) {
+     unsigned idx = i;
+-    int * temp = var;
++    int * temp = (int *)var;
+     saveptr[idx] = (int *)(var);
+     saveptr[idx+1] = (int *)(*var);
+ }
+ 
+ void f() {
+     gvar[0].a = malloc(sizeof(basestruct));
+-    save (&gvar[0]);
++    save ((basestruct **)&gvar[0]);
+ 
+-    basestruct * temp = saveptr[i];
++    basestruct * temp = (basestruct *)saveptr[i];
+     extendstruct * t1 = (extendstruct *) temp;
+ 
+     basestruct * t2 = t1->a;
+     *(t2->a) = 0;
+ }
+ 
+-
+-
++int main() {
++    f();
++    return 0;
++}
+diff --git a/src/complex_tests/test1-path.c b/src/complex_tests/test1-path.c
+index 64f04fc..c4338a6 100644
+--- a/src/complex_tests/test1-path.c
++++ b/src/complex_tests/test1-path.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ char h(char * a) {
+    *a = 0;
+    return 0;
+@@ -20,6 +22,6 @@ int main (){
+ 
+     f(b, 1);
+     f(a, 2);
+-}
+-
+ 
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/test1.c b/src/complex_tests/test1.c
+index 7059b25..416e88d 100644
+--- a/src/complex_tests/test1.c
++++ b/src/complex_tests/test1.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ char * g(char * a) {
+     *a = 0;
+     return a;
+@@ -11,6 +13,13 @@ char * f(char * a) {
+    return g(b);
+ }
+ 
++void swap(char **a, char **b) {
++   char * c;
++   c = *a;
++   *a = *b;
++   *b = c;
++}
++
+ char * c;
+ int main (){
+     char b[20];
+@@ -24,6 +33,11 @@ int main (){
+     c = b;
+     c = f(c);
+     g(c);
+-}
+-
+ 
++    MAYALIAS(c, b);
++    MAYALIAS(p1, a);
++    MAYALIAS(p1, b);
++    MAYALIAS(p2, a);
++    MAYALIAS(p2, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/test2-path.c b/src/complex_tests/test2-path.c
+index 18a9fbb..9357cea 100644
+--- a/src/complex_tests/test2-path.c
++++ b/src/complex_tests/test2-path.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ char * h(char * a) {
+    *a = 0;
+    return a;
+@@ -18,6 +20,10 @@ int main (){
+ 
+     pa = f(a, b, 0);
+     pb = f(a, b, 1);
+-}
+-
+ 
++    MAYALIAS(pa, a);
++    MAYALIAS(pa, b);
++    MAYALIAS(pb, a);
++    MAYALIAS(pb, b);
++    NOALIAS(a, b);
++}
+diff --git a/src/complex_tests/test2.c b/src/complex_tests/test2.c
+index 2789f60..81f550f 100644
+--- a/src/complex_tests/test2.c
++++ b/src/complex_tests/test2.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ char * f(char * a) {
+    char * b ;
+ 
+@@ -17,6 +19,6 @@ int main (){
+ 
+     f(a);
+     g(a);
+-}
+-
+ 
++    MAYALIAS(a, a);
++}
+diff --git a/src/complex_tests/test3-path.c b/src/complex_tests/test3-path.c
+index c139b7e..bae5104 100644
+--- a/src/complex_tests/test3-path.c
++++ b/src/complex_tests/test3-path.c
+@@ -1,4 +1,6 @@
+-extern char * malloc(int);
++#include "aliascheck.h"
++
++
+ char * h() {
+    char * a = malloc(20);
+    return a;
+@@ -27,8 +29,5 @@ int main (){
+     else  {
+        pb = f(flag);
+     }
+-    * pa = 0;
+-    * pb = 1;
++    MAYALIAS(pa, pb);
+ }
+-
+-
+diff --git a/src/complex_tests/test3.c b/src/complex_tests/test3.c
+index 4dcb8e1..d35df50 100644
+--- a/src/complex_tests/test3.c
++++ b/src/complex_tests/test3.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ char * f(char * a) {
+    char * c;
+    char * b ;
+@@ -24,6 +26,6 @@ int main (){
+ 
+     if (a[0] == 1) c=h(a);
+     else c=i(a);
+-}
+-
+ 
++    MAYALIAS(c, a);
++}
+diff --git a/src/complex_tests/test4.c b/src/complex_tests/test4.c
+index b4f9186..8366446 100644
+--- a/src/complex_tests/test4.c
++++ b/src/complex_tests/test4.c
+@@ -1,4 +1,6 @@
+-extern char * malloc(int);
++#include "aliascheck.h"
++
++
+ char * f(char * a) {
+    char * c;
+    c = malloc(10*sizeof(char));
+@@ -23,6 +25,6 @@ int main (){
+ 
+     if (a[0] == 1) c=h(a);
+     else c=i(a);
+-}
+-
+ 
++    NOALIAS(c, a);
++}
+diff --git a/src/complex_tests/test5.c b/src/complex_tests/test5.c
+index 41da2c2..eefbb15 100644
+--- a/src/complex_tests/test5.c
++++ b/src/complex_tests/test5.c
+@@ -1,3 +1,5 @@
++#include "aliascheck.h"
++
+ char * f(char * a) {
+    char * b ;
+ 
+@@ -6,19 +8,16 @@ char * f(char * a) {
+    return b;
+ }
+ 
+-char * g(char * a) {
+-    *a = 0;
+-    return f(a);
+-}
+-
+ int main (){
+     char a[10];
+-    char b[20];
+     char * c;
+ 
+-    f(a);
+-    c = f(b);
+-    g(c);
+-}
+-
++    c = f(a);
++    c = f(c);
++    c = f(c);
++    c = f(c);
++    c[9] = 0;
++    *c = 0;
+ 
++    MAYALIAS(c, a);
++}
+diff --git a/src/complex_tests/test6.c b/src/complex_tests/test6.c
+index 122873e..404456f 100644
+--- a/src/complex_tests/test6.c
++++ b/src/complex_tests/test6.c
+@@ -1,21 +1,23 @@
+-char * f(char * a) {
+-   char * b ;
++#include "aliascheck.h"
+ 
+-   b = a;
+-    *(b++) = 1;
+-   return b;
++void f(char ** a) {
++   int b[10];
++   (*a)++;
++
++   b[10] = 0;
+ }
+ 
+ int main (){
+     char a[10];
+     char * c;
+ 
+-    c = f(a);
+-    c = f(c);
+-    c = f(c);
+-    c = f(c);
+-    c[9] = 0;
+-    *c = 0;
+-}
++    c = a;
+ 
++    f(&c);
++    f(&c);
+ 
++    *c = 0;
++    a[10] = 0;
++
++    MAYALIAS(c, a);
++}
+diff --git a/src/complex_tests/test8.c b/src/complex_tests/test8.c
+index c14c25c..2fcd034 100644
+--- a/src/complex_tests/test8.c
++++ b/src/complex_tests/test8.c
+@@ -1,21 +1,27 @@
+-void f(char ** a) {
+-   int b[10];
+-   (*a)++; 
++#include "aliascheck.h"
+ 
+-   b[10] = 0;
++char * f(char * a) {
++   char * b ;
++
++   b = a;
++    *(b++) = 1;
++   return b;
++}
++
++char * g(char * a) {
++    *a = 0;
++    return f(a);
+ }
+ 
+ int main (){
+     char a[10];
++    char b[20];
+     char * c;
+ 
+-    c = a;
++    f(a);
++    c = f(b);
++    g(c);
+ 
+-    f(&c);
+-    f(&c);
+-
+-    *c = 0;
+-    a[10] = 0;
++    MAYALIAS(c, b);
++    NOALIAS(a, b);
+ }
+-
+-
+diff --git a/std_testcase.h b/std_testcase.h
+index d252bc1..747cbdc 100644
+--- a/std_testcase.h
++++ b/std_testcase.h
+@@ -88,6 +88,16 @@ class OneIntClass
+ 
+ #endif /* end ifndef __cplusplus */
+ 
++/* Buffer access oracles for ae_overflow_tests - available for both C and C++ */
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern void SAFE_BUFACCESS(void* data, int size);
++extern void UNSAFE_BUFACCESS(void* data, int size);
++#ifdef __cplusplus
++}
++#endif
++
+ /* rand only returns 15 bits, so we xor 3 calls together to get the full result (13 bits overflow, but that is okay) */
+ // shifting signed values might overflow and be undefined
+ #define URAND31() (((unsigned)rand()<<30) ^ ((unsigned)rand()<<15) ^ rand())
