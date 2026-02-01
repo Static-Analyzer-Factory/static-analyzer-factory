@@ -1,0 +1,25 @@
+[package]
+name = "saf-datalog"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Datalog-based analysis engine for SAF using Ascent"
+publish = false
+
+[dependencies]
+saf-core = { workspace = true }
+saf-analysis = { workspace = true }
+ascent = { version = "0.8", default-features = false }
+tracing = { workspace = true }
+rustc-hash = { workspace = true }
+fixedbitset = "0.5"
+
+[dev-dependencies]
+saf-test-utils = { path = "../saf-test-utils" }
+saf-frontends = { workspace = true, features = ["llvm-18"] }
+
+[features]
+default = []
+parallel = ["ascent/par"]
+wasm = ["ascent/wasm-bindgen"]

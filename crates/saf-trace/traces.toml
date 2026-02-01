@@ -1,0 +1,27 @@
+# Trace generation manifest for saf-trace --all
+# Each [[trace]] entry defines an algorithm trace to generate.
+
+[[trace]]
+algorithm = "pta"
+input = "tests/fixtures/llvm/e2e/simple_alias.ll"
+output = "pta-andersen/pta-andersen-basic.trace.json"
+title = "Andersen's PTA: Basic Pointer Assignment"
+
+# Future entries (uncomment when ready):
+# [[trace]]
+# algorithm = "ifds"
+# input = "tests/fixtures/llvm/e2e/taint_basic.ll"
+# output = "ifds-taint/ifds-taint-basic.trace.json"
+# title = "IFDS Taint Analysis: Basic Source-Sink"
+
+# [[trace]]
+# algorithm = "absint"
+# input = "tests/fixtures/llvm/e2e/loop_simple.ll"
+# output = "interval-analysis/interval-basic.trace.json"
+# title = "Interval Analysis: Simple Loop Widening"
+
+# [[trace]]
+# algorithm = "mssa"
+# input = "tests/fixtures/llvm/e2e/simple_alias.ll"
+# output = "memory-ssa/mssa-basic.trace.json"
+# title = "Memory SSA: Basic Clobber Walk"
