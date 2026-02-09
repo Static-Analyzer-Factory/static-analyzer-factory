@@ -1,0 +1,395 @@
+{
+  "meta": {
+    "title": "SAF System Architecture",
+    "version": "1.0.0"
+  },
+  "actors": [
+    { "id": "ai-agents", "label": "AI Agents", "icon": "robot" },
+    { "id": "humans", "label": "Humans", "icon": "user" }
+  ],
+  "layers": [
+    {
+      "id": "shells",
+      "label": "Entry Points / Shells",
+      "color": "#0ea5e9",
+      "groups": [
+        { "id": "shells-api", "label": "API", "children": ["python-sdk", "cli"] },
+        { "id": "shells-webapps", "label": "Web Apps", "children": ["playground", "tutorials"] },
+        { "id": "shells-static", "label": "Static Sites", "children": ["docs", "site"] }
+      ],
+      "nodes": [
+        {
+          "id": "python-sdk",
+          "label": "Python SDK",
+          "desc": "project.points_to(), taint_flow(), check()",
+          "crate": "saf-python",
+          "tags": ["pyo3", "api"]
+        },
+        {
+          "id": "cli",
+          "label": "CLI",
+          "desc": "Command-line binary for batch analysis",
+          "crate": "saf-cli",
+          "tags": ["binary"]
+        },
+        {
+          "id": "playground",
+          "label": "Playground",
+          "desc": "Browser IDE with Monaco, QueryPanel, AnalyzerPanel, GraphPanel",
+          "path": "playground/",
+          "tags": ["react", "wasm", "browser"]
+        },
+        {
+          "id": "tutorials",
+          "label": "Tutorials",
+          "desc": "Interactive algorithm stepper with graph visualization",
+          "path": "tutorials/",
+          "tags": ["react", "browser"]
+        },
+        {
+          "id": "docs",
+          "label": "Documentation",
+          "desc": "mdBook developer docs",
+          "path": "docs/book/",
+          "tags": ["mdbook"]
+        },
+        {
+          "id": "site",
+          "label": "Landing Site",
+          "desc": "Marketing and overview page",
+          "path": "site/",
+          "tags": ["react"]
+        }
+      ]
+    },
+    {
+      "id": "bridges",
+      "label": "Compilation Targets",
+      "color": "#8b5cf6",
+      "groups": [
+        { "id": "bridges-native", "label": "Native", "children": ["pyo3"] },
+        { "id": "bridges-browser", "label": "Browser", "children": ["wasm-bridge", "pyodide", "web-worker"] }
+      ],
+      "nodes": [
+        {
+          "id": "pyo3",
+          "label": "PyO3 FFI",
+          "desc": "Rust-to-Python bindings via maturin",
+          "crate": "saf-python",
+          "tags": ["ffi", "native"]
+        },
+        {
+          "id": "wasm-bridge",
+          "label": "WASM Bridge",
+          "desc": "Rust compiled to WASM via wasm-pack",
+          "crate": "saf-wasm",
+          "tags": ["wasm", "browser"]
+        },
+        {
+          "id": "pyodide",
+          "label": "Pyodide Runtime",
+          "desc": "Python-in-browser, mirrors SDK API via pyodide-bridge.ts",
+          "path": "playground/src/analysis/pyodide-bridge.ts",
+          "tags": ["python", "browser"]
+        },
+        {
+          "id": "web-worker",
+          "label": "Web Worker",
+          "desc": "Runs WASM off main thread for non-blocking analysis",
+          "path": "playground/src/analysis/",
+          "tags": ["browser", "threading"]
+        }
+      ]
+    },
+    {
+      "id": "protocol",
+      "label": "JSON Protocol",
+      "color": "#f59e0b",
+      "groups": [
+        { "id": "protocol-dispatch", "label": "Actions", "hub": "handle-request", "children": ["schema-action", "check-action", "query-action", "analyze-action"] }
+      ],
+      "nodes": [
+        {
+          "id": "handle-request",
+          "label": "handle_request()",
+          "desc": "ProgramDatabase::handle_request(json) — dispatches all queries",
+          "crate": "saf-analysis",
+          "path": "crates/saf-analysis/src/database/handler.rs",
+          "tags": ["protocol", "core"]
+        },
+        {
+          "id": "schema-action",
+          "label": "schema",
+          "desc": "Returns catalog of available checks and graphs",
+          "tags": ["action"]
+        },
+        {
+          "id": "check-action",
+          "label": "check / check_all",
+          "desc": "Run named checkers (use-after-free, null-deref, ...)",
+          "tags": ["action"]
+        },
+        {
+          "id": "query-action",
+          "label": "query",
+          "desc": "Primitive queries: points_to, alias, taint_flow, flows",
+          "tags": ["action"]
+        },
+        {
+          "id": "analyze-action",
+          "label": "analyze",
+          "desc": "Custom analysis with inline config",
+          "tags": ["action"]
+        }
+      ]
+    },
+    {
+      "id": "query",
+      "label": "Query & Export",
+      "color": "#10b981",
+      "groups": [
+        { "id": "query-input", "label": "Input Specs", "children": ["selectors", "checker-specs"] },
+        { "id": "query-output", "label": "Output Formats", "children": ["property-graph", "pta-export", "findings"] }
+      ],
+      "nodes": [
+        {
+          "id": "selectors",
+          "label": "Selectors",
+          "desc": "Source/sink specification (JSON-deserializable)",
+          "crate": "saf-analysis",
+          "path": "crates/saf-analysis/src/selector/",
+          "tags": ["query"]
+        },
+        {
+          "id": "property-graph",
+          "label": "PropertyGraph Export",
+          "desc": "Unified format for CFG, callgraph, defuse, valueflow",
+          "crate": "saf-analysis",
+          "tags": ["export", "graph"]
+        },
+        {
+          "id": "pta-export",
+          "label": "PTA Export",
+          "desc": "Value-to-locations points-to results",
+          "crate": "saf-analysis",
+          "tags": ["export", "pta"]
+        },
+        {
+          "id": "checker-specs",
+          "label": "Checker Specs",
+          "desc": "YAML-defined typestate/resource/taint rules",
+          "crate": "saf-analysis",
+          "path": "crates/saf-analysis/src/checker/",
+          "tags": ["checkers", "yaml"]
+        },
+        {
+          "id": "findings",
+          "label": "Findings / SARIF",
+          "desc": "Output with path traces, CWE tags, severity",
+          "crate": "saf-analysis",
+          "tags": ["export", "sarif"]
+        }
+      ]
+    },
+    {
+      "id": "engines",
+      "label": "Analysis Engines",
+      "color": "#ef4444",
+      "groups": [
+        { "id": "engines-graphs", "label": "Graph Construction", "hub": "program-db", "children": ["callgraph", "pta", "mssa", "vfg"] },
+        { "id": "engines-solvers", "label": "Solvers & Checkers", "children": ["svfg-checkers", "ifds-ide"] }
+      ],
+      "nodes": [
+        {
+          "id": "program-db",
+          "label": "ProgramDatabase",
+          "desc": "Central facade, owns all analysis results",
+          "crate": "saf-analysis",
+          "path": "crates/saf-analysis/src/database/mod.rs",
+          "tags": ["core", "facade"]
+        },
+        {
+          "id": "callgraph",
+          "label": "Call Graph",
+          "desc": "CHA + on-the-fly refinement via PTA",
+          "crate": "saf-analysis",
+          "tags": ["graph", "cg"]
+        },
+        {
+          "id": "pta",
+          "label": "Pointer Analysis",
+          "desc": "Andersen-style (Worklist solver, Datalog/Ascent solver)",
+          "crate": "saf-analysis",
+          "tags": ["pta", "andersen"]
+        },
+        {
+          "id": "vfg",
+          "label": "Value Flow Graph",
+          "desc": "Sparse value-flow for taint/dataflow analysis",
+          "crate": "saf-analysis",
+          "tags": ["graph", "vfg"]
+        },
+        {
+          "id": "mssa",
+          "label": "Memory SSA",
+          "desc": "Store/load reasoning (MemPhi, chi/mu)",
+          "crate": "saf-analysis",
+          "tags": ["ssa", "memory"]
+        },
+        {
+          "id": "svfg-checkers",
+          "label": "SVFG Checkers",
+          "desc": "Typestate, resource leak, double-free, null-deref",
+          "crate": "saf-analysis",
+          "path": "crates/saf-analysis/src/checker/",
+          "tags": ["checkers", "svfg"]
+        },
+        {
+          "id": "ifds-ide",
+          "label": "IFDS/IDE Solvers",
+          "desc": "Interprocedural taint, typestate via tabulation",
+          "crate": "saf-analysis",
+          "tags": ["solver", "ifds"]
+        }
+      ]
+    },
+    {
+      "id": "ir",
+      "label": "IR & Frontends",
+      "color": "#6366f1",
+      "groups": [
+        { "id": "ir-core", "label": "Core", "hub": "air-bundle", "children": [] },
+        { "id": "ir-frontends", "label": "Frontends", "children": ["llvm-frontend", "air-json-frontend", "tree-sitter"] }
+      ],
+      "nodes": [
+        {
+          "id": "air-bundle",
+          "label": "AIR Bundle",
+          "desc": "Canonical intermediate representation",
+          "crate": "saf-core",
+          "path": "crates/saf-core/src/air/",
+          "tags": ["ir", "core"]
+        },
+        {
+          "id": "llvm-frontend",
+          "label": "LLVM Frontend",
+          "desc": "Ingests .ll/.bc via LLVM C API",
+          "crate": "saf-frontends",
+          "tags": ["frontend", "llvm"]
+        },
+        {
+          "id": "air-json-frontend",
+          "label": "AIR-JSON Frontend",
+          "desc": "Ingests .air.json directly (no LLVM required)",
+          "crate": "saf-frontends",
+          "tags": ["frontend", "json"]
+        },
+        {
+          "id": "tree-sitter",
+          "label": "Tree-sitter (browser)",
+          "desc": "Parses C source to CST, converts to AIR in-browser",
+          "path": "packages/shared/src/analysis/",
+          "tags": ["frontend", "browser", "wasm"]
+        }
+      ]
+    },
+    {
+      "id": "infra",
+      "label": "Build & Deploy",
+      "color": "#64748b",
+      "groups": [
+        { "id": "infra-build", "label": "Build Tools", "children": ["docker", "wasm-pack", "maturin"] },
+        { "id": "infra-deploy", "label": "Deployment", "children": ["github-pages"] }
+      ],
+      "nodes": [
+        {
+          "id": "docker",
+          "label": "Docker (dev)",
+          "desc": "Ubuntu 24.04 + LLVM 18 build environment",
+          "path": "docker/",
+          "tags": ["build", "ci"]
+        },
+        {
+          "id": "wasm-pack",
+          "label": "wasm-pack",
+          "desc": "Compiles Rust to WASM for browser",
+          "tags": ["build", "wasm"]
+        },
+        {
+          "id": "maturin",
+          "label": "Maturin",
+          "desc": "Builds Python wheels from Rust (PyO3)",
+          "tags": ["build", "python"]
+        },
+        {
+          "id": "github-pages",
+          "label": "GitHub Pages",
+          "desc": "Deploys site, playground, tutorials, docs",
+          "path": ".github/workflows/playground.yml",
+          "tags": ["deploy", "ci"]
+        }
+      ]
+    }
+  ],
+  "connections": [
+    { "from": "ai-agents", "to": "python-sdk", "type": "uses" },
+    { "from": "humans", "to": "playground", "type": "uses" },
+    { "from": "humans", "to": "cli", "type": "uses" },
+    { "from": "humans", "to": "tutorials", "type": "uses" },
+    { "from": "humans", "to": "docs", "type": "uses" },
+    { "from": "humans", "to": "site", "type": "uses" },
+
+    { "from": "python-sdk", "to": "pyo3", "type": "data", "label": "FFI calls" },
+    { "from": "playground", "to": "pyodide", "type": "data", "label": "Python-in-browser" },
+    { "from": "playground", "to": "wasm-bridge", "type": "data", "label": "direct WASM" },
+    { "from": "playground", "to": "web-worker", "type": "data", "label": "off-thread" },
+    { "from": "cli", "to": "handle-request", "type": "data", "label": "native Rust" },
+
+    { "from": "pyo3", "to": "handle-request", "type": "data", "label": "same Rust fn" },
+    { "from": "wasm-bridge", "to": "handle-request", "type": "data", "label": "WASM target" },
+    { "from": "pyodide", "to": "wasm-bridge", "type": "data", "label": "JS interop" },
+    { "from": "web-worker", "to": "wasm-bridge", "type": "data", "label": "message passing" },
+
+    { "from": "handle-request", "to": "schema-action", "type": "data", "label": "dispatches" },
+    { "from": "handle-request", "to": "check-action", "type": "data", "label": "dispatches" },
+    { "from": "handle-request", "to": "query-action", "type": "data", "label": "dispatches" },
+    { "from": "handle-request", "to": "analyze-action", "type": "data", "label": "dispatches" },
+
+    { "from": "check-action", "to": "checker-specs", "type": "data" },
+    { "from": "check-action", "to": "svfg-checkers", "type": "data" },
+    { "from": "query-action", "to": "selectors", "type": "data" },
+    { "from": "query-action", "to": "pta", "type": "data" },
+    { "from": "query-action", "to": "vfg", "type": "data" },
+    { "from": "analyze-action", "to": "program-db", "type": "data" },
+
+    { "from": "program-db", "to": "callgraph", "type": "data", "label": "owns" },
+    { "from": "program-db", "to": "pta", "type": "data", "label": "owns" },
+    { "from": "program-db", "to": "vfg", "type": "data", "label": "owns" },
+    { "from": "program-db", "to": "mssa", "type": "data", "label": "owns" },
+    { "from": "pta", "to": "callgraph", "type": "data", "label": "refines CG" },
+    { "from": "vfg", "to": "mssa", "type": "data", "label": "built on MSSA" },
+
+    { "from": "callgraph", "to": "air-bundle", "type": "data", "label": "operates on" },
+    { "from": "pta", "to": "air-bundle", "type": "data", "label": "operates on" },
+    { "from": "vfg", "to": "air-bundle", "type": "data", "label": "operates on" },
+    { "from": "mssa", "to": "air-bundle", "type": "data", "label": "operates on" },
+    { "from": "svfg-checkers", "to": "vfg", "type": "data", "label": "traverses" },
+    { "from": "ifds-ide", "to": "air-bundle", "type": "data", "label": "operates on" },
+
+    { "from": "llvm-frontend", "to": "air-bundle", "type": "data", "label": "produces" },
+    { "from": "air-json-frontend", "to": "air-bundle", "type": "data", "label": "produces" },
+    { "from": "tree-sitter", "to": "air-bundle", "type": "data", "label": "produces (browser)" },
+
+    { "from": "docker", "to": "llvm-frontend", "type": "compiles-to" },
+    { "from": "wasm-pack", "to": "wasm-bridge", "type": "compiles-to" },
+    { "from": "maturin", "to": "pyo3", "type": "compiles-to" },
+    { "from": "github-pages", "to": "playground", "type": "deploys" },
+    { "from": "github-pages", "to": "tutorials", "type": "deploys" },
+    { "from": "github-pages", "to": "docs", "type": "deploys" },
+    { "from": "github-pages", "to": "site", "type": "deploys" },
+
+    { "from": "selectors", "to": "findings", "type": "data", "label": "produces" },
+    { "from": "program-db", "to": "property-graph", "type": "data", "label": "exports" },
+    { "from": "pta", "to": "pta-export", "type": "data", "label": "exports" }
+  ]
+}

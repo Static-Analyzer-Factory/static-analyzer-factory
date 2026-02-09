@@ -1,0 +1,344 @@
+/* AnalyzerPanel — Python analyzer editor + output */
+
+.analyzer-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  background: var(--color-surface);
+}
+
+/* Toolbar */
+.analyzer-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 0.75rem;
+  background: var(--color-surface-raised);
+  border-bottom: 1px solid var(--color-bg);
+  flex-shrink: 0;
+}
+
+.analyzer-toolbar select {
+  padding: 0.2rem 0.4rem;
+  font-size: 0.75em;
+  background: var(--color-bg);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+}
+
+.analyzer-toolbar select:focus {
+  border-color: var(--color-accent);
+}
+
+.btn-run {
+  padding: 0.3rem 0.75rem;
+  font-size: 0.75em;
+  font-weight: 500;
+  color: var(--color-text-inverse);
+  background: var(--color-accent);
+  border: 1px solid var(--color-accent);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-run:hover {
+  background: var(--color-accent-hover);
+  color: var(--color-text-inverse);
+}
+
+.btn-run:disabled {
+  background: var(--color-border);
+  border-color: var(--color-border);
+  color: var(--color-text-secondary);
+  cursor: not-allowed;
+}
+
+/* Help button */
+.btn-help {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font-size: 0.75em;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.btn-help:hover {
+  color: var(--color-text);
+  border-color: var(--color-accent);
+  background: var(--color-accent-subtle);
+}
+
+/* Help popover */
+.help-popover {
+  position: relative;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-bg);
+  padding: 0.6rem 0.75rem;
+  font-size: 0.75em;
+  color: var(--color-text-secondary);
+  flex-shrink: 0;
+}
+
+.help-popover-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+  font-weight: 600;
+  color: var(--color-text);
+  font-size: 1.05em;
+}
+
+.help-popover-close {
+  background: none;
+  border: none;
+  color: var(--color-text-secondary);
+  font-size: 1.3em;
+  cursor: pointer;
+  padding: 0 0.2rem;
+  line-height: 1;
+}
+
+.help-popover-close:hover {
+  color: var(--color-text);
+}
+
+.help-popover-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.help-popover-table td {
+  padding: 0.2rem 0;
+}
+
+.help-popover-table td:first-child {
+  white-space: nowrap;
+  padding-right: 1.5rem;
+  color: var(--color-text);
+}
+
+.help-popover-table td:last-child {
+  color: var(--color-text-secondary);
+}
+
+.help-popover-table kbd {
+  display: inline-block;
+  padding: 0.1rem 0.35rem;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.9em;
+  color: var(--color-text);
+  background: var(--color-border);
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  line-height: 1.4;
+}
+
+.help-popover-hint {
+  margin-top: 0.5rem;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+.help-popover-hint code {
+  padding: 0.1rem 0.3rem;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.9em;
+  background: var(--color-border);
+  border-radius: 2px;
+  color: var(--color-accent);
+}
+
+.help-popover-hint strong {
+  color: var(--color-text-secondary);
+}
+
+.pyodide-status {
+  margin-left: auto;
+  font-size: 0.7em;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.pyodide-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.pyodide-dot.loading {
+  background: var(--color-warning);
+  animation: pulse 1s infinite;
+}
+
+.pyodide-dot.ready {
+  background: var(--color-success);
+}
+
+.pyodide-dot.idle {
+  background: var(--color-text-tertiary);
+}
+
+.pyodide-status-text {
+  color: var(--color-text-secondary);
+}
+
+/* Editor area */
+.analyzer-editor {
+  flex: 1 1 0%;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.analyzer-editor .cm-editor {
+  height: 100%;
+}
+
+.analyzer-editor .cm-editor .cm-scroller {
+  font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace;
+  font-size: 13px;
+}
+
+/* Output area */
+.analyzer-output {
+  height: 200px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--color-bg);
+  overflow: hidden;
+}
+
+.analyzer-output-tabs {
+  display: flex;
+  gap: 0;
+  flex-shrink: 0;
+  background: var(--color-surface-raised);
+  border-bottom: 1px solid var(--color-bg);
+}
+
+.analyzer-output-tab {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.72em;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.analyzer-output-tab:hover {
+  color: var(--color-text-secondary);
+  background: rgba(44, 44, 46, 0.03);
+}
+
+.analyzer-output-tab.active {
+  color: var(--color-text);
+  border-bottom-color: var(--color-accent);
+  background: var(--color-accent-subtle);
+}
+
+.analyzer-output-content {
+  flex: 1;
+  overflow: auto;
+  padding: 0.5rem 0.75rem;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.analyzer-output-content .error-text {
+  color: var(--color-error);
+}
+
+.analyzer-output-placeholder {
+  color: var(--color-text-tertiary);
+  font-style: italic;
+}
+
+/* Findings */
+.findings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.finding-card {
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  border-left: 3px solid;
+  background: rgba(44, 44, 46, 0.03);
+}
+
+.finding-card.severity-critical {
+  border-left-color: var(--color-error);
+  background: rgba(196, 100, 84, 0.08);
+}
+
+.finding-card.severity-high {
+  border-left-color: var(--color-error);
+  background: rgba(196, 100, 84, 0.08);
+}
+
+.finding-card.severity-medium {
+  border-left-color: var(--color-warning);
+  background: rgba(196, 165, 97, 0.08);
+}
+
+.finding-card.severity-low {
+  border-left-color: var(--color-info);
+  background: rgba(132, 163, 161, 0.08);
+}
+
+.finding-card.severity-info {
+  border-left-color: var(--color-info);
+  background: rgba(132, 163, 161, 0.08);
+}
+
+.finding-severity {
+  font-size: 0.7em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 0.2rem;
+}
+
+.severity-critical .finding-severity { color: var(--color-error); }
+.severity-high .finding-severity { color: var(--color-error); }
+.severity-medium .finding-severity { color: var(--color-warning); }
+.severity-low .finding-severity { color: var(--color-info); }
+.severity-info .finding-severity { color: var(--color-info); }
+
+.finding-message {
+  font-size: 0.8em;
+  color: var(--color-text);
+  line-height: 1.4;
+}
+
+.finding-node {
+  font-size: 0.68em;
+  color: var(--color-text-tertiary);
+  margin-top: 0.2rem;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}

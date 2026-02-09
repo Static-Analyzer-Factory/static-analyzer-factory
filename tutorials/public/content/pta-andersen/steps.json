@@ -1,0 +1,18 @@
+[
+  {
+    "title": "What is Pointer Analysis?",
+    "content": "## Motivation & Context\n\nWhen analyzing C programs, we need to know which pointers can refer to which memory locations. Without this, every pointer dereference is ambiguous — we can't track data flow, detect use-after-free, or reason about aliasing. Pointer analysis is the foundation that makes all other SAF analyses precise. Andersen's analysis gives us a sound, whole-program answer using an inclusion-based approach.\n\n## Key Concepts\n\n- **Points-to set** `pts(v)`: The set of memory locations that pointer `v` may reference at any point during execution\n- **Inclusion constraint** `pts(q) ⊇ pts(p)`: Everything `p` points to, `q` also points to (from assignment `q = p`)\n- **Address constraint** `loc ∈ pts(p)`: Pointer `p` directly takes the address of location `loc` (from `p = &x`)\n- **Fixed point**: The state where no more points-to information can be derived — the algorithm terminates\n- **Worklist**: A queue of pointer variables whose points-to sets recently changed and need their constraints re-evaluated\n\n## Algorithm Overview\n\nAndersen's analysis proceeds in three phases. First, **extract constraints** from the program: each `p = &x` becomes an address constraint, each `q = p` becomes a copy constraint, and pointer dereferences create load/store constraints. Second, **process the worklist**: starting with variables that have address constraints (rank 0), resolve each variable's constraints and propagate new points-to information to dependent variables. Third, **reach fixed point**: when the worklist is empty and no new information flows, the analysis is complete. The result maps every pointer to its possible targets.\n\n## Formal Properties\n\nFlow-insensitive (ignores statement order), context-insensitive (merges all calling contexts). Subset-based / inclusion-based. Time complexity O(n³) worst case where n is the number of pointer variables. **Sound**: never misses a real alias pair. **May be imprecise**: can report aliases that never actually occur at runtime. Monotone over a lattice of points-to sets ordered by ⊆."
+  },
+  {
+    "title": "Our Example Program",
+    "content": "Consider this simple C program with three pointer variables:\n\n- `p = &x` — `p` is assigned the address of `x` (an **addr** constraint)\n- `q = p` — `q` copies from `p` (a **copy** constraint: `pts(q) ⊇ pts(p)`)\n- `r = &y` — `r` is assigned the address of `y` (another **addr** constraint)\n\nAndersen's analysis extracts these constraints and solves them:\n\n| Constraint | Type | Meaning |\n|-----------|------|---------|\n| `p = &x` | addr | `x ∈ pts(p)` |\n| `q = p` | copy | `pts(q) ⊇ pts(p)` |\n| `r = &y` | addr | `y ∈ pts(r)` |\n\nIn the next step, you'll watch the solver process these constraints step by step.",
+    "code": "int x, y;\nint *p = &x;  // addr constraint: x ∈ pts(p)\nint *q = p;   // copy constraint: pts(q) ⊇ pts(p)\nint *r = &y;  // addr constraint: y ∈ pts(r)",
+    "codeLanguage": "c"
+  },
+  {
+    "title": "Andersen's PTA: Step by Step",
+    "content": "Use the controls below to step through Andersen's constraint solver. Watch how the worklist is processed rank-by-rank, constraints are resolved, and points-to sets grow until a fixed point is reached.",
+    "stepType": "algorithm",
+    "algorithmTrace": "pta-andersen-basic.trace.json"
+  }
+]

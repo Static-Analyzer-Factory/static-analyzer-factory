@@ -1,0 +1,179 @@
+graph TB
+
+  subgraph actors["Actors"]
+    ai-agents{{"AI Agents"}}
+    humans(["Humans"])
+  end
+
+  subgraph shells["Entry Points / Shells"]
+    subgraph shells-api["API"]
+      python-sdk["Python SDK"]
+      cli["CLI"]
+    end
+    subgraph shells-webapps["Web Apps"]
+      playground["Playground"]
+      tutorials["Tutorials"]
+    end
+    subgraph shells-static["Static Sites"]
+      docs["Documentation"]
+      site["Landing Site"]
+    end
+  end
+
+  subgraph bridges["Compilation Targets"]
+    subgraph bridges-native["Native"]
+      pyo3["PyO3 FFI"]
+    end
+    subgraph bridges-browser["Browser"]
+      wasm-bridge["WASM Bridge"]
+      pyodide["Pyodide Runtime"]
+      web-worker["Web Worker"]
+    end
+  end
+
+  subgraph protocol["JSON Protocol"]
+    subgraph protocol-dispatch["Actions"]
+      handle-request["handle_request()"]
+      schema-action["schema"]
+      check-action["check / check_all"]
+      query-action["query"]
+      analyze-action["analyze"]
+    end
+  end
+
+  subgraph query["Query & Export"]
+    subgraph query-input["Input Specs"]
+      selectors["Selectors"]
+      checker-specs["Checker Specs"]
+    end
+    subgraph query-output["Output Formats"]
+      property-graph["PropertyGraph Export"]
+      pta-export["PTA Export"]
+      findings["Findings / SARIF"]
+    end
+  end
+
+  subgraph engines["Analysis Engines"]
+    subgraph engines-graphs["Graph Construction"]
+      program-db["ProgramDatabase"]
+      callgraph["Call Graph"]
+      pta["Pointer Analysis"]
+      mssa["Memory SSA"]
+      vfg["Value Flow Graph"]
+    end
+    subgraph engines-solvers["Solvers & Checkers"]
+      svfg-checkers["SVFG Checkers"]
+      ifds-ide["IFDS/IDE Solvers"]
+    end
+  end
+
+  subgraph ir["IR & Frontends"]
+    subgraph ir-core["Core"]
+      air-bundle["AIR Bundle"]
+    end
+    subgraph ir-frontends["Frontends"]
+      llvm-frontend["LLVM Frontend"]
+      air-json-frontend["AIR-JSON Frontend"]
+      tree-sitter["Tree-sitter (browser)"]
+    end
+  end
+
+  subgraph infra["Build & Deploy"]
+    subgraph infra-build["Build Tools"]
+      docker["Docker (dev)"]
+      wasm-pack["wasm-pack"]
+      maturin["Maturin"]
+    end
+    subgraph infra-deploy["Deployment"]
+      github-pages["GitHub Pages"]
+    end
+  end
+
+  ai-agents --> python-sdk
+  humans --> playground
+  humans --> cli
+  humans --> tutorials
+  humans --> docs
+  humans --> site
+  python-sdk ==>|FFI calls| pyo3
+  playground ==>|Python-in-browser| pyodide
+  playground ==>|direct WASM| wasm-bridge
+  playground ==>|off-thread| web-worker
+  cli ==>|native Rust| handle-request
+  pyo3 ==>|same Rust fn| handle-request
+  wasm-bridge ==>|WASM target| handle-request
+  pyodide ==>|JS interop| wasm-bridge
+  web-worker ==>|message passing| wasm-bridge
+  handle-request ==>|dispatches| schema-action
+  handle-request ==>|dispatches| check-action
+  handle-request ==>|dispatches| query-action
+  handle-request ==>|dispatches| analyze-action
+  check-action ==> checker-specs
+  check-action ==> svfg-checkers
+  query-action ==> selectors
+  query-action ==> pta
+  query-action ==> vfg
+  analyze-action ==> program-db
+  program-db ==>|owns| callgraph
+  program-db ==>|owns| pta
+  program-db ==>|owns| vfg
+  program-db ==>|owns| mssa
+  pta ==>|refines CG| callgraph
+  vfg ==>|built on MSSA| mssa
+  callgraph ==>|operates on| air-bundle
+  pta ==>|operates on| air-bundle
+  vfg ==>|operates on| air-bundle
+  mssa ==>|operates on| air-bundle
+  svfg-checkers ==>|traverses| vfg
+  ifds-ide ==>|operates on| air-bundle
+  llvm-frontend ==>|produces| air-bundle
+  air-json-frontend ==>|produces| air-bundle
+  tree-sitter ==>|produces  browser| air-bundle
+  docker -.-> llvm-frontend
+  wasm-pack -.-> wasm-bridge
+  maturin -.-> pyo3
+  github-pages -..-> playground
+  github-pages -..-> tutorials
+  github-pages -..-> docs
+  github-pages -..-> site
+  selectors ==>|produces| findings
+  program-db ==>|exports| property-graph
+  pta ==>|exports| pta-export
+
+  style ai-agents fill:#faf9f7,stroke:#9b9ba0,color:#2c2c2e
+  style humans fill:#faf9f7,stroke:#9b9ba0,color:#2c2c2e
+  style python-sdk fill:#faf9f7,stroke:#5088b5,color:#2c2c2e
+  style cli fill:#faf9f7,stroke:#5088b5,color:#2c2c2e
+  style playground fill:#faf9f7,stroke:#5088b5,color:#2c2c2e
+  style tutorials fill:#faf9f7,stroke:#5088b5,color:#2c2c2e
+  style docs fill:#faf9f7,stroke:#5088b5,color:#2c2c2e
+  style site fill:#faf9f7,stroke:#5088b5,color:#2c2c2e
+  style pyo3 fill:#faf9f7,stroke:#8b5dc8,color:#2c2c2e
+  style wasm-bridge fill:#faf9f7,stroke:#8b5dc8,color:#2c2c2e
+  style pyodide fill:#faf9f7,stroke:#8b5dc8,color:#2c2c2e
+  style web-worker fill:#faf9f7,stroke:#8b5dc8,color:#2c2c2e
+  style handle-request fill:#faf9f7,stroke:#c49a3c,color:#2c2c2e
+  style schema-action fill:#faf9f7,stroke:#c49a3c,color:#2c2c2e
+  style check-action fill:#faf9f7,stroke:#c49a3c,color:#2c2c2e
+  style query-action fill:#faf9f7,stroke:#c49a3c,color:#2c2c2e
+  style analyze-action fill:#faf9f7,stroke:#c49a3c,color:#2c2c2e
+  style selectors fill:#faf9f7,stroke:#3d9b8f,color:#2c2c2e
+  style property-graph fill:#faf9f7,stroke:#3d9b8f,color:#2c2c2e
+  style pta-export fill:#faf9f7,stroke:#3d9b8f,color:#2c2c2e
+  style checker-specs fill:#faf9f7,stroke:#3d9b8f,color:#2c2c2e
+  style findings fill:#faf9f7,stroke:#3d9b8f,color:#2c2c2e
+  style program-db fill:#faf9f7,stroke:#c75050,color:#2c2c2e
+  style callgraph fill:#faf9f7,stroke:#c75050,color:#2c2c2e
+  style pta fill:#faf9f7,stroke:#c75050,color:#2c2c2e
+  style vfg fill:#faf9f7,stroke:#c75050,color:#2c2c2e
+  style mssa fill:#faf9f7,stroke:#c75050,color:#2c2c2e
+  style svfg-checkers fill:#faf9f7,stroke:#c75050,color:#2c2c2e
+  style ifds-ide fill:#faf9f7,stroke:#c75050,color:#2c2c2e
+  style air-bundle fill:#faf9f7,stroke:#5088b5,color:#2c2c2e
+  style llvm-frontend fill:#faf9f7,stroke:#5088b5,color:#2c2c2e
+  style air-json-frontend fill:#faf9f7,stroke:#5088b5,color:#2c2c2e
+  style tree-sitter fill:#faf9f7,stroke:#5088b5,color:#2c2c2e
+  style docker fill:#faf9f7,stroke:#9b9ba0,color:#2c2c2e
+  style wasm-pack fill:#faf9f7,stroke:#9b9ba0,color:#2c2c2e
+  style maturin fill:#faf9f7,stroke:#9b9ba0,color:#2c2c2e
+  style github-pages fill:#faf9f7,stroke:#9b9ba0,color:#2c2c2e

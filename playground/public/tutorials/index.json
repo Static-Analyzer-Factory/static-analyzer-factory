@@ -1,0 +1,3 @@
+[
+  { "id": "uaf-detection", "title": "Detecting Use-After-Free (CWE-416)", "difficulty": "beginner" }
+]

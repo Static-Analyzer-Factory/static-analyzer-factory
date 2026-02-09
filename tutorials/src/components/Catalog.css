@@ -1,0 +1,205 @@
+.catalog {
+  padding: 0 24px 48px;
+}
+
+/* Hero */
+.catalog-hero {
+  text-align: center;
+  padding: 64px 24px 40px;
+  background: linear-gradient(135deg, var(--bg) 0%, var(--surface) 50%, var(--color-surface-raised, #e7e3df) 100%);
+  border-radius: 12px;
+  margin-bottom: 40px;
+}
+
+.catalog-hero h1 {
+  font-size: 36px;
+  margin: 0 0 12px;
+  color: var(--text);
+}
+
+.catalog-hero p {
+  font-size: 16px;
+  color: var(--color-text-secondary, #6b6b70);
+  max-width: 600px;
+  margin: 0 auto;
+  line-height: 1.6;
+}
+
+/* Learning path cards */
+.catalog-paths {
+  margin-bottom: 32px;
+}
+
+.catalog-paths h2 {
+  font-size: 18px;
+  margin: 0 0 16px;
+  color: var(--text);
+}
+
+.path-cards {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 8px;
+  scrollbar-width: thin;
+}
+
+.path-card {
+  flex: 0 0 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--color-border, #dbd6d0);
+  border-radius: 10px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--text);
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.path-card:hover {
+  border-color: var(--accent);
+}
+
+.path-card.active {
+  border-color: var(--accent);
+  background: rgba(61, 155, 143, 0.08);
+}
+
+.path-icon {
+  font-size: 24px;
+}
+
+.path-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.path-desc {
+  font-size: 11px;
+  color: var(--color-text-secondary, #6b6b70);
+  line-height: 1.4;
+}
+
+/* Filter bar */
+.catalog-filters {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.catalog-filters label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--color-text-secondary, #6b6b70);
+}
+
+.catalog-filters select {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--color-border, #dbd6d0);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+
+.clear-filter {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+/* Tutorial grid */
+.catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+.tutorial-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--color-border, #dbd6d0);
+  border-radius: 10px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--text);
+  transition: border-color 0.15s, transform 0.15s;
+}
+
+.tutorial-card:hover {
+  border-color: var(--accent-secondary);
+  transform: translateY(-2px);
+}
+
+.card-badges {
+  display: flex;
+  gap: 6px;
+}
+
+.badge {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 8px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.badge.difficulty {
+  color: var(--color-text-inverse, #fff);
+}
+
+.badge.mode {
+  background: rgba(61, 155, 143, 0.15);
+  color: var(--accent);
+}
+
+.tutorial-card h3 {
+  font-size: 15px;
+  margin: 0;
+}
+
+.tutorial-card p {
+  font-size: 12px;
+  color: var(--color-text-secondary, #6b6b70);
+  margin: 0;
+  line-height: 1.5;
+}
+
+.no-results {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: var(--color-text-secondary, #6b6b70);
+  padding: 40px;
+}
+
+@media (max-width: 1200px) {
+  .catalog-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 480px) {
+  .catalog-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .catalog-hero h1 {
+    font-size: 28px;
+  }
+
+  .path-card {
+    flex: 0 0 180px;
+  }
+}

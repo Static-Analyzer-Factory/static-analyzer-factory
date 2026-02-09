@@ -1,0 +1,214 @@
+{
+  "algorithm": "sparse-vf",
+  "title": "Sparse Value-Flow Taint Propagation",
+  "example": {
+    "code": "int main() {\n    int x = source();\n    int y = 42;\n    int z = x + 1;\n    sink(z);\n}",
+    "language": "c"
+  },
+  "phases": ["Build Def-Use", "Compute SSA", "Build VF Edges", "Propagate", "Query"],
+  "pseudocode": {
+    "title": "SPARSE-VF(P)",
+    "lines": [
+      {"text": "Build def-use chains (SSA)"},
+      {"text": "for each def d:"},
+      {"text": "  for each use u of d:"},
+      {"text": "    add VF edge d \u2192 u"},
+      {"text": "for each store *p = v:"},
+      {"text": "  locs \u2190 pts(p)"},
+      {"text": "  for each load w = *q:"},
+      {"text": "    if pts(q) \u2229 locs \u2260 \u2205:"},
+      {"text": "      add indirect edge v \u2192 w"},
+      {"text": "Propagate facts along VF edges"},
+      {"text": "return reaching definitions"}
+    ]
+  },
+  "steps": [
+    {
+      "id": 0,
+      "action": "Build value-flow graph",
+      "phase": 0,
+      "activeLines": [0, 1, 2, 3],
+      "explanation": "Construct the value-flow graph from SSA def-use chains. Edges connect definitions to their uses:\n\n- `source()` \u2192 `x` (direct: return value assignment)\n- `x` \u2192 `z` (direct: `z = x + 1` uses `x`)\n- `z` \u2192 `sink()` (direct: `sink(z)` uses `z`)\n\nNote: `y = 42` has **no** incoming taint edge \u2014 it will never be visited.",
+      "highlights": { "nodes": ["source", "x", "z", "sink"], "edges": [] },
+      "graph": {
+        "nodes": [
+          { "id": "source", "label": "source()", "type": "value" },
+          { "id": "x", "label": "x = source()", "type": "value" },
+          { "id": "y", "label": "y = 42", "type": "value" },
+          { "id": "z", "label": "z = x + 1", "type": "value" },
+          { "id": "sink", "label": "sink(z)", "type": "value" }
+        ],
+        "edges": [
+          { "src": "source", "dst": "x", "type": "direct", "label": "def-use" },
+          { "src": "x", "dst": "z", "type": "direct", "label": "def-use" },
+          { "src": "z", "dst": "sink", "type": "direct", "label": "def-use" }
+        ]
+      },
+      "diff": {
+        "added": {
+          "nodes": ["source", "x", "y", "z", "sink"],
+          "edges": [
+            { "src": "source", "dst": "x" },
+            { "src": "x", "dst": "z" },
+            { "src": "z", "dst": "sink" }
+          ]
+        },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "currentNode": "",
+        "vfEdges": [
+          { "src": "source", "dst": "x", "kind": "direct", "processed": false },
+          { "src": "x", "dst": "z", "kind": "direct", "processed": false },
+          { "src": "z", "dst": "sink", "kind": "direct", "processed": false }
+        ],
+        "facts": {}
+      }
+    },
+    {
+      "id": 1,
+      "action": "Seed source",
+      "phase": 3,
+      "activeLines": [9],
+      "explanation": "Mark `source()` return value as **tainted**. This is our initial fact. Add it to the worklist for propagation.",
+      "highlights": { "nodes": ["source"], "edges": [] },
+      "graph": {
+        "nodes": [
+          { "id": "source", "label": "source()", "type": "value" },
+          { "id": "x", "label": "x = source()", "type": "value" },
+          { "id": "y", "label": "y = 42", "type": "value" },
+          { "id": "z", "label": "z = x + 1", "type": "value" },
+          { "id": "sink", "label": "sink(z)", "type": "value" }
+        ],
+        "edges": [
+          { "src": "source", "dst": "x", "type": "direct", "label": "def-use" },
+          { "src": "x", "dst": "z", "type": "direct", "label": "def-use" },
+          { "src": "z", "dst": "sink", "type": "direct", "label": "def-use" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["source"], "edges": [] }
+      },
+      "algorithmState": {
+        "currentNode": "source",
+        "vfEdges": [
+          { "src": "source", "dst": "x", "kind": "direct", "processed": false },
+          { "src": "x", "dst": "z", "kind": "direct", "processed": false },
+          { "src": "z", "dst": "sink", "kind": "direct", "processed": false }
+        ],
+        "facts": { "source": ["tainted"] }
+      }
+    },
+    {
+      "id": 2,
+      "action": "Propagate to x",
+      "phase": 3,
+      "activeLines": [9],
+      "explanation": "Follow the direct edge `source() \u2192 x`. Transfer function: assignment preserves taint. Facts at `x`: `{tainted}`.\n\nNote: `y = 42` is **never visited** \u2014 there is no value-flow edge connecting tainted data to `y`.",
+      "highlights": { "nodes": ["x"], "edges": [{ "src": "source", "dst": "x" }] },
+      "graph": {
+        "nodes": [
+          { "id": "source", "label": "source()", "type": "value" },
+          { "id": "x", "label": "x = source()", "type": "value" },
+          { "id": "y", "label": "y = 42", "type": "value" },
+          { "id": "z", "label": "z = x + 1", "type": "value" },
+          { "id": "sink", "label": "sink(z)", "type": "value" }
+        ],
+        "edges": [
+          { "src": "source", "dst": "x", "type": "direct", "label": "def-use" },
+          { "src": "x", "dst": "z", "type": "direct", "label": "def-use" },
+          { "src": "z", "dst": "sink", "type": "direct", "label": "def-use" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["x"], "edges": [{ "src": "source", "dst": "x" }] }
+      },
+      "algorithmState": {
+        "currentNode": "x",
+        "vfEdges": [
+          { "src": "source", "dst": "x", "kind": "direct", "processed": true },
+          { "src": "x", "dst": "z", "kind": "direct", "processed": false },
+          { "src": "z", "dst": "sink", "kind": "direct", "processed": false }
+        ],
+        "facts": { "source": ["tainted"], "x": ["tainted"] }
+      }
+    },
+    {
+      "id": 3,
+      "action": "Propagate to z",
+      "phase": 3,
+      "activeLines": [9],
+      "explanation": "Follow the direct edge `x \u2192 z`. The operation `z = x + 1` uses `x` (tainted), so `z` becomes tainted too. Facts at `z`: `{tainted}`.\n\nStill skipping `y = 42` \u2014 sparse analysis only follows value-flow edges.",
+      "highlights": { "nodes": ["z"], "edges": [{ "src": "x", "dst": "z" }] },
+      "graph": {
+        "nodes": [
+          { "id": "source", "label": "source()", "type": "value" },
+          { "id": "x", "label": "x = source()", "type": "value" },
+          { "id": "y", "label": "y = 42", "type": "value" },
+          { "id": "z", "label": "z = x + 1", "type": "value" },
+          { "id": "sink", "label": "sink(z)", "type": "value" }
+        ],
+        "edges": [
+          { "src": "source", "dst": "x", "type": "direct", "label": "def-use" },
+          { "src": "x", "dst": "z", "type": "direct", "label": "def-use" },
+          { "src": "z", "dst": "sink", "type": "direct", "label": "def-use" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["z"], "edges": [{ "src": "x", "dst": "z" }] }
+      },
+      "algorithmState": {
+        "currentNode": "z",
+        "vfEdges": [
+          { "src": "source", "dst": "x", "kind": "direct", "processed": true },
+          { "src": "x", "dst": "z", "kind": "direct", "processed": true },
+          { "src": "z", "dst": "sink", "kind": "direct", "processed": false }
+        ],
+        "facts": { "source": ["tainted"], "x": ["tainted"], "z": ["tainted"] }
+      }
+    },
+    {
+      "id": 4,
+      "action": "Reach sink \u2014 taint found!",
+      "phase": 4,
+      "activeLines": [10],
+      "explanation": "Follow the direct edge `z \u2192 sink()`. Tainted data reaches the sink! **Vulnerability found.**\n\nThe sparse analysis visited only **3 out of 4** program statements (skipped `y = 42`). In larger programs, this savings is dramatic \u2014 sparse analysis can skip 90%+ of irrelevant statements.\n\n| Statement | Visited (Dense) | Visited (Sparse) |\n|-----------|-----------------|-------------------|\n| x = source() | Yes | Yes |\n| y = 42 | Yes | **No** |\n| z = x + 1 | Yes | Yes |\n| sink(z) | Yes | Yes |",
+      "highlights": { "nodes": ["sink"], "edges": [{ "src": "z", "dst": "sink" }] },
+      "graph": {
+        "nodes": [
+          { "id": "source", "label": "source()", "type": "value" },
+          { "id": "x", "label": "x = source()", "type": "value" },
+          { "id": "y", "label": "y = 42", "type": "value" },
+          { "id": "z", "label": "z = x + 1", "type": "value" },
+          { "id": "sink", "label": "sink(z)", "type": "value" }
+        ],
+        "edges": [
+          { "src": "source", "dst": "x", "type": "direct", "label": "def-use" },
+          { "src": "x", "dst": "z", "type": "direct", "label": "def-use" },
+          { "src": "z", "dst": "sink", "type": "direct", "label": "def-use" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["sink"], "edges": [{ "src": "z", "dst": "sink" }] }
+      },
+      "algorithmState": {
+        "currentNode": "sink",
+        "vfEdges": [
+          { "src": "source", "dst": "x", "kind": "direct", "processed": true },
+          { "src": "x", "dst": "z", "kind": "direct", "processed": true },
+          { "src": "z", "dst": "sink", "kind": "direct", "processed": true }
+        ],
+        "facts": { "source": ["tainted"], "x": ["tainted"], "z": ["tainted"], "sink": ["tainted"] }
+      }
+    }
+  ]
+}

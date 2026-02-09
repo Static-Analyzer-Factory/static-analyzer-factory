@@ -1,0 +1,39 @@
+{
+  "id": "uaf-detection",
+  "title": "Detecting Use-After-Free (CWE-416)",
+  "description": "Learn how static analysis detects use-after-free vulnerabilities using CFG, value-flow, and points-to analysis.",
+  "difficulty": "beginner",
+  "steps": [
+    {
+      "title": "The Vulnerable Program",
+      "text": "A string is duplicated via malloc, then freed, but accessed again afterward. This is a use-after-free vulnerability (CWE-416). After free(copy), the code reads copy[0] — a dangling pointer access that can lead to crashes or exploitation.",
+      "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *duplicate(const char *src) {\n    size_t len = strlen(src);\n    char *buf = (char *)malloc(len + 1);\n    strcpy(buf, src);\n    return buf;\n}\n\nvoid process(const char *input) {\n    char *copy = duplicate(input);\n    char *other = (char *)malloc(256);\n    strcpy(other, copy);\n    free(copy);\n    // BUG: use-after-free (copy was freed)\n    other[0] = copy[0];\n    free(other);\n}\n\nint main() {\n    process(\"hello world\");\n    return 0;\n}",
+      "graph": "cfg"
+    },
+    {
+      "title": "Control Flow",
+      "text": "The CFG shows the linear flow through process(). After free(copy), execution continues to copy[0] — the dangling pointer access. There's no branch that could skip the buggy line.",
+      "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *duplicate(const char *src) {\n    size_t len = strlen(src);\n    char *buf = (char *)malloc(len + 1);\n    strcpy(buf, src);\n    return buf;\n}\n\nvoid process(const char *input) {\n    char *copy = duplicate(input);\n    char *other = (char *)malloc(256);\n    strcpy(other, copy);\n    free(copy);\n    // BUG: use-after-free (copy was freed)\n    other[0] = copy[0];\n    free(other);\n}\n\nint main() {\n    process(\"hello world\");\n    return 0;\n}",
+      "graph": "cfg"
+    },
+    {
+      "title": "Value Flow",
+      "text": "The value-flow graph traces data from malloc to buf to the return value to copy. After free(copy), the value still flows to copy[0]. This malloc-free-use chain is the signature of a UAF.",
+      "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *duplicate(const char *src) {\n    size_t len = strlen(src);\n    char *buf = (char *)malloc(len + 1);\n    strcpy(buf, src);\n    return buf;\n}\n\nvoid process(const char *input) {\n    char *copy = duplicate(input);\n    char *other = (char *)malloc(256);\n    strcpy(other, copy);\n    free(copy);\n    // BUG: use-after-free (copy was freed)\n    other[0] = copy[0];\n    free(other);\n}\n\nint main() {\n    process(\"hello world\");\n    return 0;\n}",
+      "graph": "valueflow"
+    },
+    {
+      "title": "Points-To Analysis",
+      "text": "PTA reveals that both copy and buf point to the same malloc allocation. When free(copy) executes, the allocation is deallocated, but copy still holds a dangling pointer.",
+      "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *duplicate(const char *src) {\n    size_t len = strlen(src);\n    char *buf = (char *)malloc(len + 1);\n    strcpy(buf, src);\n    return buf;\n}\n\nvoid process(const char *input) {\n    char *copy = duplicate(input);\n    char *other = (char *)malloc(256);\n    strcpy(other, copy);\n    free(copy);\n    // BUG: use-after-free (copy was freed)\n    other[0] = copy[0];\n    free(other);\n}\n\nint main() {\n    process(\"hello world\");\n    return 0;\n}",
+      "graph": "pta"
+    },
+    {
+      "title": "Finding the Bug",
+      "text": "By combining value-flow (data reaches freed memory) with PTA (copy aliases buf), we can confirm the use-after-free. The path malloc to free to use is the detection pattern.",
+      "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *duplicate(const char *src) {\n    size_t len = strlen(src);\n    char *buf = (char *)malloc(len + 1);\n    strcpy(buf, src);\n    return buf;\n}\n\nvoid process(const char *input) {\n    char *copy = duplicate(input);\n    char *other = (char *)malloc(256);\n    strcpy(other, copy);\n    free(copy);\n    // BUG: use-after-free (copy was freed)\n    other[0] = copy[0];\n    free(other);\n}\n\nint main() {\n    process(\"hello world\");\n    return 0;\n}",
+      "graph": "valueflow",
+      "prompt": "Try removing the free(copy) line and re-analyzing — the value-flow chain to copy[0] should look different."
+    }
+  ]
+}

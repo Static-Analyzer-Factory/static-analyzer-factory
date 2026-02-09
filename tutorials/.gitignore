@@ -1,0 +1,3 @@
+# Copied at build/dev time from playground/public/
+public/web-tree-sitter.wasm
+public/tree-sitter-llvm.wasm

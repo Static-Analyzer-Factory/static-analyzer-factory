@@ -1,0 +1,258 @@
+version: "1.0"
+specs:
+  # File opening
+  - name: fopen
+    role: io
+    returns:
+      pointer: fresh_heap
+      nullness: maybe_null
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: freopen
+    role: io
+    returns:
+      nullness: maybe_null
+    params:
+      - index: 0
+        reads: true
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        reads: true
+        modifies: true
+
+  - name: fclose
+    role: deallocator
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  # File reading
+  - name: fread
+    role: io
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+        tainted: true
+      - index: 1
+        semantic: element_size
+      - index: 2
+        semantic: element_count
+      - index: 3
+        reads: true
+        modifies: true
+        nullness: required_nonnull
+
+  - name: fgets
+    role: source
+    returns:
+      nullness: maybe_null
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+        tainted: true
+      - index: 1
+        semantic: buffer_size
+      - index: 2
+        reads: true
+        modifies: true
+        nullness: required_nonnull
+
+  - name: getc
+    role: io
+    params:
+      - index: 0
+        reads: true
+        modifies: true
+        nullness: required_nonnull
+
+  - name: fgetc
+    role: io
+    params:
+      - index: 0
+        reads: true
+        modifies: true
+        nullness: required_nonnull
+
+  - name: getchar
+    role: source
+    returns:
+      tainted: true
+
+  # File writing
+  - name: fwrite
+    role: io
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        semantic: element_size
+      - index: 2
+        semantic: element_count
+      - index: 3
+        reads: true
+        modifies: true
+        nullness: required_nonnull
+
+  - name: fputs
+    role: io
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        modifies: true
+        nullness: required_nonnull
+
+  - name: fputc
+    role: io
+    params:
+      - index: 1
+        reads: true
+        modifies: true
+        nullness: required_nonnull
+
+  - name: putc
+    role: io
+    params:
+      - index: 1
+        reads: true
+        modifies: true
+        nullness: required_nonnull
+
+  - name: putchar
+    role: io
+
+  - name: puts
+    role: io
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  # Printf family
+  - name: printf
+    role: sink
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: fprintf
+    role: sink
+    params:
+      - index: 0
+        reads: true
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: sprintf
+    role: sink
+    returns:
+      aliases: param.0
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: snprintf
+    role: sink
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        semantic: buffer_size
+      - index: 2
+        reads: true
+        nullness: required_nonnull
+
+  - name: swprintf
+    role: sink
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        semantic: buffer_size
+      - index: 2
+        reads: true
+        nullness: required_nonnull
+
+  # Scanf family (sources)
+  - name: scanf
+    role: source
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: fscanf
+    role: source
+    params:
+      - index: 0
+        reads: true
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: sscanf
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+    taint:
+      propagates:
+        - from: param.0
+          to: [return]
+
+  # Other I/O
+  - name: fseek
+    params:
+      - index: 0
+        reads: true
+        modifies: true
+        nullness: required_nonnull
+
+  - name: ftell
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: rewind
+    params:
+      - index: 0
+        reads: true
+        modifies: true
+        nullness: required_nonnull
+
+  - name: fflush
+    params:
+      - index: 0
+        reads: true
+        modifies: true
+        nullness: nullable

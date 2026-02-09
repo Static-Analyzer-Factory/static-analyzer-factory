@@ -1,0 +1,58 @@
+.phase-bar {
+  display: flex;
+  align-items: center;
+  padding: 6px 16px;
+  gap: 0;
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+
+.phase-item {
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.phase-arrow {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 0 6px;
+  opacity: 0.5;
+}
+
+.phase-node {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.phase-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.phase-pending .phase-dot {
+  border: 1.5px solid var(--text-muted);
+  background: transparent;
+}
+.phase-pending .phase-label {
+  color: var(--text-muted);
+}
+.phase-active .phase-dot {
+  background: var(--accent);
+  box-shadow: 0 0 6px rgba(61, 155, 143, 0.4);
+}
+.phase-active .phase-label {
+  color: var(--accent);
+  font-weight: 600;
+}
+.phase-completed .phase-dot {
+  background: var(--text-muted);
+}
+.phase-completed .phase-label {
+  color: var(--text-muted);
+}

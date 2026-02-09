@@ -1,0 +1,22 @@
+[
+  {
+    "title": "What is SAF?",
+    "content": "**SAF (Static Analyzer Factory)** is a framework for building static analyzers that find bugs in C/C++ programs *without running them*.\n\nUnlike dynamic analysis tools (like Valgrind or AddressSanitizer) that require executing the program with test inputs, static analysis examines the program's **source code** or **intermediate representation** to reason about *all possible* executions.\n\nSAF provides:\n- **Pointer analysis** -- determines which memory locations each pointer can reference\n- **Value-flow analysis** -- tracks how data moves through the program\n- **Graph representations** -- CFG, call graph, def-use chains, and more\n- **A Python SDK** -- write custom analyzers in Python, powered by a high-performance Rust engine\n\nIn this tutorial, you'll load a simple C program into SAF and explore the analysis output. No prior static analysis experience is needed."
+  },
+  {
+    "title": "Loading a Program",
+    "content": "Let's analyze a C program that sums the positive values in an array, skipping negatives.\n\nSAF operates on **LLVM IR** (Intermediate Representation), not C source code directly. The C code is first compiled to LLVM IR using `clang`, and then SAF analyzes the IR.\n\nThe **Control Flow Graph (CFG)** on the right shows how control flows through `main()`. Notice the structure:\n\n- **Entry** -- initializes `sum` and `i`\n- **Loop header** -- tests `i < 5` (the `cond_br` terminator)\n- **Branch** -- tests `arr[i] > 0` and either adds to `sum` or skips\n- **Loop latch** -- increments `i` and jumps back to the header\n- **Exit** -- returns `sum`\n\nEach node is a **basic block** (a straight-line sequence of instructions with no branches except at the end). Edges represent possible transfers of control -- forward edges in gray, **back edges** (loops) in red.\n\nTry editing the code: remove the `if` to see the branch disappear, or change the loop bound. Click **Analyze** to see the updated CFG. Click a node to highlight its source lines.",
+    "code": "#include <stdlib.h>\n\nint main() {\n    int arr[] = {3, -1, 4, -5, 2};\n    int sum = 0;\n    for (int i = 0; i < 5; i++) {\n        if (arr[i] > 0) {\n            sum += arr[i];\n        }\n    }\n    return sum;\n}",
+    "codeLanguage": "c",
+    "graphType": "cfg",
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/simple_alloc.ll\\\"); print(p.graphs().export(\\\"cfg\\\"))\"'"
+  },
+  {
+    "title": "Understanding the Output",
+    "content": "Now let's look at the **Value Flow Graph**, which shows how data moves through the program.\n\nThe value flow reveals the complete lifecycle of our allocated memory:\n\n1. `malloc` returns a pointer to a **heap object** -- this is a `Value` node\n2. The pointer flows into `p` via a `Direct` edge (simple assignment)\n3. The constant `42` flows into the heap object via a `Store` edge (`*p = 42`)\n4. The value is read back via a `Load` edge (`val = *p`)\n5. The pointer `p` also flows to `free(p)` -- the deallocation\n\nKey concepts:\n- **Direct edges** represent pointer assignments and copies\n- **Store edges** represent writes to memory (`*ptr = value`)\n- **Load edges** represent reads from memory (`value = *ptr`)\n\nThis value flow graph is the foundation for bug detection. A UAF detector, for example, would look for values that flow to both `free` and a subsequent use. In this program, the `free(p)` happens *before* `return val`, but since `val` was loaded before the free, there's no bug here.",
+    "code": "#include <stdlib.h>\n\nint main() {\n    int *p = (int *)malloc(sizeof(int));\n    *p = 42;\n    int val = *p;\n    free(p);\n    return val;\n}",
+    "codeLanguage": "c",
+    "graphType": "valueflow",
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/simple_alloc.ll\\\"); print(p.graphs().export(\\\"valueflow\\\"))\"'"
+  }
+]

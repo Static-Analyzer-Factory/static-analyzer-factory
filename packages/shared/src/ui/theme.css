@@ -1,0 +1,48 @@
+/* ==========================================================================
+   SAF Theme — Fresh & Friendly
+   Edit this single file to re-theme the entire site.
+   ========================================================================== */
+
+:root {
+  /* ── Backgrounds & Surfaces ── */
+  --color-bg:              #faf9f7;
+  --color-surface:         #f1eeeb;
+  --color-surface-raised:  #e7e3df;
+  --color-surface-editor:  #f5f3f0;
+  --color-border:          #dbd6d0;
+  --color-border-subtle:   #eae6e2;
+
+  /* ── Text ── */
+  --color-text:            #2c2c2e;
+  --color-text-secondary:  #6b6b70;
+  --color-text-tertiary:   #9b9ba0;
+  --color-text-inverse:    #faf9f7;
+
+  /* ── Primary Accent (fresh teal) ── */
+  --color-accent:          #3d9b8f;
+  --color-accent-hover:    #338a7f;
+  --color-accent-subtle:   rgba(61, 155, 143, 0.10);
+
+  /* ── Secondary Accent (warm coral) ── */
+  --color-secondary:       #d08c60;
+  --color-secondary-hover: #c07c50;
+  --color-secondary-subtle: rgba(208, 140, 96, 0.10);
+
+  /* ── Semantic ── */
+  --color-error:           #c75050;
+  --color-error-subtle:    rgba(199, 80, 80, 0.08);
+  --color-warning:         #c49a3c;
+  --color-warning-subtle:  rgba(196, 154, 60, 0.08);
+  --color-info:            #5088b5;
+  --color-info-subtle:     rgba(80, 136, 181, 0.08);
+  --color-success:         #3d9b8f;
+
+  /* ── Scrollbar ── */
+  --color-scrollbar-track:       #eeebe8;
+  --color-scrollbar-thumb:       #d5d0cb;
+  --color-scrollbar-thumb-hover: #c0bab4;
+
+  /* ── Shadows ── */
+  --shadow-sm: 0 1px 2px rgba(44, 44, 46, 0.06);
+  --shadow-md: 0 2px 8px rgba(44, 44, 46, 0.08);
+}

@@ -1,0 +1,23 @@
+[
+  {
+    "title": "Dense vs Sparse Dataflow",
+    "stepType": "prose",
+    "content": "## Motivation\n\nDense dataflow analysis propagates facts through every program point, even when nothing changes. For a taint analysis on the program below, a dense approach visits `y = 42` even though it is completely unrelated to the taint originating from `source()`. Sparse value-flow analysis eliminates this waste by using SSA def-use chains to skip irrelevant points entirely -- facts propagate only along value-flow edges from definitions to their uses, dramatically reducing work while maintaining the same precision.\n\n## Key Concepts\n\n- **SSA form**: each variable is defined exactly once, enabling precise def-use tracking without ambiguity\n- **Def-use chains**: explicit links from each definition to all of its uses -- the backbone of sparse propagation\n- **Direct value-flow edges**: created by assignments like `y = x`, producing an edge `x -> y` that carries dataflow facts directly\n- **Indirect value-flow edges**: created through memory operations -- a store `*p = v` is matched with a load `w = *q` when `pts(p)` and `pts(q)` overlap, producing an edge `v -> w` through aliased memory\n- **Sparse vs. dense propagation**: sparse analysis follows only value-flow edges, visiting O(E) nodes; dense analysis visits every program point, visiting O(N) nodes regardless of relevance\n\n## Algorithm Overview\n\n1. **Build SSA def-use chains** for all variables in the program\n2. **Create direct VF edges** for each definition-to-use pair (e.g., `x = source()` used at `z = x + 1` creates edge `x -> z`)\n3. **Create indirect VF edges** using pointer analysis: match stores `*p = v` with loads `w = *q` where `pts(p) ∩ pts(q) ≠ {}` -- these edges bridge value flow through memory\n4. **Propagate dataflow facts** along VF edges only, skipping all irrelevant program points (e.g., `y = 42` has no VF edge from `source()`, so it is never visited)\n\nIn the example below, the sparse value-flow chain is: `source() -> x -> z -> sink()`, skipping `y` entirely.\n\n## Formal Properties\n\n- **Same precision** as dense analysis -- every fact that dense analysis discovers, sparse analysis also discovers, because VF edges capture all relevant data dependencies\n- **Complexity**: O(E * D) where E is the number of value-flow edges and D is the dataflow domain size, compared to O(N * D) for dense analysis where N >> E\n- **Foundation** for taint tracking, typestate analysis, and reaching definitions in SAF\n- **Requires pointer analysis** for indirect VF edges -- the precision of the PTA directly affects the precision of the value-flow graph",
+    "code": "int main() {\n    int x = source();\n    int y = 42;\n    int z = x + 1;\n    sink(z);\n}",
+    "codeLanguage": "c"
+  },
+  {
+    "title": "Sparse Propagation: Step by Step",
+    "stepType": "algorithm",
+    "content": "Watch how facts propagate along value-flow edges, skipping irrelevant statements. Only nodes connected by def-use chains are visited.",
+    "algorithmTrace": "svf-basic.trace.json"
+  },
+  {
+    "title": "Interactive: Explore Value Flow",
+    "stepType": "interactive",
+    "content": "Explore the value-flow graph to see which edges carry dataflow facts and which statements are skipped.",
+    "graphType": "valueflow",
+    "code": "int main() {\n    int x = source();\n    int y = 42;\n    int z = x + 1;\n    sink(z);\n}",
+    "codeLanguage": "c"
+  }
+]

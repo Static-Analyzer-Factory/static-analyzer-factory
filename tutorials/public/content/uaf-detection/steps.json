@@ -1,0 +1,58 @@
+[
+  {
+    "title": "The Vulnerable Program",
+    "content": "This program contains a **use-after-free (UAF)** vulnerability -- one of the most common and dangerous memory safety bugs in C/C++ programs.\n\nIn the `process()` function, a string is duplicated using `duplicate()`, which allocates heap memory via `malloc`. The copy is then freed with `free(copy)`, but immediately afterward, `copy[0]` is read. Since `copy` points to freed memory, this is **undefined behavior**.\n\nUAF bugs are particularly dangerous because:\n- The freed memory may be **reallocated** to another object\n- An attacker can control what data occupies the freed region\n- This leads to **arbitrary code execution** in many real-world exploits\n\nLet's use SAF's analysis capabilities to understand how this bug manifests and how static analysis can detect it automatically.",
+    "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *duplicate(const char *src) {\n    size_t len = strlen(src);\n    char *buf = (char *)malloc(len + 1);\n    strcpy(buf, src);\n    return buf;\n}\n\nvoid process(const char *input) {\n    char *copy = duplicate(input);\n    char *other = (char *)malloc(256);\n    strcpy(other, copy);\n    free(copy);\n    // BUG: use-after-free (copy was freed)\n    other[0] = copy[0];\n    free(other);\n}\n\nint main() {\n    process(\"hello world\");\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "cfg",
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/use_after_free.ll\\\"); print(p.graphs().export(\\\"cfg\\\"))\"'"
+  },
+  {
+    "title": "Control Flow",
+    "content": "The **Control Flow Graph (CFG)** shows the execution paths through the `process()` function. Each node represents a **basic block** -- a straight-line sequence of instructions with no branches.\n\nIn this program, `process()` has a mostly linear flow:\n1. **Entry** -- function prologue\n2. **Block 1** -- call `duplicate(input)`, store result in `copy`\n3. **Block 2** -- allocate `other`, copy data, call `free(copy)`\n4. **Block 3** -- read `copy[0]` (the UAF!), write to `other[0]`\n5. **Return** -- call `free(other)`, return\n\nThe CFG is useful because it tells us the **order of operations**. We can see that `free(copy)` in block 2 executes *before* the read of `copy[0]` in block 3. This ordering is essential for detecting the UAF -- without it, we wouldn't know whether the free happens before or after the use.",
+    "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *duplicate(const char *src) {\n    size_t len = strlen(src);\n    char *buf = (char *)malloc(len + 1);\n    strcpy(buf, src);\n    return buf;\n}\n\nvoid process(const char *input) {\n    char *copy = duplicate(input);\n    char *other = (char *)malloc(256);\n    strcpy(other, copy);\n    free(copy);\n    // BUG: use-after-free (copy was freed)\n    other[0] = copy[0];\n    free(other);\n}\n\nint main() {\n    process(\"hello world\");\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "cfg",
+    "highlightLines": [
+      15,
+      17
+    ],
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/use_after_free.ll\\\"); print(p.graphs().export(\\\"cfg\\\"))\"'"
+  },
+  {
+    "title": "Value Flow",
+    "content": "The **Value Flow Graph** traces how data moves through the program. This is where we see the full lifecycle of the allocated memory.\n\nThe value flow for our UAF bug looks like this:\n1. `malloc(len + 1)` returns a pointer to a heap object\n2. That pointer flows into `buf` inside `duplicate()`\n3. `buf` is returned, flowing into `copy` in `process()`\n4. `copy` flows into `free(copy)` -- the deallocation\n5. `copy` *also* flows into `copy[0]` -- the **use after free**\n\nThe critical insight is that `copy` has **two outgoing flows**: one to `free()` and one to the array access `copy[0]`. A UAF detector looks for exactly this pattern: a value that flows to both a `free` and a subsequent use.\n\nNotice how value flow analysis is **interprocedural** -- it tracks the pointer across the `duplicate()` function boundary through the return value.",
+    "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *duplicate(const char *src) {\n    size_t len = strlen(src);\n    char *buf = (char *)malloc(len + 1);\n    strcpy(buf, src);\n    return buf;\n}\n\nvoid process(const char *input) {\n    char *copy = duplicate(input);\n    char *other = (char *)malloc(256);\n    strcpy(other, copy);\n    free(copy);\n    // BUG: use-after-free (copy was freed)\n    other[0] = copy[0];\n    free(other);\n}\n\nint main() {\n    process(\"hello world\");\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "valueflow",
+    "highlightLines": [
+      6,
+      8,
+      12,
+      15,
+      17
+    ],
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/use_after_free.ll\\\"); print(p.graphs().export(\\\"valueflow\\\"))\"'"
+  },
+  {
+    "title": "Points-To Analysis",
+    "content": "**Points-to analysis (PTA)** answers the question: *which heap objects can a pointer refer to?*\n\nIn our program, PTA reveals a crucial fact:\n- `buf` (inside `duplicate()`) points to `heap_obj_0` (the malloc allocation)\n- `copy` (in `process()`) **also** points to `heap_obj_0`\n\nThis is because `duplicate()` returns `buf`, which gets assigned to `copy`. Both variables are **aliases** -- they refer to the same underlying heap object.\n\nWhy does this matter for UAF detection?\n- When `free(copy)` executes, it deallocates `heap_obj_0`\n- Any subsequent access through **any alias** of `heap_obj_0` is a UAF\n- PTA tells us which pointers are aliases, so we know which accesses are dangerous\n\nWithout PTA, we would miss UAF bugs that occur through indirect aliases. For example, if `copy` were passed to another function and stored in a global, PTA would still track that the global aliases the freed object.",
+    "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *duplicate(const char *src) {\n    size_t len = strlen(src);\n    char *buf = (char *)malloc(len + 1);\n    strcpy(buf, src);\n    return buf;\n}\n\nvoid process(const char *input) {\n    char *copy = duplicate(input);\n    char *other = (char *)malloc(256);\n    strcpy(other, copy);\n    free(copy);\n    // BUG: use-after-free (copy was freed)\n    other[0] = copy[0];\n    free(other);\n}\n\nint main() {\n    process(\"hello world\");\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "pta",
+    "highlightLines": [
+      6,
+      12
+    ],
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/use_after_free.ll\\\"); print(p.pta_result().export())\"'"
+  },
+  {
+    "title": "Finding the Bug",
+    "content": "Now we combine **value flow** and **points-to analysis** to automatically detect the UAF.\n\nThe detection algorithm works in three steps:\n\n1. **Find deallocations**: Identify all calls to `free()` and their arguments\n2. **Find post-free uses**: Using value flow, find all uses of a pointer that occur *after* the free on some execution path\n3. **Check aliasing**: Using PTA, verify that the used pointer and the freed pointer may refer to the same heap object\n\nIn our program:\n- `free(copy)` deallocates the object pointed to by `copy`\n- `copy[0]` uses `copy` after the free\n- PTA confirms `copy` points to `heap_obj_0`, the freed object\n\nThe combined value-flow graph below highlights the **free-to-use path** that constitutes the bug. The red path shows data flowing from `malloc` through `buf`/`copy` to both `free` and the subsequent array access.\n\nTry opening this in the playground to experiment with the analysis interactively.",
+    "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *duplicate(const char *src) {\n    size_t len = strlen(src);\n    char *buf = (char *)malloc(len + 1);\n    strcpy(buf, src);\n    return buf;\n}\n\nvoid process(const char *input) {\n    char *copy = duplicate(input);\n    char *other = (char *)malloc(256);\n    strcpy(other, copy);\n    free(copy);\n    // BUG: use-after-free (copy was freed)\n    other[0] = copy[0];\n    free(other);\n}\n\nint main() {\n    process(\"hello world\");\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "valueflow",
+    "challenge": "Try removing the free(copy) line and re-analyzing -- the value-flow chain to copy[0] should look different.",
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/use_after_free.ll\\\"); print(p.graphs().export(\\\"valueflow\\\"))\"'"
+  }
+]

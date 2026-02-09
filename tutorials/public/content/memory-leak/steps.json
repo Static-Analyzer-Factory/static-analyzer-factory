@@ -1,0 +1,38 @@
+[
+  {
+    "title": "Missing Deallocations",
+    "content": "A **memory leak** occurs when dynamically allocated memory is never freed. While not as immediately dangerous as UAF or double free, memory leaks cause:\n- **Gradual resource exhaustion** -- long-running programs slowly consume all available memory\n- **Denial of service** -- servers eventually crash from OOM (out of memory)\n- **Performance degradation** -- excessive memory usage triggers swapping and GC pressure\n\nIn this program, `create_buffer()` is called twice:\n- `data = create_buffer(1024)` -- allocated AND freed (correct)\n- `temp = create_buffer(256)` -- allocated but **never freed** (leak!)\n\nMemory leak detection requires tracking the lifecycle of every allocation:\n1. **Allocation**: where was the memory allocated?\n2. **Deallocation**: is there a matching `free` on every path to function exit?\n3. **Escaping**: does the pointer escape the function (via return, globals, or output parameters)?\n\nIf an allocation has no matching free and doesn't escape, it's a leak.",
+    "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *create_buffer(int size) {\n    char *buf = (char *)malloc(size);\n    memset(buf, 0, size);\n    return buf;\n}\n\nint main() {\n    char *data = create_buffer(1024);\n    char *temp = create_buffer(256);\n    // BUG: temp is never freed (memory leak)\n    free(data);\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "cfg",
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/memory_leak.ll\\\"); print(p.graphs().export(\\\"cfg\\\"))\"'"
+  },
+  {
+    "title": "Allocation Tracking",
+    "content": "The **value flow graph** reveals the full lifecycle of each allocation, making it easy to spot which ones lack a matching `free`.\n\nFor `data` (the correct path):\n1. `malloc(1024)` inside `create_buffer` produces a heap pointer\n2. The pointer flows through `buf` and is returned\n3. In `main`, it flows into `data`\n4. `data` flows into `free(data)` -- **lifecycle complete**\n\nFor `temp` (the leak):\n1. `malloc(256)` inside `create_buffer` produces a heap pointer\n2. The pointer flows through `buf` and is returned\n3. In `main`, it flows into `temp`\n4. `temp` has **no outgoing flow to any `free` call** -- the pointer is lost at function return\n\nThe leak detection pattern in value flow is straightforward: find allocation nodes whose pointer value never reaches a deallocation node on any path. In the graph, `temp` is a \"dead end\" -- the value stops flowing without being freed.\n\nCompare the two allocation lifecycles in the value flow graph to see the difference clearly.",
+    "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *create_buffer(int size) {\n    char *buf = (char *)malloc(size);\n    memset(buf, 0, size);\n    return buf;\n}\n\nint main() {\n    char *data = create_buffer(1024);\n    char *temp = create_buffer(256);\n    // BUG: temp is never freed (memory leak)\n    free(data);\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "valueflow",
+    "highlightLines": [
+      11,
+      12,
+      14
+    ],
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/memory_leak.ll\\\"); print(p.graphs().export(\\\"valueflow\\\"))\"'"
+  },
+  {
+    "title": "Using Specs for Detection",
+    "content": "SAF uses **specs** (specifications) to model the behavior of library functions like `malloc` and `free`. Specs tell the analyzer:\n- `malloc` **allocates** heap memory and returns a pointer to it\n- `free` **deallocates** the memory pointed to by its argument\n\nWithout specs, the analyzer wouldn't know that `malloc` creates a new heap object or that `free` releases one. Specs bridge the gap between the analyzed code and the external library functions it calls.\n\nFor memory leak detection, the relevant spec properties are:\n- **Allocation functions**: `malloc`, `calloc`, `realloc`, `strdup` -- functions that return freshly allocated memory\n- **Deallocation functions**: `free`, `realloc` (for its input pointer) -- functions that release memory\n- **Transfer functions**: functions that take ownership of a pointer (like passing to a container)\n\nSAF's built-in specs cover the C standard library. For custom allocators, you can write your own specs (covered in the Specs Authoring tutorial).\n\nThe detection rule is: for each allocation site, check if every execution path from the allocation to function exit passes through a deallocation of the same object.",
+    "code": "#include <stdlib.h>\n#include <string.h>\n\nchar *create_buffer(int size) {\n    char *buf = (char *)malloc(size);\n    memset(buf, 0, size);\n    return buf;\n}\n\nint main() {\n    char *data = create_buffer(1024);\n    char *temp = create_buffer(256);\n    // BUG: temp is never freed (memory leak)\n    free(data);\n    return 0;\n}",
+    "codeLanguage": "c",
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/memory_leak.ll\\\"); [print(f.to_dict()) for f in p.check_all()]\"'"
+  },
+  {
+    "title": "Running the Detector",
+    "content": "Let's put it all together and run a memory leak detector using the SAF Python SDK.\n\nThe script below:\n1. **Opens** the LLVM IR file using `saf.Project.open()`\n2. **Exports** the value flow graph via `.graphs().export()` to inspect allocation lifecycles\n3. **Reports** any findings detected by the built-in checkers\n\nTo run this locally:\n1. Make sure Docker is running and the SAF dev environment is set up\n2. Save the script as `detect_leak.py`\n3. Run it inside the dev container with `make shell`, then `python3 detect_leak.py`\n\nThe output will show the value flow graph statistics and any detected memory leak findings, including the allocation site and the function where the leak occurs.\n\nYou can download the script using the link below and modify it to analyze your own programs -- just change the path to point to your LLVM IR file.",
+    "code": "#!/usr/bin/env python3\n\"\"\"Detect memory leaks using the SAF SDK.\"\"\"\nimport saf\n\nproj = saf.Project.open(\"tests/fixtures/llvm/e2e/memory_leak.ll\")\nvf = proj.graphs().export(\"valueflow\")\nprint(\"Value Flow Graph:\")\nprint(f\"  Nodes: {len(vf['nodes'])}\")\nprint(f\"  Edges: {len(vf['edges'])}\")\n\n# Check for findings\nfor finding in proj.check(\"memory-leak\"):\n    print(f\"  [{finding.severity}] {finding.message}\")",
+    "codeLanguage": "python",
+    "localScript": "detect_leak.py",
+    "localCmd": "docker compose run --rm dev sh -c 'python3 detect_leak.py'"
+  }
+]

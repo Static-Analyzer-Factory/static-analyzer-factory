@@ -1,0 +1,23 @@
+[
+  {
+    "title": "Why Context Sensitivity?",
+    "stepType": "prose",
+    "content": "## Motivation\n\nContext-insensitive pointer analysis (Andersen's) merges all calling contexts into a single summary for each function. When a function like `identity` is called from multiple sites with different pointer arguments, the merged summary conflates their points-to sets -- producing spurious results like `pts(p) = pts(q) = {a, b}` when the true answer is `pts(p) = {a}` and `pts(q) = {b}`. k-CFA recovers this lost precision by distinguishing contexts: it tracks the *k* most recent call sites, giving each calling context its own independent points-to sets.\n\n## Key Concepts\n\n- **Calling context**: the sequence of call sites leading to a particular function invocation\n- **Context string**: the *k* most recent call sites stored as a tuple, used to distinguish different invocations of the same function\n- **Context cloning**: creating separate analysis state (constraints, points-to sets) for each distinct context string\n- **Context-sensitive points-to set**: `pts(v, ctx)` -- each variable's points-to set is now indexed by context, not shared globally\n- **k parameter**: controls the precision/cost tradeoff -- higher *k* yields more precise results but exponentially more contexts\n- **Context sensitivity**: the fundamental property of distinguishing different call paths to the same function, eliminating spurious merging\n\n## Algorithm Overview\n\nk-CFA uses the same worklist-based constraint solving as Andersen's, but maintains each variable's points-to set *per-context*. When processing a function call, the algorithm pushes the current call site onto the context stack and truncates it to length *k*. Constraints are then propagated within each context independently. At *k*=0, the context stack is always empty, and the algorithm degenerates to standard context-insensitive Andersen's. At *k*=1 (1-CFA), each call site gets its own copy of the callee's constraints, separating the two calls to `identity` shown below.\n\n## Formal Properties\n\n- **k=0** is equivalent to Andersen's context-insensitive analysis\n- **k=1** is classical 1-CFA, distinguishing one level of call sites\n- **Worst case** is exponential in *k* due to context explosion (O(C^k) contexts where C is the number of call sites)\n- **Practical** with bounded *k* and context limits (most programs need k <= 2)\n- **Sound**: never misses a true points-to pair\n- **Strictly more precise** than CI for k >= 1 on programs with polymorphic call patterns",
+    "code": "int *identity(int *x) { return x; }\nint main() {\n    int a, b;\n    int *p = identity(&a);  // call-site 1\n    int *q = identity(&b);  // call-site 2\n}",
+    "codeLanguage": "c"
+  },
+  {
+    "title": "CI vs 1-CFA: Step by Step",
+    "stepType": "algorithm",
+    "content": "Watch as context-insensitive analysis merges both calls, then see how 1-CFA cloning separates them for precise results.",
+    "algorithmTrace": "kcfa-basic.trace.json"
+  },
+  {
+    "title": "Interactive: Explore Points-To",
+    "stepType": "interactive",
+    "content": "Explore the points-to graph and see how context sensitivity eliminates spurious edges.",
+    "graphType": "pta",
+    "code": "int *identity(int *x) { return x; }\nint main() {\n    int a, b;\n    int *p = identity(&a);\n    int *q = identity(&b);\n}",
+    "codeLanguage": "c"
+  }
+]

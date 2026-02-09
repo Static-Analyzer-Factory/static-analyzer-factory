@@ -1,0 +1,21 @@
+[
+  {
+    "title": "What is Interval Abstract Interpretation?",
+    "content": "## Motivation & Context\n\nNumeric errors — integer overflow, division by zero, array out-of-bounds — are among the most common sources of undefined behavior in C programs. Interval analysis detects these statically by computing safe bounds on every integer variable at every program point. If we know `i` is always in `[0, 9]` and the array has 10 elements, we can prove the access is safe. This is an instance of abstract interpretation, the foundational framework for sound static analysis.\n\n## Key Concepts\n\n- **Abstract domain** `[lo, hi]`: Represents all integers a variable may hold; `-∞` and `+∞` denote unbounded ranges\n- **Transfer functions**: Lift arithmetic operations to intervals — if `x ∈ [2, 5]` then `x + 1 ∈ [3, 6]`\n- **Join** (⊔): At control-flow merge points, combine intervals by taking the hull: `[0, 3] ⊔ [5, 8] = [0, 8]`\n- **Widening** (∇): Forces convergence at loop headers by jumping increasing bounds to infinity\n- **Narrowing** (△): After widening reaches a fixpoint, regains precision by incorporating loop conditions\n- **Ascending chain condition**: Guarantees termination — widening ensures no infinite ascending chains in the lattice\n\n## Algorithm Overview\n\nInitialize all variables to ⊥ (unreachable). Run a forward worklist pass: pop a basic block, compute transfer functions for each instruction using intervals from predecessor blocks, and join the results at merge points. At loop headers, apply widening to force convergence — if a bound keeps increasing across iterations, jump it to infinity. Continue until the worklist is empty and no intervals change (fixpoint). Then run an optional narrowing pass: revisit loop headers using branch conditions to tighten overly wide intervals back to precise bounds. The final result maps each variable at each program point to a sound interval.\n\n## Formal Properties\n\nSound: computed intervals always contain the true runtime values. Convergence guaranteed by widening — at most height-of-lattice iterations per loop. May be imprecise due to over-approximation from joins and widening. Founded on the abstract interpretation framework of Cousot & Cousot (1977).",
+    "stepType": "prose"
+  },
+  {
+    "title": "Interval Fixpoint: Step by Step",
+    "content": "Use the controls below to step through the interval fixpoint computation on the `sum` function. Watch how variable intervals evolve at each basic block, how **join** merges intervals from different control-flow paths, how **widening** accelerates convergence at the loop header, and how **narrowing** recovers precision using loop conditions.",
+    "stepType": "algorithm",
+    "algorithmTrace": "interval-basic.trace.json"
+  },
+  {
+    "title": "Interactive: Analyze Variable Bounds",
+    "content": "Edit the C program below and click **Analyze** to compute interval bounds for all variables. The CFG will display each basic block annotated with the intervals that hold at that program point.\n\nTry modifying the loop bound, changing the loop body computation, or adding conditional branches to see how the intervals change.",
+    "stepType": "interactive",
+    "graphType": "cfg",
+    "code": "int sum(int n) {\n    int s = 0;\n    for (int i = 0; i < 10; i++) {\n        s += i;\n    }\n    return s;\n}",
+    "codeLanguage": "c"
+  }
+]

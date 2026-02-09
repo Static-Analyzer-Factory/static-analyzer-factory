@@ -1,0 +1,287 @@
+{
+  "algorithm": "interval-absint",
+  "title": "Interval Fixpoint: Loop Summation",
+  "example": {
+    "code": "int sum(int n) {\n    int s = 0;\n    for (int i = 0; i < 10; i++) { s += i; }\n    return s;\n}",
+    "language": "c"
+  },
+  "phases": ["Init Domain", "Forward Pass", "Widen", "Narrow", "Converge"],
+  "pseudocode": {
+    "title": "INTERVAL-ANALYSIS(CFG)",
+    "lines": [
+      {"text": "for each var v: I(v) ← ⊥"},
+      {"text": "worklist ← {entry}"},
+      {"text": "while worklist ≠ ∅:"},
+      {"text": "  b ← pop(worklist)"},
+      {"text": "  old ← state(b)"},
+      {"text": "  new ← ⊔ {transfer(p) | p ∈ pred(b)}"},
+      {"text": "  if b is loop header:"},
+      {"text": "    new ← widen(old, new)"},
+      {"text": "  if new ≠ old:"},
+      {"text": "    state(b) ← new"},
+      {"text": "    add successors to worklist"},
+      {"text": "NARROW(CFG)"},
+      {"text": "return state"}
+    ]
+  },
+  "steps": [
+    {
+      "id": 0,
+      "phase": 0,
+      "activeLines": [0, 1],
+      "action": "Initialize variables at entry",
+      "explanation": "The analysis begins at the function entry block. The assignment `s = 0` gives `s` the precise interval `[0, 0]`. The loop initializer `i = 0` gives `i` the interval `[0, 0]`. Control flows from the entry block to the loop header, carrying these initial intervals.\n\n| Variable | Interval |\n|----------|----------|\n| `s` | `[0, 0]` |\n| `i` | `[0, 0]` |",
+      "highlights": {
+        "nodes": ["entry"],
+        "edges": [{ "src": "entry", "dst": "loop_header" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "entry", "label": "entry\\ns = 0, i = 0", "type": "block" },
+          { "id": "loop_header", "label": "loop_header\\ni < 10?", "type": "block" },
+          { "id": "loop_body", "label": "loop_body\\ns += i; i++", "type": "block" },
+          { "id": "loop_exit", "label": "loop_exit", "type": "block" },
+          { "id": "return", "label": "return s", "type": "block" }
+        ],
+        "edges": [
+          { "src": "entry", "dst": "loop_header", "type": "flow" },
+          { "src": "loop_header", "dst": "loop_body", "type": "flow", "label": "true" },
+          { "src": "loop_header", "dst": "loop_exit", "type": "flow", "label": "false" },
+          { "src": "loop_body", "dst": "loop_header", "type": "flow", "label": "back-edge" },
+          { "src": "loop_exit", "dst": "return", "type": "flow" }
+        ]
+      },
+      "diff": {
+        "added": {
+          "nodes": ["entry", "loop_header", "loop_body", "loop_exit", "return"],
+          "edges": [
+            { "src": "entry", "dst": "loop_header" },
+            { "src": "loop_header", "dst": "loop_body" },
+            { "src": "loop_header", "dst": "loop_exit" },
+            { "src": "loop_body", "dst": "loop_header" },
+            { "src": "loop_exit", "dst": "return" }
+          ]
+        },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "currentBlock": "entry",
+        "iteration": 0,
+        "variables": {
+          "s": { "lo": 0, "hi": 0 },
+          "i": { "lo": 0, "hi": 0 }
+        }
+      }
+    },
+    {
+      "id": 1,
+      "phase": 1,
+      "activeLines": [2, 3, 4, 5],
+      "action": "First iteration through loop body",
+      "explanation": "Control enters the loop body for the first time. The loop condition `i < 10` is satisfied since `i ∈ [0, 0]`.\n\nInside the loop body:\n- `s += i`: `s = [0, 0] + [0, 0] = [0, 0]` (adding zero to zero)\n- `i++`: `i = [0, 0] + [1, 1] = [1, 1]`\n\nAfter the first iteration, the back-edge carries `i ∈ [1, 1]` and `s ∈ [0, 0]` back to the loop header.\n\n| Variable | Interval |\n|----------|----------|\n| `s` | `[0, 0]` |\n| `i` | `[1, 1]` |",
+      "highlights": {
+        "nodes": ["loop_body"],
+        "edges": [{ "src": "loop_header", "dst": "loop_body" }, { "src": "loop_body", "dst": "loop_header" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "entry", "label": "entry\\ns = 0, i = 0", "type": "block" },
+          { "id": "loop_header", "label": "loop_header\\ni < 10?", "type": "block" },
+          { "id": "loop_body", "label": "loop_body\\ns += i; i++", "type": "block" },
+          { "id": "loop_exit", "label": "loop_exit", "type": "block" },
+          { "id": "return", "label": "return s", "type": "block" }
+        ],
+        "edges": [
+          { "src": "entry", "dst": "loop_header", "type": "flow" },
+          { "src": "loop_header", "dst": "loop_body", "type": "flow", "label": "true" },
+          { "src": "loop_header", "dst": "loop_exit", "type": "flow", "label": "false" },
+          { "src": "loop_body", "dst": "loop_header", "type": "flow", "label": "back-edge" },
+          { "src": "loop_exit", "dst": "return", "type": "flow" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["loop_body"], "edges": [] }
+      },
+      "algorithmState": {
+        "currentBlock": "loop_body",
+        "iteration": 1,
+        "variables": {
+          "s": { "lo": 0, "hi": 0 },
+          "i": { "lo": 1, "hi": 1 }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "phase": 1,
+      "activeLines": [2, 3, 4, 5, 8, 9, 10],
+      "action": "Join at loop header",
+      "explanation": "The loop header now receives intervals from **two** incoming edges:\n\n- **Entry edge**: `i ∈ [0, 0]`, `s ∈ [0, 0]`\n- **Back-edge**: `i ∈ [1, 1]`, `s ∈ [0, 0]`\n\nThe **join** operation computes the union (least upper bound) of these intervals:\n\n- `i`: `[0, 0] ∪ [1, 1] = [0, 1]` — `i` could be 0 (from entry) or 1 (from back-edge)\n- `s`: `[0, 0] ∪ [0, 0] = [0, 0]` — `s` is still precisely 0\n\nSince the intervals changed (i went from `[0, 0]` to `[0, 1]`), we must iterate again.\n\n| Variable | Interval |\n|----------|----------|\n| `s` | `[0, 0]` |\n| `i` | `[0, 1]` |",
+      "highlights": {
+        "nodes": ["loop_header"],
+        "edges": [{ "src": "entry", "dst": "loop_header" }, { "src": "loop_body", "dst": "loop_header" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "entry", "label": "entry\\ns = 0, i = 0", "type": "block" },
+          { "id": "loop_header", "label": "loop_header\\ni < 10?\\ni ∈ [0,1], s ∈ [0,0]", "type": "block" },
+          { "id": "loop_body", "label": "loop_body\\ns += i; i++", "type": "block" },
+          { "id": "loop_exit", "label": "loop_exit", "type": "block" },
+          { "id": "return", "label": "return s", "type": "block" }
+        ],
+        "edges": [
+          { "src": "entry", "dst": "loop_header", "type": "flow" },
+          { "src": "loop_header", "dst": "loop_body", "type": "flow", "label": "true" },
+          { "src": "loop_header", "dst": "loop_exit", "type": "flow", "label": "false" },
+          { "src": "loop_body", "dst": "loop_header", "type": "flow", "label": "back-edge" },
+          { "src": "loop_exit", "dst": "return", "type": "flow" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["loop_header"], "edges": [] }
+      },
+      "algorithmState": {
+        "currentBlock": "loop_header",
+        "iteration": 2,
+        "variables": {
+          "s": { "lo": 0, "hi": 0 },
+          "i": { "lo": 0, "hi": 1 }
+        },
+        "operation": {
+          "type": "join",
+          "description": "Merge from entry and back-edge: i = [0,0] ∪ [1,1] = [0,1]"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "phase": 2,
+      "activeLines": [6, 7, 8, 9, 10],
+      "action": "Widening at loop header",
+      "explanation": "After processing the loop body again with `i ∈ [0, 1]`, the back-edge brings `i ∈ [1, 2]` and `s ∈ [0, 1]`. The join would give `i ∈ [0, 2]`, but the upper bound of `i` has been **monotonically increasing**: `0 → 1 → 2`.\n\nWithout intervention, this would continue for every loop iteration — the analysis would never terminate. **Widening** detects the increasing trend and jumps the bound to infinity:\n\n- `i`: old = `[0, 1]`, new = `[0, 2]` → widen to `[0, +∞)` (upper bound increasing, so jump to `+∞`)\n- `s`: old = `[0, 0]`, new = `[0, 1]` → widen to `[0, +∞)` (upper bound increasing too)\n\nThis is a dramatic over-approximation, but it **guarantees termination**. The narrowing step will recover precision.\n\n| Variable | Interval |\n|----------|----------|\n| `s` | `[0, +∞)` |\n| `i` | `[0, +∞)` |",
+      "highlights": {
+        "nodes": ["loop_header"],
+        "edges": [{ "src": "loop_body", "dst": "loop_header" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "entry", "label": "entry\\ns = 0, i = 0", "type": "block" },
+          { "id": "loop_header", "label": "loop_header\\ni < 10?\\ni ∈ [0,+∞), s ∈ [0,+∞)", "type": "block" },
+          { "id": "loop_body", "label": "loop_body\\ns += i; i++", "type": "block" },
+          { "id": "loop_exit", "label": "loop_exit", "type": "block" },
+          { "id": "return", "label": "return s", "type": "block" }
+        ],
+        "edges": [
+          { "src": "entry", "dst": "loop_header", "type": "flow" },
+          { "src": "loop_header", "dst": "loop_body", "type": "flow", "label": "true" },
+          { "src": "loop_header", "dst": "loop_exit", "type": "flow", "label": "false" },
+          { "src": "loop_body", "dst": "loop_header", "type": "flow", "label": "back-edge" },
+          { "src": "loop_exit", "dst": "return", "type": "flow" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["loop_header"], "edges": [] }
+      },
+      "algorithmState": {
+        "currentBlock": "loop_header",
+        "iteration": 3,
+        "variables": {
+          "s": { "lo": 0, "hi": "+inf" },
+          "i": { "lo": 0, "hi": "+inf" }
+        },
+        "operation": {
+          "type": "widen",
+          "description": "Upper bound increasing: 1 → 2 → ∞. Widening guarantees termination by jumping to +∞."
+        }
+      }
+    },
+    {
+      "id": 4,
+      "phase": 3,
+      "activeLines": [11],
+      "action": "Narrowing with loop condition",
+      "explanation": "After widening, the fixpoint has `i ∈ [0, +∞)` — a massive over-approximation. But we know the loop condition is `i < 10`, which means inside the loop body `i` is at most 9, and when the loop exits `i` is at least 10.\n\n**Narrowing** uses this information to tighten bounds:\n\n- `i`: The condition `i < 10` constrains the upper bound. At the loop header (for the true branch), `i ∈ [0, +∞) ∩ (-∞, 10) = [0, 9]`\n- `s`: With `i ∈ [0, 9]` and `s += i` over 10 iterations, `s ∈ [0, 45]` (sum of 0 through 9)\n\nNarrowing recovers the precision that widening sacrificed, giving us tight bounds without sacrificing soundness.\n\n| Variable | Interval |\n|----------|----------|\n| `s` | `[0, 45]` |\n| `i` | `[0, 9]` |",
+      "highlights": {
+        "nodes": ["loop_header", "loop_body"],
+        "edges": [{ "src": "loop_header", "dst": "loop_body" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "entry", "label": "entry\\ns = 0, i = 0", "type": "block" },
+          { "id": "loop_header", "label": "loop_header\\ni < 10?\\ni ∈ [0,9], s ∈ [0,45]", "type": "block" },
+          { "id": "loop_body", "label": "loop_body\\ns += i; i++\\ni ∈ [0,9], s ∈ [0,45]", "type": "block" },
+          { "id": "loop_exit", "label": "loop_exit\\ni = 10", "type": "block" },
+          { "id": "return", "label": "return s\\ns ∈ [0,45]", "type": "block" }
+        ],
+        "edges": [
+          { "src": "entry", "dst": "loop_header", "type": "flow" },
+          { "src": "loop_header", "dst": "loop_body", "type": "flow", "label": "true" },
+          { "src": "loop_header", "dst": "loop_exit", "type": "flow", "label": "false" },
+          { "src": "loop_body", "dst": "loop_header", "type": "flow", "label": "back-edge" },
+          { "src": "loop_exit", "dst": "return", "type": "flow" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["loop_header", "loop_body", "loop_exit", "return"], "edges": [] }
+      },
+      "algorithmState": {
+        "currentBlock": "loop_header",
+        "iteration": 4,
+        "variables": {
+          "s": { "lo": 0, "hi": 45 },
+          "i": { "lo": 0, "hi": 9 }
+        },
+        "operation": {
+          "type": "narrow",
+          "description": "Loop bound i < 10 constrains upper bound: i narrowed from [0,+∞) to [0,9], s narrowed to [0,45]"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "phase": 4,
+      "activeLines": [12],
+      "action": "Fixed point reached",
+      "explanation": "No more changes occur — the analysis has reached a **fixed point**. All intervals are stable across every basic block.\n\n**Final results at each program point:**\n\n| Block | `i` | `s` |\n|-------|-----|-----|\n| entry | `[0, 0]` | `[0, 0]` |\n| loop_header | `[0, 9]` | `[0, 45]` |\n| loop_body | `[0, 9]` | `[0, 45]` |\n| loop_exit | `[10, 10]` | `[45, 45]` |\n| return | `[10, 10]` | `[45, 45]` |\n\nThe analysis has proven that `s` is in the range `[0, 45]` and `i` reaches exactly 10 when the loop exits. These bounds are **sound** (they contain all possible runtime values) and **precise** (narrowing recovered tight bounds after widening).\n\nThis information can now be used to verify array bounds, detect potential overflows, or prove the absence of division-by-zero errors.",
+      "highlights": { "nodes": [], "edges": [] },
+      "graph": {
+        "nodes": [
+          { "id": "entry", "label": "entry\\ns = 0, i = 0", "type": "block" },
+          { "id": "loop_header", "label": "loop_header\\ni ∈ [0,9], s ∈ [0,45]", "type": "block" },
+          { "id": "loop_body", "label": "loop_body\\ni ∈ [0,9], s ∈ [0,45]", "type": "block" },
+          { "id": "loop_exit", "label": "loop_exit\\ni = 10, s = 45", "type": "block" },
+          { "id": "return", "label": "return s\\ns = 45", "type": "block" }
+        ],
+        "edges": [
+          { "src": "entry", "dst": "loop_header", "type": "flow" },
+          { "src": "loop_header", "dst": "loop_body", "type": "flow", "label": "true" },
+          { "src": "loop_header", "dst": "loop_exit", "type": "flow", "label": "false" },
+          { "src": "loop_body", "dst": "loop_header", "type": "flow", "label": "back-edge" },
+          { "src": "loop_exit", "dst": "return", "type": "flow" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "currentBlock": "return",
+        "iteration": 5,
+        "variables": {
+          "s": { "lo": 0, "hi": 45 },
+          "i": { "lo": 0, "hi": 9 }
+        }
+      }
+    }
+  ]
+}

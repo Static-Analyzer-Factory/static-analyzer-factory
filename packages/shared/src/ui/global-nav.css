@@ -1,0 +1,72 @@
+/* ==========================================================================
+   SAF Global Navigation Bar — Shared across all frontend apps
+   ========================================================================== */
+
+.global-nav {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 48px;
+  padding: 0 1.5rem;
+  background: rgba(250, 249, 247, 0.92);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--color-border, #dbd6d0);
+}
+
+.global-nav-brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--color-accent, #3d9b8f);
+  text-decoration: none;
+}
+
+.global-nav-links {
+  display: flex;
+  gap: 1.5rem;
+}
+
+.global-nav-links a {
+  color: var(--color-text-secondary, #6b6b70);
+  text-decoration: none;
+  font-size: 0.875rem;
+  font-weight: 500;
+  transition: color 0.2s;
+}
+
+.global-nav-links a:hover {
+  color: var(--color-text, #2c2c2e);
+}
+
+.global-nav-links .global-nav-active {
+  color: var(--color-accent, #3d9b8f);
+}
+
+/* Mobile: hamburger button for sidebar toggle (tutorials only) */
+.global-nav-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* ── Responsive ── */
+
+@media (max-width: 768px) {
+  .global-nav-links {
+    gap: 1rem;
+  }
+
+  .global-nav-links a {
+    font-size: 0.8rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .global-nav-links a:not(.global-nav-active) {
+    display: none;
+  }
+}

@@ -1,0 +1,114 @@
+.tutorial-page {
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100vh - 48px);
+}
+
+.tutorial-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 80px 24px;
+  color: var(--color-text-secondary, #6b6b70);
+}
+
+.spinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid var(--color-border, #dbd6d0);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.tutorial-error {
+  padding: 80px 24px;
+  text-align: center;
+}
+
+.tutorial-error h2 {
+  color: var(--color-error, #c75050);
+  margin-bottom: 8px;
+}
+
+.tutorial-error button {
+  margin-top: 16px;
+  padding: 8px 20px;
+  background: var(--accent);
+  color: var(--color-text-inverse, #fff);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.tutorial-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--color-border, #dbd6d0);
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.tutorial-header-left {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.tutorial-header h1 {
+  font-size: 20px;
+  margin: 0;
+  color: var(--text);
+}
+
+.step-counter {
+  font-size: 13px;
+  color: var(--color-text-secondary, #6b6b70);
+}
+
+.tutorial-header-right {
+  display: flex;
+  gap: 8px;
+}
+
+.nav-btn {
+  padding: 6px 16px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--color-border, #dbd6d0);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: background 0.15s;
+}
+
+.nav-btn:hover:not(:disabled) {
+  background: rgba(44, 44, 46, 0.08);
+}
+
+.nav-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.progress-bar {
+  height: 3px;
+  background: var(--color-border, #dbd6d0);
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+  border-radius: 0 2px 2px 0;
+}

@@ -1,0 +1,92 @@
+.tutorial-panel {
+  display: flex;
+  flex-direction: column;
+  height: 160px;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-bg);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.tutorial-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.4rem 0.75rem;
+  background: var(--color-surface-raised);
+  border-bottom: 1px solid var(--color-bg);
+}
+
+.tutorial-title {
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.tutorial-exit {
+  padding: 0.2rem 0.5rem;
+  font-size: 0.7em;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tutorial-exit:hover {
+  color: var(--color-text);
+  border-color: var(--color-error);
+  background: rgba(196, 100, 84, 0.1);
+}
+
+.tutorial-body {
+  flex: 1;
+  padding: 0.4rem 0.75rem;
+  overflow-y: auto;
+}
+
+.tutorial-step-counter {
+  font-size: 0.7em;
+  color: var(--color-text-secondary);
+  margin-bottom: 0.2rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.tutorial-step-title {
+  font-size: 0.8em;
+  font-weight: 600;
+  color: var(--color-text);
+  margin-bottom: 0.3rem;
+}
+
+.tutorial-step-text {
+  font-size: 0.75em;
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+.tutorial-prompt {
+  margin-top: 0.3rem;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.72em;
+  color: var(--color-accent);
+  background: var(--color-accent-subtle);
+  border-left: 3px solid var(--color-accent);
+  border-radius: 0 3px 3px 0;
+  line-height: 1.4;
+}
+
+.tutorial-nav {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.3rem 0.75rem;
+  border-top: 1px solid var(--color-bg);
+  gap: 0.5rem;
+}
+
+.tutorial-nav .btn-primary {
+  font-size: 0.72em;
+  padding: 0.25rem 0.6rem;
+}

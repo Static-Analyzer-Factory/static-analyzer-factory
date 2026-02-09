@@ -1,0 +1,182 @@
+{
+  "algorithm": "andersen-pta",
+  "title": "Andersen's PTA: Basic Pointer Assignment",
+  "example": {
+    "code": "int x, y;\nint *p = &x;\nint *q = p;\nint *r = &y;",
+    "language": "c"
+  },
+  "phases": ["Extract Constraints", "Process Rank 0", "Propagate Copies", "Fixed Point"],
+  "pseudocode": {
+    "title": "ANDERSEN-PTA(P)",
+    "lines": [
+      {"text": "C ← ExtractConstraints(P)"},
+      {"text": "for each addr(v,loc) ∈ C:"},
+      {"text": "  pts(v) ← pts(v) ∪ {loc}"},
+      {"text": "  add v to worklist"},
+      {"text": "while worklist ≠ ∅:"},
+      {"text": "  v ← pop(worklist)"},
+      {"text": "  for each copy(v,w) ∈ C:"},
+      {"text": "    if pts(w) ⊅ pts(v):"},
+      {"text": "      pts(w) ← pts(w) ∪ pts(v)"},
+      {"text": "      add w to worklist"},
+      {"text": "return pts"}
+    ]
+  },
+  "steps": [
+    {
+      "id": 0,
+      "phase": 0,
+      "activeLines": [0],
+      "action": "Extract constraints",
+      "explanation": "The solver begins by extracting constraints from the program. Three constraints are found:\n\n- **addr**: `p = &x` → `x ∈ pts(p)`\n- **copy**: `q = p` → `pts(q) ⊇ pts(p)`\n- **addr**: `r = &y` → `y ∈ pts(r)`\n\nThe worklist is seeded with variables that have **addr** constraints (`p` and `r` at rank 0), followed by variables reachable via **copy** edges (`q` at rank 1).",
+      "highlights": { "nodes": ["p", "q", "r", "x", "y"], "edges": [] },
+      "graph": {
+        "nodes": [
+          { "id": "p", "label": "p", "type": "value" },
+          { "id": "q", "label": "q", "type": "value" },
+          { "id": "r", "label": "r", "type": "value" },
+          { "id": "x", "label": "x", "type": "location" },
+          { "id": "y", "label": "y", "type": "location" }
+        ],
+        "edges": [
+          { "src": "p", "dst": "x", "type": "constraint", "label": "addr" },
+          { "src": "p", "dst": "q", "type": "constraint", "label": "copy" },
+          { "src": "r", "dst": "y", "type": "constraint", "label": "addr" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": ["p", "q", "r", "x", "y"], "edges": [{ "src": "p", "dst": "x" }, { "src": "p", "dst": "q" }, { "src": "r", "dst": "y" }] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "worklist": [
+          { "rank": 0, "values": ["p", "r"] },
+          { "rank": 1, "values": ["q"] }
+        ],
+        "pointsTo": {},
+        "constraints": [
+          { "type": "addr", "from": "x", "to": "p", "processed": false },
+          { "type": "copy", "from": "p", "to": "q", "processed": false },
+          { "type": "addr", "from": "y", "to": "r", "processed": false }
+        ]
+      }
+    },
+    {
+      "id": 1,
+      "phase": 1,
+      "activeLines": [1, 2, 3],
+      "action": "Process wave at rank 0: initialize addr constraints",
+      "explanation": "The solver processes all variables at **rank 0** (`p` and `r`). For each addr constraint:\n\n- `p = &x`: Add `x` to `pts(p)` → draw edge `p → x`\n- `r = &y`: Add `y` to `pts(r)` → draw edge `r → y`\n\nThe rank-0 wave is complete. The worklist advances to rank 1, where `q` waits to be processed.",
+      "highlights": {
+        "nodes": ["p", "r"],
+        "edges": [{ "src": "p", "dst": "x" }, { "src": "r", "dst": "y" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "p", "label": "p", "type": "value" },
+          { "id": "q", "label": "q", "type": "value" },
+          { "id": "r", "label": "r", "type": "value" },
+          { "id": "x", "label": "x", "type": "location" },
+          { "id": "y", "label": "y", "type": "location" }
+        ],
+        "edges": [
+          { "src": "p", "dst": "x", "type": "points-to", "label": "addr" },
+          { "src": "r", "dst": "y", "type": "points-to", "label": "addr" },
+          { "src": "p", "dst": "q", "type": "constraint", "label": "copy" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [{ "src": "p", "dst": "x" }, { "src": "r", "dst": "y" }] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["p", "r"], "edges": [] }
+      },
+      "algorithmState": {
+        "worklist": [
+          { "rank": 1, "values": ["q"] }
+        ],
+        "pointsTo": { "p": ["x"], "r": ["y"] },
+        "constraints": [
+          { "type": "addr", "from": "x", "to": "p", "processed": true },
+          { "type": "copy", "from": "p", "to": "q", "processed": false },
+          { "type": "addr", "from": "y", "to": "r", "processed": true }
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "phase": 2,
+      "activeLines": [4, 5, 6, 7, 8, 9],
+      "action": "Process wave at rank 1: propagate copy q ⊇ p",
+      "explanation": "The solver processes `q` at **rank 1**. The copy constraint `q = p` means:\n\n> `pts(q) ⊇ pts(p)` → copy everything from `pts(p)` into `pts(q)`\n\nSince `pts(p) = {x}`, we add `x` to `pts(q)` and draw edge `q → x`.\n\nAll constraints are now processed and the worklist is empty.",
+      "highlights": {
+        "nodes": ["q"],
+        "edges": [{ "src": "q", "dst": "x" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "p", "label": "p", "type": "value" },
+          { "id": "q", "label": "q", "type": "value" },
+          { "id": "r", "label": "r", "type": "value" },
+          { "id": "x", "label": "x", "type": "location" },
+          { "id": "y", "label": "y", "type": "location" }
+        ],
+        "edges": [
+          { "src": "p", "dst": "x", "type": "points-to", "label": "addr" },
+          { "src": "r", "dst": "y", "type": "points-to", "label": "addr" },
+          { "src": "q", "dst": "x", "type": "points-to", "label": "copy" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [{ "src": "q", "dst": "x" }] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["q"], "edges": [] }
+      },
+      "algorithmState": {
+        "worklist": [],
+        "pointsTo": { "p": ["x"], "q": ["x"], "r": ["y"] },
+        "constraints": [
+          { "type": "addr", "from": "x", "to": "p", "processed": true },
+          { "type": "copy", "from": "p", "to": "q", "processed": true },
+          { "type": "addr", "from": "y", "to": "r", "processed": true }
+        ]
+      }
+    },
+    {
+      "id": 3,
+      "phase": 3,
+      "activeLines": [10],
+      "action": "Fixed point reached",
+      "explanation": "The worklist is empty and no new points-to information can be derived. The analysis has reached a **fixed point**.\n\n**Final results:**\n\n| Variable | Points-To Set |\n|----------|---------------|\n| `p` | `{x}` |\n| `q` | `{x}` |\n| `r` | `{y}` |\n\n**Alias analysis conclusion:** `p` and `q` are **aliases** (both point to `x`). `r` is independent (points only to `y`). This information is critical for subsequent analyses like value-flow tracking and memory safety checking.",
+      "highlights": { "nodes": [], "edges": [] },
+      "graph": {
+        "nodes": [
+          { "id": "p", "label": "p", "type": "value" },
+          { "id": "q", "label": "q", "type": "value" },
+          { "id": "r", "label": "r", "type": "value" },
+          { "id": "x", "label": "x", "type": "location" },
+          { "id": "y", "label": "y", "type": "location" }
+        ],
+        "edges": [
+          { "src": "p", "dst": "x", "type": "points-to", "label": "addr" },
+          { "src": "r", "dst": "y", "type": "points-to", "label": "addr" },
+          { "src": "q", "dst": "x", "type": "points-to", "label": "copy" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "worklist": [],
+        "pointsTo": { "p": ["x"], "q": ["x"], "r": ["y"] },
+        "constraints": [
+          { "type": "addr", "from": "x", "to": "p", "processed": true },
+          { "type": "copy", "from": "p", "to": "q", "processed": true },
+          { "type": "addr", "from": "y", "to": "r", "processed": true }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+[
+  {
+    "title": "Why Callgraph Precision Matters",
+    "stepType": "prose",
+    "content": "## Motivation\n\nA call graph maps which functions can call which other functions -- essential for every interprocedural analysis. For direct calls like `foo()`, the target is known statically. But indirect calls through function pointers (like `fn()` in the example below) require analysis to determine the possible targets. Without a call graph, we cannot scope analysis across function boundaries or resolve indirect calls, making whole-program reasoning impossible.\n\n## Key Concepts\n\n- **CHA (Class Hierarchy Analysis)**: resolves indirect calls using type hierarchy alone -- every function with a compatible type signature is a potential target. Fast but imprecise\n- **RTA (Rapid Type Analysis)**: refines CHA by filtering targets to only those whose types are actually instantiated and reachable from `main`. Eliminates dead code targets\n- **VTA (Variable Type Analysis)**: uses pointer analysis to resolve the actual values flowing to call sites, keeping only targets where PTA confirms the pointer can reach that function. Most precise\n- **Direct calls**: target function is known statically at compile time (e.g., `dog_bark()`)\n- **Indirect calls**: target must be resolved through analysis of function pointers or virtual dispatch (e.g., `fn()` where `fn` is a `SpeakFn` pointer)\n- **Precision hierarchy**: CHA >= RTA >= VTA -- each level produces a subset of the previous level's call edges, strictly more precise but more costly to compute\n\n## Algorithm Overview\n\nCall graph construction uses three-phase refinement, starting coarse and ending precise:\n\n1. **Phase 1 -- CHA**: resolve all indirect calls using type compatibility alone. Every function whose signature matches the call site's function pointer type is added as a potential callee. In the example below, both `dog_bark` and `cat_meow` match `SpeakFn`, so both are included.\n2. **Phase 2 -- RTA**: filter CHA targets to only those whose types are actually instantiated and reachable from `main`. Functions that are never referenced are pruned.\n3. **Phase 3 -- VTA**: use pointer analysis to track which function addresses actually flow to each indirect call site. Only targets where PTA shows the function pointer can actually point to that function are kept. For `make_noise(dog_bark)`, VTA determines that `fn` can only point to `dog_bark`, eliminating the spurious edge to `cat_meow`.\n\n## Formal Properties\n\n- **Containment**: CHA >= RTA >= VTA -- each phase produces a strict subset of call edges (more precise)\n- **CHA complexity**: O(T * C) where T is the number of type-compatible targets and C is the number of call sites -- fast but imprecise\n- **VTA precision**: requires running PTA but gives near-optimal call graph precision\n- **Iterative refinement**: practical systems use CG-PTA co-refinement -- build an initial CG, run PTA, refine the CG using PTA results, and repeat until convergence\n\nExample with function pointers:",
+    "code": "void dog_bark() { }\nvoid cat_meow() { }\ntypedef void (*SpeakFn)(void);\nvoid make_noise(SpeakFn fn) { fn(); }\nint main() { make_noise(dog_bark); }",
+    "codeLanguage": "c"
+  },
+  {
+    "title": "CHA \u2192 RTA \u2192 VTA: Step by Step",
+    "stepType": "algorithm",
+    "content": "Watch how callgraph precision improves as we go from CHA (most conservative) through RTA to VTA (most precise). The indirect call `fn()` in `make_noise` is the key challenge.",
+    "algorithmTrace": "cg-basic.trace.json"
+  },
+  {
+    "title": "Interactive: Explore the Callgraph",
+    "stepType": "interactive",
+    "content": "Explore the resulting call graph. Notice how VTA eliminates the spurious edge to `cat_meow`.",
+    "graphType": "callgraph",
+    "code": "void dog_bark() { }\nvoid cat_meow() { }\ntypedef void (*SpeakFn)(void);\nvoid make_noise(SpeakFn fn) { fn(); }\nint main() { make_noise(dog_bark); }",
+    "codeLanguage": "c"
+  }
+]

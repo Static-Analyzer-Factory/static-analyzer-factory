@@ -1,0 +1,256 @@
+{
+  "algorithm": "memory-ssa",
+  "title": "Clobber Walking: Demand-Driven Memory Dependency Resolution",
+  "example": {
+    "code": "void foo(int *p, int *q) {\n    *p = 10;\n    *q = 20;\n    int x = *p;  // Is this 10 or 20? Depends on alias(p,q)\n}",
+    "language": "c"
+  },
+  "phases": ["Build SSA", "Insert MemoryDefs", "Insert MemoryPhis", "Clobber Walk", "Result"],
+  "pseudocode": {
+    "title": "MSSA-CLOBBER-WALK(use)",
+    "lines": [
+      {"text": "def ← use.defining_access"},
+      {"text": "while def ≠ LiveOnEntry:"},
+      {"text": "  if def is MemoryDef:"},
+      {"text": "    a ← alias(def.loc, use.loc)"},
+      {"text": "    if a = MustAlias: return def"},
+      {"text": "    if a = MayAlias: return def"},
+      {"text": "    def ← def.defining_access"},
+      {"text": "  if def is MemoryPhi:"},
+      {"text": "    for each operand op:"},
+      {"text": "      walk(op)  // recurse"},
+      {"text": "  return LiveOnEntry"}
+    ]
+  },
+  "steps": [
+    {
+      "id": 0,
+      "phase": 0,
+      "activeLines": [0],
+      "action": "Query: what is the reaching definition for *p at x = *p?",
+      "explanation": "We begin with a **clobber query**: at the load `x = *p`, which store(s) could have last written to the memory location `*p`?\n\nThe memory def chain contains two stores before this load:\n1. `*p = 10` (store to `*p`)\n2. `*q = 20` (store to `*q`)\n\nThe walk starts at the load instruction and will proceed backward through the chain. We also have the **points-to context** from pointer analysis: `p` points to `{obj_a}`, while `q` points to `{obj_a, obj_b}` (a may-alias situation).",
+      "highlights": {
+        "nodes": ["load_p"],
+        "edges": []
+      },
+      "graph": {
+        "nodes": [
+          { "id": "store_p", "label": "*p = 10", "type": "store" },
+          { "id": "store_q", "label": "*q = 20", "type": "store" },
+          { "id": "load_p", "label": "x = *p", "type": "load" }
+        ],
+        "edges": [
+          { "src": "store_p", "dst": "store_q", "type": "mem-def-chain", "label": "mem def" },
+          { "src": "store_q", "dst": "load_p", "type": "mem-def-chain", "label": "mem def" }
+        ]
+      },
+      "diff": {
+        "added": {
+          "nodes": ["store_p", "store_q", "load_p"],
+          "edges": [{ "src": "store_p", "dst": "store_q" }, { "src": "store_q", "dst": "load_p" }]
+        },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "query": "Reaching definition for *p at load: x = *p",
+        "walkChain": [
+          { "inst": "x = *p", "type": "load" }
+        ],
+        "pointsToContext": {
+          "p": ["obj_a"],
+          "q": ["obj_a", "obj_b"]
+        }
+      }
+    },
+    {
+      "id": 1,
+      "phase": 3,
+      "activeLines": [1, 2, 3, 5],
+      "action": "Walk back: encounter *q = 20, alias check alias(p, q) = may",
+      "explanation": "Walking backward from the load, we encounter the nearest memory definition: `*q = 20`.\n\nWe issue an **alias query**: does `q` point to the same location as `p`?\n\n- `pts(p) = {obj_a}`\n- `pts(q) = {obj_a, obj_b}`\n- The sets **overlap** (both contain `obj_a`), so `alias(p, q) = may`\n\nSince this is a **may-alias**, `*q = 20` *might* have overwritten `*p`. We cannot skip this store -- it must be recorded as a **potential clobber**. However, because it is only *may* (not *must*), the store might not have actually affected `*p`, so we must continue walking to find other possible reaching definitions.",
+      "highlights": {
+        "nodes": ["store_q"],
+        "edges": [{ "src": "store_q", "dst": "load_p" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "store_p", "label": "*p = 10", "type": "store" },
+          { "id": "store_q", "label": "*q = 20 [may-clobber]", "type": "store" },
+          { "id": "load_p", "label": "x = *p", "type": "load" }
+        ],
+        "edges": [
+          { "src": "store_p", "dst": "store_q", "type": "mem-def-chain", "label": "mem def" },
+          { "src": "store_q", "dst": "load_p", "type": "clobber", "label": "may-clobber" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [{ "src": "store_q", "dst": "load_p" }] },
+        "changed": {
+          "nodes": ["store_q"],
+          "edges": [{ "src": "store_q", "dst": "load_p" }]
+        }
+      },
+      "algorithmState": {
+        "query": "Reaching definition for *p at load: x = *p",
+        "walkChain": [
+          { "inst": "x = *p", "type": "load" },
+          {
+            "inst": "*q = 20",
+            "type": "store",
+            "aliasQuery": { "ptr1": "p", "ptr2": "q", "result": "may" }
+          }
+        ],
+        "pointsToContext": {
+          "p": ["obj_a"],
+          "q": ["obj_a", "obj_b"]
+        }
+      }
+    },
+    {
+      "id": 2,
+      "phase": 3,
+      "activeLines": [1, 2, 3, 4],
+      "action": "Walk back: encounter *p = 10, alias check alias(p, p) = must",
+      "explanation": "Continuing backward, we encounter the next memory definition: `*p = 10`.\n\nWe issue another **alias query**: does `p` point to the same location as `p`?\n\n- `pts(p) = {obj_a}`\n- `pts(p) = {obj_a}`\n- The sets are **identical** and contain exactly one element, so `alias(p, p) = must`\n\nSince this is a **must-alias**, `*p = 10` *definitely* wrote to the same location that our load `x = *p` reads from. This is a **definite clobber** -- we know for certain this store provides a reaching definition.\n\nWith a must-alias found, we know we have reached a definitive definition. No store before this point can provide an additional reaching definition for `*p` (it would be killed by `*p = 10`).",
+      "highlights": {
+        "nodes": ["store_p"],
+        "edges": [{ "src": "store_p", "dst": "store_q" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "store_p", "label": "*p = 10 [must-clobber]", "type": "store" },
+          { "id": "store_q", "label": "*q = 20 [may-clobber]", "type": "store" },
+          { "id": "load_p", "label": "x = *p", "type": "load" }
+        ],
+        "edges": [
+          { "src": "store_p", "dst": "store_q", "type": "mem-def-chain", "label": "mem def" },
+          { "src": "store_q", "dst": "load_p", "type": "clobber", "label": "may-clobber" },
+          { "src": "store_p", "dst": "load_p", "type": "clobber", "label": "must-clobber" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [{ "src": "store_p", "dst": "load_p" }] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["store_p"], "edges": [] }
+      },
+      "algorithmState": {
+        "query": "Reaching definition for *p at load: x = *p",
+        "walkChain": [
+          { "inst": "x = *p", "type": "load" },
+          {
+            "inst": "*q = 20",
+            "type": "store",
+            "aliasQuery": { "ptr1": "p", "ptr2": "q", "result": "may" }
+          },
+          {
+            "inst": "*p = 10",
+            "type": "store",
+            "aliasQuery": { "ptr1": "p", "ptr2": "p", "result": "must" }
+          }
+        ],
+        "pointsToContext": {
+          "p": ["obj_a"],
+          "q": ["obj_a", "obj_b"]
+        }
+      }
+    },
+    {
+      "id": 3,
+      "phase": 3,
+      "activeLines": [10],
+      "action": "Walk complete: no more memory definitions to examine",
+      "explanation": "There are no more stores in the memory def chain to walk past. The backward walk is complete.\n\nWe found a **must-alias clobber** at `*p = 10`, which means the walk would normally terminate there even if there were earlier stores -- a must-alias kills all prior definitions for that location.\n\nThe walk has identified all possible reaching definitions for the load `x = *p`.",
+      "highlights": {
+        "nodes": [],
+        "edges": []
+      },
+      "graph": {
+        "nodes": [
+          { "id": "store_p", "label": "*p = 10 [must-clobber]", "type": "store" },
+          { "id": "store_q", "label": "*q = 20 [may-clobber]", "type": "store" },
+          { "id": "load_p", "label": "x = *p", "type": "load" }
+        ],
+        "edges": [
+          { "src": "store_p", "dst": "store_q", "type": "mem-def-chain", "label": "mem def" },
+          { "src": "store_q", "dst": "load_p", "type": "clobber", "label": "may-clobber" },
+          { "src": "store_p", "dst": "load_p", "type": "clobber", "label": "must-clobber" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "query": "Reaching definition for *p at load: x = *p",
+        "walkChain": [
+          { "inst": "x = *p", "type": "load" },
+          {
+            "inst": "*q = 20",
+            "type": "store",
+            "aliasQuery": { "ptr1": "p", "ptr2": "q", "result": "may" }
+          },
+          {
+            "inst": "*p = 10",
+            "type": "store",
+            "aliasQuery": { "ptr1": "p", "ptr2": "p", "result": "must" }
+          }
+        ],
+        "pointsToContext": {
+          "p": ["obj_a"],
+          "q": ["obj_a", "obj_b"]
+        }
+      }
+    },
+    {
+      "id": 4,
+      "phase": 4,
+      "activeLines": [10],
+      "action": "Result: reaching definitions for x = *p determined",
+      "explanation": "The clobber walk is complete. The reaching definitions for `x = *p` are:\n\n| Store | Alias Result | Interpretation |\n|-------|-------------|----------------|\n| `*p = 10` | **must** | Definite reaching definition -- `x` is `10` if `*q = 20` did not alias |\n| `*q = 20` | **may** | Potential reaching definition -- `x` could be `20` if `p` and `q` alias at runtime |\n\n**Conservative conclusion:** The value of `x` could be either `10` or `20`. A sound analysis must account for both possibilities.\n\nIf pointer analysis were more precise and determined that `p` and `q` **never** alias, the may-clobber from `*q = 20` would become a no-alias skip, and `x` would definitively be `10`. This illustrates how **pointer analysis precision directly impacts Memory SSA precision**.",
+      "highlights": {
+        "nodes": ["store_p", "store_q", "load_p"],
+        "edges": [{ "src": "store_p", "dst": "load_p" }, { "src": "store_q", "dst": "load_p" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "store_p", "label": "*p = 10 [must-clobber]", "type": "store" },
+          { "id": "store_q", "label": "*q = 20 [may-clobber]", "type": "store" },
+          { "id": "load_p", "label": "x = *p", "type": "load" }
+        ],
+        "edges": [
+          { "src": "store_p", "dst": "store_q", "type": "mem-def-chain", "label": "mem def" },
+          { "src": "store_q", "dst": "load_p", "type": "clobber", "label": "may-clobber" },
+          { "src": "store_p", "dst": "load_p", "type": "clobber", "label": "must-clobber" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "query": "Reaching definition for *p at load: x = *p",
+        "walkChain": [
+          { "inst": "x = *p", "type": "load" },
+          {
+            "inst": "*q = 20",
+            "type": "store",
+            "aliasQuery": { "ptr1": "p", "ptr2": "q", "result": "may" }
+          },
+          {
+            "inst": "*p = 10",
+            "type": "store",
+            "aliasQuery": { "ptr1": "p", "ptr2": "p", "result": "must" }
+          }
+        ],
+        "pointsToContext": {
+          "p": ["obj_a"],
+          "q": ["obj_a", "obj_b"]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "specs": [
+    { "path": "gnu/xalloc.yaml", "category": "gnu", "name": "xalloc" },
+    { "path": "libc/alloc.yaml", "category": "libc", "name": "alloc" },
+    { "path": "libc/stdio.yaml", "category": "libc", "name": "stdio" },
+    { "path": "libc/stdlib.yaml", "category": "libc", "name": "stdlib" },
+    { "path": "libc/string.yaml", "category": "libc", "name": "string" },
+    { "path": "posix/pthread.yaml", "category": "posix", "name": "pthread" },
+    { "path": "posix/socket.yaml", "category": "posix", "name": "socket" },
+    { "path": "posix/unistd.yaml", "category": "posix", "name": "unistd" },
+    { "path": "taint/sanitizers.yaml", "category": "taint", "name": "sanitizers" },
+    { "path": "taint/sinks.yaml", "category": "taint", "name": "sinks" },
+    { "path": "taint/sources.yaml", "category": "taint", "name": "sources" }
+  ]
+}

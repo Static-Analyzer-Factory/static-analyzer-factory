@@ -1,0 +1,36 @@
+{
+  "name": "@saf/web-shared",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    "./types": "./src/types/index.ts",
+    "./graph": "./src/graph/index.ts",
+    "./analysis": "./src/analysis/index.ts",
+    "./ui/global-nav.css": "./src/ui/global-nav.css",
+    "./ui/theme.css": "./src/ui/theme.css",
+    "./ui/codemirror-morandi": "./src/ui/codemirror-morandi.ts",
+    "./ui/SiteNav": "./src/ui/SiteNav.tsx",
+    "./architecture": "./src/architecture/types.ts",
+    "./architecture/data": "./src/architecture/architecture.json"
+  },
+  "dependencies": {
+    "@codemirror/language": "^6.0.0",
+    "@codemirror/state": "^6.0.0",
+    "@codemirror/view": "^6.0.0",
+    "@lezer/highlight": "^1.0.0",
+    "cytoscape": "^3.33.1",
+    "cytoscape-dagre": "^2.5.0",
+    "dagre": "^0.8.5",
+    "web-tree-sitter": "^0.26.5",
+    "tree-sitter-llvm": "^1.1.0"
+  },
+  "scripts": {
+    "generate:mermaid": "tsx src/architecture/generate-mermaid.ts"
+  },
+  "devDependencies": {
+    "@types/cytoscape": "^3.21.9",
+    "@types/cytoscape-dagre": "^2.3.4",
+    "typescript": "~5.9.3"
+  }
+}

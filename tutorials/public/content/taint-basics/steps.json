@@ -1,0 +1,39 @@
+[
+  {
+    "title": "Sources and Sinks",
+    "content": "**Taint analysis** tracks the flow of untrusted (\"tainted\") data through a program to determine if it can reach a security-sensitive operation without being sanitized.\n\nThe three key concepts:\n\n- **Sources** -- where untrusted data enters the program. Examples: `scanf()`, `gets()`, `read()`, network input, environment variables, command-line arguments\n- **Sinks** -- security-sensitive operations that should not receive unsanitized tainted data. Examples: `printf()` (format string attacks), `system()` (command injection), `SQL_exec()` (SQL injection)\n- **Sanitizers** -- functions that validate or transform data to make it safe. Examples: input validation, escaping, bounds checking\n\nIn this program:\n- `scanf(\"%d\", &secret)` is a **source** -- it reads user input into `secret`\n- `printf(\"Result: %d\\n\", result)` is a **sink** -- it outputs data\n- `result = secret * 2` is a **transformation** -- the tainted data is modified but still tainted\n\nThe question taint analysis answers: **can tainted data flow from a source to a sink?** If yes, there's a potential vulnerability.",
+    "code": "#include <stdio.h>\n\nint main() {\n    int secret;\n    scanf(\"%d\", &secret);  // SOURCE: user input\n    int result = secret * 2;\n    printf(\"Result: %d\\n\", result);  // SINK: output\n    return 0;\n}",
+    "codeLanguage": "c"
+  },
+  {
+    "title": "Tracing Data Flow",
+    "content": "The **value flow graph** shows exactly how the tainted data moves from `scanf` to `printf`.\n\nFollow the taint propagation:\n1. `scanf(\"%d\", &secret)` writes user input into `secret` -- **taint introduced**\n2. `secret` flows into the multiplication `secret * 2` -- taint **propagates** through arithmetic\n3. The result flows into `result` -- still tainted\n4. `result` flows into `printf()` as an argument -- tainted data reaches the **sink**\n\nImportant: arithmetic operations like `* 2` do **not** sanitize data. The result is still derived from untrusted input and is therefore still tainted. Only explicit sanitization (validation, escaping) removes taint.\n\nIn the value flow graph, you can trace the complete chain from source to sink. Every node on this path carries the taint, and any sink reachable from a tainted node is flagged as a potential vulnerability.\n\nIn this simple example, the information disclosure is intentional. But the same pattern with `printf(secret_string)` (format string vulnerability) or `system(user_input)` (command injection) would be a critical security bug.",
+    "code": "#include <stdio.h>\n\nint main() {\n    int secret;\n    scanf(\"%d\", &secret);  // SOURCE: user input\n    int result = secret * 2;\n    printf(\"Result: %d\\n\", result);  // SINK: output\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "valueflow",
+    "highlightLines": [
+      5,
+      6,
+      7
+    ]
+  },
+  {
+    "title": "Taint Analysis",
+    "content": "SAF's **taint_flow** analysis automates the source-to-sink tracking by combining value flow with spec-defined source and sink annotations.\n\nThe analysis works in three phases:\n\n**Phase 1: Source Identification**\nUsing specs, SAF identifies which function calls introduce taint. `scanf` is specified as a taint source -- its output parameters receive tainted data.\n\n**Phase 2: Taint Propagation**\nStarting from each source, SAF follows value flow edges to propagate taint. Direct assignments, arithmetic, and memory operations all propagate taint. Only explicitly specified sanitizers remove it.\n\n**Phase 3: Sink Checking**\nAt each sink (identified by specs), SAF checks if any incoming value is tainted. If tainted data reaches a sink without passing through a sanitizer, a finding is reported.\n\nThe value flow graph below highlights the taint propagation path. Notice how the taint flows through the `* 2` operation -- SAF correctly models that arithmetic preserves taint.\n\nThis is a **conservative** (over-approximate) analysis: if SAF says there's a taint flow, the path definitely exists in the value flow graph. However, the path might not be feasible at runtime due to conditions the analysis doesn't model.",
+    "code": "#include <stdio.h>\n\nint main() {\n    int secret;\n    scanf(\"%d\", &secret);  // SOURCE: user input\n    int result = secret * 2;\n    printf(\"Result: %d\\n\", result);  // SINK: output\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "valueflow",
+    "highlightLines": [
+      5,
+      6,
+      7
+    ]
+  },
+  {
+    "title": "Finding the Flow",
+    "content": "Let's see the complete taint analysis in action. Open the playground to explore the taint flow interactively.\n\nIn the playground, you can:\n- **Switch graph types** to see the same program from different perspectives (CFG, value flow, call graph)\n- **Click on nodes** to see their properties and connections\n- **Trace paths** from source to sink by following the highlighted edges\n\n**What to look for:**\n- The `scanf` call node is the taint source\n- Follow the value flow edges through `secret`, the multiplication, and `result`\n- The `printf` call node is the sink where tainted data arrives\n\n**Try these modifications:**\n- What happens if you add an `if (result > 100) return 1;` guard before `printf`? The value flow still shows the taint path (flow-insensitive analysis), but a more precise analysis might determine the sink is only reachable for certain inputs.\n- What if you replace `result` with a constant in the `printf` call? The taint flow should disappear.\n\nTaint analysis is the foundation for detecting many vulnerability classes: SQL injection, XSS, command injection, format string bugs, and path traversal.",
+    "code": "#include <stdio.h>\n\nint main() {\n    int secret;\n    scanf(\"%d\", &secret);  // SOURCE: user input\n    int result = secret * 2;\n    printf(\"Result: %d\\n\", result);  // SINK: output\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "valueflow"
+  }
+]

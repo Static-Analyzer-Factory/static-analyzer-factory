@@ -1,0 +1,22 @@
+[package]
+name = "saf-wasm"
+version = "0.1.0"
+edition.workspace = true
+description = "SAF static analysis engine compiled to WebAssembly"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+saf-core = { path = "../saf-core" }
+saf-analysis = { path = "../saf-analysis", default-features = false }
+saf-datalog = { path = "../saf-datalog", features = ["wasm"] }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,0 +1,101 @@
+version: "1.0"
+specs:
+  # GNU xalloc functions - abort on failure, never return NULL
+  # Used by coreutils, gnulib, and many GNU projects
+
+  - name: xmalloc
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: not_null  # aborts on failure
+    params:
+      - index: 0
+        semantic: allocation_size
+
+  - name: xcalloc
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: not_null  # aborts on failure
+    params:
+      - index: 0
+        semantic: element_count
+      - index: 1
+        semantic: element_size
+
+  - name: xrealloc
+    role: reallocator
+    returns:
+      pointer: fresh_heap
+      nullness: not_null  # aborts on failure
+    params:
+      - index: 0
+        semantic: old_pointer
+      - index: 1
+        semantic: new_size
+
+  - name: xstrdup
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: not_null  # aborts on failure
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+    taint:
+      propagates:
+        - from: param.0
+          to: [return]
+
+  - name: xstrndup
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: not_null  # aborts on failure
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        semantic: max_length
+    taint:
+      propagates:
+        - from: param.0
+          to: [return]
+
+  - name: xzalloc
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: not_null  # aborts on failure
+    params:
+      - index: 0
+        semantic: allocation_size
+
+  - name: x2realloc
+    role: reallocator
+    returns:
+      pointer: fresh_heap
+      nullness: not_null
+    params:
+      - index: 0
+        semantic: old_pointer
+      - index: 1
+        modifies: true  # writes new size
+
+  - name: xmemdup
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: not_null
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        semantic: byte_count
+    taint:
+      propagates:
+        - from: param.0
+          to: [return]

@@ -1,0 +1,321 @@
+{
+  "algorithm": "kcfa-pta",
+  "title": "Context-Insensitive vs 1-CFA Pointer Analysis",
+  "example": {
+    "code": "int *identity(int *x) { return x; }\nint main() {\n    int a, b;\n    int *p = identity(&a);\n    int *q = identity(&b);\n}",
+    "language": "c"
+  },
+  "phases": ["Init Contexts", "Extract Constraints", "Process Context", "Clone/Merge", "Fixed Point"],
+  "pseudocode": {
+    "title": "K-CFA-PTA(P, k)",
+    "lines": [
+      {"text": "C \u2190 ExtractConstraints(P)"},
+      {"text": "ctx \u2190 [\u2205]  // initial context"},
+      {"text": "for each call site cs:"},
+      {"text": "  ctx' \u2190 push(ctx, cs)[0:k]"},
+      {"text": "  seed worklist with (ctx', v)"},
+      {"text": "while worklist \u2260 \u2205:"},
+      {"text": "  (ctx, v) \u2190 pop(worklist)"},
+      {"text": "  resolve constraints for v in ctx"},
+      {"text": "  propagate pts changes"},
+      {"text": "  if indirect call resolved:"},
+      {"text": "    clone context for callee"},
+      {"text": "return per-context pts"}
+    ]
+  },
+  "steps": [
+    {
+      "id": 0,
+      "action": "Extract constraints",
+      "phase": 1,
+      "activeLines": [0],
+      "explanation": "Extract pointer constraints from the program. Two calls to `identity` create address constraints (`p\u2192a`, `q\u2192b` via `identity`) and copy constraints through the parameter `x` and return value.\n\nKey: both call-sites funnel through the same `x` parameter in `identity`.",
+      "highlights": { "nodes": ["p", "q", "a", "b"], "edges": [] },
+      "graph": {
+        "nodes": [
+          { "id": "p", "label": "p", "type": "value" },
+          { "id": "q", "label": "q", "type": "value" },
+          { "id": "a", "label": "a", "type": "location" },
+          { "id": "b", "label": "b", "type": "location" },
+          { "id": "x", "label": "x", "type": "value" }
+        ],
+        "edges": [
+          { "src": "a", "dst": "x", "type": "constraint", "label": "addr (call 1)" },
+          { "src": "b", "dst": "x", "type": "constraint", "label": "addr (call 2)" },
+          { "src": "x", "dst": "p", "type": "constraint", "label": "copy (ret 1)" },
+          { "src": "x", "dst": "q", "type": "constraint", "label": "copy (ret 2)" }
+        ]
+      },
+      "diff": {
+        "added": {
+          "nodes": ["p", "q", "a", "b", "x"],
+          "edges": [
+            { "src": "a", "dst": "x" },
+            { "src": "b", "dst": "x" },
+            { "src": "x", "dst": "p" },
+            { "src": "x", "dst": "q" }
+          ]
+        },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "currentContext": [],
+        "worklist": [{ "context": [], "variable": "x" }],
+        "pointsTo": {},
+        "contextCount": 0
+      }
+    },
+    {
+      "id": 1,
+      "action": "CI: Solve (merged)",
+      "phase": 3,
+      "activeLines": [5, 6, 7, 8],
+      "explanation": "**Context-insensitive** solve: Both calls merge into a single `x`. Since `x` receives both `&a` and `&b`, we get `pts(x) = {a, b}`. This propagates to both `p` and `q`:\n\n- `pts(p) = {a, b}` (2 spurious: includes `b`)\n- `pts(q) = {a, b}` (2 spurious: includes `a`)\n\nTotal: 4 points-to edges, 2 are spurious.",
+      "highlights": {
+        "nodes": ["x", "p", "q"],
+        "edges": [
+          { "src": "x", "dst": "p" },
+          { "src": "x", "dst": "q" }
+        ]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "p", "label": "p", "type": "value" },
+          { "id": "q", "label": "q", "type": "value" },
+          { "id": "a", "label": "a", "type": "location" },
+          { "id": "b", "label": "b", "type": "location" },
+          { "id": "x", "label": "x", "type": "value" }
+        ],
+        "edges": [
+          { "src": "p", "dst": "a", "type": "points-to" },
+          { "src": "p", "dst": "b", "type": "points-to" },
+          { "src": "q", "dst": "a", "type": "points-to" },
+          { "src": "q", "dst": "b", "type": "points-to" }
+        ]
+      },
+      "diff": {
+        "added": {
+          "nodes": [],
+          "edges": [
+            { "src": "p", "dst": "a" },
+            { "src": "p", "dst": "b" },
+            { "src": "q", "dst": "a" },
+            { "src": "q", "dst": "b" }
+          ]
+        },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["p", "q", "x"], "edges": [] }
+      },
+      "algorithmState": {
+        "currentContext": [],
+        "worklist": [],
+        "pointsTo": {
+          "[]": {
+            "x": ["a", "b"],
+            "p": ["a", "b"],
+            "q": ["a", "b"]
+          }
+        },
+        "contextCount": 0
+      }
+    },
+    {
+      "id": 2,
+      "action": "Switch to 1-CFA",
+      "phase": 0,
+      "activeLines": [1, 2, 3, 4],
+      "explanation": "Now applying **1-CFA**: clone `identity()` per call-site. Context `[main@L5]` handles the first call, context `[main@L6]` handles the second. Each context gets its own copy of `x`.",
+      "highlights": {
+        "nodes": ["x_ctx1", "x_ctx2"],
+        "edges": []
+      },
+      "graph": {
+        "nodes": [
+          { "id": "p", "label": "p", "type": "value" },
+          { "id": "q", "label": "q", "type": "value" },
+          { "id": "a", "label": "a", "type": "location" },
+          { "id": "b", "label": "b", "type": "location" },
+          { "id": "x_ctx1", "label": "x [L5]", "type": "value" },
+          { "id": "x_ctx2", "label": "x [L6]", "type": "value" }
+        ],
+        "edges": [
+          { "src": "a", "dst": "x_ctx1", "type": "constraint", "label": "addr" },
+          { "src": "x_ctx1", "dst": "p", "type": "constraint", "label": "copy" },
+          { "src": "b", "dst": "x_ctx2", "type": "constraint", "label": "addr" },
+          { "src": "x_ctx2", "dst": "q", "type": "constraint", "label": "copy" }
+        ]
+      },
+      "diff": {
+        "added": {
+          "nodes": ["x_ctx1", "x_ctx2"],
+          "edges": [
+            { "src": "a", "dst": "x_ctx1" },
+            { "src": "x_ctx1", "dst": "p" },
+            { "src": "b", "dst": "x_ctx2" },
+            { "src": "x_ctx2", "dst": "q" }
+          ]
+        },
+        "removed": { "nodes": ["x"], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "currentContext": ["main@L5"],
+        "worklist": [
+          { "context": ["main@L5"], "variable": "x" },
+          { "context": ["main@L6"], "variable": "x" }
+        ],
+        "pointsTo": {},
+        "contextCount": 2
+      }
+    },
+    {
+      "id": 3,
+      "action": "Solve context [main@L5]",
+      "phase": 2,
+      "activeLines": [5, 6, 7, 8],
+      "explanation": "In context `[main@L5]`: `identity` receives `&a` only. So `pts(x) = {a}` in this context, and `pts(p) = {a}`. Exact!",
+      "highlights": {
+        "nodes": ["x_ctx1", "p", "a"],
+        "edges": [{ "src": "p", "dst": "a" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "p", "label": "p", "type": "value" },
+          { "id": "q", "label": "q", "type": "value" },
+          { "id": "a", "label": "a", "type": "location" },
+          { "id": "b", "label": "b", "type": "location" },
+          { "id": "x_ctx1", "label": "x [L5]", "type": "value" },
+          { "id": "x_ctx2", "label": "x [L6]", "type": "value" }
+        ],
+        "edges": [
+          { "src": "x_ctx1", "dst": "a", "type": "points-to" },
+          { "src": "p", "dst": "a", "type": "points-to" },
+          { "src": "b", "dst": "x_ctx2", "type": "constraint", "label": "addr" },
+          { "src": "x_ctx2", "dst": "q", "type": "constraint", "label": "copy" }
+        ]
+      },
+      "diff": {
+        "added": {
+          "nodes": [],
+          "edges": [
+            { "src": "x_ctx1", "dst": "a" },
+            { "src": "p", "dst": "a" }
+          ]
+        },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["p", "x_ctx1"], "edges": [] }
+      },
+      "algorithmState": {
+        "currentContext": ["main@L5"],
+        "worklist": [
+          { "context": ["main@L6"], "variable": "x" }
+        ],
+        "pointsTo": {
+          "[main@L5]": {
+            "x": ["a"],
+            "p": ["a"]
+          }
+        },
+        "contextCount": 2
+      }
+    },
+    {
+      "id": 4,
+      "action": "Solve context [main@L6]",
+      "phase": 2,
+      "activeLines": [5, 6, 7, 8],
+      "explanation": "In context `[main@L6]`: `identity` receives `&b` only. So `pts(x) = {b}` in this context, and `pts(q) = {b}`. Exact!",
+      "highlights": {
+        "nodes": ["x_ctx2", "q", "b"],
+        "edges": [{ "src": "q", "dst": "b" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "p", "label": "p", "type": "value" },
+          { "id": "q", "label": "q", "type": "value" },
+          { "id": "a", "label": "a", "type": "location" },
+          { "id": "b", "label": "b", "type": "location" },
+          { "id": "x_ctx1", "label": "x [L5]", "type": "value" },
+          { "id": "x_ctx2", "label": "x [L6]", "type": "value" }
+        ],
+        "edges": [
+          { "src": "x_ctx1", "dst": "a", "type": "points-to" },
+          { "src": "p", "dst": "a", "type": "points-to" },
+          { "src": "x_ctx2", "dst": "b", "type": "points-to" },
+          { "src": "q", "dst": "b", "type": "points-to" }
+        ]
+      },
+      "diff": {
+        "added": {
+          "nodes": [],
+          "edges": [
+            { "src": "x_ctx2", "dst": "b" },
+            { "src": "q", "dst": "b" }
+          ]
+        },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["q", "x_ctx2"], "edges": [] }
+      },
+      "algorithmState": {
+        "currentContext": ["main@L6"],
+        "worklist": [],
+        "pointsTo": {
+          "[main@L5]": {
+            "x": ["a"],
+            "p": ["a"]
+          },
+          "[main@L6]": {
+            "x": ["b"],
+            "q": ["b"]
+          }
+        },
+        "contextCount": 2
+      }
+    },
+    {
+      "id": 5,
+      "action": "Compare CI vs 1-CFA",
+      "phase": 4,
+      "activeLines": [11],
+      "explanation": "| Analysis | pts(p) | pts(q) | Total edges | Spurious |\n|----------|--------|--------|-------------|----------|\n| CI | {a, b} | {a, b} | 4 | 2 |\n| 1-CFA | {a} | {b} | 2 | 0 |\n\n1-CFA eliminated **all spurious edges** by cloning `identity` per call-site. The cost: 2 contexts instead of 1. For k>1, nested call chains get even more precise.",
+      "highlights": {
+        "nodes": ["p", "q", "a", "b"],
+        "edges": [
+          { "src": "p", "dst": "a" },
+          { "src": "q", "dst": "b" }
+        ]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "p", "label": "p", "type": "value" },
+          { "id": "q", "label": "q", "type": "value" },
+          { "id": "a", "label": "a", "type": "location" },
+          { "id": "b", "label": "b", "type": "location" }
+        ],
+        "edges": [
+          { "src": "p", "dst": "a", "type": "points-to" },
+          { "src": "q", "dst": "b", "type": "points-to" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": ["x_ctx1", "x_ctx2"], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "currentContext": [],
+        "worklist": [],
+        "pointsTo": {
+          "[main@L5]": {
+            "p": ["a"]
+          },
+          "[main@L6]": {
+            "q": ["b"]
+          }
+        },
+        "contextCount": 2
+      }
+    }
+  ]
+}

@@ -1,0 +1,237 @@
+{
+  "algorithm": "dominator-tree",
+  "title": "Dominator Tree Construction",
+  "example": {
+    "code": "int sum(int n) {\n    int s = 0;\n    for (int i = 0; i < n; i++) s += i;\n    return s;\n}",
+    "language": "c"
+  },
+  "phases": ["Init", "Compute Idom", "Build Tree", "Compute DF", "Detect Loops"],
+  "pseudocode": {
+    "title": "DOMINATORS(CFG)",
+    "lines": [
+      {"text": "idom(entry) \u2190 entry"},
+      {"text": "for each b in RPO (skip entry):"},
+      {"text": "  idom(b) \u2190 first processed pred"},
+      {"text": "repeat:"},
+      {"text": "  for each b in RPO:"},
+      {"text": "    new_idom \u2190 intersect preds"},
+      {"text": "    if new_idom \u2260 idom(b):"},
+      {"text": "      idom(b) \u2190 new_idom"},
+      {"text": "  until no changes"},
+      {"text": "COMPUTE-DF(idom)"},
+      {"text": "DETECT-LOOPS(idom, back_edges)"}
+    ]
+  },
+  "steps": [
+    {
+      "id": 0,
+      "action": "Initialize",
+      "phase": 0,
+      "activeLines": [0],
+      "explanation": "Start dominator computation. Process the **entry** block first. The entry block dominates itself: `idom(entry) = entry`.",
+      "highlights": { "nodes": ["entry"], "edges": [] },
+      "graph": {
+        "nodes": [
+          { "id": "entry", "label": "entry", "type": "value" },
+          { "id": "loop_header", "label": "loop_header", "type": "value" },
+          { "id": "loop_body", "label": "loop_body", "type": "value" },
+          { "id": "loop_exit", "label": "loop_exit", "type": "value" },
+          { "id": "return", "label": "return", "type": "value" }
+        ],
+        "edges": [
+          { "src": "entry", "dst": "loop_header", "type": "cfg-edge" },
+          { "src": "loop_header", "dst": "loop_body", "type": "cfg-edge", "label": "true" },
+          { "src": "loop_header", "dst": "loop_exit", "type": "cfg-edge", "label": "false" },
+          { "src": "loop_body", "dst": "loop_header", "type": "cfg-edge", "label": "back" },
+          { "src": "loop_exit", "dst": "return", "type": "cfg-edge" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": ["entry"], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "processed": ["entry"],
+        "idom": { "entry": "entry" },
+        "domFrontier": {},
+        "loopHeaders": [],
+        "backEdges": []
+      }
+    },
+    {
+      "id": 1,
+      "action": "Process loop_header",
+      "phase": 1,
+      "activeLines": [1, 2],
+      "explanation": "Process **loop_header**. Its only predecessor in the first pass is `entry`, so `idom(loop_header) = entry`.",
+      "highlights": {
+        "nodes": ["loop_header"],
+        "edges": [{ "src": "entry", "dst": "loop_header" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "entry", "label": "entry", "type": "value" },
+          { "id": "loop_header", "label": "loop_header", "type": "value" },
+          { "id": "loop_body", "label": "loop_body", "type": "value" },
+          { "id": "loop_exit", "label": "loop_exit", "type": "value" },
+          { "id": "return", "label": "return", "type": "value" }
+        ],
+        "edges": [
+          { "src": "entry", "dst": "loop_header", "type": "cfg-edge" },
+          { "src": "loop_header", "dst": "loop_body", "type": "cfg-edge", "label": "true" },
+          { "src": "loop_header", "dst": "loop_exit", "type": "cfg-edge", "label": "false" },
+          { "src": "loop_body", "dst": "loop_header", "type": "cfg-edge", "label": "back" },
+          { "src": "loop_exit", "dst": "return", "type": "cfg-edge" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": ["loop_header"], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["loop_header"], "edges": [] }
+      },
+      "algorithmState": {
+        "processed": ["entry", "loop_header"],
+        "idom": { "entry": "entry", "loop_header": "entry" },
+        "domFrontier": {},
+        "loopHeaders": [],
+        "backEdges": []
+      }
+    },
+    {
+      "id": 2,
+      "action": "Process loop_body and loop_exit",
+      "phase": 1,
+      "activeLines": [3, 4, 5, 6, 7, 8],
+      "explanation": "Process **loop_body** (dominated by `loop_header`) and **loop_exit** (also dominated by `loop_header`). Then process **return** (dominated by `loop_exit`).",
+      "highlights": {
+        "nodes": ["loop_body", "loop_exit", "return"],
+        "edges": []
+      },
+      "graph": {
+        "nodes": [
+          { "id": "entry", "label": "entry", "type": "value" },
+          { "id": "loop_header", "label": "loop_header", "type": "value" },
+          { "id": "loop_body", "label": "loop_body", "type": "value" },
+          { "id": "loop_exit", "label": "loop_exit", "type": "value" },
+          { "id": "return", "label": "return", "type": "value" }
+        ],
+        "edges": [
+          { "src": "entry", "dst": "loop_header", "type": "cfg-edge" },
+          { "src": "loop_header", "dst": "loop_body", "type": "cfg-edge", "label": "true" },
+          { "src": "loop_header", "dst": "loop_exit", "type": "cfg-edge", "label": "false" },
+          { "src": "loop_body", "dst": "loop_header", "type": "cfg-edge", "label": "back" },
+          { "src": "loop_exit", "dst": "return", "type": "cfg-edge" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": ["loop_body", "loop_exit", "return"], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["loop_body", "loop_exit", "return"], "edges": [] }
+      },
+      "algorithmState": {
+        "processed": ["entry", "loop_header", "loop_body", "loop_exit", "return"],
+        "idom": {
+          "entry": "entry",
+          "loop_header": "entry",
+          "loop_body": "loop_header",
+          "loop_exit": "loop_header",
+          "return": "loop_exit"
+        },
+        "domFrontier": {},
+        "loopHeaders": [],
+        "backEdges": []
+      }
+    },
+    {
+      "id": 3,
+      "action": "Detect back edge",
+      "phase": 4,
+      "activeLines": [10],
+      "explanation": "Edge `loop_body \u2192 loop_header` is a **back edge** because the destination (`loop_header`) dominates the source (`loop_body`). This means `loop_header` is a **loop header**.",
+      "highlights": {
+        "nodes": ["loop_header", "loop_body"],
+        "edges": [{ "src": "loop_body", "dst": "loop_header" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "entry", "label": "entry", "type": "value" },
+          { "id": "loop_header", "label": "loop_header", "type": "value" },
+          { "id": "loop_body", "label": "loop_body", "type": "value" },
+          { "id": "loop_exit", "label": "loop_exit", "type": "value" },
+          { "id": "return", "label": "return", "type": "value" }
+        ],
+        "edges": [
+          { "src": "entry", "dst": "loop_header", "type": "cfg-edge" },
+          { "src": "loop_header", "dst": "loop_body", "type": "cfg-edge", "label": "true" },
+          { "src": "loop_header", "dst": "loop_exit", "type": "cfg-edge", "label": "false" },
+          { "src": "loop_body", "dst": "loop_header", "type": "back-edge", "label": "back" },
+          { "src": "loop_exit", "dst": "return", "type": "cfg-edge" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["loop_header"], "edges": [{ "src": "loop_body", "dst": "loop_header" }] }
+      },
+      "algorithmState": {
+        "processed": ["entry", "loop_header", "loop_body", "loop_exit", "return"],
+        "idom": {
+          "entry": "entry",
+          "loop_header": "entry",
+          "loop_body": "loop_header",
+          "loop_exit": "loop_header",
+          "return": "loop_exit"
+        },
+        "domFrontier": {},
+        "loopHeaders": ["loop_header"],
+        "backEdges": [{ "src": "loop_body", "dst": "loop_header" }]
+      }
+    },
+    {
+      "id": 4,
+      "action": "Compute dominance frontier",
+      "phase": 3,
+      "activeLines": [9],
+      "explanation": "Compute the dominance frontier. `DF(loop_header) = {loop_header}` because `loop_header` is a join point where two control flow paths merge (from `entry` and from `loop_body`). The dominator tree is now complete.\n\n| Block | idom | DF |\n|-------|------|----|\n| entry | entry | {} |\n| loop_header | entry | {loop_header} |\n| loop_body | loop_header | {} |\n| loop_exit | loop_header | {} |\n| return | loop_exit | {} |",
+      "highlights": {
+        "nodes": ["loop_header"],
+        "edges": []
+      },
+      "graph": {
+        "nodes": [
+          { "id": "entry", "label": "entry", "type": "value" },
+          { "id": "loop_header", "label": "loop_header", "type": "value" },
+          { "id": "loop_body", "label": "loop_body", "type": "value" },
+          { "id": "loop_exit", "label": "loop_exit", "type": "value" },
+          { "id": "return", "label": "return", "type": "value" }
+        ],
+        "edges": [
+          { "src": "entry", "dst": "loop_header", "type": "cfg-edge" },
+          { "src": "loop_header", "dst": "loop_body", "type": "cfg-edge", "label": "true" },
+          { "src": "loop_header", "dst": "loop_exit", "type": "cfg-edge", "label": "false" },
+          { "src": "loop_body", "dst": "loop_header", "type": "back-edge", "label": "back" },
+          { "src": "loop_exit", "dst": "return", "type": "cfg-edge" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": ["loop_header"], "edges": [] }
+      },
+      "algorithmState": {
+        "processed": ["entry", "loop_header", "loop_body", "loop_exit", "return"],
+        "idom": {
+          "entry": "entry",
+          "loop_header": "entry",
+          "loop_body": "loop_header",
+          "loop_exit": "loop_header",
+          "return": "loop_exit"
+        },
+        "domFrontier": { "loop_header": ["loop_header"] },
+        "loopHeaders": ["loop_header"],
+        "backEdges": [{ "src": "loop_body", "dst": "loop_header" }]
+      }
+    }
+  ]
+}

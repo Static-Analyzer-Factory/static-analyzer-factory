@@ -1,0 +1,16 @@
+/* Hamburger button — mobile sidebar toggle (tutorials only) */
+.hamburger {
+  display: none;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 20px;
+  cursor: pointer;
+  padding: 4px;
+}
+
+@media (max-width: 768px) {
+  .hamburger {
+    display: block;
+  }
+}

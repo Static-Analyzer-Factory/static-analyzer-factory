@@ -1,0 +1,264 @@
+{
+  "algorithm": "callgraph-construction",
+  "title": "Callgraph Construction: CHA \u2192 RTA \u2192 VTA",
+  "example": {
+    "code": "void dog_bark() { }\nvoid cat_meow() { }\ntypedef void (*SpeakFn)(void);\nvoid make_noise(SpeakFn fn) { fn(); }\nint main() { make_noise(dog_bark); }",
+    "language": "c"
+  },
+  "phases": ["Scan Declarations", "Resolve CHA", "Refine RTA", "Refine VTA", "Final"],
+  "pseudocode": {
+    "title": "CG-CONSTRUCTION(P)",
+    "lines": [
+      {"text": "// Phase 1: CHA"},
+      {"text": "for each call site cs:"},
+      {"text": "  targets \u2190 type_hierarchy(cs)"},
+      {"text": "  add edges cs \u2192 targets"},
+      {"text": "// Phase 2: RTA"},
+      {"text": "reachable \u2190 {main}"},
+      {"text": "for each r in reachable:"},
+      {"text": "  for each call in r:"},
+      {"text": "    filter targets by instantiated"},
+      {"text": "// Phase 3: VTA"},
+      {"text": "for each call in reachable:"},
+      {"text": "  refine by PTA(receiver)"},
+      {"text": "return callgraph"}
+    ]
+  },
+  "steps": [
+    {
+      "id": 0,
+      "action": "Initialize",
+      "phase": 0,
+      "activeLines": [0, 1],
+      "explanation": "Program has an indirect call `fn()` in `make_noise`. Both `dog_bark` and `cat_meow` have compatible types (`void (*)(void)`). We need to determine which functions `fn` can actually point to.",
+      "highlights": { "nodes": ["make_noise"], "edges": [] },
+      "graph": {
+        "nodes": [
+          { "id": "main", "label": "main", "type": "value" },
+          { "id": "make_noise", "label": "make_noise", "type": "value" },
+          { "id": "dog_bark", "label": "dog_bark", "type": "location" },
+          { "id": "cat_meow", "label": "cat_meow", "type": "location" }
+        ],
+        "edges": [
+          { "src": "main", "dst": "make_noise", "type": "call", "label": "direct" }
+        ]
+      },
+      "diff": {
+        "added": {
+          "nodes": ["main", "make_noise", "dog_bark", "cat_meow"],
+          "edges": [{ "src": "main", "dst": "make_noise" }]
+        },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "algorithm": "cha",
+        "resolvedCalls": [],
+        "reachableMethods": ["main", "make_noise"],
+        "unresolvedCalls": ["fn()"]
+      }
+    },
+    {
+      "id": 1,
+      "action": "CHA Resolution",
+      "phase": 1,
+      "activeLines": [1, 2, 3],
+      "explanation": "**CHA** resolves by type compatibility. Both `dog_bark` and `cat_meow` match `SpeakFn` (type `void (*)(void)`), so both are potential targets. This is an **over-approximation** \u2014 `cat_meow` is never actually passed to `make_noise`.",
+      "highlights": {
+        "nodes": ["dog_bark", "cat_meow"],
+        "edges": [
+          { "src": "make_noise", "dst": "dog_bark" },
+          { "src": "make_noise", "dst": "cat_meow" }
+        ]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "main", "label": "main", "type": "value" },
+          { "id": "make_noise", "label": "make_noise", "type": "value" },
+          { "id": "dog_bark", "label": "dog_bark", "type": "location" },
+          { "id": "cat_meow", "label": "cat_meow", "type": "location" }
+        ],
+        "edges": [
+          { "src": "main", "dst": "make_noise", "type": "call", "label": "direct" },
+          { "src": "make_noise", "dst": "dog_bark", "type": "call", "label": "CHA" },
+          { "src": "make_noise", "dst": "cat_meow", "type": "call", "label": "CHA" }
+        ]
+      },
+      "diff": {
+        "added": {
+          "nodes": [],
+          "edges": [
+            { "src": "make_noise", "dst": "dog_bark" },
+            { "src": "make_noise", "dst": "cat_meow" }
+          ]
+        },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "algorithm": "cha",
+        "resolvedCalls": [
+          { "callsite": "fn()", "targets": ["dog_bark", "cat_meow"], "precision": "over-approx" }
+        ],
+        "reachableMethods": ["main", "make_noise", "dog_bark", "cat_meow"],
+        "unresolvedCalls": []
+      }
+    },
+    {
+      "id": 2,
+      "action": "RTA Resolution",
+      "phase": 2,
+      "activeLines": [4, 5, 6, 7, 8],
+      "explanation": "**RTA** refines by checking which function addresses are actually taken. Both `dog_bark` and `cat_meow` have their addresses taken (even though `cat_meow` is never used as a `SpeakFn`). Result: still 2 targets. RTA doesn't improve here because both are address-taken.",
+      "highlights": {
+        "nodes": ["dog_bark", "cat_meow"],
+        "edges": []
+      },
+      "graph": {
+        "nodes": [
+          { "id": "main", "label": "main", "type": "value" },
+          { "id": "make_noise", "label": "make_noise", "type": "value" },
+          { "id": "dog_bark", "label": "dog_bark", "type": "location" },
+          { "id": "cat_meow", "label": "cat_meow", "type": "location" }
+        ],
+        "edges": [
+          { "src": "main", "dst": "make_noise", "type": "call", "label": "direct" },
+          { "src": "make_noise", "dst": "dog_bark", "type": "call", "label": "RTA" },
+          { "src": "make_noise", "dst": "cat_meow", "type": "call", "label": "RTA" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": {
+          "nodes": [],
+          "edges": [
+            { "src": "make_noise", "dst": "dog_bark" },
+            { "src": "make_noise", "dst": "cat_meow" }
+          ]
+        }
+      },
+      "algorithmState": {
+        "algorithm": "rta",
+        "resolvedCalls": [
+          { "callsite": "fn()", "targets": ["dog_bark", "cat_meow"], "precision": "over-approx" }
+        ],
+        "reachableMethods": ["main", "make_noise", "dog_bark", "cat_meow"],
+        "unresolvedCalls": []
+      }
+    },
+    {
+      "id": 3,
+      "action": "VTA Resolution",
+      "phase": 3,
+      "activeLines": [9, 10, 11],
+      "explanation": "**VTA** tracks value flow. The parameter `fn` in `make_noise` receives its value from `main`, which only passes `dog_bark`. Value flow: `&dog_bark \u2192 fn`. Therefore `fn` can only point to `dog_bark`. The spurious edge to `cat_meow` is eliminated!",
+      "highlights": {
+        "nodes": ["dog_bark"],
+        "edges": [{ "src": "make_noise", "dst": "dog_bark" }]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "main", "label": "main", "type": "value" },
+          { "id": "make_noise", "label": "make_noise", "type": "value" },
+          { "id": "dog_bark", "label": "dog_bark", "type": "location" },
+          { "id": "cat_meow", "label": "cat_meow", "type": "location" }
+        ],
+        "edges": [
+          { "src": "main", "dst": "make_noise", "type": "call", "label": "direct" },
+          { "src": "make_noise", "dst": "dog_bark", "type": "call", "label": "VTA" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": {
+          "nodes": [],
+          "edges": [{ "src": "make_noise", "dst": "cat_meow" }]
+        },
+        "changed": {
+          "nodes": [],
+          "edges": [{ "src": "make_noise", "dst": "dog_bark" }]
+        }
+      },
+      "algorithmState": {
+        "algorithm": "vta",
+        "resolvedCalls": [
+          { "callsite": "fn()", "targets": ["dog_bark"], "precision": "exact" }
+        ],
+        "reachableMethods": ["main", "make_noise", "dog_bark"],
+        "unresolvedCalls": []
+      }
+    },
+    {
+      "id": 4,
+      "action": "Precision Comparison",
+      "phase": 4,
+      "activeLines": [12],
+      "explanation": "| Algorithm | Targets for fn() | Edges | Precision |\n|-----------|-------------------|-------|-----------|\n| CHA | dog_bark, cat_meow | 2 | Over-approx |\n| RTA | dog_bark, cat_meow | 2 | Over-approx |\n| VTA | dog_bark | 1 | Exact |\n\nVTA eliminated 1 spurious edge by tracking value flow through the `fn` parameter.",
+      "highlights": { "nodes": [], "edges": [] },
+      "graph": {
+        "nodes": [
+          { "id": "main", "label": "main", "type": "value" },
+          { "id": "make_noise", "label": "make_noise", "type": "value" },
+          { "id": "dog_bark", "label": "dog_bark", "type": "location" },
+          { "id": "cat_meow", "label": "cat_meow", "type": "location" }
+        ],
+        "edges": [
+          { "src": "main", "dst": "make_noise", "type": "call", "label": "direct" },
+          { "src": "make_noise", "dst": "dog_bark", "type": "call", "label": "VTA" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": [], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "algorithm": "vta",
+        "resolvedCalls": [
+          { "callsite": "fn()", "targets": ["dog_bark"], "precision": "exact" }
+        ],
+        "reachableMethods": ["main", "make_noise", "dog_bark"],
+        "unresolvedCalls": []
+      }
+    },
+    {
+      "id": 5,
+      "action": "Final Callgraph",
+      "phase": 4,
+      "activeLines": [12],
+      "explanation": "The final call graph with VTA precision: `main \u2192 make_noise \u2192 dog_bark`. The function `cat_meow` is unreachable \u2014 it was never passed as an argument.",
+      "highlights": {
+        "nodes": ["main", "make_noise", "dog_bark"],
+        "edges": [
+          { "src": "main", "dst": "make_noise" },
+          { "src": "make_noise", "dst": "dog_bark" }
+        ]
+      },
+      "graph": {
+        "nodes": [
+          { "id": "main", "label": "main", "type": "value" },
+          { "id": "make_noise", "label": "make_noise", "type": "value" },
+          { "id": "dog_bark", "label": "dog_bark", "type": "location" }
+        ],
+        "edges": [
+          { "src": "main", "dst": "make_noise", "type": "call", "label": "direct" },
+          { "src": "make_noise", "dst": "dog_bark", "type": "call", "label": "VTA" }
+        ]
+      },
+      "diff": {
+        "added": { "nodes": [], "edges": [] },
+        "removed": { "nodes": ["cat_meow"], "edges": [] },
+        "changed": { "nodes": [], "edges": [] }
+      },
+      "algorithmState": {
+        "algorithm": "vta",
+        "resolvedCalls": [
+          { "callsite": "fn()", "targets": ["dog_bark"], "precision": "exact" }
+        ],
+        "reachableMethods": ["main", "make_noise", "dog_bark"],
+        "unresolvedCalls": []
+      }
+    }
+  ]
+}

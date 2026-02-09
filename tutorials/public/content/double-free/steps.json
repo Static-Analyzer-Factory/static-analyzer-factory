@@ -1,0 +1,43 @@
+[
+  {
+    "title": "The Vulnerable Program",
+    "content": "A **double free** occurs when the same heap object is freed twice. This is a serious memory safety vulnerability (CWE-415) that can lead to heap corruption, crashes, and exploitable conditions.\n\nIn this program, the bug is subtle because it involves **pointer aliasing**:\n- `ptr` is allocated with `malloc`\n- `alias` is assigned `ptr` -- both now point to the **same** heap object\n- `process(ptr)` frees the object via `ptr`\n- `free(alias)` frees the **same** object again via `alias`\n\nThe double free isn't obvious from a quick code review because the two `free` calls use *different variable names*. A developer might think they're freeing two different allocations. This is why static analysis tools that understand **aliasing** are essential.\n\nLet's walk through how SAF detects this bug using its CFG, points-to analysis, and value flow.",
+    "code": "#include <stdlib.h>\n\nvoid process(int *data) {\n    free(data);\n}\n\nint main() {\n    int *ptr = (int *)malloc(sizeof(int));\n    *ptr = 42;\n    int *alias = ptr;\n    process(ptr);\n    free(alias);  // BUG: double free (alias == ptr, already freed)\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "cfg",
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/double_free.ll\\\"); print(p.graphs().export(\\\"cfg\\\"))\"'"
+  },
+  {
+    "title": "Tracking Aliased Pointers",
+    "content": "**Points-to analysis** reveals the key fact that makes this bug detectable: `ptr` and `alias` are **aliases** -- they point to the same heap object.\n\nThe points-to graph shows:\n- `ptr` points to `heap_obj_0` (the `malloc` allocation)\n- `alias` points to `heap_obj_0` (because `alias = ptr`)\n- The `data` parameter in `process()` also points to `heap_obj_0` (because `process(ptr)` passes the pointer)\n\nAll three variables -- `ptr`, `alias`, and `data` -- reference the same memory. This means:\n- `free(data)` inside `process()` deallocates `heap_obj_0`\n- `free(alias)` in `main()` attempts to deallocate `heap_obj_0` **again**\n\nWithout PTA, a simple analysis might see `free(data)` and `free(alias)` as freeing different things (different variable names, different functions). PTA cuts through the naming to reveal the underlying aliasing.",
+    "code": "#include <stdlib.h>\n\nvoid process(int *data) {\n    free(data);\n}\n\nint main() {\n    int *ptr = (int *)malloc(sizeof(int));\n    *ptr = 42;\n    int *alias = ptr;\n    process(ptr);\n    free(alias);  // BUG: double free (alias == ptr, already freed)\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "pta",
+    "highlightLines": [
+      8,
+      10,
+      12
+    ],
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/double_free.ll\\\"); print(p.pta_result().export())\"'"
+  },
+  {
+    "title": "Value Flow Through Free",
+    "content": "The **value flow graph** traces the allocated pointer from its creation to both `free` calls, making the double-free pattern visible.\n\nFollow the flow:\n1. `malloc` creates a pointer to `heap_obj_0`\n2. The pointer flows **directly** into `ptr`\n3. From `ptr`, the value flows two ways:\n   - Into `process(ptr)` as the `data` parameter, then to `free(data)`\n   - Into `alias` (via `alias = ptr`), then to `free(alias)`\n\nThe value flow graph makes the **two paths to free** explicit. A double-free detector looks for this pattern: a single allocation site with value flows reaching **two or more** `free` calls.\n\nNote how the analysis is **interprocedural** -- it follows the pointer through the `process()` function call and back. The `data` parameter inside `process()` is connected to `ptr` in `main()` through the call edge.",
+    "code": "#include <stdlib.h>\n\nvoid process(int *data) {\n    free(data);\n}\n\nint main() {\n    int *ptr = (int *)malloc(sizeof(int));\n    *ptr = 42;\n    int *alias = ptr;\n    process(ptr);\n    free(alias);  // BUG: double free (alias == ptr, already freed)\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "valueflow",
+    "highlightLines": [
+      4,
+      12
+    ],
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/double_free.ll\\\"); print(p.graphs().export(\\\"valueflow\\\"))\"'"
+  },
+  {
+    "title": "Detecting the Bug",
+    "content": "Combining **PTA** and **value flow**, SAF can automatically detect the double free:\n\n**Detection algorithm:**\n1. For each `free(x)` call, use PTA to find the set of objects `x` may point to\n2. For each freed object, check if any *other* `free(y)` call also frees an object in the same points-to set\n3. Use the CFG to verify that both frees are reachable (not dead code)\n\n**In our program:**\n- `free(data)` frees `{heap_obj_0}` (PTA: `data -> heap_obj_0`)\n- `free(alias)` frees `{heap_obj_0}` (PTA: `alias -> heap_obj_0`)\n- The sets **overlap** -- both free the same object\n- Both calls are on reachable paths\n\nResult: **Double free detected** on `heap_obj_0`.\n\nThe key insight is that no single analysis is sufficient. The **CFG** provides reachability and ordering. **PTA** provides aliasing. **Value flow** provides the data flow paths. Together, they form a complete picture.\n\nTry exploring this analysis in the playground to see the full graph interactively.",
+    "code": "#include <stdlib.h>\n\nvoid process(int *data) {\n    free(data);\n}\n\nint main() {\n    int *ptr = (int *)malloc(sizeof(int));\n    *ptr = 42;\n    int *alias = ptr;\n    process(ptr);\n    free(alias);  // BUG: double free (alias == ptr, already freed)\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "valueflow",
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/double_free.ll\\\"); print(p.graphs().export(\\\"valueflow\\\"))\"'"
+  }
+]

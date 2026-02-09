@@ -1,0 +1,120 @@
+version: "1.0"
+specs:
+  # Memory allocation functions
+  - name: malloc
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: maybe_null
+    params:
+      - index: 0
+        semantic: allocation_size
+
+  - name: calloc
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: maybe_null
+    params:
+      - index: 0
+        semantic: element_count
+      - index: 1
+        semantic: element_size
+
+  - name: realloc
+    role: reallocator
+    returns:
+      pointer: fresh_heap
+      nullness: maybe_null
+      aliases: param.0
+    params:
+      - index: 0
+        reads: true
+        semantic: old_pointer
+      - index: 1
+        semantic: new_size
+
+  - name: reallocarray
+    role: reallocator
+    returns:
+      pointer: fresh_heap
+      nullness: maybe_null
+    params:
+      - index: 0
+        reads: true
+        semantic: old_pointer
+      - index: 1
+        semantic: element_count
+      - index: 2
+        semantic: element_size
+
+  - name: free
+    role: deallocator
+    params:
+      - index: 0
+        semantic: freed_pointer
+        nullness: nullable
+
+  - name: aligned_alloc
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: maybe_null
+    params:
+      - index: 0
+        semantic: alignment
+      - index: 1
+        semantic: allocation_size
+
+  - name: posix_memalign
+    role: allocator
+    params:
+      - index: 0
+        modifies: true
+      - index: 1
+        semantic: alignment
+      - index: 2
+        semantic: allocation_size
+
+  # Aborting allocators (never return NULL)
+  - name: xmalloc
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: not_null
+    params:
+      - index: 0
+        semantic: allocation_size
+
+  - name: xcalloc
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: not_null
+    params:
+      - index: 0
+        semantic: element_count
+      - index: 1
+        semantic: element_size
+
+  - name: xrealloc
+    role: reallocator
+    returns:
+      pointer: fresh_heap
+      nullness: not_null
+    params:
+      - index: 0
+        reads: true
+        semantic: old_pointer
+      - index: 1
+        semantic: new_size
+
+  - name: xstrdup
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: not_null
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull

@@ -1,0 +1,69 @@
+.stepper-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-secondary);
+  min-height: 48px;
+}
+
+.stepper-controls-left {
+  display: flex;
+  gap: 4px;
+}
+
+.stepper-controls-center {
+  flex: 1;
+  text-align: center;
+}
+
+.stepper-controls-right {
+  display: flex;
+  gap: 4px;
+}
+
+.stepper-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+  padding: 4px 10px;
+  font-size: 14px;
+  transition: background 0.15s, border-color 0.15s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.stepper-btn:hover:not(:disabled) {
+  background: var(--bg-primary);
+  border-color: var(--accent);
+}
+
+.stepper-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.stepper-btn-play {
+  font-size: 16px;
+  padding: 4px 14px;
+}
+
+.stepper-btn svg {
+  display: block;
+}
+
+.stepper-btn-speed {
+  font-family: monospace;
+  font-size: 13px;
+  min-width: 40px;
+}
+
+.step-counter {
+  font-size: 13px;
+  color: var(--text-muted);
+  font-family: monospace;
+}

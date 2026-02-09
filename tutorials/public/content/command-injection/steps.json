@@ -1,0 +1,37 @@
+[
+  {
+    "title": "The Injection Vulnerability",
+    "content": "**Command injection (CWE-78)** is one of the most critical vulnerability classes. It occurs when untrusted user input is passed directly to a system command execution function.\n\nIn this program:\n- `gets(input)` reads a line from stdin into `input` -- this is the **taint source**\n- `system(input)` executes `input` as a shell command -- this is the **sink**\n\nIf a user enters `ls`, the program lists files. But if they enter `ls; rm -rf /`, the shell executes **both** commands. The attacker can execute arbitrary commands with the program's privileges.\n\nThis vulnerability is ranked in the **OWASP Top 10** and **CWE Top 25** because:\n- It gives attackers **full control** of the system\n- It's easy to exploit (just type a malicious string)\n- It's common in programs that build shell commands from user input\n\nNote: `gets()` itself is also dangerous (buffer overflow, CWE-120), but we're focusing on the command injection aspect here.",
+    "code": "#include <stdio.h>\n#include <stdlib.h>\n\nint main() {\n    char input[256];\n    gets(input);           // SOURCE: untrusted input\n    system(input);         // SINK: command execution (CWE-78)\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "cfg",
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/command_injection.ll\\\"); print(p.graphs().export(\\\"cfg\\\"))\"'"
+  },
+  {
+    "title": "Tracing User Input",
+    "content": "The **value flow graph** makes the injection path explicit by tracing user input from `gets` to `system`.\n\nThe flow is direct and short:\n1. `gets(input)` writes untrusted data into the `input` buffer -- **taint source**\n2. `input` (the buffer) flows directly to `system(input)` -- **taint sink**\n\nThere are only **two** hops in this taint chain, making it easy to spot. In real-world code, the chain is usually much longer:\n- User input might flow through string concatenation (`sprintf`, `strcat`)\n- The tainted data might be stored in a struct and retrieved later\n- It might pass through multiple function calls before reaching the sink\n\nSAF's value flow analysis handles all of these cases because it's **interprocedural** (crosses function boundaries) and **memory-aware** (tracks data through stores and loads).\n\nThe value flow graph below shows the tainted data path highlighted. Notice that `input` appears as both the source (written by `gets`) and the sink argument (read by `system`).",
+    "code": "#include <stdio.h>\n#include <stdlib.h>\n\nint main() {\n    char input[256];\n    gets(input);           // SOURCE: untrusted input\n    system(input);         // SINK: command execution (CWE-78)\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "valueflow",
+    "highlightLines": [
+      6,
+      7
+    ],
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/command_injection.ll\\\"); print(p.graphs().export(\\\"valueflow\\\"))\"'"
+  },
+  {
+    "title": "Specs for Library Functions",
+    "content": "SAF uses **specs** to model library functions that it can't analyze directly (because their source code isn't available). For taint analysis, specs define:\n\n**Taint sources** -- functions that introduce untrusted data:\n- `gets(buf)` -- writes untrusted data into `buf`\n- `scanf(\"%s\", buf)` -- writes untrusted data into `buf`\n- `read(fd, buf, len)` -- writes untrusted data into `buf`\n- `getenv(name)` -- returns untrusted environment variable\n\n**Taint sinks** -- security-sensitive functions:\n- `system(cmd)` -- executes `cmd` as a shell command\n- `exec*(path, ...)` -- executes a program\n- `popen(cmd, mode)` -- opens a process with a shell command\n\n**Sanitizers** -- functions that make data safe:\n- Custom validation functions\n- Input escaping functions (e.g., `escape_shell_arg`)\n\nThe spec for `gets` tells SAF that its output parameter becomes tainted. The spec for `system` tells SAF that its input parameter is a sensitive sink. When value flow connects a source to a sink, SAF reports a finding.\n\nYou can extend these specs to model your own library functions (see the Specs Authoring tutorial).",
+    "code": "#include <stdio.h>\n#include <stdlib.h>\n\nint main() {\n    char input[256];\n    gets(input);           // SOURCE: untrusted input\n    system(input);         // SINK: command execution (CWE-78)\n    return 0;\n}",
+    "codeLanguage": "c",
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/command_injection.ll\\\"); [print(f.to_dict()) for f in p.check_all()]\"'"
+  },
+  {
+    "title": "Automated Detection",
+    "content": "SAF automatically detects this command injection vulnerability by combining taint analysis with its spec database.\n\nThe detection works end-to-end:\n1. **Load** the program: `saf.Project.open(\"command_injection.ll\")`\n2. **Identify sources**: `gets(input)` is a taint source (from specs)\n3. **Propagate taint**: value flow carries taint from `input` to `system`\n4. **Check sinks**: `system(input)` receives tainted data -- **vulnerability found**\n\nThe finding includes:\n- **Vulnerability type**: Command Injection (CWE-78)\n- **Source**: `gets()` call at the input location\n- **Sink**: `system()` call at the execution location\n- **Taint path**: the value flow chain connecting them\n\nTry it in the playground to see the analysis results interactively. You can modify the code to add a sanitizer between `gets` and `system` and observe how the taint flow changes.\n\n**Mitigation**: Never pass untrusted input directly to `system()`. Use `execve()` with a fixed command and pass user input as arguments, or validate/escape the input thoroughly.",
+    "code": "#include <stdio.h>\n#include <stdlib.h>\n\nint main() {\n    char input[256];\n    gets(input);           // SOURCE: untrusted input\n    system(input);         // SINK: command execution (CWE-78)\n    return 0;\n}",
+    "codeLanguage": "c",
+    "graphType": "valueflow",
+    "localCmd": "docker compose run --rm dev sh -c 'python3 -c \"import saf; p = saf.Project.open(\\\"tests/fixtures/llvm/e2e/command_injection.ll\\\"); print(p.graphs().export(\\\"valueflow\\\"))\"'"
+  }
+]
