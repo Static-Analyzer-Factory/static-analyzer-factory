@@ -1,0 +1,176 @@
+version: "1.0"
+specs:
+  # Environment
+  - name: getenv
+    role: source
+    returns:
+      tainted: true
+      nullness: maybe_null
+
+  # Standard input
+  - name: getchar
+    role: source
+    returns:
+      tainted: true
+
+  - name: gets
+    role: source
+    returns:
+      tainted: true
+      nullness: maybe_null
+    params:
+      - index: 0
+        modifies: true
+        tainted: true
+
+  - name: fgets
+    role: source
+    returns:
+      nullness: maybe_null
+    params:
+      - index: 0
+        modifies: true
+        tainted: true
+
+  - name: getline
+    role: source
+    params:
+      - index: 0
+        modifies: true
+        tainted: true
+
+  - name: getdelim
+    role: source
+    params:
+      - index: 0
+        modifies: true
+        tainted: true
+
+  # Scanf family
+  - name: scanf
+    role: source
+
+  - name: fscanf
+    role: source
+
+  - name: vscanf
+    role: source
+
+  - name: vfscanf
+    role: source
+
+  # File reading
+  - name: fread
+    role: source
+    params:
+      - index: 0
+        modifies: true
+        tainted: true
+
+  - name: fgetc
+    role: source
+    returns:
+      tainted: true
+
+  - name: getc
+    role: source
+    returns:
+      tainted: true
+
+  - name: ungetc
+    role: source
+    returns:
+      tainted: true
+
+  # POSIX file reading
+  - name: read
+    role: source
+    params:
+      - index: 1
+        modifies: true
+        tainted: true
+
+  - name: pread
+    role: source
+    params:
+      - index: 1
+        modifies: true
+        tainted: true
+
+  - name: readv
+    role: source
+
+  - name: preadv
+    role: source
+
+  # Network sources
+  - name: recv
+    role: source
+    params:
+      - index: 1
+        modifies: true
+        tainted: true
+
+  - name: recvfrom
+    role: source
+    params:
+      - index: 1
+        modifies: true
+        tainted: true
+
+  - name: recvmsg
+    role: source
+    params:
+      - index: 1
+        modifies: true
+        tainted: true
+
+  # DNS/network info
+  - name: gethostbyname
+    role: source
+    returns:
+      tainted: true
+
+  - name: gethostbyaddr
+    role: source
+    returns:
+      tainted: true
+
+  - name: getaddrinfo
+    role: source
+
+  - name: getnameinfo
+    role: source
+    params:
+      - index: 2
+        modifies: true
+        tainted: true
+      - index: 4
+        modifies: true
+        tainted: true
+
+  # Command line arguments (main function)
+  # Note: These are typically tracked by marking argv as tainted
+
+  # CGI/web sources
+  - name: getenv_s
+    role: source
+    params:
+      - index: 3
+        modifies: true
+        tainted: true
+
+  # User input
+  - name: readline
+    role: source
+    returns:
+      tainted: true
+      nullness: maybe_null
+
+  # Readlink (filesystem)
+  - name: readlink
+    role: source
+    params:
+      - index: 1
+        modifies: true
+        tainted: true

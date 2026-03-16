@@ -1,0 +1,459 @@
+version: "1.0"
+specs:
+  # String length
+  - name: strlen
+    pure: true
+    returns:
+      interval: [0, 9223372036854775807]  # [0, SIZE_MAX / 2] for signed comparison safety
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: strnlen
+    pure: true
+    returns:
+      interval: [0, 9223372036854775807]
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        semantic: max_length
+
+  - name: wcslen
+    pure: true
+    returns:
+      interval: [0, 9223372036854775807]
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  # String copy functions
+  - name: strcpy
+    role: string_operation
+    returns:
+      aliases: param.0
+      nullness: not_null
+    params:
+      - index: 0
+        name: dst
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        name: src
+        reads: true
+        nullness: required_nonnull
+        semantic: copies_string
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0, return]
+
+  - name: strncpy
+    role: string_operation
+    returns:
+      aliases: param.0
+      nullness: not_null
+    params:
+      - index: 0
+        name: dst
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        name: src
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: max_length
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0, return]
+
+  - name: stpcpy
+    role: string_operation
+    returns:
+      nullness: not_null
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0]
+
+  - name: stpncpy
+    role: string_operation
+    returns:
+      nullness: not_null
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: max_length
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0]
+
+  # String concatenation
+  - name: strcat
+    role: string_operation
+    returns:
+      aliases: param.0
+      nullness: not_null
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+        semantic: copies_string
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0, return]
+
+  - name: strncat
+    role: string_operation
+    returns:
+      aliases: param.0
+      nullness: not_null
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: max_length
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0, return]
+
+  # String comparison
+  - name: strcmp
+    pure: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: strncmp
+    pure: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: max_length
+
+  - name: strcasecmp
+    pure: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: strncasecmp
+    pure: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: max_length
+
+  # String search
+  - name: strchr
+    pure: true
+    returns:
+      aliases: param.0
+      nullness: maybe_null
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: strrchr
+    pure: true
+    returns:
+      aliases: param.0
+      nullness: maybe_null
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: strstr
+    pure: true
+    returns:
+      aliases: param.0
+      nullness: maybe_null
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: strpbrk
+    pure: true
+    returns:
+      aliases: param.0
+      nullness: maybe_null
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  # String duplication
+  - name: strdup
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: maybe_null
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+    taint:
+      propagates:
+        - from: param.0
+          to: [return]
+
+  - name: strndup
+    role: allocator
+    returns:
+      pointer: fresh_heap
+      nullness: maybe_null
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        semantic: max_length
+    taint:
+      propagates:
+        - from: param.0
+          to: [return]
+
+  # Memory functions
+  - name: memcpy
+    returns:
+      aliases: param.0
+      nullness: not_null
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: byte_count
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0, return]
+
+  - name: memmove
+    returns:
+      aliases: param.0
+      nullness: not_null
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: byte_count
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0, return]
+
+  - name: memset
+    returns:
+      aliases: param.0
+      nullness: not_null
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: byte_count
+
+  - name: memcmp
+    pure: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: byte_count
+
+  - name: memchr
+    pure: true
+    returns:
+      aliases: param.0
+      nullness: maybe_null
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: byte_count
+
+  # Wide-char string copy functions
+  - name: wcscpy
+    role: string_operation
+    returns:
+      aliases: param.0
+      nullness: not_null
+    params:
+      - index: 0
+        name: dst
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        name: src
+        reads: true
+        nullness: required_nonnull
+        semantic: copies_string
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0, return]
+
+  - name: wcsncpy
+    role: string_operation
+    returns:
+      aliases: param.0
+      nullness: not_null
+    params:
+      - index: 0
+        name: dst
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        name: src
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: max_length
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0, return]
+
+  - name: wcscat
+    role: string_operation
+    returns:
+      aliases: param.0
+      nullness: not_null
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+        semantic: copies_string
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0, return]
+
+  - name: wcsncat
+    role: string_operation
+    returns:
+      aliases: param.0
+      nullness: not_null
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: max_length
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0, return]
+
+  # LLVM intrinsics for memory ops
+  - name: "glob:llvm.memcpy.*"
+    returns:
+      aliases: param.0
+    params:
+      - index: 0
+        modifies: true
+      - index: 1
+        reads: true
+      - index: 2
+        semantic: byte_count
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0]
+
+  - name: "glob:llvm.memmove.*"
+    returns:
+      aliases: param.0
+    params:
+      - index: 0
+        modifies: true
+      - index: 1
+        reads: true
+      - index: 2
+        semantic: byte_count
+    taint:
+      propagates:
+        - from: param.1
+          to: [param.0]
+
+  - name: "glob:llvm.memset.*"
+    returns:
+      aliases: param.0
+    params:
+      - index: 0
+        modifies: true
+      - index: 2
+        semantic: byte_count

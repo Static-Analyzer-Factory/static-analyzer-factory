@@ -1,0 +1,296 @@
+version: "1.0"
+specs:
+  # Thread lifecycle
+  - name: pthread_create
+    params:
+      - index: 0
+        modifies: true  # writes thread ID
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: nullable  # attr can be NULL
+      - index: 2
+        callback: true
+        nullness: required_nonnull
+      - index: 3
+        escapes: true  # arg passed to thread function
+
+  - name: pthread_exit
+    noreturn: true
+
+  - name: pthread_join
+    params:
+      - index: 1
+        modifies: true
+        nullness: nullable  # retval can be NULL
+
+  - name: pthread_detach
+
+  - name: pthread_self
+    pure: true
+
+  - name: pthread_equal
+    pure: true
+
+  # Thread cancellation
+  - name: pthread_cancel
+
+  - name: pthread_setcancelstate
+    params:
+      - index: 1
+        modifies: true
+        nullness: nullable
+
+  - name: pthread_setcanceltype
+    params:
+      - index: 1
+        modifies: true
+        nullness: nullable
+
+  - name: pthread_testcancel
+
+  # Mutex operations
+  - name: pthread_mutex_init
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: nullable
+
+  - name: pthread_mutex_destroy
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_mutex_lock
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_mutex_unlock
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_mutex_trylock
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_mutex_timedlock
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  # Condition variables
+  - name: pthread_cond_init
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: nullable
+
+  - name: pthread_cond_destroy
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_cond_wait
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_cond_timedwait
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+      - index: 2
+        reads: true
+        nullness: required_nonnull
+
+  - name: pthread_cond_signal
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_cond_broadcast
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  # Read-write locks
+  - name: pthread_rwlock_init
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: nullable
+
+  - name: pthread_rwlock_destroy
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_rwlock_rdlock
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_rwlock_wrlock
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_rwlock_unlock
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_rwlock_tryrdlock
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_rwlock_trywrlock
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  # Once initialization
+  - name: pthread_once
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        callback: true
+        nullness: required_nonnull
+
+  # Thread-local storage
+  - name: pthread_key_create
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        callback: true
+        nullness: nullable  # destructor can be NULL
+
+  - name: pthread_key_delete
+
+  - name: pthread_getspecific
+    pure: true
+    returns:
+      nullness: maybe_null
+
+  - name: pthread_setspecific
+    params:
+      - index: 1
+        escapes: true
+
+  # Thread attributes
+  - name: pthread_attr_init
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_attr_destroy
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_attr_setdetachstate
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_attr_getdetachstate
+    pure: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_attr_setstacksize
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pthread_attr_getstacksize
+    pure: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+
+  # C11 threads
+  - name: thrd_create
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 1
+        callback: true
+        nullness: required_nonnull
+      - index: 2
+        escapes: true
+
+  - name: thrd_exit
+    noreturn: true
+
+  - name: thrd_join
+    params:
+      - index: 1
+        modifies: true
+        nullness: nullable
+
+  - name: thrd_detach
+
+  - name: thrd_current
+    pure: true
+
+  - name: thrd_equal
+    pure: true
+
+  - name: thrd_yield

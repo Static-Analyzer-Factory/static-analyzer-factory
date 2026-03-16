@@ -1,0 +1,17 @@
+version: "1.0"
+specs:
+  - name: gmtime
+    returns:
+      nullness: maybe_null
+      pointer: static_singleton
+    params:
+      - index: 0
+        reads: true
+
+  - name: localtime
+    returns:
+      nullness: maybe_null
+      pointer: static_singleton
+    params:
+      - index: 0
+        reads: true

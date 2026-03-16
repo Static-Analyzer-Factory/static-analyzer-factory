@@ -1,0 +1,269 @@
+version: "1.0"
+specs:
+  # File I/O
+  - name: read
+    role: source
+    params:
+      - index: 0
+        semantic: file_descriptor
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+        tainted: true
+      - index: 2
+        semantic: byte_count
+
+  - name: write
+    role: io
+    params:
+      - index: 0
+        semantic: file_descriptor
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: byte_count
+
+  - name: pread
+    role: source
+    params:
+      - index: 0
+        semantic: file_descriptor
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+        tainted: true
+      - index: 2
+        semantic: byte_count
+
+  - name: pwrite
+    role: io
+    params:
+      - index: 0
+        semantic: file_descriptor
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: byte_count
+
+  # File operations
+  - name: open
+    role: io
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: close
+    role: io
+    params:
+      - index: 0
+        semantic: file_descriptor
+
+  - name: lseek
+    params:
+      - index: 0
+        semantic: file_descriptor
+
+  - name: dup
+    params:
+      - index: 0
+        semantic: file_descriptor
+
+  - name: dup2
+    params:
+      - index: 0
+        semantic: file_descriptor
+      - index: 1
+        semantic: file_descriptor
+
+  # Process control
+  - name: fork
+    returns:
+      nullness: not_null
+
+  - name: vfork
+    returns:
+      nullness: not_null
+
+  - name: "glob:exec*"
+    role: sink
+    noreturn: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: execl
+    role: sink
+    noreturn: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: execle
+    role: sink
+    noreturn: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: execlp
+    role: sink
+    noreturn: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: execv
+    role: sink
+    noreturn: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: execve
+    role: sink
+    noreturn: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        reads: true
+        nullness: required_nonnull
+
+  - name: execvp
+    role: sink
+    noreturn: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  # Pipe
+  - name: pipe
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: pipe2
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  # Directory
+  - name: chdir
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: fchdir
+    params:
+      - index: 0
+        semantic: file_descriptor
+
+  - name: getcwd
+    returns:
+      nullness: maybe_null
+    params:
+      - index: 0
+        modifies: true
+        nullness: nullable
+      - index: 1
+        semantic: buffer_size
+
+  # User/group
+  - name: getuid
+    pure: true
+
+  - name: geteuid
+    pure: true
+
+  - name: getgid
+    pure: true
+
+  - name: getegid
+    pure: true
+
+  - name: getpid
+    pure: true
+
+  - name: getppid
+    pure: true
+
+  # Link operations
+  - name: link
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: unlink
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: symlink
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: readlink
+    returns:
+      tainted: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+        tainted: true
+      - index: 2
+        semantic: buffer_size
+
+  # Access checks
+  - name: access
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: faccessat
+    params:
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  # Sleep
+  - name: sleep
+    pure: false
+
+  - name: usleep
+    pure: false

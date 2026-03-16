@@ -1,0 +1,291 @@
+version: "1.0"
+specs:
+  # Program termination
+  - name: exit
+    noreturn: true
+
+  - name: _Exit
+    noreturn: true
+
+  - name: abort
+    noreturn: true
+
+  - name: _exit
+    noreturn: true
+
+  - name: __assert_fail
+    noreturn: true
+    params:
+      - index: 0
+        reads: true
+      - index: 1
+        reads: true
+      - index: 2
+        reads: true
+      - index: 3
+        reads: true
+
+  - name: __assert_rtn
+    noreturn: true
+    params:
+      - index: 0
+        reads: true
+      - index: 1
+        reads: true
+      - index: 2
+        reads: true
+      - index: 3
+        reads: true
+
+  - name: longjmp
+    noreturn: true
+
+  - name: siglongjmp
+    noreturn: true
+
+  # Environment
+  - name: getenv
+    role: source
+    returns:
+      nullness: maybe_null
+      tainted: true
+      pointer: static_singleton
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: __errno_location
+    pure: true
+    returns:
+      nullness: not_null
+      pointer: static_singleton
+
+  - name: setenv
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: unsetenv
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: putenv
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  # Command execution (sinks)
+  - name: system
+    role: sink
+    params:
+      - index: 0
+        reads: true
+        nullness: nullable
+
+  - name: popen
+    role: sink
+    returns:
+      nullness: maybe_null
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: pclose
+    role: deallocator
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  # String conversion
+  - name: atoi
+    pure: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: atol
+    pure: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: atoll
+    pure: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: atof
+    pure: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: strtol
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        modifies: true
+        nullness: nullable
+
+  - name: strtoll
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        modifies: true
+        nullness: nullable
+
+  - name: strtoul
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        modifies: true
+        nullness: nullable
+
+  - name: strtoull
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        modifies: true
+        nullness: nullable
+
+  - name: strtod
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        modifies: true
+        nullness: nullable
+
+  - name: strtof
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        modifies: true
+        nullness: nullable
+
+  # Random numbers
+  - name: rand
+    pure: false
+    returns:
+      interval: [0, 2147483647]  # [0, INT_MAX]
+
+  - name: srand
+    pure: false
+
+  - name: random
+    pure: false
+    returns:
+      interval: [0, 2147483647]  # [0, INT_MAX]
+
+  - name: srandom
+    pure: false
+
+  # Sorting and searching
+  - name: qsort
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+      - index: 3
+        callback: true
+        nullness: required_nonnull
+
+  - name: bsearch
+    pure: true
+    returns:
+      nullness: maybe_null
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 4
+        callback: true
+        nullness: required_nonnull
+
+  # Misc
+  - name: abs
+    pure: true
+    returns:
+      interval: [0, 2147483647]  # [0, INT_MAX]
+
+  - name: labs
+    pure: true
+    returns:
+      interval: [0, 9223372036854775807]  # [0, LONG_MAX]
+
+  - name: llabs
+    pure: true
+    returns:
+      interval: [0, 9223372036854775807]  # [0, LLONG_MAX]
+
+  - name: div
+    pure: true
+
+  - name: ldiv
+    pure: true
+
+  - name: lldiv
+    pure: true
+
+  # Character classification (ctype.h equivalents often in stdlib)
+  - name: isalpha
+    pure: true
+    returns:
+      interval: [0, 1]  # Boolean result
+
+  - name: isdigit
+    pure: true
+    returns:
+      interval: [0, 1]
+
+  - name: isalnum
+    pure: true
+    returns:
+      interval: [0, 1]
+
+  - name: isspace
+    pure: true
+    returns:
+      interval: [0, 1]
+
+  - name: isupper
+    pure: true
+    returns:
+      interval: [0, 1]
+
+  - name: islower
+    pure: true
+    returns:
+      interval: [0, 1]

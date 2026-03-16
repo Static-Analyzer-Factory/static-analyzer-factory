@@ -1,0 +1,183 @@
+version: "1.0"
+specs:
+  # HTML/XML escaping
+  - name: htmlspecialchars
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: htmlentities
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: html_escape
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: xml_escape
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: escape_html
+    role: sanitizer
+    returns:
+      tainted: false
+
+  # URL encoding
+  - name: urlencode
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: rawurlencode
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: url_encode
+    role: sanitizer
+    returns:
+      tainted: false
+
+  # SQL escaping
+  - name: mysql_real_escape_string
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: mysqli_real_escape_string
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: sqlite3_escape_string
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: PQescapeString
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: PQescapeLiteral
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: PQescapeIdentifier
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: escape_sql
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: sql_escape
+    role: sanitizer
+    returns:
+      tainted: false
+
+  # Shell escaping
+  - name: escapeshellarg
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: escapeshellcmd
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: shell_escape
+    role: sanitizer
+    returns:
+      tainted: false
+
+  # Path sanitization
+  - name: basename
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: realpath
+    role: sanitizer
+    returns:
+      tainted: false
+
+  # Validation functions (conceptually sanitizers when they pass)
+  - name: "glob:validate_*"
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: "glob:sanitize_*"
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: "glob:clean_*"
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: "glob:escape_*"
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: "glob:filter_*"
+    role: sanitizer
+    returns:
+      tainted: false
+
+  # Integer parsing (numeric validation)
+  - name: atoi
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: atol
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: atoll
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: strtol
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: strtoll
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: strtoul
+    role: sanitizer
+    returns:
+      tainted: false
+
+  - name: strtoull
+    role: sanitizer
+    returns:
+      tainted: false
+
+  # Constant comparison (timing-safe)
+  - name: constant_time_compare
+    role: sanitizer
+
+  - name: timingsafe_bcmp
+    role: sanitizer
+
+  - name: timingsafe_memcmp
+    role: sanitizer

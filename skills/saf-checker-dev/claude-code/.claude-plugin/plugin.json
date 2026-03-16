@@ -1,0 +1,10 @@
+{
+  "name": "saf-checker-dev",
+  "description": "Coding-agent skill for creating SAF bug-finding checkers and analyzers",
+  "author": {
+    "name": "SAF Team"
+  },
+  "version": "0.1.0",
+  "license": "MIT",
+  "keywords": ["saf", "static-analysis", "checker", "bug-finding"]
+}

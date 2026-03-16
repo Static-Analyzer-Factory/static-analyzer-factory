@@ -1,0 +1,274 @@
+version: "1.0"
+specs:
+  # Socket creation
+  - name: socket
+    role: io
+
+  - name: socketpair
+    params:
+      - index: 3
+        modifies: true
+        nullness: required_nonnull
+
+  # Socket binding
+  - name: bind
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: listen
+    params:
+      - index: 0
+        semantic: socket_fd
+
+  - name: accept
+    role: io
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 1
+        modifies: true
+        nullness: nullable
+      - index: 2
+        modifies: true
+        nullness: nullable
+
+  - name: accept4
+    role: io
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 1
+        modifies: true
+        nullness: nullable
+      - index: 2
+        modifies: true
+        nullness: nullable
+
+  # Socket connection
+  - name: connect
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  - name: shutdown
+    params:
+      - index: 0
+        semantic: socket_fd
+
+  # Socket I/O (sources)
+  - name: recv
+    role: source
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+        tainted: true
+      - index: 2
+        semantic: buffer_size
+
+  - name: recvfrom
+    role: source
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+        tainted: true
+      - index: 2
+        semantic: buffer_size
+      - index: 4
+        modifies: true
+        nullness: nullable
+      - index: 5
+        modifies: true
+        nullness: nullable
+
+  - name: recvmsg
+    role: source
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+        tainted: true
+
+  # Socket I/O (sinks for data)
+  - name: send
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: buffer_size
+
+  - name: sendto
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        semantic: buffer_size
+      - index: 4
+        reads: true
+        nullness: nullable
+
+  - name: sendmsg
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+
+  # Socket options
+  - name: getsockopt
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 3
+        modifies: true
+        nullness: required_nonnull
+      - index: 4
+        modifies: true
+        nullness: required_nonnull
+
+  - name: setsockopt
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 3
+        reads: true
+        nullness: required_nonnull
+
+  # Socket info
+  - name: getsockname
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+      - index: 2
+        modifies: true
+        nullness: required_nonnull
+
+  - name: getpeername
+    params:
+      - index: 0
+        semantic: socket_fd
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+      - index: 2
+        modifies: true
+        nullness: required_nonnull
+
+  # Network address conversion
+  - name: inet_ntoa
+    pure: true
+    returns:
+      nullness: not_null
+
+  - name: inet_aton
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        modifies: true
+        nullness: required_nonnull
+
+  - name: inet_pton
+    params:
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        modifies: true
+        nullness: required_nonnull
+
+  - name: inet_ntop
+    returns:
+      nullness: maybe_null
+    params:
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        modifies: true
+        nullness: required_nonnull
+      - index: 3
+        semantic: buffer_size
+
+  # Host resolution (sources)
+  - name: gethostbyname
+    role: source
+    returns:
+      nullness: maybe_null
+      tainted: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: gethostbyaddr
+    role: source
+    returns:
+      nullness: maybe_null
+      tainted: true
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+
+  - name: getaddrinfo
+    role: source
+    params:
+      - index: 0
+        reads: true
+        nullness: nullable
+      - index: 1
+        reads: true
+        nullness: nullable
+      - index: 2
+        reads: true
+        nullness: nullable
+      - index: 3
+        modifies: true
+        nullness: required_nonnull
+
+  - name: freeaddrinfo
+    role: deallocator
+    params:
+      - index: 0
+        modifies: true
+        nullness: required_nonnull
+
+  - name: getnameinfo
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        modifies: true
+        nullness: nullable
+        tainted: true
+      - index: 4
+        modifies: true
+        nullness: nullable
+        tainted: true

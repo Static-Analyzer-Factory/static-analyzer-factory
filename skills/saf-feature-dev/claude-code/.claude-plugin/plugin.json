@@ -1,0 +1,10 @@
+{
+  "name": "saf-dev-skills",
+  "description": "Coding-agent skills for developing features in the SAF (Static Analyzer Factory) project",
+  "author": {
+    "name": "SAF Team"
+  },
+  "version": "0.1.0",
+  "license": "MIT",
+  "keywords": ["saf", "static-analysis", "rust", "feature-development"]
+}

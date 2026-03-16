@@ -1,0 +1,77 @@
+/* ==========================================================================
+   SAF Global Navigation Bar — mdBook injection
+   Mirror of packages/shared/src/ui/global-nav.css for non-React context
+   ========================================================================== */
+
+.global-nav {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 48px;
+  padding: 0 1.5rem;
+  background: rgba(250, 249, 247, 0.92);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--color-border, #dbd6d0);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+.global-nav-brand {
+  font-weight: 700;
+  font-size: 18px;
+  color: var(--color-accent, #3d9b8f);
+  text-decoration: none;
+}
+
+.global-nav-links {
+  display: flex;
+  gap: 24px;
+}
+
+.global-nav-links a {
+  color: var(--color-text-secondary, #6b6b70);
+  text-decoration: none;
+  font-size: 14px;
+  font-weight: 500;
+  transition: color 0.2s;
+}
+
+.global-nav-links a:hover {
+  color: var(--color-text, #2c2c2e);
+}
+
+.global-nav-links .global-nav-active {
+  color: var(--color-accent, #3d9b8f);
+}
+
+/* Push mdBook content below the fixed nav */
+.page-wrapper {
+  margin-top: 48px !important;
+}
+
+/* Push mdBook sidebar below the fixed nav */
+.sidebar {
+  top: 48px !important;
+}
+
+/* ── Responsive ── */
+
+@media (max-width: 768px) {
+  .global-nav-links {
+    gap: 16px;
+  }
+
+  .global-nav-links a {
+    font-size: 13px;
+  }
+}
+
+@media (max-width: 480px) {
+  .global-nav-links a:not(.global-nav-active) {
+    display: none;
+  }
+}

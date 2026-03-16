@@ -1,0 +1,27 @@
+version: "1.0"
+specs:
+  # C++ ABI runtime functions (Itanium C++ ABI)
+
+  - name: __dynamic_cast
+    returns:
+      nullness: maybe_null
+      aliases: "param.0"
+    params:
+      - index: 0
+        reads: true
+        nullness: required_nonnull
+      - index: 1
+        reads: true
+        nullness: required_nonnull
+      - index: 2
+        reads: true
+        nullness: required_nonnull
+
+  - name: __cxa_pure_virtual
+    noreturn: true
+
+  - name: __cxa_throw
+    noreturn: true
+    params:
+      - index: 0
+        nullness: required_nonnull

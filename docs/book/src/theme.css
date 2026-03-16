@@ -1,0 +1,17 @@
+/* SAF Theme variables for mdBook (standalone copy of packages/shared/src/ui/theme.css) */
+:root {
+  --color-bg:              #faf9f7;
+  --color-surface:         #f1eeeb;
+  --color-surface-raised:  #e7e3df;
+  --color-border:          #dbd6d0;
+  --color-border-subtle:   #eae6e2;
+  --color-text:            #2c2c2e;
+  --color-text-secondary:  #6b6b70;
+  --color-text-tertiary:   #9b9ba0;
+  --color-accent:          #3d9b8f;
+  --color-accent-hover:    #338a7f;
+  --color-secondary:       #d08c60;
+  --color-error:           #c75050;
+  --color-warning:         #c49a3c;
+  --color-info:            #5088b5;
+}

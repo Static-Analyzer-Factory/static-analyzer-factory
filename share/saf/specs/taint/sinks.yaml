@@ -1,0 +1,281 @@
+version: "1.0"
+specs:
+  # Command execution
+  - name: system
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: popen
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: execl
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: execle
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: execlp
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: execv
+    role: sink
+    params:
+      - index: 0
+        reads: true
+      - index: 1
+        reads: true
+
+  - name: execve
+    role: sink
+    params:
+      - index: 0
+        reads: true
+      - index: 1
+        reads: true
+      - index: 2
+        reads: true
+
+  - name: execvp
+    role: sink
+    params:
+      - index: 0
+        reads: true
+      - index: 1
+        reads: true
+
+  - name: execvpe
+    role: sink
+    params:
+      - index: 0
+        reads: true
+      - index: 1
+        reads: true
+
+  - name: fexecve
+    role: sink
+    params:
+      - index: 1
+        reads: true
+      - index: 2
+        reads: true
+
+  # Format string sinks
+  - name: printf
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: fprintf
+    role: sink
+    params:
+      - index: 1
+        reads: true
+
+  - name: sprintf
+    role: sink
+    params:
+      - index: 1
+        reads: true
+
+  - name: snprintf
+    role: sink
+    params:
+      - index: 2
+        reads: true
+
+  - name: vprintf
+    role: sink
+
+  - name: vfprintf
+    role: sink
+
+  - name: vsprintf
+    role: sink
+
+  - name: vsnprintf
+    role: sink
+
+  - name: syslog
+    role: sink
+    params:
+      - index: 1
+        reads: true
+
+  # File path operations
+  - name: fopen
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: freopen
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: open
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: openat
+    role: sink
+    params:
+      - index: 1
+        reads: true
+
+  - name: creat
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: unlink
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: remove
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: rename
+    role: sink
+    params:
+      - index: 0
+        reads: true
+      - index: 1
+        reads: true
+
+  - name: mkdir
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: rmdir
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: chdir
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: chmod
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: chown
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  - name: link
+    role: sink
+    params:
+      - index: 0
+        reads: true
+      - index: 1
+        reads: true
+
+  - name: symlink
+    role: sink
+    params:
+      - index: 0
+        reads: true
+      - index: 1
+        reads: true
+
+  # Network operations
+  - name: connect
+    role: sink
+    params:
+      - index: 1
+        reads: true
+
+  - name: sendto
+    role: sink
+    params:
+      - index: 1
+        reads: true
+
+  - name: send
+    role: sink
+    params:
+      - index: 1
+        reads: true
+
+  # Database (common patterns)
+  - name: "glob:mysql_query*"
+    role: sink
+
+  - name: "glob:sqlite3_exec*"
+    role: sink
+
+  - name: "glob:PQ*exec*"
+    role: sink
+
+  # LDAP
+  - name: ldap_search
+    role: sink
+
+  - name: ldap_search_s
+    role: sink
+
+  # Dynamic loading
+  - name: dlopen
+    role: sink
+    params:
+      - index: 0
+        reads: true
+
+  # Memory operations with attacker-controlled size
+  - name: malloc
+    role: sink
+    params:
+      - index: 0
+        semantic: allocation_size
+
+  - name: calloc
+    role: sink
+    params:
+      - index: 0
+        semantic: element_count
+      - index: 1
+        semantic: element_size
+
+  - name: realloc
+    role: sink
+    params:
+      - index: 1
+        semantic: new_size
+
+  # Array indexing is a sink for buffer overflow
+  # (handled specially by buffer overflow checker)
