@@ -2334,7 +2334,7 @@ fn format_sarif(output: &AnalysisOutput) -> anyhow::Result<String> {
                 "driver": {
                     "name": "SAF",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "informationUri": "https://github.com/psa-lab/static-analyzer-factory",
+                    "informationUri": "https://github.com/Static-Analyzer-Factory/static-analyzer-factory",
                     "rules": rules,
                 }
             },

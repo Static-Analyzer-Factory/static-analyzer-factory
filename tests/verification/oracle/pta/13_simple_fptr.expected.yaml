@@ -1,0 +1,7 @@
+description: "Function pointer resolved by PTA"
+layer: pta
+difficulty: basic
+expectations:
+  points_to:
+    - pointer: "fp"
+      must_contain: [handler]

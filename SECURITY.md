@@ -4,7 +4,7 @@
 
 If you discover a security vulnerability in SAF, please report it responsibly.
 
-**Email:** [open an issue](https://github.com/ThePatrickStar/static-analyzer-factory/issues) with the label `security`, or contact the maintainers directly.
+**Email:** [open an issue](https://github.com/Static-Analyzer-Factory/static-analyzer-factory/issues) with the label `security`, or contact the maintainers directly.
 
 Please include:
 - A description of the vulnerability

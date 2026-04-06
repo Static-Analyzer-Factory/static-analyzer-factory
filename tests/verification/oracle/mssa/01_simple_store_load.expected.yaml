@@ -1,0 +1,8 @@
+description: "Simple store followed by load — reaching def is the store"
+layer: mssa
+difficulty: basic
+expectations:
+  reaching_def:
+    - use_line: 5
+      def_line: 4
+      variable: "x"

@@ -1,0 +1,11 @@
+description: "Mutually recursive call edges"
+layer: callgraph
+difficulty: basic
+expectations:
+  calls:
+    - caller: "test"
+      callees: [ping]
+    - caller: "ping"
+      callees: [pong]
+    - caller: "pong"
+      callees: [ping]

@@ -1,0 +1,8 @@
+description: "Switch statement with multiple cases creates one multi-successor block"
+layer: cfg
+difficulty: basic
+expectations:
+  cfg_edges:
+    - function: "test"
+      description: "One switch block with multiple successor edges"
+      branch_count: 1

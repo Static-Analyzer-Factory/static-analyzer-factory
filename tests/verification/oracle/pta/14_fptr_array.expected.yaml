@@ -1,0 +1,7 @@
+description: "Function pointer array dispatch"
+layer: pta
+difficulty: intermediate
+expectations:
+  points_to:
+    - pointer: "handlers"
+      must_contain: [a, b, c]

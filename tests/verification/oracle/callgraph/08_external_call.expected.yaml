@@ -1,0 +1,7 @@
+description: "External library function calls (libc)"
+layer: callgraph
+difficulty: basic
+expectations:
+  calls:
+    - caller: "test"
+      callees: [malloc, memset, free]

@@ -673,7 +673,7 @@ Change the default theme from `navy` to `light` and add theme.css:
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "light"
-git-repository-url = "https://github.com/ThePatrickStar/static-analyzer-factory"
+git-repository-url = "https://github.com/Static-Analyzer-Factory/static-analyzer-factory"
 additional-css = ["src/theme.css", "src/custom.css", "src/global-nav.css"]
 additional-js = ["src/global-nav.js"]
 ```

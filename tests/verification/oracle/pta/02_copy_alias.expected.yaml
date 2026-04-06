@@ -1,0 +1,12 @@
+description: "Copy propagates points-to set"
+layer: pta
+difficulty: basic
+expectations:
+  points_to:
+    - pointer: "p"
+      must_contain: [x]
+    - pointer: "q"
+      must_contain: [x]
+  alias:
+    - pair: [p, q]
+      relation: must_alias

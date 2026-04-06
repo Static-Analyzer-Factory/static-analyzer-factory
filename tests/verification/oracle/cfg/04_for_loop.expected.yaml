@@ -1,0 +1,8 @@
+description: "For loop creates a loop header with conditional branch"
+layer: cfg
+difficulty: basic
+expectations:
+  cfg_edges:
+    - function: "test"
+      description: "Loop condition block branches to body or exit"
+      branch_count: 1

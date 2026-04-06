@@ -1,0 +1,9 @@
+description: "Double pointer dereference chain"
+layer: pta
+difficulty: intermediate
+expectations:
+  points_to:
+    - pointer: "q"
+      must_contain: [x]
+    - pointer: "p"
+      must_contain: [q]

@@ -1,0 +1,8 @@
+description: "Return value flows from callee to caller"
+layer: svfg
+difficulty: basic
+expectations:
+  value_flow:
+    - from_line: 3
+      to_line: 7
+      description: "return value of produce() flows to x at call site"

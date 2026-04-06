@@ -1,0 +1,50 @@
+# Schema for oracle expected results files.
+# Each .c file has a companion .expected.yaml describing what SAF should compute.
+#
+# Naming convention:
+#   tests/verification/oracle/<layer>/<test_name>.c
+#   tests/verification/oracle/<layer>/<test_name>.expected.yaml
+
+# --- Top-level fields ---
+description: "Human-readable description of what this test verifies"
+layer: "pta | callgraph | cfg | mssa | svfg"
+difficulty: "basic | intermediate | advanced"
+
+# --- PTA expectations ---
+expectations:
+  points_to:
+    - pointer: "variable_name"       # Human-readable C variable name
+      at_line: 10                     # Source line (optional, for disambiguation)
+      must_contain: [x, y]            # SOUNDNESS: these MUST be in pts(p) — missing = BUG
+      may_only_contain: [x, y, z]     # PRECISION: only these should be in pts(p) — extra = WARN
+
+  alias:
+    - pair: [p, q]
+      relation: "must_alias | may_alias | no_alias"
+
+  # --- Call graph expectations ---
+  calls:
+    - caller: "main"
+      callees: [foo, bar]             # Direct + resolved indirect calls
+
+  indirect_targets:
+    - call_site_line: 15              # Line where indirect call occurs
+      targets: [handler_a, handler_b] # PTA-resolved targets
+
+  # --- CFG expectations ---
+  cfg_edges:
+    - function: "test"
+      block: "entry"                  # Block name (from LLVM IR label)
+      successors: [then_block, else_block]
+
+  # --- MSSA expectations ---
+  reaching_def:
+    - use_line: 10
+      def_line: 5
+      variable: "x"
+
+  # --- SVFG expectations ---
+  value_flow:
+    - from_line: 3
+      to_line: 8
+      description: "alloca flows to use via store+load"

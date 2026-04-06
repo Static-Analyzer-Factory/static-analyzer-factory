@@ -29,7 +29,8 @@ export default function SiteNav({ active, siteRoot = './', leftSlot }: SiteNavPr
         <a href={`${siteRoot}tutorials/`} className={cls('tutorials')}>Tutorials</a>
         <a href={`${siteRoot}playground/`} className={cls('playground')}>Playground</a>
         <a href={`${siteRoot}docs/`} className={cls('docs')}>Docs</a>
-        <a href="https://github.com" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <a href={`${siteRoot}rustdoc/saf_core/`}>API Docs</a>
+        <a href="https://github.com/Static-Analyzer-Factory/static-analyzer-factory" target="_blank" rel="noopener noreferrer">GitHub</a>
       </div>
     </nav>
   );

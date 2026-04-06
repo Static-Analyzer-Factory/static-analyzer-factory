@@ -85,7 +85,7 @@ def main() -> None:
                 "driver": {
                     "name": "SAF",
                     "version": "0.1.0",
-                    "informationUri": "https://github.com/anthropics/static-analyzer-factory",
+                    "informationUri": "https://github.com/Static-Analyzer-Factory/static-analyzer-factory",
                     "rules": [{
                         "id": "CWE-78",
                         "name": "OSCommandInjection",

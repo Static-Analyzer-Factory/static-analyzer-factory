@@ -1,0 +1,12 @@
+description: "Field-sensitive analysis distinguishes struct fields"
+layer: pta
+difficulty: intermediate
+expectations:
+  points_to:
+    - pointer: "a"
+      must_contain: [x]
+    - pointer: "b"
+      must_contain: [y]
+  alias:
+    - pair: [a, b]
+      relation: no_alias

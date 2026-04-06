@@ -1,0 +1,7 @@
+description: "Variadic function call edge"
+layer: callgraph
+difficulty: basic
+expectations:
+  calls:
+    - caller: "test"
+      callees: [sum]

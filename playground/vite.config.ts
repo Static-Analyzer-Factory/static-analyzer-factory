@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
-  base: process.env.GITHUB_PAGES ? '/static-analyzer-lib/playground/' : './',
+  base: process.env.GITHUB_PAGES ? '/static-analyzer-factory/playground/' : './',
   build: {
     outDir: 'dist',
     target: 'esnext',

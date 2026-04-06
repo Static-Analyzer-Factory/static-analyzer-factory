@@ -1,0 +1,9 @@
+description: "Callback stored in struct field and invoked through dispatch"
+layer: callgraph
+difficulty: advanced
+expectations:
+  calls:
+    - caller: "test"
+      callees: [dispatch]
+    - caller: "dispatch"
+      callees: [handle]

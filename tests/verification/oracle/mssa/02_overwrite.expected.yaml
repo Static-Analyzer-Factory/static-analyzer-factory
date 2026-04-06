@@ -1,0 +1,8 @@
+description: "Second store overwrites first — reaching def is the last store"
+layer: mssa
+difficulty: basic
+expectations:
+  reaching_def:
+    - use_line: 6
+      def_line: 5
+      variable: "x"

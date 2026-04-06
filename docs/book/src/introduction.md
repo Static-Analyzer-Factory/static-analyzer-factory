@@ -62,7 +62,7 @@ The fastest way to try SAF:
 2. **Locally with Docker:**
 
    ```bash
-   git clone https://github.com/ThePatrickStar/static-analyzer-factory.git
+   git clone https://github.com/Static-Analyzer-Factory/static-analyzer-factory.git
    cd static-analyzer-factory
    make shell
    # Inside the container:

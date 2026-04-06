@@ -1,0 +1,8 @@
+description: "Nested if/else creates two distinct branch points"
+layer: cfg
+difficulty: basic
+expectations:
+  cfg_edges:
+    - function: "test"
+      description: "Two if/else branch points (outer and inner)"
+      branch_count: 2

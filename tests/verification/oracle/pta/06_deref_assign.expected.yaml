@@ -1,0 +1,9 @@
+description: "Store through pointer reassigns target"
+layer: pta
+difficulty: intermediate
+expectations:
+  points_to:
+    - pointer: "pp"
+      must_contain: [p]
+    - pointer: "p"
+      must_contain: [x, y]

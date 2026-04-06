@@ -352,12 +352,20 @@ To sync references after editing core content: `skills/saf-checker-dev/build.sh`
 ## Session Workflow (MANDATORY)
 
 ### On session start
-1. Read `CHANGELOG.md` to understand current development state
-2. Browse `plans/` for context on specific feature areas
+1. Read `plans/PROGRESS.md` to understand current development state
+2. Read the plan file for the current/next task listed in "Next Steps"
 
 ### After brainstorming a new plan
 1. Save the plan to `plans/NNN-<topic>.md` (increment NNN from the last plan)
-2. Update `CHANGELOG.md` if a new milestone is reached
+2. Update `plans/PROGRESS.md`:
+   - Add the new plan to the Plans Index with status "approved"
+   - Update "Next Steps" if appropriate
+   - Append to Session Log
 
 ### After ANY implementation work (complete OR partial)
-1. Update `CHANGELOG.md` with summary of significant changes
+1. Update `plans/PROGRESS.md`:
+   - If plan fully implemented: set plan status to "done"
+   - If partial (bugs, blockers, session ending): set plan status to "in-progress" and
+     add Notes describing what's done, what remains, and any blockers
+   - Update "Next Steps" for the next session
+   - Append to Session Log with summary of work done

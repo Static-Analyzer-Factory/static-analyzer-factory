@@ -1,0 +1,11 @@
+description: "Conditional stores create a phi node at merge point"
+layer: mssa
+difficulty: intermediate
+expectations:
+  reaching_def:
+    - use_line: 11
+      def_line: 7
+      variable: "x"
+    - use_line: 11
+      def_line: 9
+      variable: "x"

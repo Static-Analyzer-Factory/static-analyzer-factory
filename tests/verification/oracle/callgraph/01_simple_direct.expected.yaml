@@ -1,0 +1,7 @@
+description: "Simple direct function calls"
+layer: callgraph
+difficulty: basic
+expectations:
+  calls:
+    - caller: "test"
+      callees: [foo, bar]

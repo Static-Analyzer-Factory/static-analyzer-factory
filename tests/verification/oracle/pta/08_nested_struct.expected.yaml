@@ -1,0 +1,7 @@
+description: "Nested struct field pointer access"
+layer: pta
+difficulty: intermediate
+expectations:
+  points_to:
+    - pointer: "p"
+      must_contain: [x]

@@ -1,0 +1,10 @@
+target/
+.git/
+.venv/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+.DS_Store
+plans/
+.cache/

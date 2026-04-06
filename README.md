@@ -23,7 +23,7 @@ A Rust-powered static analysis framework with a Python SDK for finding bugs in C
 SAF runs inside Docker (LLVM 18 + all dependencies included).
 
 ```bash
-git clone https://github.com/ThePatrickStar/static-analyzer-factory.git
+git clone https://github.com/Static-Analyzer-Factory/static-analyzer-factory.git
 cd static-analyzer-factory
 make shell
 ```
@@ -96,11 +96,23 @@ Input (.ll / .bc)
 - Source-level frontends (Clang AST, rust-analyzer) — architecture is ready, implementation is planned
 - Symbolic execution
 
+## AI-Assisted Development
+
+SAF ships coding-agent skills that guide AI assistants through SAF-specific development workflows. These work with Claude Code, Codex, and other coding agents.
+
+| Skill | Purpose | Install |
+|-------|---------|---------|
+| [**saf-feature-dev**](skills/saf-feature-dev/) | 8-phase workflow for adding features (frontends, analysis, SDK, CLI) | `claude plugin add skills/saf-feature-dev/claude-code` |
+| [**saf-checker-dev**](skills/saf-checker-dev/) | Spec-first workflow for creating bug-finding checkers | `claude plugin add skills/saf-checker-dev/claude-code` |
+
+These skills provide SAF-specific guidance including e2e testing recipes, `SAF_LOG` debug instrumentation, benchmark validation, and determinism checks. See each skill's README for details.
+
 ## Documentation
 
-- [**Docs**](https://thepatrickstar.github.io/static-analyzer-factory/docs/) — concepts, API reference, getting started
-- [**Tutorials**](https://thepatrickstar.github.io/static-analyzer-factory/tutorials/) — step-by-step guides from hello-taint to custom checkers
-- [**Playground**](https://thepatrickstar.github.io/static-analyzer-factory/playground/) — try SAF in the browser (WASM build)
+- [**Docs**](https://static-analyzer-factory.github.io/static-analyzer-factory/docs/) — concepts, API reference, getting started
+- [**Tutorials**](https://static-analyzer-factory.github.io/static-analyzer-factory/tutorials/) — step-by-step guides from hello-taint to custom checkers
+- [**Playground**](https://static-analyzer-factory.github.io/static-analyzer-factory/playground/) — try SAF in the browser (WASM build)
+- [**API Docs**](https://static-analyzer-factory.github.io/static-analyzer-factory/rustdoc/saf_core/) — Rust API reference (rustdoc)
 
 ## Contributing
 

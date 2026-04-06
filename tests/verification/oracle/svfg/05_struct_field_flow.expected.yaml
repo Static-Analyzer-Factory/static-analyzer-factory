@@ -1,0 +1,8 @@
+description: "Value flows through struct field store and load"
+layer: svfg
+difficulty: intermediate
+expectations:
+  value_flow:
+    - from_line: 6
+      to_line: 7
+      description: "value 42 flows through d.value store to load"

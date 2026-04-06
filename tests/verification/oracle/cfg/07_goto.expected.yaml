@@ -1,0 +1,8 @@
+description: "Goto creates unconditional edge"
+layer: cfg
+difficulty: basic
+expectations:
+  cfg_edges:
+    - function: "test"
+      description: "Goto is unconditional, no conditional branches"
+      branch_count: 0

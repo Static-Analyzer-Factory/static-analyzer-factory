@@ -1,0 +1,11 @@
+description: "Three-level pointer chain"
+layer: pta
+difficulty: intermediate
+expectations:
+  points_to:
+    - pointer: "c"
+      must_contain: [x]
+    - pointer: "b"
+      must_contain: [c]
+    - pointer: "a"
+      must_contain: [b]

@@ -1,0 +1,7 @@
+description: "Malloc creates a fresh heap location"
+layer: pta
+difficulty: basic
+expectations:
+  points_to:
+    - pointer: "p"
+      must_contain: ["malloc@test"]

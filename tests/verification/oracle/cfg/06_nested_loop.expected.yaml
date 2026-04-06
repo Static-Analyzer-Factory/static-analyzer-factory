@@ -1,0 +1,8 @@
+description: "Nested loops create two loop condition branches"
+layer: cfg
+difficulty: intermediate
+expectations:
+  cfg_edges:
+    - function: "test"
+      description: "Outer and inner loop condition branches"
+      branch_count: 2

@@ -7,28 +7,48 @@ on:
       - 'crates/saf-wasm/**'
       - 'crates/saf-core/**'
       - 'crates/saf-analysis/**'
+      - 'crates/saf-frontends/**'
+      - 'crates/saf-python/**'
+      - 'crates/saf-cli/**'
       - 'packages/shared/**'
       - 'playground/**'
       - 'site/**'
       - 'docs/book/**'
       - 'tutorials/**'
+      - '.github/workflows/playground.yml'
   pull_request:
     paths:
       - 'crates/saf-wasm/**'
       - 'crates/saf-core/**'
       - 'crates/saf-analysis/**'
+      - 'crates/saf-frontends/**'
+      - 'crates/saf-python/**'
+      - 'crates/saf-cli/**'
       - 'packages/shared/**'
       - 'playground/**'
       - 'site/**'
       - 'docs/book/**'
       - 'tutorials/**'
+      - '.github/workflows/playground.yml'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      # LLVM 18 (needed for rustdoc of saf-frontends, saf-analysis, etc.)
+      - name: Install LLVM 18
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-18-dev libclang-18-dev clang-18 libpolly-18-dev libzstd-dev
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Set LLVM env
+        run: echo "LLVM_SYS_181_PREFIX=/usr/lib/llvm-18" >> $GITHUB_ENV
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -45,6 +65,12 @@ jobs:
 
       - name: Build WASM
         run: wasm-pack build crates/saf-wasm --target web --release --out-dir ../../packages/shared/src/wasm
+
+      # Rustdoc for all crates
+      - name: Build rustdoc
+        run: cargo doc --workspace --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: "--enable-index-page -Zunstable-options"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -64,13 +90,11 @@ jobs:
         env:
           GITHUB_PAGES: '1'
 
-      # Build landing page
       - name: Build landing page
         run: cd site && npm run build
         env:
           GITHUB_PAGES: '1'
 
-      # Build documentation
       - name: Install mdBook
         run: |
           mkdir -p $HOME/.local/bin
@@ -80,7 +104,6 @@ jobs:
       - name: Build docs
         run: cd docs/book && mdbook build
 
-      # Build tutorials
       - name: Build tutorials
         run: cd tutorials && npm run build
         env:
@@ -89,15 +112,16 @@ jobs:
       # Assemble site directory
       - name: Assemble site directory
         run: |
-          mkdir -p _site/playground _site/docs _site/tutorials
+          mkdir -p _site/playground _site/docs _site/tutorials _site/rustdoc
           cp -r site/dist/* _site/
           cp -r playground/dist/* _site/playground/
           cp -r docs/book/build/* _site/docs/
           cp -r tutorials/dist/* _site/tutorials/
+          cp -r target/doc/* _site/rustdoc/
 
-      # - name: Deploy to GitHub Pages
-      #   if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-      #   uses: peaceiris/actions-gh-pages@v4
-      #   with:
-      #     github_token: ${{ secrets.GITHUB_TOKEN }}
-      #     publish_dir: ./_site
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./_site

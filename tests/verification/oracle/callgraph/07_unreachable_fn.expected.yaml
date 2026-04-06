@@ -1,0 +1,7 @@
+description: "Unreachable function has no incoming call edges"
+layer: callgraph
+difficulty: basic
+expectations:
+  calls:
+    - caller: "test"
+      callees: [reachable]

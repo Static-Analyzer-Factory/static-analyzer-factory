@@ -1,0 +1,7 @@
+description: "Global pointer initialization"
+layer: pta
+difficulty: basic
+expectations:
+  points_to:
+    - pointer: "g_ptr"
+      must_contain: [g_val]

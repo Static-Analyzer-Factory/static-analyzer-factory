@@ -1,0 +1,14 @@
+description: "Value flows caller to callee to return to caller"
+layer: svfg
+difficulty: intermediate
+expectations:
+  value_flow:
+    - from_line: 7
+      to_line: 2
+      description: "a flows from call site to parameter x of transform"
+    - from_line: 2
+      to_line: 3
+      description: "parameter x flows to return expression"
+    - from_line: 3
+      to_line: 8
+      description: "return value flows back to b at call site"

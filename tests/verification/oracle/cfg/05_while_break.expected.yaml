@@ -1,0 +1,8 @@
+description: "While loop with break creates two branch points"
+layer: cfg
+difficulty: intermediate
+expectations:
+  cfg_edges:
+    - function: "test"
+      description: "Loop condition branch plus if/break branch"
+      branch_count: 2

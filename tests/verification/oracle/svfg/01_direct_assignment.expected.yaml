@@ -1,0 +1,11 @@
+description: "Direct assignment chain creates value-flow edges"
+layer: svfg
+difficulty: basic
+expectations:
+  value_flow:
+    - from_line: 3
+      to_line: 4
+      description: "x flows to y via direct assignment"
+    - from_line: 4
+      to_line: 5
+      description: "y flows to z via direct assignment"

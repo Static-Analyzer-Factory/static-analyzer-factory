@@ -1,0 +1,11 @@
+description: "Value flows from argument to parameter"
+layer: svfg
+difficulty: basic
+expectations:
+  value_flow:
+    - from_line: 8
+      to_line: 2
+      description: "argument 42 flows from call site to parameter x"
+    - from_line: 2
+      to_line: 3
+      description: "parameter x flows to y via direct assignment"

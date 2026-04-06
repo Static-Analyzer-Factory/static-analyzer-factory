@@ -1,0 +1,8 @@
+description: "Early return creates one conditional branch point"
+layer: cfg
+difficulty: basic
+expectations:
+  cfg_edges:
+    - function: "test"
+      description: "If condition branches to early return or continuation"
+      branch_count: 1

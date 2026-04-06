@@ -16,7 +16,8 @@
     '<a href="' + siteRoot + 'tutorials/">Tutorials</a>' +
     '<a href="' + siteRoot + 'playground/">Playground</a>' +
     '<a href="' + docsRoot + '" class="global-nav-active">Docs</a>' +
-    '<a href="https://github.com" target="_blank" rel="noopener noreferrer">GitHub</a>' +
+    '<a href="' + siteRoot + 'rustdoc/saf_core/">API Docs</a>' +
+    '<a href="https://github.com/Static-Analyzer-Factory/static-analyzer-factory" target="_blank" rel="noopener noreferrer">GitHub</a>' +
     '</div>';
 
   document.body.insertBefore(nav, document.body.firstChild);

@@ -1,0 +1,7 @@
+description: "Two malloc calls produce distinct locations"
+layer: pta
+difficulty: basic
+expectations:
+  alias:
+    - pair: [p, q]
+      relation: no_alias

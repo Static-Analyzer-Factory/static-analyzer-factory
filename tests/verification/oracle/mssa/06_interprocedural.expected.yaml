@@ -1,0 +1,8 @@
+description: "Store in callee visible after call returns"
+layer: mssa
+difficulty: intermediate
+expectations:
+  reaching_def:
+    - use_line: 9
+      def_line: 3
+      variable: "x"

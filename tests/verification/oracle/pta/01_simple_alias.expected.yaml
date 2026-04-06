@@ -1,0 +1,8 @@
+description: "Address-of creates a single points-to edge"
+layer: pta
+difficulty: basic
+expectations:
+  points_to:
+    - pointer: "p"
+      must_contain: [x]
+      may_only_contain: [x]

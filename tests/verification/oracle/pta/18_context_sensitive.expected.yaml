@@ -1,0 +1,12 @@
+description: "Context sensitivity test — same function, different args"
+layer: pta
+difficulty: advanced
+expectations:
+  points_to:
+    # Context-insensitive (Andersen): both a and b point to {x, y}
+    - pointer: "a"
+      must_contain: [x]
+      may_only_contain: [x, y]
+    - pointer: "b"
+      must_contain: [y]
+      may_only_contain: [x, y]

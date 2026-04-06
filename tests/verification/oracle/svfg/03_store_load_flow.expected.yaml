@@ -1,0 +1,8 @@
+description: "Value flows through store and load pair"
+layer: svfg
+difficulty: basic
+expectations:
+  value_flow:
+    - from_line: 3
+      to_line: 5
+      description: "value of x flows to y via store+load through pointer p"

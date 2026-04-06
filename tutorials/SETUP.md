@@ -11,7 +11,7 @@ This guide covers the one-time setup required before working through any SAF tut
 ## Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/anthropics/static-analyzer-factory.git
+git clone https://github.com/Static-Analyzer-Factory/static-analyzer-factory.git
 cd static-analyzer-factory
 ```
 

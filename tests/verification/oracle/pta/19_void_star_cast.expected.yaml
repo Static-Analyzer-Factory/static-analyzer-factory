@@ -1,0 +1,9 @@
+description: "void* cast preserves points-to"
+layer: pta
+difficulty: basic
+expectations:
+  points_to:
+    - pointer: "v"
+      must_contain: [x]
+    - pointer: "p"
+      must_contain: [x]

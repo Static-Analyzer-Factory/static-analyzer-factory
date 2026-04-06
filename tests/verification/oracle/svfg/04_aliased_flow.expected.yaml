@@ -1,0 +1,8 @@
+description: "Value flows through aliased pointers"
+layer: svfg
+difficulty: intermediate
+expectations:
+  value_flow:
+    - from_line: 3
+      to_line: 6
+      description: "value of x flows to y through alias chain p -> q"

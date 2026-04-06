@@ -1,0 +1,8 @@
+description: "If/else creates two successor edges"
+layer: cfg
+difficulty: basic
+expectations:
+  cfg_edges:
+    - function: "test"
+      description: "Condition block has two successors (then, else)"
+      branch_count: 2

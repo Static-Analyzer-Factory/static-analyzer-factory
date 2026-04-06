@@ -1,0 +1,8 @@
+description: "Global variable modified by function call"
+layer: mssa
+difficulty: intermediate
+expectations:
+  reaching_def:
+    - use_line: 10
+      def_line: 5
+      variable: "g"

@@ -31,8 +31,8 @@ with Rust, Python 3.12, LLVM 18, and all dependencies pre-installed.
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/nicholasgasior/static-analyzer-lib.git
-cd static-analyzer-lib
+git clone https://github.com/Static-Analyzer-Factory/static-analyzer-factory.git
+cd static-analyzer-factory
 ```
 
 ### Step 2: Start the Development Shell

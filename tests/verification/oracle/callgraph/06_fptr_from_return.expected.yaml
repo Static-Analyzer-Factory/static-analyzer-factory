@@ -1,0 +1,7 @@
+description: "Function pointer returned from function then called"
+layer: callgraph
+difficulty: intermediate
+expectations:
+  calls:
+    - caller: "test"
+      callees: [get_handler, actual_handler]

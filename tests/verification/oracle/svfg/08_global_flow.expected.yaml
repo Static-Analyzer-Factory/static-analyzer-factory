@@ -1,0 +1,8 @@
+description: "Value flows through global variable from writer to reader"
+layer: svfg
+difficulty: intermediate
+expectations:
+  value_flow:
+    - from_line: 5
+      to_line: 9
+      description: "value 42 flows from writer's store to g to reader's load from g"

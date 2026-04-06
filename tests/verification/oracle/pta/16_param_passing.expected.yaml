@@ -1,0 +1,7 @@
+description: "Pointer flows through function parameter"
+layer: pta
+difficulty: basic
+expectations:
+  points_to:
+    - pointer: "p"
+      must_contain: [x]
