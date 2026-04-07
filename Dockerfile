@@ -9,10 +9,10 @@ FROM ubuntu:24.04 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# APT mirror override. Set APT_MIRROR in your .env or docker-compose to use
-# a faster mirror for your region (e.g., mirrors.aliyun.com for China,
-# mirrors.ustc.edu.cn for USTC). Leave empty for default Ubuntu mirrors.
-ARG APT_MIRROR=
+# APT mirror override. Set to "" to keep the default Ubuntu mirrors.
+# Default: mirrors.aliyun.com (fast in China; the stock ports/archive mirrors
+# are extremely slow from many networks).
+ARG APT_MIRROR=mirrors.aliyun.com
 RUN if [ -n "$APT_MIRROR" ]; then \
       sed -i "s|ports.ubuntu.com|${APT_MIRROR}|g; s|archive.ubuntu.com|${APT_MIRROR}|g" \
         /etc/apt/sources.list.d/ubuntu.sources; \
@@ -107,7 +107,7 @@ CMD ["sh", "-c", "cargo nextest run --workspace --exclude saf-python && pytest p
 # -----------------------------------------------------------------------------
 FROM ubuntu:24.04 AS runtime
 
-ARG APT_MIRROR=
+ARG APT_MIRROR=mirrors.aliyun.com
 RUN if [ -n "$APT_MIRROR" ]; then \
       sed -i "s|ports.ubuntu.com|${APT_MIRROR}|g; s|archive.ubuntu.com|${APT_MIRROR}|g" \
         /etc/apt/sources.list.d/ubuntu.sources; \
