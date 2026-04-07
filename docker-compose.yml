@@ -4,7 +4,7 @@ services:
       context: .
       target: dev
       args:
-        APT_MIRROR: ${APT_MIRROR-mirrors.aliyun.com}
+        APT_MIRROR: ${APT_MIRROR-}
     user: "${UID:-1000}:${GID:-1000}"
     environment:
       - NEO4J_URI=bolt://neo4j:7687
@@ -26,7 +26,7 @@ services:
       context: .
       target: dev
       args:
-        APT_MIRROR: ${APT_MIRROR-mirrors.aliyun.com}
+        APT_MIRROR: ${APT_MIRROR-}
     user: "${UID:-1000}:${GID:-1000}"
     environment:
       - SKIP_MATURIN_BUILD=1
@@ -52,14 +52,14 @@ services:
       context: .
       target: test
       args:
-        APT_MIRROR: ${APT_MIRROR-mirrors.aliyun.com}
+        APT_MIRROR: ${APT_MIRROR-}
 
   build:
     build:
       context: .
       target: runtime
       args:
-        APT_MIRROR: ${APT_MIRROR-mirrors.aliyun.com}
+        APT_MIRROR: ${APT_MIRROR-}
 
   neo4j:
     image: neo4j:5-community
