@@ -67,6 +67,12 @@ RUN pip3 install --break-system-packages maturin>=1.7
 
 WORKDIR /workspace
 
+# Pre-create volume mount points with permissive permissions so that
+# Docker named volumes (which are root-owned on first creation) are
+# writable by the non-root UID specified in docker-compose.yml.
+RUN mkdir -p /workspace/target /workspace/target-maturin && \
+    chmod 777 /workspace/target /workspace/target-maturin
+
 # -----------------------------------------------------------------------------
 # Stage: dev — interactive development shell
 # -----------------------------------------------------------------------------

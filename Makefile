@@ -17,13 +17,13 @@ test: ## Run all tests (Rust + Python, cached)
 	docker compose run --rm test
 
 test-rust: ## Run Rust tests only (no Python rebuild)
-	docker compose run --rm dev sh -c "cargo nextest run --workspace --exclude saf-python"
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c "cargo nextest run --workspace --exclude saf-python"
 
 test-python: ## Run Python tests only (assumes extension is built)
 	docker compose run --rm dev sh -c "pytest python/tests/ -v"
 
 test-crate: ## Run tests for a single crate (usage: make test-crate CRATE=saf-core)
-	docker compose run --rm dev sh -c "cargo nextest run -p $(CRATE)"
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c "cargo nextest run -p $(CRATE)"
 
 test-clean: ## Run all tests (hermetic — clean build, no cache)
 	docker compose run --rm --build test-clean
@@ -39,7 +39,7 @@ lint-fmt: ## Run rustfmt check only inside Docker
 		"cargo fmt --all -- --check"
 
 fmt: ## Auto-format all Rust code inside Docker
-	docker compose run --rm dev cargo fmt --all
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo fmt --all
 
 shell: ## Open an interactive dev shell inside Docker
 	docker compose run --rm dev
@@ -78,17 +78,17 @@ bench-incremental: ## Run incremental analysis benchmark (CPython, requires comp
 
 compile-ptaben: ## Compile PTABen test suite with LLVM 18 (run once after clone/update)
 	@echo "Compiling PTABen test suite..."
-	docker compose run --rm dev ./scripts/compile-ptaben.sh
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev ./scripts/compile-ptaben.sh
 
 test-ptaben: ## Run PTABen benchmark suite against SAF
 	@echo "Running PTABen benchmarks..."
-	docker compose run --rm dev sh -c '\
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c '\
 	  cargo build --release -p saf-cli && \
 	  cargo run --release -p saf-bench -- ptaben \
 	    --compiled-dir tests/benchmarks/ptaben/.compiled'
 
 test-ptaben-json: ## Run PTABen benchmarks with JSON output
-	docker compose run --rm dev sh -c '\
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c '\
 	  cargo build --release -p saf-cli && \
 	  cargo run --release -p saf-bench -- ptaben \
 	    --compiled-dir tests/benchmarks/ptaben/.compiled \
@@ -105,18 +105,18 @@ SVCOMP_FLAGS := $(if $(filter 1,$(AGGRESSIVE)),--aggressive,)
 
 compile-svcomp: ## Compile SV-COMP benchmarks with LLVM 18 (run once after clone/update)
 	@echo "Compiling SV-COMP benchmarks..."
-	docker compose run --rm dev ./scripts/compile-svcomp.sh --verbose
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev ./scripts/compile-svcomp.sh --verbose
 
 compile-svcomp-category: ## Compile single SV-COMP category (CAT=ReachSafety)
-	docker compose run --rm dev ./scripts/compile-svcomp.sh --category $(CAT) --verbose
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev ./scripts/compile-svcomp.sh --category $(CAT) --verbose
 
 test-svcomp: ## Run SV-COMP benchmarks (AGGRESSIVE=1 for aggressive mode)
 	@echo "Running SV-COMP benchmarks$(if $(filter 1,$(AGGRESSIVE)), (aggressive mode),)..."
-	docker compose run --rm dev cargo run --release -p saf-bench -- svcomp \
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo run --release -p saf-bench -- svcomp \
 		--compiled-dir tests/benchmarks/sv-benchmarks/.compiled $(SVCOMP_FLAGS)
 
 test-svcomp-category: ## Run single SV-COMP category (CAT=memsafety AGGRESSIVE=1)
-	docker compose run --rm dev cargo run --release -p saf-bench -- svcomp \
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo run --release -p saf-bench -- svcomp \
 		--compiled-dir tests/benchmarks/sv-benchmarks/.compiled \
 		--category $(CAT) $(SVCOMP_FLAGS)
 
@@ -154,7 +154,7 @@ svcomp-categories: ## List available SV-COMP benchmark categories
 	@echo "       make test-svcomp-category CAT=memsafety AGGRESSIVE=1"
 
 test-svcomp-json: ## Run SV-COMP benchmarks with JSON output (AGGRESSIVE=1 supported)
-	docker compose run --rm dev cargo run --release -p saf-bench -- svcomp \
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo run --release -p saf-bench -- svcomp \
 		--compiled-dir tests/benchmarks/sv-benchmarks/.compiled \
 		--json $(SVCOMP_FLAGS)
 
@@ -166,16 +166,16 @@ clean-svcomp: ## Remove compiled SV-COMP bitcode
 
 compile-juliet: ## Compile Juliet tests (15 supported CWEs) with LLVM 18 + mem2reg
 	@echo "Compiling Juliet test suite..."
-	docker compose run --rm dev ./scripts/compile-juliet.sh --verbose
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev ./scripts/compile-juliet.sh --verbose
 
 test-juliet: ## Run Juliet benchmarks with precision/recall/F1 (CWE=CWE476 to filter)
 	@echo "Running Juliet benchmarks..."
-	docker compose run --rm dev cargo run --release -p saf-bench -- juliet \
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo run --release -p saf-bench -- juliet \
 		--compiled-dir tests/benchmarks/sv-benchmarks/.compiled-juliet \
 		$(if $(CWE),--cwe $(CWE),)
 
 test-juliet-json: ## Run Juliet benchmarks with JSON output to file
-	docker compose run --rm dev cargo run --release -p saf-bench -- juliet \
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo run --release -p saf-bench -- juliet \
 		--compiled-dir tests/benchmarks/sv-benchmarks/.compiled-juliet \
 		$(if $(CWE),--cwe $(CWE),) \
 		-o /workspace/tests/benchmarks/sv-benchmarks/juliet-results.json
@@ -213,13 +213,13 @@ clean-juliet: ## Remove compiled Juliet bitcode
 # Daily: make test-cruxbc FILTER=small && make compare-cruxbc
 
 prepare-cruxbc: ## Convert cruxbc .bc → .ll with mem2reg (LLVM 18, one-time)
-	docker compose run --rm dev ./scripts/prepare-cruxbc.sh
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev ./scripts/prepare-cruxbc.sh
 
 test-cruxbc: ## Run SAF benchmark (use FILTER=small for fast feedback)
 	@[ -f tests/benchmarks/cruxbc/saf-results.json ] && \
 	  mv tests/benchmarks/cruxbc/saf-results.json \
 	     tests/benchmarks/cruxbc/saf-results.prev.json || true
-	docker compose run --rm dev sh -c '\
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c '\
 	  cargo build --release -p saf-cli && \
 	  cargo run --release -p saf-bench -- cruxbc \
 	    --compiled-dir tests/benchmarks/cruxbc/.compiled \
@@ -238,7 +238,7 @@ test-cruxbc-svf-mem2reg: ## Run SVF on mem2reg-optimized .ll files (apples-to-ap
 	  -o tests/benchmarks/cruxbc/svf-mem2reg-results.json
 
 test-cruxbc-llvm-cg: ## Run LLVM callgraph pass for cross-check (use FILTER=small)
-	docker compose run --rm dev ./scripts/run-llvm-cg-cruxbc.sh \
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev ./scripts/run-llvm-cg-cruxbc.sh \
 	  --compiled-dir tests/benchmarks/cruxbc/.compiled \
 	  $(if $(FILTER),--filter $(FILTER)) \
 	  -o /workspace/tests/benchmarks/cruxbc/llvm-cg-results.json
@@ -260,23 +260,23 @@ clean-cruxbc: ## Remove compiled .ll files and all results
 
 compile-oracle: ## Compile oracle C programs to LLVM IR
 	@echo "Compiling oracle verification programs..."
-	docker compose run --rm dev ./scripts/compile-oracle.sh \
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev ./scripts/compile-oracle.sh \
 		$(if $(LAYER),--layer $(LAYER),)
 
 verify-oracle: ## Run oracle verification suite (LAYER=pta to filter)
 	@echo "Running oracle verification suite..."
-	docker compose run --rm dev cargo run --release -p saf-bench -- oracle \
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo run --release -p saf-bench -- oracle \
 		--oracle-dir tests/verification/oracle \
 		$(if $(LAYER),--layer $(LAYER),)
 
 verify-props: ## Run property tests with 10000 iterations
 	@echo "Running property tests (10000 iterations)..."
-	docker compose run --rm dev sh -c \
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c \
 		"PROPTEST_CASES=10000 cargo nextest run --workspace --exclude saf-python -E 'test(proptest) | test(constraint_extraction)'"
 
 verify-props-quick: ## Run property tests with 256 iterations (fast feedback)
 	@echo "Running property tests (256 iterations)..."
-	docker compose run --rm dev sh -c \
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c \
 		"cargo nextest run --workspace --exclude saf-python -E 'test(proptest) | test(constraint_extraction)'"
 
 verify-quick: verify-props-quick verify-oracle ## Quick verification (proptest + oracle)
