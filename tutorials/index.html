@@ -3,8 +3,59 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>SAF Tutorials — Learn Static Analysis</title>
-    <meta name="description" content="Interactive tutorials for learning static analysis with the Static Analyzer Factory." />
+    <meta name="theme-color" content="#3d9b8f" />
+    <meta name="color-scheme" content="light dark" />
+
+    <title>SAF Tutorials — Learn Static Program Analysis Interactively</title>
+    <meta name="description" content="Interactive, browser-based tutorials on static program analysis: pointer analysis, memory SSA, value-flow graphs, taint tracking, and security bug detection. Powered by the Static Analyzer Factory (Rust + WebAssembly)." />
+    <meta name="keywords" content="static analysis tutorial, pointer analysis, Andersen, k-CFA, memory SSA, value flow, IFDS taint, use-after-free, double free, memory leak, command injection, learn program analysis" />
+    <meta name="author" content="Static Analyzer Factory" />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+
+    <link rel="canonical" href="https://static-analyzer-factory.github.io/static-analyzer-factory/tutorials/" />
+    <link rel="icon" href="/favicon.ico" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Static Analyzer Factory" />
+    <meta property="og:title" content="SAF Tutorials — Learn Static Program Analysis" />
+    <meta property="og:description" content="Interactive tutorials on pointer analysis, value-flow, taint tracking, and bug detection — all in the browser." />
+    <meta property="og:url" content="https://static-analyzer-factory.github.io/static-analyzer-factory/tutorials/" />
+    <meta property="og:image" content="https://static-analyzer-factory.github.io/static-analyzer-factory/og-image.svg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="SAF Tutorials — learn static program analysis interactively" />
+    <meta property="og:locale" content="en_US" />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="SAF Tutorials — Static Program Analysis" />
+    <meta name="twitter:description" content="Hands-on lessons on pointer analysis, memory SSA, taint tracking, and security bug detection — in the browser." />
+    <meta name="twitter:image" content="https://static-analyzer-factory.github.io/static-analyzer-factory/og-image.svg" />
+
+    <!-- Structured data -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "Course",
+      "name": "Static Analyzer Factory Tutorials",
+      "description": "Interactive tutorials covering pointer analysis, value-flow, memory SSA, IFDS taint, and bug detection with SAF.",
+      "provider": {
+        "@type": "Organization",
+        "name": "Static Analyzer Factory",
+        "sameAs": "https://github.com/Static-Analyzer-Factory/static-analyzer-factory"
+      },
+      "inLanguage": "en",
+      "url": "https://static-analyzer-factory.github.io/static-analyzer-factory/tutorials/",
+      "isAccessibleForFree": true,
+      "hasCourseInstance": {
+        "@type": "CourseInstance",
+        "courseMode": "online",
+        "courseWorkload": "PT8H"
+      }
+    }
+    </script>
+
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
