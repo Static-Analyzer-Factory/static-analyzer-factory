@@ -19,10 +19,20 @@
 }
 
 .global-nav-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
   font-weight: 700;
   font-size: 1.1rem;
   color: var(--color-accent, #3d9b8f);
   text-decoration: none;
+}
+
+.global-nav-logo {
+  display: block;
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
 }
 
 .global-nav-links {
