@@ -88,6 +88,32 @@ Input (.ll / .bc)
         → Queries & checkers → Findings (JSON / SARIF)
 ```
 
+## Benchmark Results
+
+SAF's memory-safety checkers evaluated on the [NIST Juliet C/C++ Test Suite](https://samate.nist.gov/SARD/test-suites/112), compared against [SVF](https://github.com/SVF-tools/SVF) and [Lotus](https://github.com/ZJU-PL/lotus).
+
+### Memory Leak (CWE-401) — 1,408 tests
+
+| Tool | TP | FP | FN | TN | Precision | Recall | F1 |
+|:-----|---:|---:|---:|---:|----------:|-------:|---:|
+| **SAF** | **694** | **85** | **16** | **613** | **89.1%** | **97.7%** | **0.932** |
+| SVF | 666 | 144 | 44 | 554 | 82.2% | 93.8% | 0.876 |
+
+### Double Free (CWE-415) — 385 tests
+
+| Tool | TP | FP | FN | TN | Precision | Recall | F1 |
+|:-----|---:|---:|---:|---:|----------:|-------:|---:|
+| **SAF** | **180** | **5** | **15** | **185** | **97.3%** | **92.3%** | **0.947** |
+| SVF | 170 | 0 | 25 | 190 | 100.0% | 87.2% | 0.932 |
+| Lotus | 163 | 34 | 32 | 156 | 82.7% | 83.6% | 0.829 |
+
+### Use-After-Free (CWE-416) — 236 tests
+
+| Tool | TP | FP | FN | TN | Precision | Recall | F1 |
+|:-----|---:|---:|---:|---:|----------:|-------:|---:|
+| **SAF** | **90** | **4** | **28** | **114** | **95.7%** | **76.3%** | **0.849** |
+| Lotus | 92 | 14 | 26 | 104 | 86.8% | 78.0% | 0.784 |
+
 ## Known Limitations
 
 **Analysis precision:**
