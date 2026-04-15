@@ -114,6 +114,13 @@ SAF's memory-safety checkers evaluated on the [NIST Juliet C/C++ Test Suite](htt
 | **SAF** | **90** | **4** | **28** | **114** | **95.7%** | **76.3%** | **0.849** |
 | Lotus | 92 | 14 | 26 | 104 | 86.8% | 78.0% | 0.784 |
 
+### Null Pointer Dereference (CWE-476) — 468 tests
+
+| Tool | TP | FP | FN | TN | Precision | Recall | F1 |
+|:-----|---:|---:|---:|---:|----------:|-------:|---:|
+| SAF | 188 | 79 | 46 | 155 | 70.4% | 80.3% | 0.750 |
+| **Lotus** | **199** | **55** | **35** | **179** | **78.3%** | **85.0%** | **0.792** |
+
 ## Known Limitations
 
 **Analysis precision:**
