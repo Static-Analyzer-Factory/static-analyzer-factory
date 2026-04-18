@@ -1,6 +1,7 @@
 .PHONY: test test-rust test-python test-crate test-clean lint lint-clippy lint-fmt fmt shell build rebuild clean cloc help \
 	compile-lua-fixtures test-incremental bench-incremental \
 	compile-ptaben test-ptaben test-ptaben-json clean-ptaben \
+	compile-ptaben-llvm22 test-ptaben-llvm22 test-ptaben-llvm22-json \
 	compile-svcomp compile-svcomp-category test-svcomp test-svcomp-category test-svcomp-json clean-svcomp \
 	svcomp-categories \
 	compile-juliet test-juliet test-juliet-json juliet-categories clean-juliet \
@@ -10,10 +11,16 @@
 	tutorials tutorials-dev site site-dev-all site-dev site-clean \
 	shell-llvm22 test-llvm22 lint-llvm22 build-llvm22
 
-# Feature set for LLVM 22 cargo invocations — disables defaults (which pin
+# Feature sets for LLVM 22 cargo invocations — disables defaults (which pin
 # llvm-18) and re-activates the same non-LLVM features the workspace would
 # normally get from each crate's default set.
+#
+# SAF_LLVM22_FEATURES covers the full workspace (for `cargo build/test --workspace`).
+# Per-package invocations (`cargo run -p saf-bench`) need the subset that maps
+# to that package's dependency graph.
 SAF_LLVM22_FEATURES := --no-default-features --features "saf-frontends/llvm-22,saf-analysis/z3-solver,saf-core/logging-subscriber,saf-cli/llvm-22,saf-bench/llvm-22,saf-trace/llvm-22,saf-datalog/llvm-22,saf-test-utils/llvm-22"
+SAF_LLVM22_FEATURES_BENCH := --no-default-features --features "saf-frontends/llvm-22,saf-analysis/z3-solver,saf-core/logging-subscriber,saf-cli/llvm-22,saf-bench/llvm-22"
+SAF_LLVM22_FEATURES_CLI := --no-default-features --features "saf-frontends/llvm-22,saf-analysis/z3-solver,saf-core/logging-subscriber,saf-cli/llvm-22"
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -99,22 +106,40 @@ compile-ptaben: ## Compile PTABen test suite with LLVM 18 (run once after clone/
 	@echo "Compiling PTABen test suite..."
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev ./scripts/compile-ptaben.sh
 
-test-ptaben: ## Run PTABen benchmark suite against SAF
+compile-ptaben-llvm22: ## Compile PTABen test suite with LLVM 22 to .compiled-llvm22/
+	@echo "Compiling PTABen test suite with clang-22..."
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 ./scripts/compile-ptaben.sh
+
+test-ptaben: ## Run PTABen benchmark suite against SAF (LLVM 18)
 	@echo "Running PTABen benchmarks..."
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c '\
 	  cargo build --release -p saf-cli && \
 	  cargo run --release -p saf-bench -- ptaben \
 	    --compiled-dir tests/benchmarks/ptaben/.compiled'
 
-test-ptaben-json: ## Run PTABen benchmarks with JSON output
+test-ptaben-llvm22: ## Run PTABen benchmark suite against SAF (LLVM 22)
+	@echo "Running PTABen benchmarks on LLVM 22..."
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 sh -c '\
+	  cargo build --release -p saf-cli $(SAF_LLVM22_FEATURES_CLI) && \
+	  cargo run --release -p saf-bench $(SAF_LLVM22_FEATURES_BENCH) -- ptaben \
+	    --compiled-dir tests/benchmarks/ptaben/.compiled-llvm22'
+
+test-ptaben-json: ## Run PTABen benchmarks with JSON output (LLVM 18)
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c '\
 	  cargo build --release -p saf-cli && \
 	  cargo run --release -p saf-bench -- ptaben \
 	    --compiled-dir tests/benchmarks/ptaben/.compiled \
-	    --json'
+	    -o /workspace/tests/benchmarks/ptaben/results.json'
 
-clean-ptaben: ## Remove compiled PTABen bitcode
-	rm -rf tests/benchmarks/ptaben/.compiled
+test-ptaben-llvm22-json: ## Run PTABen benchmarks with JSON output (LLVM 22)
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 sh -c '\
+	  cargo build --release -p saf-cli $(SAF_LLVM22_FEATURES_CLI) && \
+	  cargo run --release -p saf-bench $(SAF_LLVM22_FEATURES_BENCH) -- ptaben \
+	    --compiled-dir tests/benchmarks/ptaben/.compiled-llvm22 \
+	    -o /workspace/tests/benchmarks/ptaben/results-llvm22.json'
+
+clean-ptaben: ## Remove compiled PTABen bitcode (both LLVM 18 and LLVM 22)
+	rm -rf tests/benchmarks/ptaben/.compiled tests/benchmarks/ptaben/.compiled-llvm22
 
 # --- SV-COMP Benchmark Suite ---
 # Use AGGRESSIVE=1 for aggressive mode (more bug detection, slightly higher FP risk)
