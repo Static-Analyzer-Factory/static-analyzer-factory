@@ -11,15 +11,15 @@ name = "_saf"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
-llvm-17 = ["saf-frontends/llvm-17"]
+default = ["llvm-18"]
 llvm-18 = ["saf-frontends/llvm-18"]
+llvm-22 = ["saf-frontends/llvm-22"]
 
 [dependencies]
 saf-core = { workspace = true }
 saf-frontends = { workspace = true }
 saf-analysis = { workspace = true, features = ["z3-solver"] }
-saf-datalog = { path = "../saf-datalog" }
+saf-datalog = { path = "../saf-datalog", default-features = false }
 pyo3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

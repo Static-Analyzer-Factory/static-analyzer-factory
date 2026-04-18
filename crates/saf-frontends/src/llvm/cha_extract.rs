@@ -31,7 +31,7 @@
 //! }
 //! ```
 
-#![cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#![cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 
 use std::collections::BTreeMap;
 

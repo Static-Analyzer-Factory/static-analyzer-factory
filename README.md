@@ -26,13 +26,19 @@ A Rust-powered static analysis framework with a Python SDK for finding bugs in C
 
 ## Quick Start
 
-SAF runs inside Docker (LLVM 18 + all dependencies included).
+SAF runs inside Docker. Two image variants are published, one per supported
+LLVM version — pick the tag whose LLVM matches the clang you use to compile
+your source.
 
 ```bash
 git clone https://github.com/Static-Analyzer-Factory/static-analyzer-factory.git
 cd static-analyzer-factory
-make shell
+make shell            # dev shell backed by LLVM 18 (default)
+make shell-llvm22     # dev shell backed by LLVM 22 (opt-in)
 ```
+
+See [docs/book/src/getting-started/llvm-versions.md](docs/book/src/getting-started/llvm-versions.md)
+for the support policy and forward-incompatibility caveats.
 
 ### Python SDK
 

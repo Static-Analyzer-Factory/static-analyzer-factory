@@ -399,7 +399,7 @@ fn cg_named_ssa_callee_is_indirect() {
                     .find(|f| f.id == *callee)
                     .map(|f| f.name.as_str());
                 // "call" or "result" would be bogus names from named SSA values
-                if matches!(callee_name, Some("call") | Some("result")) {
+                if matches!(callee_name, Some("call" | "result")) {
                     return Some(callee_name.unwrap().to_string());
                 }
             }

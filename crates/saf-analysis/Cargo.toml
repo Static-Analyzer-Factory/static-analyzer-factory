@@ -23,18 +23,23 @@ rustc-hash = { workspace = true }
 rayon = "1.10"
 
 [features]
-default = ["z3-solver"]
+default = ["z3-solver", "llvm-18"]
 experimental = []
 z3-solver = ["dep:z3"]
 # Gate heavy, rarely-used analysis modules:
 analysis-mta = []
 analysis-cegar = []
 analysis-invariants = []
+# LLVM version selection for dev-dependencies (saf-frontends, saf-test-utils):
+llvm-18 = ["saf-frontends/llvm-18", "saf-test-utils/llvm-18"]
+llvm-22 = ["saf-frontends/llvm-22", "saf-test-utils/llvm-22"]
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 proptest = "1.5"
 insta = { version = "1.41", features = ["json"] }
-saf-frontends = { workspace = true, features = ["llvm-18"] }
-saf-test-utils = { path = "../saf-test-utils" }
+# saf-frontends inherits default-features = false from workspace; LLVM feature
+# comes via saf-analysis's own `llvm-*` passthrough features.
+saf-frontends = { workspace = true }
+saf-test-utils = { path = "../saf-test-utils", default-features = false }
 tempfile = { workspace = true }

@@ -438,7 +438,7 @@ pub fn analyze_nullness_with_context(
             }
             if let Some(pn) = param_nullness.get(&func.id) {
                 // Only re-analyze if at least one param tightened to NotNull
-                let any_tightened = pn.iter().any(|n| *n == Nullness::NotNull);
+                let any_tightened = pn.contains(&Nullness::NotNull);
                 if any_tightened {
                     analyze_function_impl(
                         func,

@@ -472,7 +472,7 @@ $_ZTV13CloneableBase = comdat any
 @_ZTV9Printable = linkonce_odr dso_local unnamed_addr constant { [5 x ptr] } { [5 x ptr] [ptr null, ptr @_ZTI9Printable, ptr @_ZN9PrintableD2Ev, ptr @_ZN9PrintableD0Ev, ptr @_ZN9Printable5printEv] }, comdat, align 8
 @_ZTV12Serializable = linkonce_odr dso_local unnamed_addr constant { [5 x ptr] } { [5 x ptr] [ptr null, ptr @_ZTI12Serializable, ptr @_ZN12SerializableD2Ev, ptr @_ZN12SerializableD0Ev, ptr @_ZN12Serializable9serializeEv] }, comdat, align 8
 @_ZTV13DiamondBottom = linkonce_odr dso_local unnamed_addr constant { [8 x ptr], [8 x ptr] } { [8 x ptr] [ptr null, ptr null, ptr null, ptr null, ptr @_ZTI13DiamondBottom, ptr @_ZN13DiamondBottomD1Ev, ptr @_ZN13DiamondBottomD0Ev, ptr @_ZN13DiamondBottom5valueEv], [8 x ptr] [ptr inttoptr (i64 -8 to ptr), ptr inttoptr (i64 -8 to ptr), ptr inttoptr (i64 -8 to ptr), ptr inttoptr (i64 -8 to ptr), ptr @_ZTI13DiamondBottom, ptr @_ZThn8_N13DiamondBottomD1Ev, ptr @_ZThn8_N13DiamondBottomD0Ev, ptr @_ZThn8_N13DiamondBottom5valueEv] }, comdat, align 8
-@_ZTT13DiamondBottom = linkonce_odr dso_local unnamed_addr constant [7 x ptr] [ptr getelementptr inbounds ({ [8 x ptr], [8 x ptr] }, ptr @_ZTV13DiamondBottom, i32 0, inrange i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr] }, ptr @_ZTC13DiamondBottom0_11DiamondLeft, i32 0, inrange i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr] }, ptr @_ZTC13DiamondBottom0_11DiamondLeft, i32 0, inrange i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr], [7 x ptr] }, ptr @_ZTC13DiamondBottom8_12DiamondRight, i32 0, inrange i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr], [7 x ptr] }, ptr @_ZTC13DiamondBottom8_12DiamondRight, i32 0, inrange i32 1, i32 4), ptr getelementptr inbounds ({ [8 x ptr], [8 x ptr] }, ptr @_ZTV13DiamondBottom, i32 0, inrange i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr], [8 x ptr] }, ptr @_ZTV13DiamondBottom, i32 0, inrange i32 1, i32 5)], comdat, align 8
+@_ZTT13DiamondBottom = linkonce_odr dso_local unnamed_addr constant [7 x ptr] [ptr getelementptr inbounds ({ [8 x ptr], [8 x ptr] }, ptr @_ZTV13DiamondBottom, i32 0, i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr] }, ptr @_ZTC13DiamondBottom0_11DiamondLeft, i32 0, i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr] }, ptr @_ZTC13DiamondBottom0_11DiamondLeft, i32 0, i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr], [7 x ptr] }, ptr @_ZTC13DiamondBottom8_12DiamondRight, i32 0, i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr], [7 x ptr] }, ptr @_ZTC13DiamondBottom8_12DiamondRight, i32 0, i32 1, i32 4), ptr getelementptr inbounds ({ [8 x ptr], [8 x ptr] }, ptr @_ZTV13DiamondBottom, i32 0, i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr], [8 x ptr] }, ptr @_ZTV13DiamondBottom, i32 0, i32 1, i32 5)], comdat, align 8
 @_ZTC13DiamondBottom0_11DiamondLeft = linkonce_odr dso_local unnamed_addr constant { [8 x ptr] } { [8 x ptr] [ptr null, ptr null, ptr null, ptr null, ptr @_ZTI11DiamondLeft, ptr @_ZN11DiamondLeftD1Ev, ptr @_ZN11DiamondLeftD0Ev, ptr @_ZN11DiamondLeft5valueEv] }, comdat, align 8
 @_ZTS11DiamondLeft = linkonce_odr dso_local constant [14 x i8] c"11DiamondLeft\00", comdat, align 1
 @_ZTS11DiamondBase = linkonce_odr dso_local constant [14 x i8] c"11DiamondBase\00", comdat, align 1
@@ -485,9 +485,9 @@ $_ZTV13CloneableBase = comdat any
 @_ZTI13DiamondBottom = linkonce_odr dso_local constant { ptr, ptr, i32, i32, ptr, i64, ptr, i64 } { ptr getelementptr inbounds (ptr, ptr @_ZTVN10__cxxabiv121__vmi_class_type_infoE, i64 2), ptr @_ZTS13DiamondBottom, i32 2, i32 2, ptr @_ZTI11DiamondLeft, i64 2, ptr @_ZTI12DiamondRight, i64 2050 }, comdat, align 8
 @_ZTV11DiamondBase = linkonce_odr dso_local unnamed_addr constant { [5 x ptr] } { [5 x ptr] [ptr null, ptr @_ZTI11DiamondBase, ptr @_ZN11DiamondBaseD2Ev, ptr @_ZN11DiamondBaseD0Ev, ptr @_ZN11DiamondBase5valueEv] }, comdat, align 8
 @_ZTV11DiamondLeft = linkonce_odr dso_local unnamed_addr constant { [8 x ptr] } { [8 x ptr] [ptr null, ptr null, ptr null, ptr null, ptr @_ZTI11DiamondLeft, ptr @_ZN11DiamondLeftD1Ev, ptr @_ZN11DiamondLeftD0Ev, ptr @_ZN11DiamondLeft5valueEv] }, comdat, align 8
-@_ZTT11DiamondLeft = linkonce_odr dso_local unnamed_addr constant [2 x ptr] [ptr getelementptr inbounds ({ [8 x ptr] }, ptr @_ZTV11DiamondLeft, i32 0, inrange i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr] }, ptr @_ZTV11DiamondLeft, i32 0, inrange i32 0, i32 5)], comdat, align 8
+@_ZTT11DiamondLeft = linkonce_odr dso_local unnamed_addr constant [2 x ptr] [ptr getelementptr inbounds ({ [8 x ptr] }, ptr @_ZTV11DiamondLeft, i32 0, i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr] }, ptr @_ZTV11DiamondLeft, i32 0, i32 0, i32 5)], comdat, align 8
 @_ZTV12DiamondRight = linkonce_odr dso_local unnamed_addr constant { [8 x ptr] } { [8 x ptr] [ptr null, ptr null, ptr null, ptr null, ptr @_ZTI12DiamondRight, ptr @_ZN12DiamondRightD1Ev, ptr @_ZN12DiamondRightD0Ev, ptr @_ZN12DiamondRight5valueEv] }, comdat, align 8
-@_ZTT12DiamondRight = linkonce_odr dso_local unnamed_addr constant [2 x ptr] [ptr getelementptr inbounds ({ [8 x ptr] }, ptr @_ZTV12DiamondRight, i32 0, inrange i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr] }, ptr @_ZTV12DiamondRight, i32 0, inrange i32 0, i32 5)], comdat, align 8
+@_ZTT12DiamondRight = linkonce_odr dso_local unnamed_addr constant [2 x ptr] [ptr getelementptr inbounds ({ [8 x ptr] }, ptr @_ZTV12DiamondRight, i32 0, i32 0, i32 5), ptr getelementptr inbounds ({ [8 x ptr] }, ptr @_ZTV12DiamondRight, i32 0, i32 0, i32 5)], comdat, align 8
 @_ZTV6Circle = linkonce_odr dso_local unnamed_addr constant { [6 x ptr] } { [6 x ptr] [ptr null, ptr @_ZTI6Circle, ptr @_ZN6CircleD2Ev, ptr @_ZN6CircleD0Ev, ptr @_ZN6Circle4areaEv, ptr @_ZN6Circle9perimeterEv] }, comdat, align 8
 @_ZTS6Circle = linkonce_odr dso_local constant [8 x i8] c"6Circle\00", comdat, align 1
 @_ZTS13AbstractShape = linkonce_odr dso_local constant [16 x i8] c"13AbstractShape\00", comdat, align 1
@@ -566,7 +566,7 @@ define linkonce_odr dso_local void @_ZN7DerivedC2Ev(ptr noundef nonnull align 8 
   call void @llvm.dbg.declare(metadata ptr %2, metadata !277, metadata !DIExpression()), !dbg !279
   %3 = load ptr, ptr %2, align 8
   call void @_ZN4BaseC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #11, !dbg !280
-  store ptr getelementptr inbounds ({ [6 x ptr] }, ptr @_ZTV7Derived, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !280
+  store ptr getelementptr inbounds ({ [6 x ptr] }, ptr @_ZTV7Derived, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !280
   ret void, !dbg !280
 }
 
@@ -608,7 +608,7 @@ define linkonce_odr dso_local void @_ZN6Level3C2Ev(ptr noundef nonnull align 8 d
   call void @llvm.dbg.declare(metadata ptr %2, metadata !322, metadata !DIExpression()), !dbg !324
   %3 = load ptr, ptr %2, align 8
   call void @_ZN6Level2C2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #11, !dbg !325
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV6Level3, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !325
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV6Level3, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !325
   ret void, !dbg !325
 }
 
@@ -674,7 +674,7 @@ define linkonce_odr dso_local void @_ZN3DogC2Ev(ptr noundef nonnull align 8 dere
   call void @llvm.dbg.declare(metadata ptr %2, metadata !383, metadata !DIExpression()), !dbg !385
   %3 = load ptr, ptr %2, align 8
   call void @_ZN6AnimalC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #11, !dbg !386
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV3Dog, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !386
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV3Dog, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !386
   ret void, !dbg !386
 }
 
@@ -685,7 +685,7 @@ define linkonce_odr dso_local void @_ZN3CatC2Ev(ptr noundef nonnull align 8 dere
   call void @llvm.dbg.declare(metadata ptr %2, metadata !389, metadata !DIExpression()), !dbg !391
   %3 = load ptr, ptr %2, align 8
   call void @_ZN6AnimalC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #11, !dbg !392
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV3Cat, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !392
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV3Cat, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !392
   ret void, !dbg !392
 }
 
@@ -696,7 +696,7 @@ define linkonce_odr dso_local void @_ZN4BirdC2Ev(ptr noundef nonnull align 8 der
   call void @llvm.dbg.declare(metadata ptr %2, metadata !395, metadata !DIExpression()), !dbg !397
   %3 = load ptr, ptr %2, align 8
   call void @_ZN6AnimalC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #11, !dbg !398
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV4Bird, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !398
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV4Bird, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !398
   ret void, !dbg !398
 }
 
@@ -769,9 +769,9 @@ define linkonce_odr dso_local void @_ZN8DocumentC2Ev(ptr noundef nonnull align 8
   call void @_ZN9PrintableC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #11, !dbg !449
   %4 = getelementptr inbounds i8, ptr %3, i64 8, !dbg !449
   call void @_ZN12SerializableC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %4) #11, !dbg !449
-  store ptr getelementptr inbounds ({ [6 x ptr], [5 x ptr] }, ptr @_ZTV8Document, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !449
+  store ptr getelementptr inbounds ({ [6 x ptr], [5 x ptr] }, ptr @_ZTV8Document, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !449
   %5 = getelementptr inbounds i8, ptr %3, i64 8, !dbg !449
-  store ptr getelementptr inbounds ({ [6 x ptr], [5 x ptr] }, ptr @_ZTV8Document, i32 0, inrange i32 1, i32 2), ptr %5, align 8, !dbg !449
+  store ptr getelementptr inbounds ({ [6 x ptr], [5 x ptr] }, ptr @_ZTV8Document, i32 0, i32 1, i32 2), ptr %5, align 8, !dbg !449
   ret void, !dbg !449
 }
 
@@ -828,10 +828,10 @@ define linkonce_odr dso_local void @_ZN13DiamondBottomC1Ev(ptr noundef nonnull a
   call void @_ZN11DiamondLeftC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3, ptr noundef getelementptr inbounds ([7 x ptr], ptr @_ZTT13DiamondBottom, i64 0, i64 1)) #11, !dbg !502
   %4 = getelementptr inbounds i8, ptr %3, i64 8, !dbg !502
   call void @_ZN12DiamondRightC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %4, ptr noundef getelementptr inbounds ([7 x ptr], ptr @_ZTT13DiamondBottom, i64 0, i64 3)) #11, !dbg !502
-  store ptr getelementptr inbounds ({ [8 x ptr], [8 x ptr] }, ptr @_ZTV13DiamondBottom, i32 0, inrange i32 0, i32 5), ptr %3, align 8, !dbg !502
-  store ptr getelementptr inbounds ({ [8 x ptr], [8 x ptr] }, ptr @_ZTV13DiamondBottom, i32 0, inrange i32 0, i32 5), ptr %3, align 8, !dbg !502
+  store ptr getelementptr inbounds ({ [8 x ptr], [8 x ptr] }, ptr @_ZTV13DiamondBottom, i32 0, i32 0, i32 5), ptr %3, align 8, !dbg !502
+  store ptr getelementptr inbounds ({ [8 x ptr], [8 x ptr] }, ptr @_ZTV13DiamondBottom, i32 0, i32 0, i32 5), ptr %3, align 8, !dbg !502
   %5 = getelementptr inbounds i8, ptr %3, i64 8, !dbg !502
-  store ptr getelementptr inbounds ({ [8 x ptr], [8 x ptr] }, ptr @_ZTV13DiamondBottom, i32 0, inrange i32 1, i32 5), ptr %5, align 8, !dbg !502
+  store ptr getelementptr inbounds ({ [8 x ptr], [8 x ptr] }, ptr @_ZTV13DiamondBottom, i32 0, i32 1, i32 5), ptr %5, align 8, !dbg !502
   ret void, !dbg !502
 }
 
@@ -952,7 +952,7 @@ define linkonce_odr dso_local void @_ZN6CircleC2Ed(ptr noundef nonnull align 8 d
   call void @llvm.dbg.declare(metadata ptr %4, metadata !583, metadata !DIExpression()), !dbg !584
   %5 = load ptr, ptr %3, align 8
   call void @_ZN13AbstractShapeC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %5) #11, !dbg !585
-  store ptr getelementptr inbounds ({ [6 x ptr] }, ptr @_ZTV6Circle, i32 0, inrange i32 0, i32 2), ptr %5, align 8, !dbg !586
+  store ptr getelementptr inbounds ({ [6 x ptr] }, ptr @_ZTV6Circle, i32 0, i32 0, i32 2), ptr %5, align 8, !dbg !586
   %6 = getelementptr inbounds %class.Circle, ptr %5, i32 0, i32 1, !dbg !587
   %7 = load double, ptr %4, align 8, !dbg !588
   store double %7, ptr %6, align 8, !dbg !587
@@ -977,7 +977,7 @@ define linkonce_odr dso_local void @_ZN9RectangleC2Edd(ptr noundef nonnull align
   call void @llvm.dbg.declare(metadata ptr %6, metadata !596, metadata !DIExpression()), !dbg !597
   %7 = load ptr, ptr %4, align 8
   call void @_ZN13AbstractShapeC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %7) #11, !dbg !598
-  store ptr getelementptr inbounds ({ [6 x ptr] }, ptr @_ZTV9Rectangle, i32 0, inrange i32 0, i32 2), ptr %7, align 8, !dbg !599
+  store ptr getelementptr inbounds ({ [6 x ptr] }, ptr @_ZTV9Rectangle, i32 0, i32 0, i32 2), ptr %7, align 8, !dbg !599
   %8 = getelementptr inbounds %class.Rectangle, ptr %7, i32 0, i32 1, !dbg !600
   %9 = load double, ptr %5, align 8, !dbg !601
   store double %9, ptr %8, align 8, !dbg !600
@@ -1065,7 +1065,7 @@ define linkonce_odr dso_local void @_ZN17ConcreteObserverAC2Ev(ptr noundef nonnu
   call void @llvm.dbg.declare(metadata ptr %2, metadata !668, metadata !DIExpression()), !dbg !670
   %3 = load ptr, ptr %2, align 8
   call void @_ZN9IObserverC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #11, !dbg !671
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV17ConcreteObserverA, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !671
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV17ConcreteObserverA, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !671
   ret void, !dbg !671
 }
 
@@ -1076,7 +1076,7 @@ define linkonce_odr dso_local void @_ZN17ConcreteObserverBC2Ev(ptr noundef nonnu
   call void @llvm.dbg.declare(metadata ptr %2, metadata !676, metadata !DIExpression()), !dbg !678
   %3 = load ptr, ptr %2, align 8
   call void @_ZN9IObserverC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #11, !dbg !679
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV17ConcreteObserverB, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !679
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV17ConcreteObserverB, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !679
   ret void, !dbg !679
 }
 
@@ -1148,7 +1148,7 @@ define linkonce_odr dso_local void @_ZN18ConcretePrototype1C2Ev(ptr noundef nonn
   call void @llvm.dbg.declare(metadata ptr %2, metadata !727, metadata !DIExpression()), !dbg !729
   %3 = load ptr, ptr %2, align 8
   call void @_ZN9PrototypeC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #11, !dbg !730
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV18ConcretePrototype1, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !730
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV18ConcretePrototype1, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !730
   ret void, !dbg !730
 }
 
@@ -1202,7 +1202,7 @@ define linkonce_odr dso_local void @_ZN16CloneableDerivedC2Ev(ptr noundef nonnul
   call void @llvm.dbg.declare(metadata ptr %2, metadata !768, metadata !DIExpression()), !dbg !769
   %3 = load ptr, ptr %2, align 8
   call void @_ZN13CloneableBaseC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #11, !dbg !770
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV16CloneableDerived, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !770
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV16CloneableDerived, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !770
   ret void, !dbg !770
 }
 
@@ -1229,7 +1229,7 @@ define linkonce_odr dso_local void @_ZN4BaseC2Ev(ptr noundef nonnull align 8 der
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !785, metadata !DIExpression()), !dbg !786
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [6 x ptr] }, ptr @_ZTV4Base, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !787
+  store ptr getelementptr inbounds ({ [6 x ptr] }, ptr @_ZTV4Base, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !787
   ret void, !dbg !787
 }
 
@@ -1308,7 +1308,7 @@ define linkonce_odr dso_local void @_ZN6Level2C2Ev(ptr noundef nonnull align 8 d
   call void @llvm.dbg.declare(metadata ptr %2, metadata !823, metadata !DIExpression()), !dbg !825
   %3 = load ptr, ptr %2, align 8
   call void @_ZN6Level1C2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #11, !dbg !826
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV6Level2, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !826
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV6Level2, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !826
   ret void, !dbg !826
 }
 
@@ -1348,7 +1348,7 @@ define linkonce_odr dso_local void @_ZN6Level1C2Ev(ptr noundef nonnull align 8 d
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !844, metadata !DIExpression()), !dbg !845
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV6Level1, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !846
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV6Level1, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !846
   ret void, !dbg !846
 }
 
@@ -1417,7 +1417,7 @@ define linkonce_odr dso_local void @_ZN6AnimalC2Ev(ptr noundef nonnull align 8 d
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !876, metadata !DIExpression()), !dbg !877
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV6Animal, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !878
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV6Animal, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !878
   ret void, !dbg !878
 }
 
@@ -1546,7 +1546,7 @@ define linkonce_odr dso_local void @_ZN9PrintableC2Ev(ptr noundef nonnull align 
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !938, metadata !DIExpression()), !dbg !939
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV9Printable, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !940
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV9Printable, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !940
   ret void, !dbg !940
 }
 
@@ -1556,7 +1556,7 @@ define linkonce_odr dso_local void @_ZN12SerializableC2Ev(ptr noundef nonnull al
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !943, metadata !DIExpression()), !dbg !944
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV12Serializable, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !945
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV12Serializable, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !945
   ret void, !dbg !945
 }
 
@@ -1695,7 +1695,7 @@ define linkonce_odr dso_local void @_ZN11DiamondBaseC2Ev(ptr noundef nonnull ali
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !998, metadata !DIExpression()), !dbg !999
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV11DiamondBase, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !1000
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV11DiamondBase, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !1000
   ret void, !dbg !1000
 }
 
@@ -2062,7 +2062,7 @@ define linkonce_odr dso_local void @_ZN13AbstractShapeC2Ev(ptr noundef nonnull a
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !1114, metadata !DIExpression()), !dbg !1115
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [6 x ptr] }, ptr @_ZTV13AbstractShape, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !1116
+  store ptr getelementptr inbounds ({ [6 x ptr] }, ptr @_ZTV13AbstractShape, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !1116
   ret void, !dbg !1116
 }
 
@@ -2194,7 +2194,7 @@ define linkonce_odr dso_local void @_ZN9IObserverC2Ev(ptr noundef nonnull align 
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !1182, metadata !DIExpression()), !dbg !1183
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV9IObserver, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !1184
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV9IObserver, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !1184
   ret void, !dbg !1184
 }
 
@@ -2289,7 +2289,7 @@ define linkonce_odr dso_local void @_ZN9PrototypeC2Ev(ptr noundef nonnull align 
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !1229, metadata !DIExpression()), !dbg !1230
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV9Prototype, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !1231
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV9Prototype, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !1231
   ret void, !dbg !1231
 }
 
@@ -2355,7 +2355,7 @@ define linkonce_odr dso_local void @_ZN18ConcretePrototype1C2ERKS_(ptr noundef n
   %5 = load ptr, ptr %3, align 8
   %6 = load ptr, ptr %4, align 8, !dbg !1266
   call void @_ZN9PrototypeC2ERKS_(ptr noundef nonnull align 8 dereferenceable(8) %5, ptr noundef nonnull align 8 dereferenceable(8) %6) #11, !dbg !1266
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV18ConcretePrototype1, i32 0, inrange i32 0, i32 2), ptr %5, align 8, !dbg !1266
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV18ConcretePrototype1, i32 0, i32 0, i32 2), ptr %5, align 8, !dbg !1266
   ret void, !dbg !1266
 }
 
@@ -2368,7 +2368,7 @@ define linkonce_odr dso_local void @_ZN9PrototypeC2ERKS_(ptr noundef nonnull ali
   store ptr %1, ptr %4, align 8
   call void @llvm.dbg.declare(metadata ptr %4, metadata !1275, metadata !DIExpression()), !dbg !1274
   %5 = load ptr, ptr %3, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV9Prototype, i32 0, inrange i32 0, i32 2), ptr %5, align 8, !dbg !1276
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV9Prototype, i32 0, i32 0, i32 2), ptr %5, align 8, !dbg !1276
   ret void, !dbg !1276
 }
 
@@ -2378,7 +2378,7 @@ define linkonce_odr dso_local void @_ZN13CloneableBaseC2Ev(ptr noundef nonnull a
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !1279, metadata !DIExpression()), !dbg !1280
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV13CloneableBase, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !1281
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV13CloneableBase, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !1281
   ret void, !dbg !1281
 }
 
@@ -2454,7 +2454,7 @@ define linkonce_odr dso_local void @_ZN13CloneableBaseC2ERKS_(ptr noundef nonnul
   store ptr %1, ptr %4, align 8
   call void @llvm.dbg.declare(metadata ptr %4, metadata !1321, metadata !DIExpression()), !dbg !1320
   %5 = load ptr, ptr %3, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV13CloneableBase, i32 0, inrange i32 0, i32 2), ptr %5, align 8, !dbg !1322
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV13CloneableBase, i32 0, i32 0, i32 2), ptr %5, align 8, !dbg !1322
   ret void, !dbg !1322
 }
 
@@ -2469,7 +2469,7 @@ define linkonce_odr dso_local void @_ZN16CloneableDerivedC2ERKS_(ptr noundef non
   %5 = load ptr, ptr %3, align 8
   %6 = load ptr, ptr %4, align 8, !dbg !1332
   call void @_ZN13CloneableBaseC2ERKS_(ptr noundef nonnull align 8 dereferenceable(8) %5, ptr noundef nonnull align 8 dereferenceable(8) %6) #11, !dbg !1332
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV16CloneableDerived, i32 0, inrange i32 0, i32 2), ptr %5, align 8, !dbg !1332
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV16CloneableDerived, i32 0, i32 0, i32 2), ptr %5, align 8, !dbg !1332
   ret void, !dbg !1332
 }
 

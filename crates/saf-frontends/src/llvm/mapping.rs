@@ -3,7 +3,7 @@
 //! Converts LLVM instructions, values, and types to their AIR equivalents.
 //! This is the core conversion logic shared by all LLVM version adapters.
 
-#![cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#![cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 
 use std::collections::BTreeMap;
 
@@ -1696,7 +1696,7 @@ fn compute_llvm_type_size(type_str: &str) -> Option<u64> {
     // Integer types: i1, i8, i16, i32, i64, i128
     if let Some(bits_str) = t.strip_prefix('i') {
         let bits: u64 = bits_str.parse().ok()?;
-        return Some((bits + 7) / 8); // round up to bytes
+        return Some(bits.div_ceil(8)); // round up to bytes
     }
 
     // Pointer type (opaque pointer in LLVM 15+)

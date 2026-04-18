@@ -369,7 +369,7 @@ impl Dbm {
     ///
     /// Panics if `var.0` >= `num_vars`.
     #[must_use]
-    #[allow(clippy::match_on_vec_items)] // Indices are validated by var bounds
+    #[allow(clippy::indexing_slicing)] // Indices are validated by var bounds
     pub fn get_interval(&self, var: VarIndex) -> (Option<i128>, Option<i128>) {
         if self.bottom {
             return (None, None);

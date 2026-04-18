@@ -275,7 +275,7 @@ mod tests {
 
         // After with_registry, thread-local should be cleared
         // (panics if we try to access)
-        let result = std::panic::catch_unwind(|| current_registry());
+        let result = std::panic::catch_unwind(current_registry);
         assert!(result.is_err());
     }
 }
