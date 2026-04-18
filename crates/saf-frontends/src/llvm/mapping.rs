@@ -1921,12 +1921,11 @@ fn parse_constant_gep(repr: &str) -> Option<(&str, Vec<i64>)> {
                 }
             }
             // Skip one whitespace-delimited token and continue.
-            match tok.find(char::is_whitespace) {
-                Some(next) => tok = tok[next..].trim_start(),
-                None => {
-                    tok = "";
-                    break;
-                }
+            if let Some(next) = tok.find(char::is_whitespace) {
+                tok = tok[next..].trim_start();
+            } else {
+                tok = "";
+                break;
             }
         }
 
