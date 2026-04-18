@@ -2,6 +2,7 @@
 	compile-lua-fixtures test-incremental bench-incremental \
 	compile-ptaben test-ptaben test-ptaben-json clean-ptaben \
 	compile-ptaben-llvm22 test-ptaben-llvm22 test-ptaben-llvm22-json \
+	compile-llvm22-syntax-fixtures \
 	compile-svcomp compile-svcomp-category test-svcomp test-svcomp-category test-svcomp-json clean-svcomp \
 	svcomp-categories \
 	compile-juliet test-juliet test-juliet-json juliet-categories clean-juliet \
@@ -109,6 +110,10 @@ compile-ptaben: ## Compile PTABen test suite with LLVM 18 (run once after clone/
 compile-ptaben-llvm22: ## Compile PTABen test suite with LLVM 22 to .compiled-llvm22/
 	@echo "Compiling PTABen test suite with clang-22..."
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 ./scripts/compile-ptaben.sh
+
+compile-llvm22-syntax-fixtures: ## Compile LLVM 19-22 syntax-target fixtures with clang-22
+	@echo "Compiling LLVM 22 syntax fixtures with clang-22..."
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 ./tests/programs/compile-llvm22-syntax.sh
 
 test-ptaben: ## Run PTABen benchmark suite against SAF (LLVM 18)
 	@echo "Running PTABen benchmarks..."
