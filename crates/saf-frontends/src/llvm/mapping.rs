@@ -316,8 +316,18 @@ impl MappingContext<'_> {
         // Need a current block to create instruction IDs
         let block_id = self.current_block_id?;
 
+        // Drop the first index: LLVM GEP's first index is a pointer-level step
+        // (advance by `sizeof(pointee)` * idx, almost always 0 for globals),
+        // not a type-descent index. SAF's `FieldPath` only carries descent
+        // steps — matching `resolve_constant_gep_element`'s behavior below.
+        let field_indices: &[i64] = if indices.len() > 1 {
+            &indices[1..]
+        } else {
+            &indices[..]
+        };
+
         // Build FieldPath from parsed indices (all constant → Field steps)
-        let steps: Vec<FieldStep> = indices
+        let steps: Vec<FieldStep> = field_indices
             .iter()
             .filter_map(|&idx| {
                 u32::try_from(idx)
@@ -326,7 +336,7 @@ impl MappingContext<'_> {
             })
             .collect();
 
-        if steps.len() != indices.len() {
+        if steps.len() != field_indices.len() {
             return None; // Some indices were negative or too large
         }
 
@@ -336,13 +346,17 @@ impl MappingContext<'_> {
         let inst_id = self.create_inst_id(block_id);
         let dst_id = self.create_inst_result_id(inst_id);
 
-        // Build operands: [base_ptr, ...index_constants]
+        // Build operands: [base_ptr, ...index_constants].
+        // Use `field_indices` (not `indices`) so the operand count matches the
+        // `FieldPath` step count — PTA's `convert_field_path_with_operands`
+        // walks both in lockstep.
+        //
         // Derive index ValueIds directly — BLAKE3 is deterministic, so the same
-        // "i64 N" string always produces the same ValueId. LLVM uniquess constant
+        // "i64 N" string always produces the same ValueId. LLVM uniques constant
         // integers, so get_or_create_value_id will produce matching IDs when it
         // encounters the same constant as an operand elsewhere.
         let mut operands = vec![base_vid];
-        for &idx in &indices {
+        for &idx in field_indices {
             let idx_repr = format!("i64 {idx}");
             let idx_vid = ValueId::derive(idx_repr.as_bytes());
             self.constants
@@ -1883,13 +1897,40 @@ fn parse_constant_gep(repr: &str) -> Option<(&str, Vec<i64>)> {
         &after_at[..end]
     };
 
-    // Extract constant integer indices: find all "iN <number>" patterns after the global name
+    // Extract constant integer indices: find "iN <number>" patterns after each
+    // comma following the global name. LLVM 18 may prefix an index with
+    // `inrange` (e.g., "inrange i32 0"); LLVM 20+ moved `inrange(N,M)` to the
+    // GEP level instead, so it doesn't appear here. Skip any leading attribute
+    // word (alphabetic) before matching the "iN N" type+value pair.
     let mut indices: Vec<i64> = Vec::new();
     let mut search_from = at_pos;
     while let Some(comma_pos) = repr[search_from..].find(',') {
         let after_comma = &repr[search_from + comma_pos + 1..];
-        let trimmed = after_comma.trim_start();
-        if let Some(rest) = trimmed.strip_prefix('i') {
+        let mut tok = after_comma.trim_start();
+
+        // Strip leading attribute words (e.g., "inrange ") until we see "iN ".
+        while let Some(first) = tok.chars().next() {
+            if first == 'i' {
+                // Candidate "iN N" — check that what follows 'i' is digits + space.
+                let after_i = &tok[1..];
+                let digits_end = after_i
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(after_i.len());
+                if digits_end > 0 && after_i[digits_end..].starts_with(' ') {
+                    break; // matches "iN " — parse below
+                }
+            }
+            // Skip one whitespace-delimited token and continue.
+            match tok.find(char::is_whitespace) {
+                Some(next) => tok = tok[next..].trim_start(),
+                None => {
+                    tok = "";
+                    break;
+                }
+            }
+        }
+
+        if let Some(rest) = tok.strip_prefix('i') {
             if let Some(space_pos) = rest.find(' ') {
                 let num_str = rest[space_pos + 1..]
                     .trim_start()
