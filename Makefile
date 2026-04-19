@@ -24,8 +24,8 @@ SAF_LLVM22_FEATURES_BENCH := --no-default-features --features "saf-frontends/llv
 SAF_LLVM22_FEATURES_CLI := --no-default-features --features "saf-frontends/llvm-22,saf-analysis/z3-solver,saf-core/logging-subscriber,saf-cli/llvm-22"
 
 help: ## Show this help message
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-32s\033[0m %s\n", $$1, $$2}'
 
 test: ## Run all tests (Rust + Python, cached)
 	docker compose run --rm test
