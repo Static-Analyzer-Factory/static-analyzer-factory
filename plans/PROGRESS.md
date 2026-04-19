@@ -10,6 +10,7 @@
 | 157 | datalog-integration | architecture | in-progress | Notes: PTA solver + benchmarks complete (15/19 tasks). Checker migration (Tasks 11-14) blocked by circular dependency. Options: (A) extract shared types to saf-core, (B) inline Ascent checker rules in saf-analysis, (C) shared interface crate. Worklist is default solver; Datalog available via `--solver datalog`. |
 | 182 | warm-morandi-theme | frontend | approved | Notes: Redesign all web apps from dark navy to warm Morandi light theme. Single shared CSS variables file. Custom CodeMirror parchment theme. ~25 files to modify. |
 | 184 | saf-checker-dev-skill | tooling | approved | Notes: Coding-agent skill for SAF checker/analyzer authoring. Spec-first workflow with 3 tiers (declarative, typestate, custom patterns). |
+| 186 | ui-github-cta-quickstart | frontend | done | Notes: Landing page — added "View on GitHub" CTA in Hero and a QuickStart section (Features/Personas) with copy-to-clipboard Docker install block. Branch `ui/github-cta-and-quickstart`. |
 
 ## Next Steps
 - **Plan 139 Phase 3:** 12 analysis consumers for the AIR type system (PTA constraint filtering, field-sensitive byte-offset locations, type-based CG pruning, etc.). Each is 30-80 lines, independent of each other.
@@ -45,3 +46,4 @@
 | Date | Area | Summary |
 |------|------|---------|
 | 2026-04-07 | release | Initial open-source release (v0.1.0). |
+| 2026-04-19 | frontend | Plan 186 implemented: Hero GitHub CTA + QuickStart install block on landing page. Site builds clean; awaiting user visual review before PR. |
