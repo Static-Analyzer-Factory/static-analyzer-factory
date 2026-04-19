@@ -28,17 +28,23 @@ release is validated against.
 
 ## Switching between tags
 
+> **Note:** The prebuilt `saf:llvm18` / `saf:llvm22` images are not published
+> yet — the GitHub Actions release workflow is still disabled
+> (`.github/workflows/ci.yml.disabled`). Until it ships, use the
+> build-from-source path below. The `docker pull` examples in this section
+> show the intended UX once the registry is live.
+
 ```bash
-# Pull and run the LLVM 18 image (default)
+# Pull and run the LLVM 18 image (default) — once published
 docker pull ghcr.io/thepatrickstar/saf:llvm18
 docker run --rm -v "$PWD":/work ghcr.io/thepatrickstar/saf:llvm18 analyze /work/program.ll
 
-# Pull and run the LLVM 22 image
+# Pull and run the LLVM 22 image — once published
 docker pull ghcr.io/thepatrickstar/saf:llvm22
 docker run --rm -v "$PWD":/work ghcr.io/thepatrickstar/saf:llvm22 analyze /work/program.ll
 ```
 
-From a local checkout:
+From a local checkout (this is the current path):
 
 ```bash
 make shell           # dev shell backed by LLVM 18

@@ -320,11 +320,17 @@ impl MappingContext<'_> {
         // (advance by `sizeof(pointee)` * idx, almost always 0 for globals),
         // not a type-descent index. SAF's `FieldPath` only carries descent
         // steps — matching `resolve_constant_gep_element`'s behavior below.
-        let field_indices: &[i64] = if indices.len() > 1 {
-            &indices[1..]
-        } else {
-            &indices[..]
-        };
+        //
+        // A single-index constant GEP (like `getelementptr [N x T], ptr @g,
+        // i64 K`) has no type descent — the index is purely pointer-level.
+        // Bail out so the caller falls through to simple base-address
+        // resolution; emitting a one-step `FieldPath{K}` would be wrong
+        // (it would descend into field K of the pointee, not offset past
+        // the aggregate by K * sizeof(pointee)).
+        if indices.len() < 2 {
+            return None;
+        }
+        let field_indices: &[i64] = &indices[1..];
 
         // Build FieldPath from parsed indices (all constant → Field steps)
         let steps: Vec<FieldStep> = field_indices
@@ -1968,11 +1974,16 @@ fn resolve_constant_gep_element(
 
     // Walk the aggregate initializer using the indices.
     // Skip the first index (it's the pointer dereference index, usually 0).
-    let element_indices = if indices.len() > 1 {
-        &indices[1..]
-    } else {
-        &indices[..]
-    };
+    //
+    // A single-index constant GEP points past the aggregate by
+    // `K * sizeof(pointee)` bytes, not to `initializer[K]` — for `K != 0`
+    // returning the latter would be wrong, and for `K == 0` the caller
+    // should already resolve to the base. Bail out and let the caller
+    // treat the GEP as a non-constant pointer.
+    if indices.len() < 2 {
+        return None;
+    }
+    let element_indices = &indices[1..];
 
     let mut current = init;
     for &idx in element_indices {
