@@ -6,6 +6,7 @@
 	compile-svcomp compile-svcomp-category test-svcomp test-svcomp-category test-svcomp-json clean-svcomp \
 	svcomp-categories \
 	compile-juliet test-juliet test-juliet-json juliet-categories clean-juliet \
+	compile-juliet-llvm22 test-juliet-llvm22 test-juliet-llvm22-json \
 	compile-oracle verify-oracle verify-props verify-props-quick verify-quick verify clean-oracle \
 	notebook wasm wasm-dev playground playground-dev playground-deploy \
 	prepare-cruxbc test-cruxbc test-cruxbc-svf test-cruxbc-svf-mem2reg test-cruxbc-llvm-cg compare-cruxbc clean-cruxbc \
@@ -217,17 +218,35 @@ compile-juliet: ## Compile Juliet tests (15 supported CWEs) with LLVM 18 + mem2r
 	@echo "Compiling Juliet test suite..."
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev ./scripts/compile-juliet.sh --verbose
 
+compile-juliet-llvm22: ## Compile Juliet tests with clang-22 to .compiled-juliet-llvm22/ (CWE=CWE476 to filter)
+	@echo "Compiling Juliet test suite with clang-22..."
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 ./scripts/compile-juliet.sh --verbose $(if $(CWE),--cwe $(CWE),)
+
 test-juliet: ## Run Juliet benchmarks with precision/recall/F1 (CWE=CWE476 to filter)
 	@echo "Running Juliet benchmarks..."
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo run --release -p saf-bench -- juliet \
 		--compiled-dir tests/benchmarks/sv-benchmarks/.compiled-juliet \
 		$(if $(CWE),--cwe $(CWE),)
 
+test-juliet-llvm22: ## Run Juliet benchmarks inside the LLVM 22 image (CWE=CWE476 to filter)
+	@echo "Running Juliet benchmarks on LLVM 22..."
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 sh -c '\
+	  cargo run --release -p saf-bench $(SAF_LLVM22_FEATURES_BENCH) -- juliet \
+	    --compiled-dir tests/benchmarks/sv-benchmarks/.compiled-juliet-llvm22 \
+	    $(if $(CWE),--cwe $(CWE),)'
+
 test-juliet-json: ## Run Juliet benchmarks with JSON output to file
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo run --release -p saf-bench -- juliet \
 		--compiled-dir tests/benchmarks/sv-benchmarks/.compiled-juliet \
 		$(if $(CWE),--cwe $(CWE),) \
 		-o /workspace/tests/benchmarks/sv-benchmarks/juliet-results.json
+
+test-juliet-llvm22-json: ## Run Juliet benchmarks (LLVM 22) with JSON output to file
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 sh -c '\
+	  cargo run --release -p saf-bench $(SAF_LLVM22_FEATURES_BENCH) -- juliet \
+	    --compiled-dir tests/benchmarks/sv-benchmarks/.compiled-juliet-llvm22 \
+	    $(if $(CWE),--cwe $(CWE),) \
+	    -o /workspace/tests/benchmarks/sv-benchmarks/juliet-results-llvm22.json'
 
 juliet-categories: ## List supported Juliet CWE categories
 	@echo "Supported CWEs (15 categories, ~24,815 tests):"
