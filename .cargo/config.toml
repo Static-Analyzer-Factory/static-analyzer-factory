@@ -3,10 +3,4 @@ rustflags = [
   "-Wclippy::pedantic",
   "-Aclippy::module_name_repetitions",
   "-Aclippy::must_use_candidate",
-  # Lints introduced by Rust 1.88+ that flag widespread pre-existing patterns;
-  # silenced here as a bulk-allow rather than touching every call site.
-  # Track follow-up cleanup in plan 186's notes.
-  "-Aclippy::format_push_string",
-  "-Aclippy::doc_lazy_continuation",
-  "-Aclippy::needless_continue",
 ]

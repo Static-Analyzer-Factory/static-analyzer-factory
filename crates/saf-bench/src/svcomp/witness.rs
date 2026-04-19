@@ -19,6 +19,7 @@
 //! See: <https://sv-comp.sosy-lab.org/2024/witnesses.php>
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::SystemTime;
@@ -468,34 +469,54 @@ impl Witness {
 
     /// Write graph-level metadata to the XML output.
     fn write_graph_metadata(&self, xml: &mut String) {
-        xml.push_str(&format!(
-            "    <data key=\"witness-type\">{}</data>\n",
+        writeln!(
+            xml,
+            "    <data key=\"witness-type\">{}</data>",
             self.witness_type.as_str()
-        ));
-        xml.push_str(&format!(
-            "    <data key=\"producer\">{}</data>\n",
+        )
+        .unwrap();
+
+        writeln!(
+            xml,
+            "    <data key=\"producer\">{}</data>",
             escape_xml(&self.producer)
-        ));
-        xml.push_str(&format!(
-            "    <data key=\"specification\">{}</data>\n",
+        )
+        .unwrap();
+
+        writeln!(
+            xml,
+            "    <data key=\"specification\">{}</data>",
             escape_xml(&self.specification)
-        ));
-        xml.push_str(&format!(
-            "    <data key=\"programfile\">{}</data>\n",
+        )
+        .unwrap();
+
+        writeln!(
+            xml,
+            "    <data key=\"programfile\">{}</data>",
             escape_xml(&self.program_file)
-        ));
-        xml.push_str(&format!(
-            "    <data key=\"programhash\">{}</data>\n",
+        )
+        .unwrap();
+
+        writeln!(
+            xml,
+            "    <data key=\"programhash\">{}</data>",
             escape_xml(&self.program_hash)
-        ));
-        xml.push_str(&format!(
-            "    <data key=\"architecture\">{}</data>\n",
+        )
+        .unwrap();
+
+        writeln!(
+            xml,
+            "    <data key=\"architecture\">{}</data>",
             escape_xml(&self.architecture)
-        ));
-        xml.push_str(&format!(
-            "    <data key=\"creationtime\">{}</data>\n",
+        )
+        .unwrap();
+
+        writeln!(
+            xml,
+            "    <data key=\"creationtime\">{}</data>",
             escape_xml(&self.creation_time)
-        ));
+        )
+        .unwrap();
     }
 
     /// Write the witness to a file.
@@ -532,16 +553,20 @@ fn write_graphml_keys(xml: &mut String) {
         "architecture",
         "creationtime",
     ] {
-        xml.push_str(&format!(
-            "  <key id=\"{key}\" for=\"graph\" attr.type=\"string\"/>\n"
-        ));
+        writeln!(
+            xml,
+            "  <key id=\"{key}\" for=\"graph\" attr.type=\"string\"/>"
+        )
+        .unwrap();
     }
 
     // Node-level keys with defaults
     for key in &["entry", "sink", "violation"] {
-        xml.push_str(&format!(
-            "  <key id=\"{key}\" for=\"node\" attr.type=\"boolean\"><default>false</default></key>\n"
-        ));
+        writeln!(
+            xml,
+            "  <key id=\"{key}\" for=\"node\" attr.type=\"boolean\"><default>false</default></key>"
+        )
+        .unwrap();
     }
     xml.push_str("  <key id=\"invariant\" for=\"node\" attr.type=\"string\"/>\n");
 
@@ -552,20 +577,20 @@ fn write_graphml_keys(xml: &mut String) {
         "enterFunction",
         "returnFromFunction",
     ] {
-        xml.push_str(&format!(
-            "  <key id=\"{key}\" for=\"edge\" attr.type=\"string\"/>\n"
-        ));
+        writeln!(
+            xml,
+            "  <key id=\"{key}\" for=\"edge\" attr.type=\"string\"/>"
+        )
+        .unwrap();
     }
     for key in &["startline", "endline"] {
-        xml.push_str(&format!(
-            "  <key id=\"{key}\" for=\"edge\" attr.type=\"int\"/>\n"
-        ));
+        writeln!(xml, "  <key id=\"{key}\" for=\"edge\" attr.type=\"int\"/>").unwrap();
     }
 }
 
 /// Write a node element to the XML output.
 fn write_node(xml: &mut String, node: &WitnessNode) {
-    xml.push_str(&format!("    <node id=\"{}\">\n", escape_xml(&node.id)));
+    writeln!(xml, "    <node id=\"{}\">", escape_xml(&node.id)).unwrap();
 
     if node.entry {
         xml.push_str("      <data key=\"entry\">true</data>\n");
@@ -577,10 +602,12 @@ fn write_node(xml: &mut String, node: &WitnessNode) {
         xml.push_str("      <data key=\"violation\">true</data>\n");
     }
     if let Some(inv) = &node.invariant {
-        xml.push_str(&format!(
-            "      <data key=\"invariant\">{}</data>\n",
+        writeln!(
+            xml,
+            "      <data key=\"invariant\">{}</data>",
             escape_xml(inv)
-        ));
+        )
+        .unwrap();
     }
 
     xml.push_str("    </node>\n");
@@ -588,42 +615,52 @@ fn write_node(xml: &mut String, node: &WitnessNode) {
 
 /// Write an edge element to the XML output.
 fn write_edge(xml: &mut String, index: usize, edge: &WitnessEdge) {
-    xml.push_str(&format!(
-        "    <edge id=\"E{}\" source=\"{}\" target=\"{}\">\n",
+    writeln!(
+        xml,
+        "    <edge id=\"E{}\" source=\"{}\" target=\"{}\">",
         index,
         escape_xml(&edge.source),
         escape_xml(&edge.target)
-    ));
+    )
+    .unwrap();
 
     if let Some(code) = &edge.source_code {
-        xml.push_str(&format!(
-            "      <data key=\"sourcecode\">{}</data>\n",
+        writeln!(
+            xml,
+            "      <data key=\"sourcecode\">{}</data>",
             escape_xml(code)
-        ));
+        )
+        .unwrap();
     }
     if let Some(line) = edge.start_line {
-        xml.push_str(&format!("      <data key=\"startline\">{line}</data>\n"));
+        writeln!(xml, "      <data key=\"startline\">{line}</data>").unwrap();
     }
     if let Some(line) = edge.end_line {
-        xml.push_str(&format!("      <data key=\"endline\">{line}</data>\n"));
+        writeln!(xml, "      <data key=\"endline\">{line}</data>").unwrap();
     }
     if let Some(assumption) = &edge.assumption {
-        xml.push_str(&format!(
-            "      <data key=\"assumption\">{}</data>\n",
+        writeln!(
+            xml,
+            "      <data key=\"assumption\">{}</data>",
             escape_xml(assumption)
-        ));
+        )
+        .unwrap();
     }
     if let Some(func) = &edge.enter_function {
-        xml.push_str(&format!(
-            "      <data key=\"enterFunction\">{}</data>\n",
+        writeln!(
+            xml,
+            "      <data key=\"enterFunction\">{}</data>",
             escape_xml(func)
-        ));
+        )
+        .unwrap();
     }
     if let Some(func) = &edge.return_from_function {
-        xml.push_str(&format!(
-            "      <data key=\"returnFromFunction\">{}</data>\n",
+        writeln!(
+            xml,
+            "      <data key=\"returnFromFunction\">{}</data>",
             escape_xml(func)
-        ));
+        )
+        .unwrap();
     }
 
     xml.push_str("    </edge>\n");

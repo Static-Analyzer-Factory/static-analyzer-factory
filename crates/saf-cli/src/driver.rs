@@ -5,6 +5,7 @@
 // are defined now and wired in Phase 3.
 #![allow(dead_code)]
 
+use std::fmt::Write as _;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
@@ -2058,26 +2059,41 @@ fn format_human(output: &AnalysisOutput, verbose: bool, _db: &ProgramDatabase) -
 
     if verbose {
         buf.push_str("=== Pipeline Statistics ===\n");
-        buf.push_str(&format!(
-            "  Def-use build:       {:.3}s\n",
+
+        writeln!(
+            buf,
+            "  Def-use build:       {:.3}s",
             output.stats.defuse_build_secs
-        ));
-        buf.push_str(&format!(
-            "  PTA solve:           {:.3}s\n",
+        )
+        .unwrap();
+
+        writeln!(
+            buf,
+            "  PTA solve:           {:.3}s",
             output.stats.pta_solve_secs
-        ));
-        buf.push_str(&format!(
-            "  CG refinement iters: {}\n",
+        )
+        .unwrap();
+
+        writeln!(
+            buf,
+            "  CG refinement iters: {}",
             output.stats.refinement_iterations
-        ));
-        buf.push_str(&format!(
-            "  Value-flow build:    {:.3}s\n",
+        )
+        .unwrap();
+
+        writeln!(
+            buf,
+            "  Value-flow build:    {:.3}s",
             output.stats.valueflow_build_secs
-        ));
-        buf.push_str(&format!(
-            "  Total:               {:.3}s\n",
+        )
+        .unwrap();
+
+        writeln!(
+            buf,
+            "  Total:               {:.3}s",
             output.stats.total_secs
-        ));
+        )
+        .unwrap();
         buf.push('\n');
     }
 
@@ -2085,28 +2101,33 @@ fn format_human(output: &AnalysisOutput, verbose: bool, _db: &ProgramDatabase) -
     if output.findings.is_empty() {
         buf.push_str("No SVFG checker findings.\n");
     } else {
-        buf.push_str(&format!(
-            "=== {} SVFG Checker Finding(s) ===\n",
+        writeln!(
+            buf,
+            "=== {} SVFG Checker Finding(s) ===",
             output.findings.len()
-        ));
+        )
+        .unwrap();
         for finding in &output.findings {
             // Header: [SEVERITY] check-name (CWE-NNN)
-            buf.push_str(&format!(
-                "\n[{}] {} ({})\n",
+
+            writeln!(
+                buf,
+                "\n[{}] {} ({})",
                 finding.severity.to_uppercase(),
                 finding.check,
                 finding
                     .cwe
                     .map_or_else(|| "no CWE".to_string(), |c| format!("CWE-{c}"))
-            ));
+            )
+            .unwrap();
 
             // Enriched message: include display_name if available
             if let Some(ref name) = finding.display_name {
-                buf.push_str(&format!("  {}: {}\n", finding.check, name));
+                writeln!(buf, "  {}: {}", finding.check, name).unwrap();
             }
-            buf.push_str(&format!("  {}\n", finding.message));
+            writeln!(buf, "  {}", finding.message).unwrap();
             if let Some(ref obj) = finding.object {
-                buf.push_str(&format!("  Object: {obj}\n"));
+                writeln!(buf, "  Object: {obj}").unwrap();
             }
 
             // Path events with enriched names and source locations
@@ -2118,30 +2139,40 @@ fn format_human(output: &AnalysisOutput, verbose: bool, _db: &ProgramDatabase) -
                 let loc_suffix = event.source_loc.as_ref().map_or(String::new(), |loc| {
                     format!(" at {}:{}:{}", loc.file, loc.line, loc.col)
                 });
-                buf.push_str(&format!(
-                    "  -> {}{}{} ({})\n",
+
+                writeln!(
+                    buf,
+                    "  -> {}{}{} ({})",
                     event.location, name_suffix, loc_suffix, event.event
-                ));
+                )
+                .unwrap();
             }
         }
     }
 
     // Numeric checker findings
     if !output.numeric_findings.is_empty() {
-        buf.push_str(&format!(
-            "\n=== {} Numeric Finding(s) ===\n",
+        writeln!(
+            buf,
+            "\n=== {} Numeric Finding(s) ===",
             output.numeric_findings.len()
-        ));
+        )
+        .unwrap();
         for finding in &output.numeric_findings {
-            buf.push_str(&format!(
-                "\n[{:?}] {:?} (CWE-{})\n",
+            writeln!(
+                buf,
+                "\n[{:?}] {:?} (CWE-{})",
                 finding.severity, finding.checker, finding.cwe
-            ));
-            buf.push_str(&format!("  {}\n", finding.description));
-            buf.push_str(&format!(
-                "  Function: {}, Interval: {}\n",
+            )
+            .unwrap();
+            writeln!(buf, "  {}", finding.description).unwrap();
+
+            writeln!(
+                buf,
+                "  Function: {}, Interval: {}",
                 finding.function, finding.interval
-            ));
+            )
+            .unwrap();
         }
     }
 
@@ -2154,30 +2185,31 @@ fn format_human(output: &AnalysisOutput, verbose: bool, _db: &ProgramDatabase) -
     // IFDS taint results
     if let Some(ref taint) = output.taint_result {
         buf.push_str("\n=== IFDS Taint Analysis ===\n");
-        buf.push_str(&format!("  Tainted values:  {}\n", taint.tainted_count));
-        buf.push_str(&format!("  Iterations:      {}\n", taint.iterations));
-        buf.push_str(&format!("  Path edges:      {}\n", taint.path_edges));
+        writeln!(buf, "  Tainted values:  {}", taint.tainted_count).unwrap();
+        writeln!(buf, "  Iterations:      {}", taint.iterations).unwrap();
+        writeln!(buf, "  Path edges:      {}", taint.path_edges).unwrap();
     }
 
     // Typestate results
     if let Some(ref ts) = output.typestate_result {
         buf.push_str("\n=== Typestate Analysis ===\n");
-        buf.push_str(&format!("  Spec:            {}\n", ts.spec_name));
-        buf.push_str(&format!("  Tracked:         {}\n", ts.tracked_count));
-        buf.push_str(&format!("  Iterations:      {}\n", ts.iterations));
+        writeln!(buf, "  Spec:            {}", ts.spec_name).unwrap();
+        writeln!(buf, "  Tracked:         {}", ts.tracked_count).unwrap();
+        writeln!(buf, "  Iterations:      {}", ts.iterations).unwrap();
     }
 
     // Combined analysis results
     if let Some(ref combined) = output.combined_result {
         buf.push_str("\n=== Combined PTA + Abstract Interpretation ===\n");
-        buf.push_str(&format!(
-            "  Refinement iterations: {}\n",
+
+        writeln!(
+            buf,
+            "  Refinement iterations: {}",
             combined.refinement_iterations
-        ));
-        buf.push_str(&format!(
-            "  Function summaries:    {}\n",
-            combined.summaries.len()
-        ));
+        )
+        .unwrap();
+
+        writeln!(buf, "  Function summaries:    {}", combined.summaries.len()).unwrap();
     }
 
     buf
