@@ -10,6 +10,7 @@
 - [First Analysis](getting-started/first-analysis.md)
 - [Playground Tour](getting-started/playground-tour.md)
 - [Browser vs Full SAF](getting-started/browser-vs-full.md)
+- [LLVM Version Support](getting-started/llvm-versions.md)
 
 # Concepts
 

@@ -1521,16 +1521,14 @@ fn extract_recursive_call_args_from_result(
 ///
 /// # Algorithm
 ///
-/// 1. Initialize all functions in SCC with bottom summaries
-/// 2. For each iteration:
-///     a. Combine external + current SCC summaries
-///     b. For each function in SCC:
-///        - Re-analyze the function using `solve_abstract_interp_with_pta_and_summaries`
-///          (which uses summary return intervals for calls)
-///        - Extract new summary from the fresh analysis result
-///     c. Apply join (or widening after threshold) to update summaries
-///     d. Check for fixpoint
-/// 3. Return converged summaries
+/// 1. Initialize all functions in SCC with bottom summaries.
+/// 2. For each iteration: combine external + current SCC summaries; for each
+///    function in the SCC, re-analyze it using
+///    `solve_abstract_interp_with_pta_and_summaries` (which uses summary
+///    return intervals for calls) and extract a new summary from the fresh
+///    result; apply join (or widening after threshold) to update summaries;
+///    check for fixpoint.
+/// 3. Return converged summaries.
 // NOTE: This function implements iterative fixpoint summary computation for
 // mutually-recursive SCCs. The initialization, per-function re-analysis,
 // summary extraction, and convergence check are tightly coupled.

@@ -1,17 +1,32 @@
 .PHONY: test test-rust test-python test-crate test-clean lint lint-clippy lint-fmt fmt shell build rebuild clean cloc help \
 	compile-lua-fixtures test-incremental bench-incremental \
 	compile-ptaben test-ptaben test-ptaben-json clean-ptaben \
+	compile-ptaben-llvm22 test-ptaben-llvm22 test-ptaben-llvm22-json \
+	compile-llvm22-syntax-fixtures \
 	compile-svcomp compile-svcomp-category test-svcomp test-svcomp-category test-svcomp-json clean-svcomp \
 	svcomp-categories \
 	compile-juliet test-juliet test-juliet-json juliet-categories clean-juliet \
+	compile-juliet-llvm22 test-juliet-llvm22 test-juliet-llvm22-json \
 	compile-oracle verify-oracle verify-props verify-props-quick verify-quick verify clean-oracle \
 	notebook wasm wasm-dev playground playground-dev playground-deploy \
 	prepare-cruxbc test-cruxbc test-cruxbc-svf test-cruxbc-svf-mem2reg test-cruxbc-llvm-cg compare-cruxbc clean-cruxbc \
-	tutorials tutorials-dev site site-dev-all site-dev site-clean
+	tutorials tutorials-dev site site-dev-all site-dev site-clean \
+	shell-llvm22 test-llvm22 lint-llvm22 build-llvm22
+
+# Feature sets for LLVM 22 cargo invocations — disables defaults (which pin
+# llvm-18) and re-activates the same non-LLVM features the workspace would
+# normally get from each crate's default set.
+#
+# SAF_LLVM22_FEATURES covers the full workspace (for `cargo build/test --workspace`).
+# Per-package invocations (`cargo run -p saf-bench`) need the subset that maps
+# to that package's dependency graph.
+SAF_LLVM22_FEATURES := --no-default-features --features "saf-frontends/llvm-22,saf-analysis/z3-solver,saf-core/logging-subscriber,saf-cli/llvm-22,saf-bench/llvm-22,saf-trace/llvm-22,saf-datalog/llvm-22,saf-test-utils/llvm-22"
+SAF_LLVM22_FEATURES_BENCH := --no-default-features --features "saf-frontends/llvm-22,saf-analysis/z3-solver,saf-core/logging-subscriber,saf-cli/llvm-22,saf-bench/llvm-22"
+SAF_LLVM22_FEATURES_CLI := --no-default-features --features "saf-frontends/llvm-22,saf-analysis/z3-solver,saf-core/logging-subscriber,saf-cli/llvm-22"
 
 help: ## Show this help message
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-32s\033[0m %s\n", $$1, $$2}'
 
 test: ## Run all tests (Rust + Python, cached)
 	docker compose run --rm test
@@ -41,11 +56,24 @@ lint-fmt: ## Run rustfmt check only inside Docker
 fmt: ## Auto-format all Rust code inside Docker
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo fmt --all
 
-shell: ## Open an interactive dev shell inside Docker
+shell: ## Open an interactive dev shell inside Docker (LLVM 18)
 	docker compose run --rm dev
 
-build: ## Build the runtime Docker image
+shell-llvm22: ## Open an interactive dev shell inside Docker (LLVM 22)
+	docker compose run --rm dev-llvm22
+
+test-llvm22: ## Run all tests (Rust + Python) inside the LLVM 22 image
+	docker compose run --rm test-llvm22
+
+lint-llvm22: ## Run clippy + rustfmt check inside the LLVM 22 image
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 sh -c \
+		"cargo clippy --workspace $(SAF_LLVM22_FEATURES) -- -D warnings && cargo fmt --all -- --check"
+
+build: ## Build the runtime Docker image (LLVM 18)
 	docker compose build build
+
+build-llvm22: ## Build the runtime Docker image (LLVM 22)
+	docker compose build build-llvm22
 
 rebuild: ## Rebuild Docker images (use after Dockerfile changes)
 	docker compose build
@@ -80,22 +108,44 @@ compile-ptaben: ## Compile PTABen test suite with LLVM 18 (run once after clone/
 	@echo "Compiling PTABen test suite..."
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev ./scripts/compile-ptaben.sh
 
-test-ptaben: ## Run PTABen benchmark suite against SAF
+compile-ptaben-llvm22: ## Compile PTABen test suite with LLVM 22 to .compiled-llvm22/
+	@echo "Compiling PTABen test suite with clang-22..."
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 ./scripts/compile-ptaben.sh
+
+compile-llvm22-syntax-fixtures: ## Compile LLVM 19-22 syntax-target fixtures with clang-22
+	@echo "Compiling LLVM 22 syntax fixtures with clang-22..."
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 ./tests/programs/compile-llvm22-syntax.sh
+
+test-ptaben: ## Run PTABen benchmark suite against SAF (LLVM 18)
 	@echo "Running PTABen benchmarks..."
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c '\
 	  cargo build --release -p saf-cli && \
 	  cargo run --release -p saf-bench -- ptaben \
 	    --compiled-dir tests/benchmarks/ptaben/.compiled'
 
-test-ptaben-json: ## Run PTABen benchmarks with JSON output
+test-ptaben-llvm22: ## Run PTABen benchmark suite against SAF (LLVM 22)
+	@echo "Running PTABen benchmarks on LLVM 22..."
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 sh -c '\
+	  cargo build --release -p saf-cli $(SAF_LLVM22_FEATURES_CLI) && \
+	  cargo run --release -p saf-bench $(SAF_LLVM22_FEATURES_BENCH) -- ptaben \
+	    --compiled-dir tests/benchmarks/ptaben/.compiled-llvm22'
+
+test-ptaben-json: ## Run PTABen benchmarks with JSON output (LLVM 18)
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c '\
 	  cargo build --release -p saf-cli && \
 	  cargo run --release -p saf-bench -- ptaben \
 	    --compiled-dir tests/benchmarks/ptaben/.compiled \
-	    --json'
+	    -o /workspace/tests/benchmarks/ptaben/results.json'
 
-clean-ptaben: ## Remove compiled PTABen bitcode
-	rm -rf tests/benchmarks/ptaben/.compiled
+test-ptaben-llvm22-json: ## Run PTABen benchmarks with JSON output (LLVM 22)
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 sh -c '\
+	  cargo build --release -p saf-cli $(SAF_LLVM22_FEATURES_CLI) && \
+	  cargo run --release -p saf-bench $(SAF_LLVM22_FEATURES_BENCH) -- ptaben \
+	    --compiled-dir tests/benchmarks/ptaben/.compiled-llvm22 \
+	    -o /workspace/tests/benchmarks/ptaben/results-llvm22.json'
+
+clean-ptaben: ## Remove compiled PTABen bitcode (both LLVM 18 and LLVM 22)
+	rm -rf tests/benchmarks/ptaben/.compiled tests/benchmarks/ptaben/.compiled-llvm22
 
 # --- SV-COMP Benchmark Suite ---
 # Use AGGRESSIVE=1 for aggressive mode (more bug detection, slightly higher FP risk)
@@ -168,17 +218,35 @@ compile-juliet: ## Compile Juliet tests (15 supported CWEs) with LLVM 18 + mem2r
 	@echo "Compiling Juliet test suite..."
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev ./scripts/compile-juliet.sh --verbose
 
+compile-juliet-llvm22: ## Compile Juliet tests with clang-22 to .compiled-juliet-llvm22/ (CWE=CWE476 to filter)
+	@echo "Compiling Juliet test suite with clang-22..."
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 ./scripts/compile-juliet.sh --verbose $(if $(CWE),--cwe $(CWE),)
+
 test-juliet: ## Run Juliet benchmarks with precision/recall/F1 (CWE=CWE476 to filter)
 	@echo "Running Juliet benchmarks..."
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo run --release -p saf-bench -- juliet \
 		--compiled-dir tests/benchmarks/sv-benchmarks/.compiled-juliet \
 		$(if $(CWE),--cwe $(CWE),)
 
+test-juliet-llvm22: ## Run Juliet benchmarks inside the LLVM 22 image (CWE=CWE476 to filter)
+	@echo "Running Juliet benchmarks on LLVM 22..."
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 sh -c '\
+	  cargo run --release -p saf-bench $(SAF_LLVM22_FEATURES_BENCH) -- juliet \
+	    --compiled-dir tests/benchmarks/sv-benchmarks/.compiled-juliet-llvm22 \
+	    $(if $(CWE),--cwe $(CWE),)'
+
 test-juliet-json: ## Run Juliet benchmarks with JSON output to file
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo run --release -p saf-bench -- juliet \
 		--compiled-dir tests/benchmarks/sv-benchmarks/.compiled-juliet \
 		$(if $(CWE),--cwe $(CWE),) \
 		-o /workspace/tests/benchmarks/sv-benchmarks/juliet-results.json
+
+test-juliet-llvm22-json: ## Run Juliet benchmarks (LLVM 22) with JSON output to file
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev-llvm22 sh -c '\
+	  cargo run --release -p saf-bench $(SAF_LLVM22_FEATURES_BENCH) -- juliet \
+	    --compiled-dir tests/benchmarks/sv-benchmarks/.compiled-juliet-llvm22 \
+	    $(if $(CWE),--cwe $(CWE),) \
+	    -o /workspace/tests/benchmarks/sv-benchmarks/juliet-results-llvm22.json'
 
 juliet-categories: ## List supported Juliet CWE categories
 	@echo "Supported CWEs (15 categories, ~24,815 tests):"

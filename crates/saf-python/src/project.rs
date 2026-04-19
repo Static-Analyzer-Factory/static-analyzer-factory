@@ -21,7 +21,7 @@ use saf_core::air::AirModule;
 use saf_core::config::Config;
 use saf_frontends::air_json::AirJsonFrontend;
 use saf_frontends::api::Frontend;
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 use saf_frontends::llvm::LlvmFrontend;
 
 use crate::absint::{self as py_absint, PyAbstractInterpResult, PyNumericFinding};
@@ -160,7 +160,7 @@ impl Project {
         } else if path.to_ascii_lowercase().ends_with(".ll")
             || path.to_ascii_lowercase().ends_with(".bc")
         {
-            #[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+            #[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
             {
                 LlvmFrontend::new()
                     .ingest(&[file_path], &saf_config)
@@ -173,12 +173,12 @@ impl Project {
                         )
                     })?
             }
-            #[cfg(not(any(feature = "llvm-17", feature = "llvm-18")))]
+            #[cfg(not(any(feature = "llvm-18", feature = "llvm-22")))]
             {
                 return Err(frontend_error(
                     py,
                     codes::FRONTEND_NOT_FOUND,
-                    "LLVM support not compiled in. Rebuild with the llvm-17 or llvm-18 feature.",
+                    "LLVM support not compiled in. Rebuild with the llvm-18 or llvm-22 feature.",
                     Some(path),
                 ));
             }
@@ -1208,7 +1208,7 @@ impl PyAnalysisSession {
             } else if path_str.to_ascii_lowercase().ends_with(".ll")
                 || path_str.to_ascii_lowercase().ends_with(".bc")
             {
-                #[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+                #[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
                 {
                     LlvmFrontend::new()
                         .ingest(&[file_path], &saf_config)
@@ -1221,12 +1221,12 @@ impl PyAnalysisSession {
                             )
                         })?
                 }
-                #[cfg(not(any(feature = "llvm-17", feature = "llvm-18")))]
+                #[cfg(not(any(feature = "llvm-18", feature = "llvm-22")))]
                 {
                     return Err(frontend_error(
                         py,
                         codes::FRONTEND_NOT_FOUND,
-                        "LLVM support not compiled in. Rebuild with the llvm-17 or llvm-18 feature.",
+                        "LLVM support not compiled in. Rebuild with the llvm-18 or llvm-22 feature.",
                         Some(path_str),
                     ));
                 }

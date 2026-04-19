@@ -189,7 +189,7 @@ fn valueflow_property_graph_nodes_have_spans() {
 
 /// Verify extracted line numbers match the known C source structure.
 ///
-/// The debug_info.ll fixture was compiled from:
+/// The `debug_info.ll` fixture was compiled from:
 /// ```c
 /// int add(int a, int b) { return a + b; }    // line 1
 /// int main() { return add(1, 2); }            // line 2

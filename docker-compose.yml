@@ -1,20 +1,25 @@
 services:
+  # -------------------------------------------------------------------------
+  # LLVM 18 (default) — the main dev / test / runtime image stream.
+  # -------------------------------------------------------------------------
   dev:
     build:
       context: .
       target: dev
       args:
         APT_MIRROR: ${APT_MIRROR-mirrors.aliyun.com}
+        LLVM_VERSION: "18"
+    image: saf-dev:llvm18
     user: "${UID:-1000}:${GID:-1000}"
     environment:
       - NEO4J_URI=bolt://neo4j:7687
     volumes:
       - .:/workspace
-      - cargo-registry:/opt/cargo/registry
-      - cargo-git:/opt/cargo/git
-      - cargo-bin:/opt/cargo/bin
-      - target-cache:/workspace/target
-      - maturin-cache:/workspace/target-maturin
+      - cargo-registry-llvm18:/opt/cargo/registry
+      - cargo-git-llvm18:/opt/cargo/git
+      - cargo-bin-llvm18:/opt/cargo/bin
+      - target-cache-llvm18:/workspace/target
+      - maturin-cache-llvm18:/workspace/target-maturin
     working_dir: /workspace
     stdin_open: true
     tty: true
@@ -27,15 +32,17 @@ services:
       target: dev
       args:
         APT_MIRROR: ${APT_MIRROR-mirrors.aliyun.com}
+        LLVM_VERSION: "18"
+    image: saf-dev:llvm18
     user: "${UID:-1000}:${GID:-1000}"
     environment:
       - SKIP_MATURIN_BUILD=1
     volumes:
       - .:/workspace
-      - cargo-registry:/opt/cargo/registry
-      - cargo-git:/opt/cargo/git
-      - target-cache:/workspace/target
-      - maturin-cache:/workspace/target-maturin
+      - cargo-registry-llvm18:/opt/cargo/registry
+      - cargo-git-llvm18:/opt/cargo/git
+      - target-cache-llvm18:/workspace/target
+      - maturin-cache-llvm18:/workspace/target-maturin
     working_dir: /workspace
     command:
       - sh
@@ -53,6 +60,7 @@ services:
       target: test
       args:
         APT_MIRROR: ${APT_MIRROR-mirrors.aliyun.com}
+        LLVM_VERSION: "18"
 
   build:
     build:
@@ -60,7 +68,74 @@ services:
       target: runtime
       args:
         APT_MIRROR: ${APT_MIRROR-mirrors.aliyun.com}
+        LLVM_VERSION: "18"
 
+  # -------------------------------------------------------------------------
+  # LLVM 22 — opt-in; parallel image stream with isolated caches.
+  # -------------------------------------------------------------------------
+  dev-llvm22:
+    build:
+      context: .
+      target: dev
+      args:
+        APT_MIRROR: ${APT_MIRROR-mirrors.aliyun.com}
+        LLVM_VERSION: "22"
+    image: saf-dev:llvm22
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - LLVM_VERSION=22
+      - SAF_CARGO_FEATURES=--no-default-features --features "saf-frontends/llvm-22,saf-analysis/z3-solver,saf-core/logging-subscriber,saf-cli/llvm-22,saf-bench/llvm-22,saf-trace/llvm-22,saf-datalog/llvm-22,saf-test-utils/llvm-22"
+    volumes:
+      - .:/workspace
+      - cargo-registry-llvm22:/opt/cargo/registry
+      - cargo-git-llvm22:/opt/cargo/git
+      - cargo-bin-llvm22:/opt/cargo/bin
+      - target-cache-llvm22:/workspace/target
+      - maturin-cache-llvm22:/workspace/target-maturin
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+
+  test-llvm22:
+    build:
+      context: .
+      target: dev
+      args:
+        APT_MIRROR: ${APT_MIRROR-mirrors.aliyun.com}
+        LLVM_VERSION: "22"
+    image: saf-dev:llvm22
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      - SKIP_MATURIN_BUILD=1
+      - LLVM_VERSION=22
+    volumes:
+      - .:/workspace
+      - cargo-registry-llvm22:/opt/cargo/registry
+      - cargo-git-llvm22:/opt/cargo/git
+      - target-cache-llvm22:/workspace/target
+      - maturin-cache-llvm22:/workspace/target-maturin
+    working_dir: /workspace
+    command:
+      - sh
+      - -c
+      - |
+        FEATS="saf-frontends/llvm-22,saf-analysis/z3-solver,saf-core/logging-subscriber,saf-cli/llvm-22,saf-bench/llvm-22,saf-trace/llvm-22,saf-datalog/llvm-22,saf-test-utils/llvm-22" && \
+        cargo nextest run --workspace --exclude saf-python --no-default-features --features "$$FEATS" && \
+        CARGO_TARGET_DIR=/workspace/target-maturin maturin develop --no-default-features --features llvm-22 && \
+        pytest python/tests/ -v
+
+  build-llvm22:
+    build:
+      context: .
+      target: runtime
+      args:
+        APT_MIRROR: ${APT_MIRROR-mirrors.aliyun.com}
+        LLVM_VERSION: "22"
+
+  # -------------------------------------------------------------------------
+  # Shared sidecars.
+  # -------------------------------------------------------------------------
   neo4j:
     image: neo4j:5-community
     ports:
@@ -73,9 +148,17 @@ services:
       - neo4j-data:/data
 
 volumes:
-  cargo-registry:
-  cargo-git:
-  cargo-bin:
-  target-cache:
-  maturin-cache:
+  # LLVM-18 caches
+  cargo-registry-llvm18:
+  cargo-git-llvm18:
+  cargo-bin-llvm18:
+  target-cache-llvm18:
+  maturin-cache-llvm18:
+  # LLVM-22 caches
+  cargo-registry-llvm22:
+  cargo-git-llvm22:
+  cargo-bin-llvm22:
+  target-cache-llvm22:
+  maturin-cache-llvm22:
+  # Sidecar
   neo4j-data:

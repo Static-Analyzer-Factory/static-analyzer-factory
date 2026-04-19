@@ -16,10 +16,15 @@ rustc-hash = { workspace = true }
 fixedbitset = "0.5"
 
 [dev-dependencies]
-saf-test-utils = { path = "../saf-test-utils" }
-saf-frontends = { workspace = true, features = ["llvm-18"] }
+saf-test-utils = { path = "../saf-test-utils", default-features = false }
+# saf-frontends inherits default-features = false from workspace; LLVM feature
+# comes via saf-datalog's own `llvm-*` passthrough features.
+saf-frontends = { workspace = true }
 
 [features]
-default = []
+default = ["llvm-18"]
 parallel = ["ascent/par"]
 wasm = ["ascent/wasm-bindgen"]
+# LLVM version selection for dev-dependencies:
+llvm-18 = ["saf-frontends/llvm-18", "saf-test-utils/llvm-18"]
+llvm-22 = ["saf-frontends/llvm-22", "saf-test-utils/llvm-22"]

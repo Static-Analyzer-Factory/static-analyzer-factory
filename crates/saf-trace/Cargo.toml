@@ -10,9 +10,14 @@ description = "Algorithm trace generator for interactive tutorial animations"
 name = "saf-trace"
 path = "src/main.rs"
 
+[features]
+default = ["llvm-18"]
+llvm-18 = ["saf-frontends/llvm-18"]
+llvm-22 = ["saf-frontends/llvm-22"]
+
 [dependencies]
 saf-core = { workspace = true, features = ["logging-subscriber"] }
-saf-frontends = { workspace = true, features = ["llvm-18"] }
+saf-frontends = { workspace = true }
 saf-analysis = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
