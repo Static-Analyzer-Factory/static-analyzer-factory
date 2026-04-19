@@ -60,6 +60,16 @@ export default function Hero() {
     <section className="hero">
       <div className="hero-content">
         <div className="hero-text">
+          <motion.img
+            src="./saf-logo.png"
+            alt="Static Analyzer Factory logo"
+            className="hero-logo"
+            width={112}
+            height={112}
+            initial={{ opacity: 0, scale: 0.85 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ duration: 0.5, ease: 'easeOut' as const }}
+          />
           <motion.h1
             initial={{ opacity: 0, y: 30 }}
             animate={{ opacity: 1, y: 0 }}

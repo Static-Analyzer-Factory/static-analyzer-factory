@@ -20,7 +20,9 @@ local installation below.
 ## Local Installation (Docker)
 
 The local installation uses Docker to provide a complete development environment
-with Rust, Python 3.12, LLVM 18, and all dependencies pre-installed.
+with Rust, Python 3.12, LLVM 18 (default — also available: LLVM 22, opt-in), and
+all dependencies pre-installed. See [LLVM Version Support](llvm-versions.md) for
+when to pick each variant.
 
 ### Prerequisites
 
@@ -76,20 +78,28 @@ The Docker environment provides:
 |------|---------|---------|
 | Rust | stable | Core analysis engine |
 | Python | 3.12 | SDK and tutorials |
-| LLVM/Clang | 18 | C/C++ to LLVM IR compilation |
+| LLVM/Clang | 18 (default) or 22 (opt-in) | C/C++ to LLVM IR compilation |
 | maturin | latest | Python-Rust bridge (PyO3) |
 
 ## Available Make Commands
 
 ```bash
-make help        # Show all available commands
-make test        # Run all tests (Rust + Python) in Docker
-make lint        # Run clippy + rustfmt check in Docker
-make fmt         # Auto-format all Rust code in Docker
-make shell       # Open interactive dev shell in Docker
-make build       # Build minimal runtime Docker image
-make clean       # Remove Docker volumes and local target/
+make help              # Show all available commands (both LLVM variants)
+make test              # Run all tests (Rust + Python) in Docker — LLVM 18
+make test-llvm22       # Same, but inside the LLVM 22 image
+make lint              # Run clippy + rustfmt check in Docker — LLVM 18
+make lint-llvm22       # Same, but inside the LLVM 22 image
+make fmt               # Auto-format all Rust code in Docker
+make shell             # Interactive dev shell (LLVM 18)
+make shell-llvm22      # Interactive dev shell (LLVM 22)
+make build             # Build minimal runtime Docker image (LLVM 18)
+make build-llvm22      # Build minimal runtime Docker image (LLVM 22)
+make clean             # Remove Docker volumes and local target/
 ```
+
+Pick `*-llvm22` variants only when you need to analyze IR emitted by clang-22
+(or otherwise post-LLVM-18). The `*-llvm22` targets build a separate Docker
+image from `apt.llvm.org` packages; the first run takes a few extra minutes.
 
 ## Next Steps
 

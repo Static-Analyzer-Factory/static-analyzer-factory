@@ -417,6 +417,8 @@ impl ProgramDatabase {
     /// Parse `"sources"` and `"sinks"` selector arrays from query params.
     ///
     /// Returns the resolved `ValueId` sets, or an error `Response`.
+    // `Response` is the JSON-RPC wire protocol response — large by design
+    #[allow(clippy::result_large_err)]
     fn parse_sources_sinks(
         &self,
         params: &BTreeMap<String, serde_json::Value>,
@@ -440,6 +442,8 @@ impl ProgramDatabase {
     }
 
     /// Parse a single selector array param and resolve to `ValueId`s.
+    // `Response` is the JSON-RPC wire protocol response — large by design
+    #[allow(clippy::result_large_err)]
     fn parse_selectors_param(
         &self,
         value: &serde_json::Value,

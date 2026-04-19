@@ -6,6 +6,11 @@ description = "Test utilities for SAF crates"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+default = ["llvm-18"]
+llvm-18 = ["saf-frontends/llvm-18"]
+llvm-22 = ["saf-frontends/llvm-22"]
+
 [dependencies]
 saf-core = { path = "../saf-core" }
-saf-frontends = { path = "../saf-frontends", features = ["llvm-18"] }
+saf-frontends = { path = "../saf-frontends", default-features = false }

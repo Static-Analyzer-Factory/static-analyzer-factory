@@ -14,9 +14,14 @@ path = "src/lib.rs"
 name = "saf"
 path = "src/main.rs"
 
+[features]
+default = ["llvm-18"]
+llvm-18 = ["saf-frontends/llvm-18"]
+llvm-22 = ["saf-frontends/llvm-22"]
+
 [dependencies]
 saf-core = { workspace = true, features = ["logging-subscriber"] }
-saf-frontends = { workspace = true, features = ["llvm-18"] }
+saf-frontends = { workspace = true }
 saf-analysis = { workspace = true, features = ["z3-solver", "analysis-mta"] }
 clap = { workspace = true }
 anyhow = { workspace = true }

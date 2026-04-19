@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 saf-core = { workspace = true, features = ["logging-subscriber"] }
-saf-frontends = { workspace = true, features = ["llvm-18"] }
+saf-frontends = { workspace = true }
 saf-analysis = { workspace = true, features = ["z3-solver", "analysis-mta"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
@@ -20,7 +20,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-saf-cli = { path = "../saf-cli" }
+saf-cli = { path = "../saf-cli", default-features = false }
 rayon = "1.10"
 walkdir = "2"
 serde_yaml = "0.9"
@@ -28,3 +28,6 @@ sha2 = "0.10"
 tempfile = "3"
 
 [features]
+default = ["llvm-18"]
+llvm-18 = ["saf-frontends/llvm-18", "saf-cli/llvm-18"]
+llvm-22 = ["saf-frontends/llvm-22", "saf-cli/llvm-22"]

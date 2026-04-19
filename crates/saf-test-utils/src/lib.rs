@@ -48,7 +48,7 @@ pub fn load_ll_bundle(name: &str) -> AirBundle {
     let config = Config::default();
     frontend
         .ingest(&[path.as_path()], &config)
-        .unwrap_or_else(|e| panic!("Failed to load fixture '{name}' at {path:?}: {e}"))
+        .unwrap_or_else(|e| panic!("Failed to load fixture '{name}' at {}: {e}", path.display()))
 }
 
 /// Load an LLVM IR fixture by name and return the module.
@@ -78,7 +78,7 @@ pub fn load_ll_from_path(path: &Path) -> AirBundle {
     let config = Config::default();
     frontend
         .ingest(&[path], &config)
-        .unwrap_or_else(|e| panic!("Failed to load fixture at {path:?}: {e}"))
+        .unwrap_or_else(|e| panic!("Failed to load fixture at {}: {e}", path.display()))
 }
 
 /// Returns the path to the verification test fixtures directory.
@@ -131,7 +131,12 @@ pub fn load_air_json_bundle(name: &str) -> AirBundle {
     let config = Config::default();
     frontend
         .ingest(&[path.as_path()], &config)
-        .unwrap_or_else(|e| panic!("Failed to load AIR-JSON fixture '{name}' at {path:?}: {e}"))
+        .unwrap_or_else(|e| {
+            panic!(
+                "Failed to load AIR-JSON fixture '{name}' at {}: {e}",
+                path.display()
+            )
+        })
 }
 
 /// Load an AIR-JSON fixture by name and return the module.

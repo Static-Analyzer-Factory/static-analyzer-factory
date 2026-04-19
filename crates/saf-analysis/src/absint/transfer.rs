@@ -1916,12 +1916,10 @@ fn compute_field_byte_offset(
                     // Navigate into the field type for further steps
                     if let Some(ty) = type_registry.get(&field.field_type) {
                         current_type = ty;
-                    } else {
-                        // Can't resolve further type — but we have the offset so far.
-                        // If there are more steps, we'll fail on the next iteration.
-                        // For a terminal step this is fine.
-                        continue;
                     }
+                    // Can't resolve further type — but we have the offset so far.
+                    // If there are more steps, we'll fail on the next iteration.
+                    // For a terminal step this is fine.
                 } else {
                     // Not a struct — cannot resolve field offset
                     return None;

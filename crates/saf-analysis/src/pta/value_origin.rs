@@ -1433,8 +1433,8 @@ fn combine_path_alias_results(results: &[AliasResult]) -> AliasResult {
         return first;
     }
 
-    let any_must = reachable.iter().any(|&r| r == AliasResult::Must);
-    let any_no = reachable.iter().any(|&r| r == AliasResult::No);
+    let any_must = reachable.contains(&AliasResult::Must);
+    let any_no = reachable.contains(&AliasResult::No);
     let all_no = reachable.iter().all(|&r| r == AliasResult::No);
     let all_must = reachable.iter().all(|&r| r == AliasResult::Must);
 

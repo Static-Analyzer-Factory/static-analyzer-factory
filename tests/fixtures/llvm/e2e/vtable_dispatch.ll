@@ -88,7 +88,7 @@ define linkonce_odr dso_local void @_ZN3DogC2Ev(ptr noundef nonnull align 8 dere
   call void @llvm.dbg.declare(metadata ptr %2, metadata !253, metadata !DIExpression()), !dbg !255
   %3 = load ptr, ptr %2, align 8
   call void @_ZN6AnimalC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #9, !dbg !256
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV3Dog, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !256
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV3Dog, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !256
   ret void, !dbg !256
 }
 
@@ -98,7 +98,7 @@ define linkonce_odr dso_local void @_ZN6AnimalC2Ev(ptr noundef nonnull align 8 d
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !259, metadata !DIExpression()), !dbg !260
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV6Animal, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !261
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV6Animal, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !261
   ret void, !dbg !261
 }
 

@@ -3,7 +3,7 @@
 //! Converts LLVM instructions, values, and types to their AIR equivalents.
 //! This is the core conversion logic shared by all LLVM version adapters.
 
-#![cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#![cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 
 use std::collections::BTreeMap;
 
@@ -316,8 +316,24 @@ impl MappingContext<'_> {
         // Need a current block to create instruction IDs
         let block_id = self.current_block_id?;
 
+        // Drop the first index: LLVM GEP's first index is a pointer-level step
+        // (advance by `sizeof(pointee)` * idx, almost always 0 for globals),
+        // not a type-descent index. SAF's `FieldPath` only carries descent
+        // steps — matching `resolve_constant_gep_element`'s behavior below.
+        //
+        // A single-index constant GEP (like `getelementptr [N x T], ptr @g,
+        // i64 K`) has no type descent — the index is purely pointer-level.
+        // Bail out so the caller falls through to simple base-address
+        // resolution; emitting a one-step `FieldPath{K}` would be wrong
+        // (it would descend into field K of the pointee, not offset past
+        // the aggregate by K * sizeof(pointee)).
+        if indices.len() < 2 {
+            return None;
+        }
+        let field_indices: &[i64] = &indices[1..];
+
         // Build FieldPath from parsed indices (all constant → Field steps)
-        let steps: Vec<FieldStep> = indices
+        let steps: Vec<FieldStep> = field_indices
             .iter()
             .filter_map(|&idx| {
                 u32::try_from(idx)
@@ -326,7 +342,7 @@ impl MappingContext<'_> {
             })
             .collect();
 
-        if steps.len() != indices.len() {
+        if steps.len() != field_indices.len() {
             return None; // Some indices were negative or too large
         }
 
@@ -336,13 +352,17 @@ impl MappingContext<'_> {
         let inst_id = self.create_inst_id(block_id);
         let dst_id = self.create_inst_result_id(inst_id);
 
-        // Build operands: [base_ptr, ...index_constants]
+        // Build operands: [base_ptr, ...index_constants].
+        // Use `field_indices` (not `indices`) so the operand count matches the
+        // `FieldPath` step count — PTA's `convert_field_path_with_operands`
+        // walks both in lockstep.
+        //
         // Derive index ValueIds directly — BLAKE3 is deterministic, so the same
-        // "i64 N" string always produces the same ValueId. LLVM uniquess constant
+        // "i64 N" string always produces the same ValueId. LLVM uniques constant
         // integers, so get_or_create_value_id will produce matching IDs when it
         // encounters the same constant as an operand elsewhere.
         let mut operands = vec![base_vid];
-        for &idx in &indices {
+        for &idx in field_indices {
             let idx_repr = format!("i64 {idx}");
             let idx_vid = ValueId::derive(idx_repr.as_bytes());
             self.constants
@@ -1696,7 +1716,7 @@ fn compute_llvm_type_size(type_str: &str) -> Option<u64> {
     // Integer types: i1, i8, i16, i32, i64, i128
     if let Some(bits_str) = t.strip_prefix('i') {
         let bits: u64 = bits_str.parse().ok()?;
-        return Some((bits + 7) / 8); // round up to bytes
+        return Some(bits.div_ceil(8)); // round up to bytes
     }
 
     // Pointer type (opaque pointer in LLVM 15+)
@@ -1883,13 +1903,39 @@ fn parse_constant_gep(repr: &str) -> Option<(&str, Vec<i64>)> {
         &after_at[..end]
     };
 
-    // Extract constant integer indices: find all "iN <number>" patterns after the global name
+    // Extract constant integer indices: find "iN <number>" patterns after each
+    // comma following the global name. LLVM 18 may prefix an index with
+    // `inrange` (e.g., "inrange i32 0"); LLVM 20+ moved `inrange(N,M)` to the
+    // GEP level instead, so it doesn't appear here. Skip any leading attribute
+    // word (alphabetic) before matching the "iN N" type+value pair.
     let mut indices: Vec<i64> = Vec::new();
     let mut search_from = at_pos;
     while let Some(comma_pos) = repr[search_from..].find(',') {
         let after_comma = &repr[search_from + comma_pos + 1..];
-        let trimmed = after_comma.trim_start();
-        if let Some(rest) = trimmed.strip_prefix('i') {
+        let mut tok = after_comma.trim_start();
+
+        // Strip leading attribute words (e.g., "inrange ") until we see "iN ".
+        while let Some(first) = tok.chars().next() {
+            if first == 'i' {
+                // Candidate "iN N" — check that what follows 'i' is digits + space.
+                let after_i = &tok[1..];
+                let digits_end = after_i
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(after_i.len());
+                if digits_end > 0 && after_i[digits_end..].starts_with(' ') {
+                    break; // matches "iN " — parse below
+                }
+            }
+            // Skip one whitespace-delimited token and continue.
+            if let Some(next) = tok.find(char::is_whitespace) {
+                tok = tok[next..].trim_start();
+            } else {
+                tok = "";
+                break;
+            }
+        }
+
+        if let Some(rest) = tok.strip_prefix('i') {
             if let Some(space_pos) = rest.find(' ') {
                 let num_str = rest[space_pos + 1..]
                     .trim_start()
@@ -1928,11 +1974,16 @@ fn resolve_constant_gep_element(
 
     // Walk the aggregate initializer using the indices.
     // Skip the first index (it's the pointer dereference index, usually 0).
-    let element_indices = if indices.len() > 1 {
-        &indices[1..]
-    } else {
-        &indices[..]
-    };
+    //
+    // A single-index constant GEP points past the aggregate by
+    // `K * sizeof(pointee)` bytes, not to `initializer[K]` — for `K != 0`
+    // returning the latter would be wrong, and for `K == 0` the caller
+    // should already resolve to the base. Bail out and let the caller
+    // treat the GEP as a non-constant pointer.
+    if indices.len() < 2 {
+        return None;
+    }
+    let element_indices = &indices[1..];
 
     let mut current = init;
     for &idx in element_indices {

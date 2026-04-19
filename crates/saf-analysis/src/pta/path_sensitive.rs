@@ -492,9 +492,9 @@ impl<'a> PathSensitiveAliasChecker<'a> {
         }
 
         // Check special cases
-        let any_must = results.iter().any(|&r| r == AliasResult::Must);
-        let any_no = results.iter().any(|&r| r == AliasResult::No);
-        let any_unknown = results.iter().any(|&r| r == AliasResult::Unknown);
+        let any_must = results.contains(&AliasResult::Must);
+        let any_no = results.contains(&AliasResult::No);
+        let any_unknown = results.contains(&AliasResult::Unknown);
 
         if any_unknown {
             // If any path is unknown, be conservative

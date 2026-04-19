@@ -1,18 +1,24 @@
 #!/bin/bash
-# Compile Juliet C/C++ test suite (supported CWEs only) with LLVM 18 + mem2reg
+# Compile Juliet C/C++ test suite (supported CWEs only) + mem2reg.
 # Usage: ./scripts/compile-juliet.sh [--cwe CWE476] [--jobs N] [--verbose] [--clean]
+#
+# Env:
+#   SAF_JULIET_CLANG_VERSION  Pin clang/opt major version (e.g. 22). If
+#                             unset, picks newest installed (22 > 18 > …).
+#   SAF_JULIET_OUT_DIR        Override the output directory. Defaults to
+#                             `.compiled-juliet/` for clang-18 or
+#                             `.compiled-juliet-llvm<N>/` otherwise.
 #
 # Compiles preprocessed .i files from sv-benchmarks/c/Juliet_Test/ into LLVM
 # text IR (.ll) files, organized by CWE category. Only the 15 CWE categories
 # that SAF can analyze are compiled.
 #
-# Output: tests/benchmarks/sv-benchmarks/.compiled-juliet/<CWE>/<testname>.ll
+# Output: tests/benchmarks/sv-benchmarks/<OUT_DIR>/<CWE>/<testname>.ll
 
 set -euo pipefail
 
 SVCOMP_DIR="tests/benchmarks/sv-benchmarks"
 JULIET_DIR="$SVCOMP_DIR/c/Juliet_Test"
-OUT_DIR="$SVCOMP_DIR/.compiled-juliet"
 JOBS="$(nproc)"
 VERBOSE="${VERBOSE:-0}"
 CLEAN=0
@@ -42,19 +48,6 @@ if [[ -n "$CWE_FILTER" ]]; then
     SUPPORTED_CWES="$CWE_FILTER"
 fi
 
-# Clean if requested
-if [[ "$CLEAN" == "1" ]] && [[ -d "$OUT_DIR" ]]; then
-    echo "Cleaning previous compilation..."
-    rm -rf "$OUT_DIR"
-fi
-
-echo "=== Juliet Compilation ==="
-echo "Source: $JULIET_DIR"
-echo "Output: $OUT_DIR"
-echo "Jobs:   $JOBS"
-echo "CWEs:   $(echo $SUPPORTED_CWES | wc -w | tr -d ' ')"
-echo ""
-
 # Ensure source exists
 if [[ ! -d "$JULIET_DIR" ]]; then
     echo "ERROR: Juliet tests not found at $JULIET_DIR"
@@ -62,15 +55,57 @@ if [[ ! -d "$JULIET_DIR" ]]; then
     exit 1
 fi
 
+# Resolve LLVM toolchain — explicit pin, else newest available.
+resolve_llvm_version() {
+    if [[ -n "${SAF_JULIET_CLANG_VERSION:-}" ]]; then
+        if command -v "clang-${SAF_JULIET_CLANG_VERSION}" &>/dev/null; then
+            echo "$SAF_JULIET_CLANG_VERSION"
+            return
+        fi
+        echo "ERROR: SAF_JULIET_CLANG_VERSION=${SAF_JULIET_CLANG_VERSION} requested but clang-${SAF_JULIET_CLANG_VERSION} not found" >&2
+        exit 1
+    fi
+    for v in 22 21 20 19 18 17; do
+        if command -v "clang-${v}" &>/dev/null; then
+            echo "$v"
+            return
+        fi
+    done
+    echo "ERROR: no versioned clang found (tried 22, 21, 20, 19, 18, 17)" >&2
+    exit 1
+}
+
+LLVM_VERSION="$(resolve_llvm_version)"
+CLANG="clang-${LLVM_VERSION}"
+OPT="opt-${LLVM_VERSION}"
+if ! command -v "$OPT" &>/dev/null; then
+    echo "ERROR: ${OPT} not found; cannot run mem2reg pass" >&2
+    exit 1
+fi
+
+if [[ -n "${SAF_JULIET_OUT_DIR:-}" ]]; then
+    OUT_DIR="$SAF_JULIET_OUT_DIR"
+elif [[ "$LLVM_VERSION" == "18" ]]; then
+    OUT_DIR="$SVCOMP_DIR/.compiled-juliet"
+else
+    OUT_DIR="$SVCOMP_DIR/.compiled-juliet-llvm${LLVM_VERSION}"
+fi
+
+# Clean if requested (after OUT_DIR is resolved).
+if [[ "$CLEAN" == "1" ]] && [[ -d "$OUT_DIR" ]]; then
+    echo "Cleaning previous compilation..."
+    rm -rf "$OUT_DIR"
+fi
+
 mkdir -p "$OUT_DIR"
 
-# Detect LLVM tools
-CLANG="clang"
-OPT="opt"
-if command -v clang-18 &>/dev/null; then CLANG="clang-18"; fi
-if command -v opt-18 &>/dev/null; then OPT="opt-18"; fi
-echo "Compiler: $CLANG"
+echo "=== Juliet Compilation ==="
+echo "Source:    $JULIET_DIR"
+echo "Output:    $OUT_DIR"
+echo "Compiler:  $CLANG"
 echo "Optimizer: $OPT"
+echo "Jobs:      $JOBS"
+echo "CWEs:      $(echo $SUPPORTED_CWES | wc -w | tr -d ' ')"
 echo ""
 
 # Find .i files for supported CWEs

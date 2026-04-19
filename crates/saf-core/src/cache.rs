@@ -51,8 +51,7 @@ impl BundleCache {
         std::fs::create_dir_all(&self.cache_dir)?;
         let key = hex_encode(fingerprint);
         let path = self.cache_dir.join(format!("{key}.air.json"));
-        let data = serde_json::to_string(bundle)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let data = serde_json::to_string(bundle).map_err(std::io::Error::other)?;
         std::fs::write(path, data)
     }
 

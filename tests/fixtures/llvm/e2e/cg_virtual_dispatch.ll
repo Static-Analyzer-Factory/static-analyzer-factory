@@ -113,7 +113,7 @@ define linkonce_odr dso_local void @_ZN15UnsafeProcessorC2Ev(ptr noundef nonnull
   call void @llvm.dbg.declare(metadata ptr %2, metadata !274, metadata !DIExpression()), !dbg !276
   %3 = load ptr, ptr %2, align 8
   call void @_ZN9ProcessorC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #8, !dbg !277
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV15UnsafeProcessor, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !277
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV15UnsafeProcessor, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !277
   ret void, !dbg !277
 }
 
@@ -135,7 +135,7 @@ define linkonce_odr dso_local void @_ZN9ProcessorC2Ev(ptr noundef nonnull align 
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !287, metadata !DIExpression()), !dbg !288
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV9Processor, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !289
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV9Processor, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !289
   ret void, !dbg !289
 }
 

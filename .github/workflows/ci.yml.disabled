@@ -8,44 +8,92 @@ on:
 
 jobs:
   test:
-    name: Test
+    name: Test (LLVM ${{ matrix.llvm }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        llvm: ["18", "22"]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build test image
+      - name: Build test image (LLVM ${{ matrix.llvm }})
         run: |
           docker build \
             --target test \
             --build-arg APT_MIRROR="" \
-            -t saf-test \
+            --build-arg LLVM_VERSION=${{ matrix.llvm }} \
+            -t saf-test:llvm${{ matrix.llvm }} \
             .
 
       - name: Run tests
-        run: docker run --rm saf-test
+        run: docker run --rm saf-test:llvm${{ matrix.llvm }}
 
   lint:
-    name: Lint
+    name: Lint (LLVM ${{ matrix.llvm }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        llvm: ["18", "22"]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build test image
+      - name: Build test image (LLVM ${{ matrix.llvm }})
         run: |
           docker build \
             --target test \
             --build-arg APT_MIRROR="" \
-            -t saf-test \
+            --build-arg LLVM_VERSION=${{ matrix.llvm }} \
+            -t saf-test:llvm${{ matrix.llvm }} \
             .
 
       - name: Run clippy
         run: |
-          docker run --rm saf-test \
-            cargo clippy --workspace -- -D warnings
+          if [ "${{ matrix.llvm }}" = "18" ]; then
+            docker run --rm saf-test:llvm${{ matrix.llvm }} \
+              cargo clippy --workspace -- -D warnings
+          else
+            docker run --rm saf-test:llvm${{ matrix.llvm }} \
+              cargo clippy --workspace --no-default-features \
+                --features "saf-frontends/llvm-${{ matrix.llvm }},saf-analysis/z3-solver,saf-core/logging-subscriber,saf-cli/llvm-${{ matrix.llvm }},saf-bench/llvm-${{ matrix.llvm }},saf-trace/llvm-${{ matrix.llvm }},saf-datalog/llvm-${{ matrix.llvm }},saf-test-utils/llvm-${{ matrix.llvm }}" \
+                -- -D warnings
+          fi
 
       - name: Check formatting
         run: |
-          docker run --rm saf-test \
+          docker run --rm saf-test:llvm${{ matrix.llvm }} \
             cargo fmt --all -- --check
+
+  # Release: builds and pushes both image tags. Skipped until CI is enabled
+  # and release tokens are configured.
+  # release:
+  #   name: Publish images
+  #   runs-on: ubuntu-latest
+  #   if: github.event_name == 'release'
+  #   needs: [test, lint]
+  #   strategy:
+  #     matrix:
+  #       llvm: ["18", "22"]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: docker/login-action@v3
+  #       with:
+  #         registry: ghcr.io
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+  #     - name: Build and push
+  #       run: |
+  #         docker build \
+  #           --target runtime \
+  #           --build-arg LLVM_VERSION=${{ matrix.llvm }} \
+  #           -t ghcr.io/${{ github.repository }}/saf:llvm${{ matrix.llvm }} \
+  #           .
+  #         docker push ghcr.io/${{ github.repository }}/saf:llvm${{ matrix.llvm }}
+  #         if [ "${{ matrix.llvm }}" = "18" ]; then
+  #           docker tag ghcr.io/${{ github.repository }}/saf:llvm18 \
+  #                      ghcr.io/${{ github.repository }}/saf:latest
+  #           docker push ghcr.io/${{ github.repository }}/saf:latest
+  #         fi

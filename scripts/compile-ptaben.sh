@@ -1,14 +1,17 @@
 #!/bin/bash
-# Compile PTABen test suite with LLVM 18
+# Compile PTABen test suite.
 # Usage: ./scripts/compile-ptaben.sh [--jobs N] [--verbose] [--clean]
 #
-# This script compiles all C/C++ source files from the PTABen (SVF Test-Suite)
-# benchmark into LLVM text IR (.ll) files for analysis with SAF.
+# Env:
+#   SAF_PTABEN_CLANG_VERSION  Pin the clang/opt major version (e.g. 22). If
+#                             unset, the script picks the newest installed.
+#   SAF_PTABEN_OUT_DIR        Override the output directory. Defaults to
+#                             `tests/benchmarks/ptaben/.compiled` for clang-18
+#                             or `.compiled-llvm<N>` for any other version.
 #
-# Compilation flags match PTABen's upstream generate_bc.sh:
-# - Textual IR output (-S -emit-llvm) with mem2reg promotion
-# - Per-directory flags (e.g. -DINCLUDEMAIN for CWE-based tests)
-# - -fno-discard-value-names for readable IR
+# Compiles all C/C++ sources from PTABen (SVF Test-Suite) into LLVM text IR
+# (.ll) files with mem2reg promotion. Flags match PTABen's upstream
+# generate_bc.sh.
 #
 # Note: The upstream generate_bc.sh misleadingly names output files .bc despite
 # producing text IR (-S flag). This script uses the correct .ll extension.
@@ -17,7 +20,37 @@ set -euo pipefail
 
 PTABEN_DIR="tests/benchmarks/ptaben"
 SRC_DIR="$PTABEN_DIR/src"
-OUT_DIR="$PTABEN_DIR/.compiled"
+
+# Resolve LLVM toolchain. Prefer explicit pin, else newest available.
+resolve_llvm_version() {
+    if [[ -n "${SAF_PTABEN_CLANG_VERSION:-}" ]]; then
+        if command -v "clang-${SAF_PTABEN_CLANG_VERSION}" &>/dev/null; then
+            echo "$SAF_PTABEN_CLANG_VERSION"
+            return
+        fi
+        echo "ERROR: SAF_PTABEN_CLANG_VERSION=${SAF_PTABEN_CLANG_VERSION} requested but clang-${SAF_PTABEN_CLANG_VERSION} not found" >&2
+        exit 1
+    fi
+    for v in 22 21 20 19 18 17; do
+        if command -v "clang-${v}" &>/dev/null; then
+            echo "$v"
+            return
+        fi
+    done
+    echo "ERROR: no versioned clang found (tried 22, 21, 20, 19, 18, 17)" >&2
+    exit 1
+}
+
+LLVM_VERSION="$(resolve_llvm_version)"
+
+if [[ -n "${SAF_PTABEN_OUT_DIR:-}" ]]; then
+    OUT_DIR="$SAF_PTABEN_OUT_DIR"
+elif [[ "$LLVM_VERSION" == "18" ]]; then
+    OUT_DIR="$PTABEN_DIR/.compiled"
+else
+    OUT_DIR="$PTABEN_DIR/.compiled-llvm${LLVM_VERSION}"
+fi
+
 JOBS="$(nproc)"
 VERBOSE="${VERBOSE:-0}"
 CLEAN=0
@@ -52,6 +85,7 @@ fi
 echo "=== PTABen Compilation ==="
 echo "Source: $SRC_DIR"
 echo "Output: $OUT_DIR"
+echo "LLVM:   clang-${LLVM_VERSION} + opt-${LLVM_VERSION}"
 echo "Jobs:   $JOBS"
 echo ""
 
@@ -80,12 +114,11 @@ fi
 # Include path for PTABen headers (aliascheck.h, std_testcase.h, etc.)
 INCLUDE_FLAGS="-I$PTABEN_DIR"
 
-# Detect LLVM tools (prefer versioned names)
-OPT="opt"
-if command -v opt-18 &>/dev/null; then
-    OPT="opt-18"
-elif command -v opt-17 &>/dev/null; then
-    OPT="opt-17"
+# Use the opt matching the resolved clang version.
+OPT="opt-${LLVM_VERSION}"
+if ! command -v "$OPT" &>/dev/null; then
+    echo "ERROR: ${OPT} not found; cannot run mem2reg pass" >&2
+    exit 1
 fi
 
 # Directories that need -DINCLUDEMAIN (CWE-based tests with guarded main())
@@ -114,16 +147,9 @@ compile_one() {
     # Detect which test directory this file belongs to
     local test_dir="${rel_path%%/*}"
 
-    # Select compiler
-    local clang_c="clang"
-    local clang_cxx="clang++"
-    if command -v clang-18 &>/dev/null; then
-        clang_c="clang-18"
-        clang_cxx="clang++-18"
-    elif command -v clang-17 &>/dev/null; then
-        clang_c="clang-17"
-        clang_cxx="clang++-17"
-    fi
+    # Use the clang matching the resolved version.
+    local clang_c="clang-${LLVM_VERSION}"
+    local clang_cxx="clang++-${LLVM_VERSION}"
 
     local clang_cmd="$clang_c"
     case "$src" in
@@ -181,7 +207,7 @@ compile_one() {
 }
 
 export -f compile_one
-export SRC_DIR OUT_DIR PTABEN_DIR INCLUDE_FLAGS VERBOSE OPT INCLUDEMAIN_DIRS
+export SRC_DIR OUT_DIR PTABEN_DIR INCLUDE_FLAGS VERBOSE OPT INCLUDEMAIN_DIRS LLVM_VERSION
 
 # Count source files
 total=$(find_sources | wc -l)

@@ -12,7 +12,7 @@ use saf_test_utils::load_ll_bundle;
 
 fn print_air_summary(name: &str, bundle: &AirBundle) {
     let module = &bundle.module;
-    println!("\n=== {} ===", name);
+    println!("\n=== {name} ===");
     println!("Functions: {}", module.functions.len());
 
     for func in &module.functions {
@@ -74,10 +74,7 @@ fn print_air_summary(name: &str, bundle: &AirBundle) {
                     format!(" {}", extras.join(" "))
                 };
 
-                println!(
-                    "      inst[{}] {} operands={} {}{}",
-                    ii, op_name, operands, has_dst, extra_str
-                );
+                println!("      inst[{ii}] {op_name} operands={operands} {has_dst}{extra_str}");
             }
         }
     }
@@ -92,8 +89,7 @@ fn print_air_summary(name: &str, bundle: &AirBundle) {
         let init = global
             .init
             .as_ref()
-            .map(|c| format!("{c:?}"))
-            .unwrap_or_else(|| "none".to_string());
+            .map_or_else(|| "none".to_string(), |c| format!("{c:?}"));
         println!("  global {}{}: init={}", global.name, constant, init);
     }
 

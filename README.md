@@ -1,8 +1,14 @@
-# SAF — Static Analyzer Factory
+<p align="center">
+  <img src="docs/assets/saf-logo.png" alt="Static Analyzer Factory logo" width="180" />
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/Python-3.12+-green.svg)](https://www.python.org)
-[![Rust 1.85+](https://img.shields.io/badge/Rust-1.85+-orange.svg)](https://www.rust-lang.org)
+<h1 align="center">SAF — Static Analyzer Factory</h1>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg" /></a>
+  <a href="https://www.python.org"><img alt="Python 3.12+" src="https://img.shields.io/badge/Python-3.12+-green.svg" /></a>
+  <a href="https://www.rust-lang.org"><img alt="Rust 1.85+" src="https://img.shields.io/badge/Rust-1.85+-orange.svg" /></a>
+</p>
 
 A Rust-powered static analysis framework with a Python SDK for finding bugs in C/C++ programs. SAF turns LLVM IR into analyzable graphs — pointer analysis, value-flow, taint tracking — and exposes them through a clean Python API and CLI.
 
@@ -20,13 +26,19 @@ A Rust-powered static analysis framework with a Python SDK for finding bugs in C
 
 ## Quick Start
 
-SAF runs inside Docker (LLVM 18 + all dependencies included).
+SAF runs inside Docker. Two image variants are published, one per supported
+LLVM version — pick the tag whose LLVM matches the clang you use to compile
+your source.
 
 ```bash
 git clone https://github.com/Static-Analyzer-Factory/static-analyzer-factory.git
 cd static-analyzer-factory
-make shell
+make shell            # dev shell backed by LLVM 18 (default)
+make shell-llvm22     # dev shell backed by LLVM 22 (opt-in)
 ```
+
+See [docs/book/src/getting-started/llvm-versions.md](docs/book/src/getting-started/llvm-versions.md)
+for the support policy and forward-incompatibility caveats.
 
 ### Python SDK
 
@@ -81,6 +93,39 @@ Input (.ll / .bc)
       → Pointer analysis → Value-flow graph
         → Queries & checkers → Findings (JSON / SARIF)
 ```
+
+## Benchmark Results
+
+SAF's memory-safety checkers evaluated on the [NIST Juliet C/C++ Test Suite](https://samate.nist.gov/SARD/test-suites/112), compared against [SVF](https://github.com/SVF-tools/SVF) and [Lotus](https://github.com/ZJU-PL/lotus).
+
+### Memory Leak (CWE-401) — 1,408 tests
+
+| Tool | TP | FP | FN | TN | Precision | Recall | F1 |
+|:-----|---:|---:|---:|---:|----------:|-------:|---:|
+| **SAF** | **694** | **85** | **16** | **613** | **89.1%** | **97.7%** | **0.932** |
+| SVF | 666 | 144 | 44 | 554 | 82.2% | 93.8% | 0.876 |
+
+### Double Free (CWE-415) — 385 tests
+
+| Tool | TP | FP | FN | TN | Precision | Recall | F1 |
+|:-----|---:|---:|---:|---:|----------:|-------:|---:|
+| **SAF** | **180** | **5** | **15** | **185** | **97.3%** | **92.3%** | **0.947** |
+| SVF | 170 | 0 | 25 | 190 | 100.0% | 87.2% | 0.932 |
+| Lotus | 163 | 34 | 32 | 156 | 82.7% | 83.6% | 0.829 |
+
+### Use-After-Free (CWE-416) — 236 tests
+
+| Tool | TP | FP | FN | TN | Precision | Recall | F1 |
+|:-----|---:|---:|---:|---:|----------:|-------:|---:|
+| **SAF** | **90** | **4** | **28** | **114** | **95.7%** | **76.3%** | **0.849** |
+| Lotus | 92 | 14 | 26 | 104 | 86.8% | 78.0% | 0.784 |
+
+### Null Pointer Dereference (CWE-476) — 468 tests
+
+| Tool | TP | FP | FN | TN | Precision | Recall | F1 |
+|:-----|---:|---:|---:|---:|----------:|-------:|---:|
+| SAF | 188 | 79 | 46 | 155 | 70.4% | 80.3% | 0.750 |
+| **Lotus** | **199** | **55** | **35** | **179** | **78.3%** | **85.0%** | **0.792** |
 
 ## Known Limitations
 

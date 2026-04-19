@@ -102,8 +102,8 @@ fn wrapper_heap_alloc_is_may_alias_not_must() {
     );
 }
 
-/// Build a module where main() has a single global variable.
-/// Two pointers load the address of the same global — this should be MustAlias
+/// Build a module where `main()` has a single global variable.
+/// Two pointers load the address of the same global — this should be `MustAlias`
 /// since globals are provably unique.
 ///
 /// ```text
