@@ -572,8 +572,8 @@ fn analyze_unreachability(ctx: &AnalysisContext<'_>) -> PropertyResult {
 
             match &callee_summary {
                 ErrorSummary::NeverErrors => {
-                    // Error in this callee is intraprocedurally unreachable
-                    continue;
+                    // Error in this callee is intraprocedurally unreachable —
+                    // fall through to the next callee.
                 }
                 ErrorSummary::Unknown { reason } => {
                     // Can't determine callee behavior, be conservative
