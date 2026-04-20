@@ -303,8 +303,18 @@ impl fmt::Display for CliExportFormat {
 // CLI struct definitions
 // ---------------------------------------------------------------------------
 
+// Version string surfaced by `saf --version`. Includes the LLVM major.minor
+// this binary links against so users can tell LLVM 18 and LLVM 22 images
+// apart without running an analysis.
+#[cfg(all(feature = "llvm-18", not(feature = "llvm-22")))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (LLVM 18.1)");
+#[cfg(all(feature = "llvm-22", not(feature = "llvm-18")))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (LLVM 22.1)");
+#[cfg(not(any(feature = "llvm-18", feature = "llvm-22")))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (no LLVM)");
+
 #[derive(Parser)]
-#[command(name = "saf", version, about = "Static Analyzer Factory")]
+#[command(name = "saf", version = VERSION, about = "Static Analyzer Factory")]
 pub struct Cli {
     /// Output errors as JSON (NFR-OBS-001).
     #[arg(long)]
@@ -1032,7 +1042,11 @@ fn print_frontends(format: CliOutputFormat) -> anyhow::Result<()> {
     match format {
         CliOutputFormat::Human => print_frontends_human(),
         CliOutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&["llvm", "air-json"])?);
+            let llvm_name = format!("llvm-{}", saf_frontends::LLVM_VERSION);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&[llvm_name.as_str(), "air-json"])?
+            );
         }
         CliOutputFormat::Sarif => {
             anyhow::bail!("SARIF format is not applicable for frontend listing")
@@ -1044,7 +1058,7 @@ fn print_frontends(format: CliOutputFormat) -> anyhow::Result<()> {
 /// Print frontends as human-readable text.
 fn print_frontends_human() {
     println!("Frontends:");
-    println!("  llvm, air-json");
+    println!("  llvm ({}), air-json", saf_frontends::LLVM_VERSION);
 }
 
 pub fn incremental(args: &IncrementalArgs) -> anyhow::Result<()> {

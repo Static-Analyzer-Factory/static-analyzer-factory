@@ -5,25 +5,26 @@
 //!
 //! # Feature Flags
 //!
-//! - `llvm-17`: Enable LLVM 17 support
 //! - `llvm-18`: Enable LLVM 18 support (default)
+//! - `llvm-22`: Enable LLVM 22 support
 //!
 //! At least one LLVM version feature must be enabled to use this frontend.
+//! The two features are mutually exclusive (both link against `llvm-sys`).
 
 #[macro_use]
 mod adapter;
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 pub(crate) mod cha_extract;
 mod debug_info;
 mod error;
 mod intrinsics;
-#[cfg(feature = "llvm-17")]
-mod llvm17;
 #[cfg(feature = "llvm-18")]
 mod llvm18;
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(feature = "llvm-22")]
+mod llvm22;
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 mod mapping;
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 mod type_intern;
 
 pub use error::LlvmError;
@@ -58,7 +59,7 @@ use crate::error::FrontendError;
 /// let bundle = frontend.ingest(&inputs, &config)?;
 /// ```
 pub struct LlvmFrontend {
-    #[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+    #[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
     adapter: Box<dyn adapter::LlvmAdapter>,
 }
 
@@ -67,21 +68,21 @@ impl LlvmFrontend {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            #[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+            #[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
             adapter: adapter::create_adapter(),
         }
     }
 
     /// Get the LLVM version this frontend is using.
     #[must_use]
-    #[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+    #[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
     pub fn llvm_version(&self) -> &'static str {
         self.adapter.version()
     }
 
     /// Get the LLVM version this frontend is using.
     #[must_use]
-    #[cfg(not(any(feature = "llvm-17", feature = "llvm-18")))]
+    #[cfg(not(any(feature = "llvm-18", feature = "llvm-22")))]
     pub fn llvm_version(&self) -> &'static str {
         "none"
     }
@@ -94,7 +95,7 @@ impl Default for LlvmFrontend {
 }
 
 impl Frontend for LlvmFrontend {
-    #[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+    #[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
     fn ingest(&self, inputs: &[&Path], _config: &Config) -> Result<AirBundle, FrontendError> {
         use blake3::Hasher;
 
@@ -148,10 +149,10 @@ impl Frontend for LlvmFrontend {
             .map_err(FrontendError::from)
     }
 
-    #[cfg(not(any(feature = "llvm-17", feature = "llvm-18")))]
+    #[cfg(not(any(feature = "llvm-18", feature = "llvm-22")))]
     fn ingest(&self, _inputs: &[&Path], _config: &Config) -> Result<AirBundle, FrontendError> {
         Err(FrontendError::NotImplemented(
-            "LLVM frontend requires llvm-17 or llvm-18 feature to be enabled".to_string(),
+            "LLVM frontend requires llvm-18 or llvm-22 feature to be enabled".to_string(),
         ))
     }
 
@@ -180,8 +181,8 @@ impl Frontend for LlvmFrontend {
 
     fn supported_features(&self) -> BTreeMap<String, bool> {
         let mut features = BTreeMap::new();
-        features.insert("llvm-17".to_string(), cfg!(feature = "llvm-17"));
         features.insert("llvm-18".to_string(), cfg!(feature = "llvm-18"));
+        features.insert("llvm-22".to_string(), cfg!(feature = "llvm-22"));
         features.insert("bitcode".to_string(), true);
         features.insert("text-ir".to_string(), true);
         features.insert("debug-info".to_string(), true);
@@ -209,14 +210,14 @@ mod tests {
         let features = frontend.supported_features();
 
         // At least one LLVM version should be enabled in tests
-        #[cfg(feature = "llvm-17")]
-        assert!(features.get("llvm-17") == Some(&true));
-
         #[cfg(feature = "llvm-18")]
         assert!(features.get("llvm-18") == Some(&true));
+
+        #[cfg(feature = "llvm-22")]
+        assert!(features.get("llvm-22") == Some(&true));
     }
 
-    #[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+    #[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
     #[test]
     fn llvm_version_matches_feature() {
         let frontend = LlvmFrontend::new();
@@ -225,7 +226,7 @@ mod tests {
         #[cfg(feature = "llvm-18")]
         assert!(version.starts_with("18"));
 
-        #[cfg(all(feature = "llvm-17", not(feature = "llvm-18")))]
-        assert!(version.starts_with("17"));
+        #[cfg(all(feature = "llvm-22", not(feature = "llvm-18")))]
+        assert!(version.starts_with("22"));
     }
 }

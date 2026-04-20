@@ -3,6 +3,7 @@ authors = ["SAF Contributors"]
 language = "en"
 src = "src"
 title = "SAF Documentation"
+description = "Static Analyzer Factory documentation — pointer analysis, value-flow, taint tracking, and bug detection with a Rust + WebAssembly program analysis framework."
 
 [build]
 build-dir = "build"
@@ -11,5 +12,11 @@ build-dir = "build"
 default-theme = "light"
 preferred-dark-theme = "light"
 git-repository-url = "https://github.com/Static-Analyzer-Factory/static-analyzer-factory"
+site-url = "/static-analyzer-factory/docs/"
 additional-css = ["src/theme.css", "src/custom.css", "src/global-nav.css"]
 additional-js = ["src/global-nav.js"]
+
+[output.html.search]
+enable = true
+limit-results = 20
+use-boolean-and = true

@@ -9,6 +9,7 @@ use super::config::AnalysisConfig;
 /// A JSON request from an LLM agent to SAF.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // Wire-protocol enum — variants vary in size intentionally
 pub enum Request {
     /// Get the API schema and available checks.
     Schema,

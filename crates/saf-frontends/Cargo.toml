@@ -8,8 +8,8 @@ description = "Frontend trait and implementations (LLVM, AIR JSON) for the Stati
 
 [features]
 default = ["llvm-18"]
-llvm-17 = ["dep:inkwell", "inkwell/llvm17-0"]
 llvm-18 = ["dep:inkwell", "inkwell/llvm18-1"]
+llvm-22 = ["dep:inkwell", "inkwell/llvm22-1"]
 
 [dependencies]
 saf-core = { workspace = true }

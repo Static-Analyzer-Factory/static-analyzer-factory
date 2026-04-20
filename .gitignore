@@ -56,14 +56,19 @@ tutorials/**/callgraph.json
 tutorials/**/defuse.json
 tutorials/**/valueflow.json
 
-# PTABen compiled bitcode (compiled at runtime via `make compile-ptaben`)
+# PTABen compiled bitcode (compiled at runtime via `make compile-ptaben[-llvm22]`)
 tests/benchmarks/ptaben/.compiled/
-# PTABen benchmark results (generated via --json)
+tests/benchmarks/ptaben/.compiled-llvm*/
+# PTABen benchmark results (generated via --json / -o)
 tests/benchmarks/ptaben/results.json
+tests/benchmarks/ptaben/results-llvm*.json
 
 # SV-COMP compiled bitcode and cache
 tests/benchmarks/sv-benchmarks/.compiled/
+tests/benchmarks/sv-benchmarks/.compiled-juliet/
+tests/benchmarks/sv-benchmarks/.compiled-juliet-llvm*/
 tests/benchmarks/sv-benchmarks/.task-cache/
+tests/benchmarks/sv-benchmarks/juliet-results*.json
 
 # CruxBC benchmark data (only README.md is tracked; .bc source comes from ptaben submodule)
 tests/benchmarks/cruxbc/.compiled/

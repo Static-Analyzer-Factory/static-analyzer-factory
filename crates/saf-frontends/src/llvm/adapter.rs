@@ -1,24 +1,24 @@
 //! Version-agnostic LLVM adapter trait.
 //!
 //! This trait abstracts over LLVM version differences, allowing the frontend
-//! to work with LLVM 17, 18, or future versions through a common interface.
+//! to work with LLVM 18, 22, or future versions through a common interface.
 
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 use inkwell::context::Context;
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 use inkwell::module::Module;
 
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 use super::error::LlvmError;
 
 /// Version-agnostic interface to LLVM operations.
 ///
 /// Each supported LLVM version implements this trait with version-specific
 /// handling where needed.
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 #[allow(dead_code)] // Trait contract: methods implemented by version-specific adapters via impl_llvm_adapter! macro
 pub trait LlvmAdapter: Send + Sync {
-    /// Get the LLVM version string (e.g., "17.0", "18.0").
+    /// Get the LLVM version string (e.g., "18.1", "22.1").
     fn version(&self) -> &'static str;
 
     /// Create a new LLVM context.
@@ -42,7 +42,7 @@ pub trait LlvmAdapter: Send + Sync {
 }
 
 /// Stub adapter trait when no LLVM feature is enabled.
-#[cfg(not(any(feature = "llvm-17", feature = "llvm-18")))]
+#[cfg(not(any(feature = "llvm-18", feature = "llvm-22")))]
 #[allow(dead_code)] // Stub trait for compilation when no LLVM feature is enabled
 pub trait LlvmAdapter: Send + Sync {
     /// Get the LLVM version string.
@@ -53,7 +53,7 @@ pub trait LlvmAdapter: Send + Sync {
 ///
 /// All LLVM versions share the same implementation — only the struct name
 /// and version string differ. This macro eliminates the duplication.
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 macro_rules! impl_llvm_adapter {
     ($name:ident, $version:expr) => {
         /// Adapter for a specific LLVM version.
@@ -74,8 +74,14 @@ macro_rules! impl_llvm_adapter {
                 bytes: &[u8],
                 name: &str,
             ) -> Result<inkwell::module::Module<'ctx>, $crate::llvm::LlvmError> {
+                // inkwell >=0.9 requires the input to be null-terminated.
+                let mut buf = Vec::with_capacity(bytes.len() + 1);
+                buf.extend_from_slice(bytes);
+                if buf.last() != Some(&0) {
+                    buf.push(0);
+                }
                 let buffer =
-                    inkwell::memory_buffer::MemoryBuffer::create_from_memory_range(bytes, name);
+                    inkwell::memory_buffer::MemoryBuffer::create_from_memory_range(&buf, name);
                 inkwell::module::Module::parse_bitcode_from_buffer(&buffer, context)
                     .map_err(|e| $crate::llvm::LlvmError::parse(e.to_string()))
             }
@@ -86,12 +92,15 @@ macro_rules! impl_llvm_adapter {
                 ir: &str,
                 name: &str,
             ) -> Result<inkwell::module::Module<'ctx>, $crate::llvm::LlvmError> {
-                // Use create_from_memory_range_copy to ensure null termination —
-                // LLVM's IR parser may read past the buffer without it.
-                let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
-                    ir.as_bytes(),
-                    name,
-                );
+                // inkwell >=0.9 requires the input to be null-terminated.
+                // Build a null-terminated copy and hand it to inkwell.
+                let mut buf = Vec::with_capacity(ir.len() + 1);
+                buf.extend_from_slice(ir.as_bytes());
+                if buf.last() != Some(&0) {
+                    buf.push(0);
+                }
+                let buffer =
+                    inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(&buf, name);
                 context
                     .create_module_from_ir(buffer)
                     .map_err(|e| $crate::llvm::LlvmError::parse(e.to_string()))
@@ -106,13 +115,13 @@ pub fn create_adapter() -> Box<dyn LlvmAdapter> {
     Box::new(super::llvm18::Llvm18Adapter)
 }
 
-#[cfg(all(feature = "llvm-17", not(feature = "llvm-18")))]
+#[cfg(all(feature = "llvm-22", not(feature = "llvm-18")))]
 pub fn create_adapter() -> Box<dyn LlvmAdapter> {
-    Box::new(super::llvm17::Llvm17Adapter)
+    Box::new(super::llvm22::Llvm22Adapter)
 }
 
-#[cfg(not(any(feature = "llvm-17", feature = "llvm-18")))]
+#[cfg(not(any(feature = "llvm-18", feature = "llvm-22")))]
 #[allow(dead_code)] // Stub for compilation when no LLVM feature is enabled
 pub fn create_adapter() -> Box<dyn LlvmAdapter> {
-    panic!("LLVM frontend requires either llvm-17 or llvm-18 feature to be enabled")
+    panic!("LLVM frontend requires either llvm-18 or llvm-22 feature to be enabled")
 }

@@ -170,7 +170,7 @@ fn test_hvn_roundtrip_preserves_semantics() {
     for (vid, pts_no_hvn) in &result_no_hvn {
         let pts_hvn = result_hvn
             .get(vid)
-            .unwrap_or_else(|| panic!("HVN result missing entry for {:?}", vid));
-        assert_eq!(pts_no_hvn, pts_hvn, "Points-to sets differ for {:?}", vid);
+            .unwrap_or_else(|| panic!("HVN result missing entry for {vid:?}"));
+        assert_eq!(pts_no_hvn, pts_hvn, "Points-to sets differ for {vid:?}");
     }
 }

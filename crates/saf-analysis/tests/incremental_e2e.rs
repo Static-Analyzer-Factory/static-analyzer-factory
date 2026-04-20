@@ -9,7 +9,7 @@ use saf_analysis::session::AnalysisSession;
 use saf_test_utils::load_incremental_lua_program;
 
 /// Run a complete incremental scenario: full first run -> swap module -> incremental second run.
-/// Returns (first_run_result, incremental_result, run_count).
+/// Returns (`first_run_result`, `incremental_result`, `run_count`).
 fn run_incremental_scenario(
     swap_from: &str,
     swap_to: &str,

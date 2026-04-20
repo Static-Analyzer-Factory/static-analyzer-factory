@@ -4,7 +4,7 @@
 //! information (`DISubprogram`) from LLVM debug metadata. Never fails
 //! ingestion due to missing or malformed debug info.
 //!
-//! Uses inkwell 0.8's `get_debug_location()` for instruction-level spans
+//! Uses inkwell's `get_debug_location()` for instruction-level spans
 //! and `llvm-sys` FFI for file info (`LLVMDIScopeGetFile`,
 //! `LLVMDIFileGetFilename`, `LLVMDIFileGetDirectory`).
 
@@ -12,12 +12,12 @@ use std::collections::BTreeMap;
 
 use saf_core::ids::FileId;
 use saf_core::span::SourceFile;
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 use saf_core::span::{Span, Symbol};
 
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 use inkwell::debug_info::AsDIScope;
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 use inkwell::values::{FunctionValue, InstructionValue};
 
 /// Tracker for source files encountered during ingestion.
@@ -69,7 +69,7 @@ impl SourceFileTracker {
 ///
 /// Uses inkwell's `get_debug_location()` for line/column and `llvm-sys` FFI
 /// for file info. Returns `None` when debug metadata is absent.
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 pub fn extract_span(inst: InstructionValue<'_>, files: &mut SourceFileTracker) -> Option<Span> {
     let di_loc = inst.get_debug_location()?;
     let line = di_loc.get_line();
@@ -88,7 +88,7 @@ pub fn extract_span(inst: InstructionValue<'_>, files: &mut SourceFileTracker) -
 /// # Safety
 ///
 /// `scope_ref` must be a valid `LLVMMetadataRef` pointing to a `DIScope`.
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 unsafe fn get_file_from_scope(
     scope_ref: inkwell::llvm_sys::prelude::LLVMMetadataRef,
 ) -> Option<(String, String)> {
@@ -100,8 +100,9 @@ unsafe fn get_file_from_scope(
     }
 
     let mut filename_len: std::ffi::c_uint = 0;
-    let filename_ptr =
-        unsafe { inkwell::llvm_sys::debuginfo::LLVMDIFileGetFilename(file_ref, &mut filename_len) };
+    let filename_ptr = unsafe {
+        inkwell::llvm_sys::debuginfo::LLVMDIFileGetFilename(file_ref, &raw mut filename_len)
+    };
     if filename_ptr.is_null() {
         return None;
     }
@@ -116,7 +117,7 @@ unsafe fn get_file_from_scope(
 
     let mut dir_len: std::ffi::c_uint = 0;
     let dir_ptr =
-        unsafe { inkwell::llvm_sys::debuginfo::LLVMDIFileGetDirectory(file_ref, &mut dir_len) };
+        unsafe { inkwell::llvm_sys::debuginfo::LLVMDIFileGetDirectory(file_ref, &raw mut dir_len) };
     let directory = if dir_ptr.is_null() {
         String::new()
     } else {
@@ -138,7 +139,7 @@ unsafe fn get_file_from_scope(
 /// Uses `DISubprogram` metadata when available. Falls back to the LLVM
 /// function name, which is always present. For C code, the function name
 /// is the display name. For C++, it is the mangled linkage name.
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 pub fn extract_function_symbol(func: FunctionValue<'_>) -> Option<Symbol> {
     let llvm_name = func.get_name().to_str().ok()?;
 
@@ -167,7 +168,7 @@ pub fn extract_function_symbol(func: FunctionValue<'_>) -> Option<Symbol> {
 ///
 /// Uses `get_subprogram()` for the function declaration line and `llvm-sys`
 /// FFI for file info. Returns `None` when debug metadata is absent.
-#[cfg(any(feature = "llvm-17", feature = "llvm-18"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 pub fn extract_function_span(
     func: FunctionValue<'_>,
     files: &mut SourceFileTracker,

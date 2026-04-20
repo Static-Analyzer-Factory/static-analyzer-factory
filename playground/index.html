@@ -3,7 +3,54 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>SAF Playground</title>
+    <meta name="theme-color" content="#3d9b8f" />
+    <meta name="color-scheme" content="light dark" />
+
+    <title>SAF Playground — Run Static Analysis in the Browser</title>
+    <meta name="description" content="Run pointer analysis, value-flow graphs, and taint checkers on your own C / LLVM IR in the browser — zero install. Powered by the Static Analyzer Factory (Rust + WebAssembly)." />
+    <meta name="keywords" content="static analysis playground, LLVM playground, pointer analysis online, value flow visualizer, WebAssembly static analysis, in-browser SAST, SAF playground" />
+    <meta name="author" content="Static Analyzer Factory" />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+
+    <link rel="canonical" href="https://static-analyzer-factory.github.io/static-analyzer-factory/playground/" />
+    <link rel="icon" type="image/png" href="/saf-logo.png" />
+    <link rel="apple-touch-icon" href="/saf-logo.png" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Static Analyzer Factory" />
+    <meta property="og:title" content="SAF Playground — Static Analysis in the Browser" />
+    <meta property="og:description" content="Run pointer analysis, value-flow, and taint checkers on your own code — directly in the browser." />
+    <meta property="og:url" content="https://static-analyzer-factory.github.io/static-analyzer-factory/playground/" />
+    <meta property="og:image" content="https://static-analyzer-factory.github.io/static-analyzer-factory/saf-logo.png" />
+    <meta property="og:image:width" content="512" />
+    <meta property="og:image:height" content="512" />
+    <meta property="og:image:alt" content="SAF Playground — run static analysis in the browser" />
+    <meta property="og:locale" content="en_US" />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="SAF Playground" />
+    <meta name="twitter:description" content="Run pointer analysis, value-flow, and taint checkers on your own C / LLVM IR — directly in the browser." />
+    <meta name="twitter:image" content="https://static-analyzer-factory.github.io/static-analyzer-factory/saf-logo.png" />
+
+    <!-- Structured data -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebApplication",
+      "name": "SAF Playground",
+      "description": "Interactive web playground for static program analysis. Run pointer analysis, value-flow, and taint checkers on LLVM IR directly in the browser.",
+      "url": "https://static-analyzer-factory.github.io/static-analyzer-factory/playground/",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Web browser",
+      "isAccessibleForFree": true,
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "sameAs": [
+        "https://github.com/Static-Analyzer-Factory/static-analyzer-factory"
+      ]
+    }
+    </script>
   </head>
   <body>
     <div id="root"></div>

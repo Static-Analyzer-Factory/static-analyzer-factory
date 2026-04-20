@@ -25,7 +25,9 @@ make build       # Build minimal runtime Docker image
 make clean       # Remove Docker volumes and local target/
 ```
 
-**IMPORTANT: Never run `cargo test` or `cargo build` locally** for crates that depend on LLVM (`saf-frontends`, `saf-analysis`, `saf-python`, `saf-cli`). LLVM 18 is only available inside the Docker container. Running `cargo test -p saf-analysis` locally will fail with "No suitable version of LLVM was found." Always use `make test` or `make shell` to run tests inside Docker. The only crate safe to build/test locally is `saf-core` (no LLVM dependency).
+**IMPORTANT: Never run `cargo test` or `cargo build` locally** for crates that depend on LLVM (`saf-frontends`, `saf-analysis`, `saf-python`, `saf-cli`). LLVM is only available inside the Docker container. Running `cargo test -p saf-analysis` locally will fail with "No suitable version of LLVM was found." Always use `make test` or `make shell` to run tests inside Docker. The only crate safe to build/test locally is `saf-core` (no LLVM dependency).
+
+**Multi-LLVM support (plan 186):** SAF ships two Docker image variants, one per supported LLVM version: `saf-dev:llvm18` (default, alias for `saf:latest`) and `saf-dev:llvm22` (opt-in). Each image contains exactly one LLVM toolchain — they do not share caches or image layers. Use `make shell` / `make test` for LLVM 18 and `make shell-llvm22` / `make test-llvm22` for LLVM 22. The LLVM 22 image pulls `llvm-22-dev` from `apt.llvm.org` (Ubuntu 24.04's distro does not ship LLVM 22). Benchmarks (PTABen, Juliet, SV-COMP, CruxBC) default to LLVM 18 for baseline reproducibility; PTABen has an LLVM 22 variant (`make compile-ptaben-llvm22` + `make test-ptaben-llvm22`), but the LLVM 18 numbers remain the headline baseline.
 
 **IMPORTANT: Subagents must NEVER call `make` commands.** All `make` commands (`make test`, `make shell`, `make lint`, etc.) must be called by the main agent only. Subagents should focus on code reading, analysis, and editing — the main agent coordinates Docker/build operations.
 

@@ -52,6 +52,7 @@ pub enum ProductId {
 /// Steps are returned in dependency order: earlier steps must complete
 /// before later steps can execute.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // `IncrementalPta` carries full constraint diffs; boxing would hurt hot paths
 pub enum RecomputeStep {
     /// Re-ingest a module from source/IR.
     ReingestModule(ModuleId),
@@ -85,6 +86,7 @@ pub enum RecomputeStep {
 /// Passed to [`InvalidationController::plan_recompute`] to compute
 /// the minimum cascade of recompute steps.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // `ConstraintsChanged` carries constraint diffs; boxing would hurt hot paths
 pub enum InvalidationTrigger {
     /// One or more modules have changed on disk.
     ModulesChanged(Vec<ModuleId>),

@@ -150,9 +150,9 @@ define linkonce_odr dso_local void @_ZN7ServiceC2Ev(ptr noundef nonnull align 8 
   call void @_ZN6LoggerC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %3) #10, !dbg !467
   %4 = getelementptr inbounds i8, ptr %3, i64 8, !dbg !467
   call void @_ZN8ExecutorC2Ev(ptr noundef nonnull align 8 dereferenceable(8) %4) #10, !dbg !467
-  store ptr getelementptr inbounds ({ [6 x ptr], [5 x ptr] }, ptr @_ZTV7Service, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !467
+  store ptr getelementptr inbounds ({ [6 x ptr], [5 x ptr] }, ptr @_ZTV7Service, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !467
   %5 = getelementptr inbounds i8, ptr %3, i64 8, !dbg !467
-  store ptr getelementptr inbounds ({ [6 x ptr], [5 x ptr] }, ptr @_ZTV7Service, i32 0, inrange i32 1, i32 2), ptr %5, align 8, !dbg !467
+  store ptr getelementptr inbounds ({ [6 x ptr], [5 x ptr] }, ptr @_ZTV7Service, i32 0, i32 1, i32 2), ptr %5, align 8, !dbg !467
   ret void, !dbg !467
 }
 
@@ -176,7 +176,7 @@ define linkonce_odr dso_local void @_ZN6LoggerC2Ev(ptr noundef nonnull align 8 d
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !477, metadata !DIExpression()), !dbg !479
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV6Logger, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !480
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV6Logger, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !480
   ret void, !dbg !480
 }
 
@@ -186,7 +186,7 @@ define linkonce_odr dso_local void @_ZN8ExecutorC2Ev(ptr noundef nonnull align 8
   store ptr %0, ptr %2, align 8
   call void @llvm.dbg.declare(metadata ptr %2, metadata !483, metadata !DIExpression()), !dbg !484
   %3 = load ptr, ptr %2, align 8
-  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV8Executor, i32 0, inrange i32 0, i32 2), ptr %3, align 8, !dbg !485
+  store ptr getelementptr inbounds ({ [5 x ptr] }, ptr @_ZTV8Executor, i32 0, i32 0, i32 2), ptr %3, align 8, !dbg !485
   ret void, !dbg !485
 }
 
