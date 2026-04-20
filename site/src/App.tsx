@@ -1,6 +1,7 @@
 import { useState, useEffect, lazy, Suspense } from 'react';
 import Hero from './components/Hero';
 import Features from './components/Features';
+import QuickStart from './components/QuickStart';
 import Personas from './components/Personas';
 import TechHighlights from './components/TechHighlights';
 import Footer from './components/Footer';
@@ -36,6 +37,7 @@ export default function App() {
     <div className="landing">
       <SiteNav active={active} />
       <Hero />
+      <QuickStart />
       <Features />
       <Personas />
       <TechHighlights />
