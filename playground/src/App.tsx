@@ -136,6 +136,20 @@ export default function App() {
   const handleAnalyzeRef = useRef(handleAnalyze);
   handleAnalyzeRef.current = handleAnalyze;
 
+  // On mobile (stacked layout), scroll the right-most panel into view when a
+  // header tab changes — otherwise the tab click looks like a no-op because
+  // the affected panel is below the fold.
+  const handleRightPanelSelect = useCallback((panel: RightPanel) => {
+    setRightPanel(panel);
+    if (window.innerWidth > 900) return;
+    requestAnimationFrame(() => {
+      const target = document.querySelector('.panels > :last-child') as HTMLElement | null;
+      if (!target) return;
+      const top = target.getBoundingClientRect().top + window.pageYOffset - 8;
+      window.scrollTo({ top, behavior: 'smooth' });
+    });
+  }, []);
+
   const handleExampleSelect = useCallback(
     (index: number) => {
       setSourceCode(examples[index].source);
@@ -269,26 +283,26 @@ export default function App() {
             <div className="header-tabs">
               <button
                 className={`header-tab ${rightPanel === 'analysis' ? 'active' : ''}`}
-                onClick={() => setRightPanel('analysis')}
+                onClick={() => handleRightPanelSelect('analysis')}
               >
                 Analysis
               </button>
               <button
                 className={`header-tab ${rightPanel === 'specs' ? 'active' : ''}`}
-                onClick={() => setRightPanel('specs')}
+                onClick={() => handleRightPanelSelect('specs')}
               >
                 Specs
               </button>
               <button
                 className={`header-tab ${rightPanel === 'analyzer' ? 'active' : ''}`}
-                onClick={() => setRightPanel('analyzer')}
+                onClick={() => handleRightPanelSelect('analyzer')}
                 onMouseEnter={preloadPyodide}
               >
                 Analyzer
               </button>
               <button
                 className={`header-tab ${rightPanel === 'query' ? 'active' : ''}`}
-                onClick={() => setRightPanel('query')}
+                onClick={() => handleRightPanelSelect('query')}
               >
                 Query
               </button>

@@ -495,3 +495,53 @@
 .app.embed.split .panels {
   grid-template-columns: 1fr 1fr;
 }
+
+/* Responsive layout — relax the 1.2fr bias on small laptops, stack on mobile */
+@media (max-width: 1200px) {
+  .panels {
+    grid-template-columns: 1fr 1fr 1fr;
+  }
+}
+
+@media (max-width: 900px) {
+  .app {
+    height: auto;
+    min-height: calc(100vh - 48px);
+  }
+
+  .panels {
+    grid-template-columns: 1fr;
+    grid-auto-rows: minmax(360px, auto);
+    overflow: visible;
+  }
+
+  .panel {
+    min-height: 360px;
+  }
+
+  .header {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .header-right {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .config-bar {
+    flex-wrap: wrap;
+    gap: 0.5rem 1rem;
+  }
+
+  /* Embed split mode — stack source and graph vertically on mobile */
+  .app.embed.split .panels {
+    grid-template-columns: 1fr;
+  }
+
+  /* Specs sidebar — shrink to leave more room for YAML content */
+  .spec-sidebar {
+    width: 140px;
+    min-width: 140px;
+  }
+}
