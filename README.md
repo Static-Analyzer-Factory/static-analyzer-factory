@@ -127,6 +127,52 @@ SAF's memory-safety checkers evaluated on the [NIST Juliet C/C++ Test Suite](htt
 | SAF | 188 | 79 | 46 | 155 | 70.4% | 80.3% | 0.750 |
 | **Lotus** | **199** | **55** | **35** | **179** | **78.3%** | **85.0%** | **0.792** |
 
+## Comparison with Other Tools
+
+SAF is one of several program-analysis frameworks for LLVM IR and source
+code. The table below shows how SAF and its peers handle the dimensions
+program-analysis users compare on most often. Each peer has its own
+strengths — SVF is the established LLVM-IR value-flow framework, Phasar
+is the reference IFDS/IDE solver, Lotus bundles a broad catalog of
+alias analyses and concurrency analyses, CodeQL has the largest query
+library across many languages, and Infer ships deep checker libraries
+for industrial source-level analysis. The table aims to be informative,
+not a ranking. The same data is also rendered at the
+[Comparison page](https://static-analyzer-factory.github.io/static-analyzer-factory/#comparison).
+
+Compared with: [SVF](https://github.com/SVF-tools/SVF) ·
+[Phasar](https://github.com/secure-software-engineering/phasar) ·
+[Lotus](https://github.com/ZJU-PL/lotus) ·
+[CodeQL](https://github.com/github/codeql) ·
+[Infer](https://github.com/facebook/infer)
+
+| Dimension | **SAF** | SVF | Phasar | Lotus | CodeQL | Infer |
+|---|---|---|---|---|---|---|
+| Primary IR / target | LLVM IR (C/C++) | LLVM IR (C/C++) | LLVM IR (C/C++) | LLVM IR (C/C++) | Source DB (10+ langs) | Source AST (C/C++/ObjC/Java) |
+| Pointer analysis | CI, FS, CS, DDA | CI, FS, CS, DDA | Computed internally (CG + AA) | Many bundled (DyckAA, SparrowAA, Sea-DSA, …) | Different paradigm | Different paradigm |
+| **PTA solver backends** | **Worklist + Datalog (Ascent)** | Worklist (wave + bit-vector) | LLVM AA + own CG algorithms | Inclusion + unification + DDA | QL → Datalog evaluation | Separation logic |
+| Value-flow / SVFG | Yes | Yes (headline) | No (IFDS-based) | DyckVFG variant | DataFlow module | No |
+| Memory SSA | Yes (hybrid: skeleton + demand-driven) | Yes (MemSSA + MemRegion) | No (IFDS-based instead) | DyckVFG instead | Different paradigm | Different paradigm |
+| IFDS / IDE solver | Yes | No | Yes (specialty) | Bundles Phasar | No | No |
+| Taint analysis | Yes (source/sink/sanitizer) | Built on SVFG | Yes (IFDS + IDE clients) | Within KINT | Yes (`TaintTracking::Global`) | Yes (Quandary + Pulse) |
+| Numeric / abstract domains | Intervals, octagons, nullness, SCCP | Intervals, numeric, relational (AE) | Monotone framework (intra + inter) | Symbolic execution + constant-time analysis | Range analysis (built into queries) | Pulse abstract domain + InferBO intervals |
+| Concurrency / MTA | Lockset + MHP | LockAnalysis, MHP, TCT | Out of scope | Race, MPI, OpenMP, CUDA, kernel | Race-detection queries | RacerD |
+| SMT-backed reasoning | Z3 (conditions, reachability, alias) | Saber path-sensitive solver | PathSensitivity module | SMT solvers + KINT + symbolic execution | Datalog evaluation, no SMT | Pulse uses SMT |
+| Built-in checkers | 5+ memory + taint | 3 SABER (leak, dbl-free, file) | 15+ IFDS/IDE clients | Many (FiTx, KINT, Saber, Concurrency, Security) | Hundreds per language | 30+ (Pulse, RacerD, …) |
+| **Custom checker authoring** | **Declarative YAML specs (may_reach modes)** | C++ subclassing (Saber framework) | C++ IFDS/IDE problem subclasses | C++ checker plug-ins | QL queries (the language is the checker) | OCaml + Infer.AI abstract domain |
+| **Interactive graph query API** | **Python SDK + CLI (points-to, flows, taint)** | C++ API (raw graph traversal) | C++ API (solver results) | C++ API (raw) | QL (queries are the model) | Results only |
+| **Specialized data structures** | **Roaring + FxHash + frozen indexer + Rayon** | Bit-vector points-to (BVDataPTAImpl) | EdgeFunctionSingletonCache + SOO | Varies by bundled backend | BDDs + Datalog indexes | Bi-abductive summaries + cache |
+| SARIF export | Native | No | No | No | Native (default) | External adapter |
+| License | MIT | AGPL-3.0 | MIT | MIT (mixed deps) | Queries MIT; CLI proprietary | MIT |
+| **Primary SDK** | **Python (Rust core)** | C++ (Pysvf wrapper) | C++ (C++20) | C++ | QL (DSL) | OCaml |
+| **Multi-LLVM (simultaneous)** | **LLVM 18 + 22** | One per build (broad history) | LLVM 16 + 17 | LLVM 14 | N/A | N/A |
+| **Browser / WASM playground** | **Yes (Pyodide + WASM)** | No | No | No | No | No |
+| **Byte-deterministic output** | **Contractual (NFR-DET-001)** | Not advertised as contract | Not advertised as contract | Not advertised as contract | Not advertised as contract | Not advertised as contract |
+| **AI-agent skills** | **2 (feature-dev, checker-dev)** | No | No | AGENTS.md present | No | No |
+
+Every claim above is sourced in
+[`plans/189-research-notes.md`](plans/189-research-notes.md).
+
 ## Known Limitations
 
 **Analysis precision:**

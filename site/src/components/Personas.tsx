@@ -2,22 +2,22 @@ import { motion } from 'motion/react';
 
 const personas = [
   {
-    title: 'Students & Learners',
-    description: 'Interactive tutorials on real vulnerabilities. Visualize CFG, value-flow, and points-to analysis step by step.',
-    link: './tutorials/',
-    linkText: 'Start Learning',
+    title: 'Program Analysis Researchers',
+    description: 'Experiment with new pointer-analysis, value-flow, IFDS, and abstract-interpretation algorithms. Build on a Rust core, author in Python, and ship reproducible, byte-deterministic analyses.',
+    link: './docs/',
+    linkText: 'Read the Docs',
     color: '#3d9b8f',
   },
   {
-    title: 'Security Researchers',
-    description: 'Author custom analyzers in Python. Detect use-after-free, command injection, and more.',
+    title: 'Security Engineers',
+    description: 'Author custom checkers for use-after-free, command injection, taint flows. Ship to CI with native SARIF output, or run interactively in the browser.',
     link: './playground/',
     linkText: 'Open Playground',
     color: '#3d9b8f',
   },
   {
     title: 'AI Agent Developers',
-    description: 'Schema-driven API for programmatic analysis. Build agents that reason about code structure and data flow.',
+    description: 'Schema-driven Python API and shipped coding-agent skills (saf-feature-dev, saf-checker-dev). Build agents that reason about code structure and data flow.',
     link: './docs/api-reference/python-sdk.html',
     linkText: 'View API Docs',
     color: '#c49a3c',

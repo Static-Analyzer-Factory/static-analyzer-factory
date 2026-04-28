@@ -1,9 +1,9 @@
 import { motion } from 'motion/react';
 
 const highlights = [
-  { label: 'Browser-native', detail: 'No install, no server' },
-  { label: 'Rust + WASM', detail: 'Fast, safe, portable' },
-  { label: 'Deterministic', detail: 'Reproducible results' },
+  { label: 'Multi-LLVM', detail: 'LLVM 18 + 22 in Docker' },
+  { label: 'Python + Rust', detail: 'Scriptable; native or in-browser' },
+  { label: 'Deterministic', detail: 'Byte-identical outputs' },
   { label: 'Open Source', detail: 'MIT License' },
 ];
 
