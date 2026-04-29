@@ -83,7 +83,7 @@ export default function Hero() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.6, delay: 0.15, ease: 'easeOut' as const }}
           >
-            Build program analysis tools. Understand code deeply.
+            Build program analyses. For research and production.
           </motion.p>
           <motion.p
             className="hero-sub"
@@ -91,8 +91,9 @@ export default function Hero() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.6, delay: 0.25, ease: 'easeOut' as const }}
           >
-            Browser-based static analysis powered by Rust + WebAssembly.
-            Visualize control flow, pointer aliasing, and value-flow graphs instantly.
+            An extensible static analysis framework for LLVM IR.
+            Pointer analysis, value-flow, and taint &mdash; scriptable in Python
+            over a Rust core, with multi-LLVM support and a browser playground.
           </motion.p>
           <motion.div
             className="hero-ctas"

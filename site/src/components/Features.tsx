@@ -88,7 +88,7 @@ function PtaPreview() {
 const features = [
   {
     title: 'Visualize',
-    description: 'See how programs actually work. Explore control flow graphs, call graphs, and def-use chains interactively.',
+    description: 'See how programs actually work. Explore control flow graphs, call graphs, def-use chains, and value-flow graphs interactively in the browser playground.',
     icon: (
       <svg viewBox="0 0 40 40" fill="none" className="feature-icon">
         <rect x="4" y="4" width="12" height="8" rx="2" stroke="#3d9b8f" strokeWidth="2" />
@@ -102,7 +102,7 @@ const features = [
   },
   {
     title: 'Analyze',
-    description: 'Points-to analysis, taint tracking, and value-flow reasoning. Whole-program analysis in your browser.',
+    description: 'Whole-program pointer analysis, taint tracking, and value-flow reasoning over LLVM IR. Context-sensitive (k-CFA), flow-sensitive, and demand-driven variants.',
     icon: (
       <svg viewBox="0 0 40 40" fill="none" className="feature-icon">
         <circle cx="12" cy="12" r="6" stroke="#3d9b8f" strokeWidth="2" />
@@ -116,7 +116,7 @@ const features = [
   },
   {
     title: 'Build',
-    description: 'Write custom analyzers in Python. Detect use-after-free, taint flows, null dereferences with a few lines of code.',
+    description: 'Write custom analyzers in Python over a Rust core. Detect use-after-free, taint flows, and null dereferences with a few lines of code — or experiment with new algorithms.',
     icon: (
       <svg viewBox="0 0 40 40" fill="none" className="feature-icon">
         <polyline points="8,12 16,20 8,28" stroke="#3d9b8f" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
@@ -158,7 +158,7 @@ export default function Features() {
           viewport={{ once: true, margin: '-80px' }}
           transition={{ duration: 0.5 }}
         >
-          What You Can Do
+          What the framework gives you
         </motion.h2>
         <div className="features-grid">
           {features.map((f, i) => (
