@@ -235,6 +235,17 @@ impl<'a> ValueFlowBuilder<'a> {
                 if operands.len() >= 2 {
                     let dst_ptr = operands[0];
                     let src_ptr = operands[1];
+                    // Rust and C++ lower many by-value moves to memcpy over
+                    // aggregate stack slots. The existing fast memory model
+                    // routes memory through unknown_mem, which is safe but can
+                    // lose the explicit slot-to-slot relation needed by
+                    // selector-level taint queries. Preserve that relation
+                    // conservatively.
+                    graph.add_edge(
+                        NodeId::value(src_ptr),
+                        EdgeKind::DefUse,
+                        NodeId::value(dst_ptr),
+                    );
                     // Create a synthetic intermediate value to bridge the
                     // Load and Store, deterministically derived from the
                     // instruction ID.
@@ -427,6 +438,29 @@ impl<'a> ValueFlowBuilder<'a> {
                 // Return edges: find return values in callee
                 // For now, we add edges from any return statement's operand to the call result
                 if let Some(result) = call_result {
+                    // Rust frequently lowers returns of aggregate values via
+                    // the LLVM `sret` ABI: operand 0 is an out pointer where
+                    // the callee writes its logical return value. AIR does not
+                    // currently record the `sret` attribute, so model the
+                    // common ABI shape conservatively: the synthetic call
+                    // result and all non-out arguments may flow to operand 0.
+                    // This makes std::env/std::process flows visible without
+                    // requiring a Rust-specific frontend.
+                    if let Some(sret_slot) = args.first() {
+                        graph.add_edge(
+                            NodeId::value(result),
+                            EdgeKind::Return,
+                            NodeId::value(*sret_slot),
+                        );
+                        for actual in args.iter().skip(1) {
+                            graph.add_edge(
+                                NodeId::value(*actual),
+                                EdgeKind::Return,
+                                NodeId::value(*sret_slot),
+                            );
+                        }
+                    }
+
                     for block in &target_func.blocks {
                         for inst in &block.instructions {
                             if let Operation::Ret = &inst.op {
