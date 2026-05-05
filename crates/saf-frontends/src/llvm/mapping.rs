@@ -21,6 +21,7 @@ use saf_core::air::{
     AirBlock, AirBundle, AirFunction, AirGlobal, AirModule, AirParam, BinaryOp, CastKind, Constant,
     FieldPath, FieldStep, HeapAllocKind, Instruction, Operation,
 };
+
 use saf_core::id::make_id;
 use saf_core::ids::{BlockId, FunctionId, InstId, ModuleId, ObjId, ValueId};
 
@@ -598,6 +599,9 @@ fn convert_constant_with_context(
             // conversion to resolve function/global references. Only do this for
             // vtable globals to avoid over-modeling non-vtable aggregates.
             let s = av.print_to_string().to_string();
+            if is_undef_or_poison_repr(&s) {
+                return Some(Constant::Undef);
+            }
             if decompose_arrays && s.contains('@') {
                 // Array contains named references — parse as aggregate with
                 // context to capture GlobalRef entries for function pointers.
@@ -1818,6 +1822,10 @@ fn convert_constant_value(value: BasicValueEnum<'_>) -> Option<Constant> {
             }
         }
         BasicValueEnum::ArrayValue(v) => {
+            let repr = v.print_to_string().to_string();
+            if is_undef_or_poison_repr(&repr) {
+                return Some(Constant::Undef);
+            }
             // Guard: check for null/zeroinitializer BEFORE calling
             // `is_const_string()`.  inkwell's `is_const_string()` incorrectly
             // returns true for `ConstantAggregateZero` (zeroinitializer) arrays,
@@ -1845,6 +1853,14 @@ fn convert_constant_value(value: BasicValueEnum<'_>) -> Option<Constant> {
         }
         _ => None,
     }
+}
+
+fn is_undef_or_poison_repr(repr: &str) -> bool {
+    let trimmed = repr.trim();
+    trimmed == "undef"
+        || trimmed == "poison"
+        || trimmed.ends_with(" undef")
+        || trimmed.ends_with(" poison")
 }
 
 /// Try to parse an LLVM constant integer array from its string representation.
