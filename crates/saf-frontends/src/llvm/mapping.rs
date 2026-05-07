@@ -1802,6 +1802,15 @@ fn convert_constant_value(value: BasicValueEnum<'_>) -> Option<Constant> {
             }
         }
         BasicValueEnum::FloatValue(v) => {
+            // `inkwell::FloatValue::get_constant` calls `LLVMConstRealGetDouble`,
+            // which static-casts to `ConstantFP` without checking. `UndefValue`
+            // and `PoisonValue` of float type pass `is_const()` but are not
+            // `ConstantFP` — calling `get_constant` on them reads garbage and
+            // SIGSEGVs inside `IEEEFloat`'s copy ctor (observed on tmux's
+            // `phi double [ undef, ... ]` PHIs).
+            if v.is_undef() {
+                return None;
+            }
             let bit_width = match v.get_type().print_to_string().to_str() {
                 Ok("float") => 32,
                 // "double" and all other types default to 64
