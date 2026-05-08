@@ -260,6 +260,16 @@ impl PyFinding {
         // Resolve source/sink names via DisplayResolver
         let source_label = resolver.resolve(finding.source.raw());
         let sink_label = resolver.resolve(finding.sink.raw());
+        let source_name = trace
+            .steps
+            .first()
+            .and_then(|s| s.from_symbol.clone())
+            .unwrap_or(source_label.short_name);
+        let sink_name = trace
+            .steps
+            .last()
+            .and_then(|s| s.to_symbol.clone())
+            .unwrap_or(sink_label.short_name);
 
         // Try to get source/sink locations from the trace
         let source_location = trace
@@ -280,8 +290,8 @@ impl PyFinding {
             sink_location,
             source_id: finding.source.to_hex(),
             sink_id: finding.sink.to_hex(),
-            source_name: Some(source_label.short_name),
-            sink_name: Some(sink_label.short_name),
+            source_name: Some(source_name),
+            sink_name: Some(sink_name),
             rule_id: finding.rule_id.clone(),
             trace,
         }

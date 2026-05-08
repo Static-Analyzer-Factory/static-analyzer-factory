@@ -34,7 +34,10 @@ fn rust_env_args_to_std_command_new_finds_flow() {
     let limits = QueryLimits::default();
 
     assert!(!sources.is_empty(), "env::args source call should resolve");
-    assert!(!sinks.is_empty(), "Command::new program argument should resolve");
+    assert!(
+        !sinks.is_empty(),
+        "Command::new program argument should resolve"
+    );
 
     let flows = graph.taint_flow(&sources, &sinks, &BTreeSet::new(), &limits);
     assert!(

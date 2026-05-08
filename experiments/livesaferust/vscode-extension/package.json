@@ -1,0 +1,84 @@
+{
+  "name": "livesaferust-vscode-prototype",
+  "displayName": "LiveSafeRust VS Code Prototype",
+  "description": "Prototype editor diagnostics for LiveSafeRust Rust taint flows.",
+  "version": "0.0.1",
+  "publisher": "livesaferust",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Linters"
+  ],
+  "activationEvents": [
+    "onLanguage:rust",
+    "onCommand:livesaferust.rescan"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "livesaferust.rescan",
+        "title": "LiveSafeRust: Rescan Current Rust File"
+      },
+      {
+        "command": "livesaferust.showOutput",
+        "title": "LiveSafeRust: Show Output"
+      }
+    ],
+    "configuration": {
+      "title": "LiveSafeRust",
+      "properties": {
+        "livesaferust.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable LiveSafeRust prototype diagnostics."
+        },
+        "livesaferust.debounceMs": {
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "description": "Delay after edits before recomputing diagnostics."
+        },
+        "livesaferust.backend": {
+          "type": "string",
+          "enum": [
+            "saf-backed",
+            "source-sidecar"
+          ],
+          "default": "saf-backed",
+          "description": "Diagnostic backend. saf-backed follows the paper pipeline on save/rescan; source-sidecar is a fast local fallback."
+        },
+        "livesaferust.safImage": {
+          "type": "string",
+          "enum": [
+            "llvm18",
+            "llvm22"
+          ],
+          "default": "llvm22",
+          "description": "SAF Docker image/toolchain path used by the SAF-backed backend."
+        },
+        "livesaferust.ensureSafSdk": {
+          "type": "boolean",
+          "default": false,
+          "description": "Pass --ensure-saf-sdk to run_saf.py before SAF-backed scans. Useful for fresh Docker images, but slower."
+        },
+        "livesaferust.rustToolchain": {
+          "type": "string",
+          "default": "",
+          "description": "Optional rustup toolchain passed to run_saf.py, for example 1.95.0."
+        },
+        "livesaferust.runSafOnOpen": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run the SAF-backed backend when a Rust file is opened. Disabled by default because SAF may invoke Docker."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node test/analyzer.test.js"
+  },
+  "devDependencies": {}
+}

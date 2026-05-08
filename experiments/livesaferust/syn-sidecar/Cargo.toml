@@ -1,0 +1,16 @@
+[package]
+name = "livesaferust-syn-sidecar"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+blake3 = "1.8"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syn = { version = "2", features = ["full", "visit"] }

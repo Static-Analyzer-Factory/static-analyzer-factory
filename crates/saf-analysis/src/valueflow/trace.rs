@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use saf_core::air::AirModule;
+use saf_core::air::{AirModule, Operation};
 use saf_core::span::Span;
 
 use super::edge::EdgeKind;
@@ -173,11 +173,19 @@ fn find_value_info(
     value_id: saf_core::ids::ValueId,
     module: &AirModule,
 ) -> (Option<String>, Option<Span>) {
+    let mut fallback: Option<(Option<String>, Option<Span>)> = None;
+
     // Check function parameters
     for func in &module.functions {
         for param in &func.params {
             if param.id == value_id {
-                return (param.name.clone(), func.span.clone());
+                let info = (param.name.clone(), func.span.clone());
+                if info.1.is_some() {
+                    return info;
+                }
+                if fallback.is_none() {
+                    fallback = Some(info);
+                }
             }
         }
 
@@ -185,10 +193,19 @@ fn find_value_info(
         for block in &func.blocks {
             for inst in &block.instructions {
                 if inst.dst == Some(value_id) {
-                    return (
-                        inst.symbol.as_ref().map(|s| s.display_name.clone()),
+                    let info = (
+                        inst.symbol
+                            .as_ref()
+                            .map(|s| s.display_name.clone())
+                            .or_else(|| operation_symbol(&inst.op, module)),
                         inst.span.clone(),
                     );
+                    if info.1.is_some() {
+                        return info;
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(info);
+                    }
                 }
             }
         }
@@ -197,11 +214,57 @@ fn find_value_info(
     // Check globals
     for global in &module.globals {
         if global.id == value_id {
-            return (Some(global.name.clone()), global.span.clone());
+            let info = (Some(global.name.clone()), global.span.clone());
+            if info.1.is_some() {
+                return info;
+            }
+            if fallback.is_none() {
+                fallback = Some(info);
+            }
         }
     }
 
-    (None, None)
+    // Values selected as taint sinks are often call arguments rather than
+    // instruction results. If the value itself has no defining span, report the
+    // source span of the user instruction so SDK findings can point at the
+    // source/sink call site instead of falling back to an opaque value id.
+    let mut first_use: Option<(Option<String>, Option<Span>)> = None;
+    for func in &module.functions {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if !inst.operands.contains(&value_id) {
+                    continue;
+                }
+                let info = (operation_symbol(&inst.op, module), inst.span.clone());
+                if matches!(
+                    inst.op,
+                    Operation::CallDirect { .. } | Operation::CallIndirect { .. }
+                ) {
+                    return info;
+                }
+                if first_use.is_none() {
+                    first_use = Some(info);
+                }
+            }
+        }
+    }
+    if let Some(info) = first_use {
+        return info;
+    }
+
+    fallback.unwrap_or((None, None))
+}
+
+fn operation_symbol(op: &Operation, module: &AirModule) -> Option<String> {
+    match op {
+        Operation::CallDirect { callee } => module
+            .function_index
+            .get(callee)
+            .and_then(|&idx| module.functions.get(idx))
+            .map(|func| format!("call @{}", func.name)),
+        Operation::CallIndirect { .. } => Some("call indirect".to_string()),
+        _ => None,
+    }
 }
 
 /// An enriched step with full node information.
