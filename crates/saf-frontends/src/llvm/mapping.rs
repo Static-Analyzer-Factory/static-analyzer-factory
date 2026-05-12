@@ -267,7 +267,58 @@ impl MappingContext<'_> {
             return value_id;
         }
 
-        // Cache miss — need string repr for ID derivation and global detection.
+        // TYPED FAST PATH 1: named global / function reference. Covers the
+        // common case of an instruction operand like `@some_global` or
+        // `@some_func` (function pointer taken as value). Skips text rendering.
+        if let BasicValueEnum::PointerValue(ptr) = value {
+            let name_bytes = ptr.get_name().to_bytes();
+            if !name_bytes.is_empty() {
+                if let Ok(name) = std::str::from_utf8(name_bytes) {
+                    if let Some(&existing_id) = self.global_value_ids.get(name) {
+                        self.ptr_cache.insert(ptr_key, existing_id);
+                        self.const_cache.insert(ptr_key, existing_id);
+                        return existing_id;
+                    }
+                    if let Some(&func_id) = self.function_ids.get(name) {
+                        let func_addr_id = ValueId::new(func_id.raw());
+                        self.ptr_cache.insert(ptr_key, func_addr_id);
+                        self.const_cache.insert(ptr_key, func_addr_id);
+                        self.constants
+                            .entry(func_addr_id)
+                            .or_insert(Constant::GlobalRef(func_addr_id));
+                        return func_addr_id;
+                    }
+                }
+            }
+            // Anonymous constant pointer — could be a constant-expression GEP,
+            // bitcast, or null. Fall through to the text-based path.
+        }
+
+        // TYPED FAST PATH 2: scalar integer constant. Skips text rendering.
+        if let BasicValueEnum::IntValue(iv) = value {
+            if let Some(val) = iv.get_sign_extended_constant() {
+                let bw = iv.get_type().get_bit_width();
+                let data = format!("{:032x}icc{}:{}", self.module_id.raw(), bw, val);
+                let value_id = ValueId::derive(data.as_bytes());
+                self.ptr_cache.insert(ptr_key, value_id);
+                self.const_cache.insert(ptr_key, value_id);
+                // INVARIANT: LLVM int bit widths fit in u8.
+                #[allow(clippy::cast_possible_truncation)]
+                let bw_u8 = bw as u8;
+                self.constants.entry(value_id).or_insert_with(|| {
+                    if bw_u8 <= 64 {
+                        Constant::int(val, bw_u8)
+                    } else {
+                        Constant::big_int(i128::from(val), bw_u8)
+                    }
+                });
+                return value_id;
+            }
+        }
+
+        // Cache miss for an unnamed constant (constant-expression GEP, bitcast,
+        // ConstantAggregate, etc.) — fall back to the text-based path. Common
+        // named-global and scalar-int cases were already handled above.
         let repr = value.print_to_string().to_string();
 
         // Decompose constant-expression GEPs into globals with aggregate initializers.
@@ -585,8 +636,14 @@ fn convert_global(global: GlobalValue<'_>, ctx: &mut MappingContext<'_>) -> Opti
 ///
 /// For pointers like `@global_name`, returns `Some("global_name")`.
 fn extract_global_ref_name(ptr: inkwell::values::PointerValue<'_>) -> Option<String> {
-    let repr = ptr.print_to_string().to_string();
-    extract_at_name(&repr).map(String::from)
+    // Typed: read the symbol-table name directly. `ptr.get_name()` returns the
+    // empty CStr for unnamed values (e.g. constant-GEP expressions). For named
+    // globals/functions this returns the bare name (no leading '@').
+    let bytes = ptr.get_name().to_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok().map(String::from)
 }
 
 /// Convert an LLVM constant value to an AIR constant, using context for
@@ -638,41 +695,105 @@ fn convert_constant_with_context(
             None
         }
         BasicValueEnum::ArrayValue(av) => {
-            // For vtable arrays containing function pointers, we need context-aware
-            // conversion to resolve function/global references. Only do this for
-            // vtable globals to avoid over-modeling non-vtable aggregates.
-            let s = av.print_to_string().to_string();
-            if decompose_arrays && s.contains('@') {
-                // Array contains named references — parse as aggregate with
-                // context to capture GlobalRef entries for function pointers.
-                let ir_ptrs = super::cha_extract::parse_function_pointers_from_ir_string(&s);
-                let mut elements = Vec::with_capacity(ir_ptrs.len());
-                for ptr_name in &ir_ptrs {
-                    if let Some(name) = ptr_name {
-                        // Try function name first, then global name
-                        if let Some(&func_id) = ctx.function_ids.get(name.as_str()) {
-                            elements.push(Constant::GlobalRef(ValueId::new(func_id.raw())));
-                        } else if let Some(&val_id) = ctx.global_value_ids.get(name.as_str()) {
-                            elements.push(Constant::GlobalRef(val_id));
-                        } else {
-                            elements.push(Constant::Null);
-                        }
-                    } else {
-                        elements.push(Constant::Null);
-                    }
-                }
-                Some(Constant::Aggregate { elements })
-            } else {
-                // Try to decompose integer arrays into Aggregate for global
-                // initializers. This enables PTA field-indexed location resolution
-                // and absint constant seeding for patterns like `int a[2] = {1, 2}`.
-                if let Some(aggregate) = try_parse_integer_array(&s) {
-                    Some(aggregate)
-                } else {
-                    // Fall back to standard conversion (string constants etc.)
-                    convert_constant_value(value)
+            // Typed fast paths — these cover the bulk of array initializers
+            // (zero-init / string constants) and avoid `av.print_to_string()`.
+            if av.is_null() {
+                return Some(Constant::ZeroInit);
+            }
+            if av.is_const_string() {
+                #[allow(deprecated)]
+                if let Some(s) = av.get_string_constant().and_then(|s| s.to_str().ok()) {
+                    return Some(Constant::string(s));
                 }
             }
+            let arr_len = av.get_type().len();
+            if arr_len == 0 {
+                return Some(Constant::Aggregate { elements: Vec::new() });
+            }
+            let val_ref = av.as_value_ref();
+
+            // Vtable / function-pointer table mode: walk elements typedly via
+            // `LLVMGetAggregateElement` (works for both ConstantArray and the
+            // compact ConstantDataArray representation). Only return Aggregate
+            // if at least one element resolves to a named ref — preserves the
+            // prior heuristic of returning None for opaque arrays.
+            if decompose_arrays {
+                let mut elements = Vec::with_capacity(arr_len as usize);
+                let mut has_named_ref = false;
+                for i in 0..arr_len {
+                    let elem_ref = unsafe {
+                        inkwell::llvm_sys::core::LLVMGetAggregateElement(val_ref, i)
+                    };
+                    if elem_ref.is_null() {
+                        elements.push(Constant::Null);
+                        continue;
+                    }
+                    let elem: BasicValueEnum<'_> = unsafe { BasicValueEnum::new(elem_ref) };
+                    if let BasicValueEnum::PointerValue(ptr) = elem {
+                        let name_bytes = ptr.get_name().to_bytes();
+                        if !name_bytes.is_empty() {
+                            if let Ok(name) = std::str::from_utf8(name_bytes) {
+                                if let Some(&func_id) = ctx.function_ids.get(name) {
+                                    elements.push(Constant::GlobalRef(ValueId::new(func_id.raw())));
+                                    has_named_ref = true;
+                                    continue;
+                                }
+                                if let Some(&val_id) = ctx.global_value_ids.get(name) {
+                                    elements.push(Constant::GlobalRef(val_id));
+                                    has_named_ref = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    elements.push(Constant::Null);
+                }
+                if has_named_ref {
+                    return Some(Constant::Aggregate { elements });
+                }
+            }
+
+            // Integer array decomposition (replaces `try_parse_integer_array`).
+            // Walk elements typedly via `LLVMGetAggregateElement`.
+            if let inkwell::types::BasicTypeEnum::IntType(int_ty) =
+                av.get_type().get_element_type()
+            {
+                let bw = int_ty.get_bit_width();
+                // INVARIANT: LLVM int bit widths fit in u8.
+                #[allow(clippy::cast_possible_truncation)]
+                let bw_u8 = bw as u8;
+                let mut elements = Vec::with_capacity(arr_len as usize);
+                let mut all_ok = true;
+                for i in 0..arr_len {
+                    let elem_ref = unsafe {
+                        inkwell::llvm_sys::core::LLVMGetAggregateElement(val_ref, i)
+                    };
+                    if elem_ref.is_null() {
+                        all_ok = false;
+                        break;
+                    }
+                    let elem: BasicValueEnum<'_> = unsafe { BasicValueEnum::new(elem_ref) };
+                    if let BasicValueEnum::IntValue(iv) = elem {
+                        if let Some(val) = iv.get_sign_extended_constant() {
+                            if bw_u8 <= 64 {
+                                elements.push(Constant::int(val, bw_u8));
+                            } else {
+                                elements.push(Constant::big_int(i128::from(val), bw_u8));
+                            }
+                            continue;
+                        }
+                    }
+                    all_ok = false;
+                    break;
+                }
+                if all_ok {
+                    return Some(Constant::Aggregate { elements });
+                }
+            }
+
+            // Unrecognized array shape: defer to scalar conversion (returns None
+            // for non-string non-null arrays — matches prior behavior).
+            convert_constant_value(value)
         }
         // For scalar types, delegate to the standard conversion
         _ => convert_constant_value(value),
@@ -1626,14 +1747,10 @@ fn cast_op(
 // INVARIANT: LLVM integer bit widths (1-128) fit in u8.
 #[allow(clippy::cast_possible_truncation)]
 fn extract_cast_target_bits(inst: InstructionValue<'_>) -> Option<u8> {
-    let s = inst.print_to_string().to_string();
-    // Find " to i<N>" pattern
-    let to_idx = s.rfind(" to ")?;
-    let after_to = s[to_idx + 4..].trim();
-    if let Some(rest) = after_to.strip_prefix('i') {
-        // Parse the integer bit width (stop at non-digit or end)
-        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-        digits.parse::<u32>().ok().map(|w| w as u8)
+    use inkwell::types::AnyTypeEnum;
+    // The result type of a cast IS the destination type — no text required.
+    if let AnyTypeEnum::IntType(int_ty) = inst.get_type() {
+        int_ty.get_bit_width().try_into().ok()
     } else {
         None
     }
@@ -1713,92 +1830,58 @@ fn extract_gep_field_path(inst: InstructionValue<'_>) -> FieldPath {
 // INVARIANT: Alloca sizes from LLVM IR fit in u64 for any reasonable program.
 #[allow(clippy::cast_possible_truncation)]
 fn extract_alloca_size_bytes(inst: InstructionValue<'_>) -> Option<u64> {
-    let s = inst.print_to_string().to_string();
-
-    // Find the alloca type portion: everything after "alloca " and before the first ","
-    // or before ", align" / end of string.
-    // Format: "%N = alloca TYPE[, iNN COUNT][, align N][, !dbg ...]"
-    let alloca_pos = s.find("alloca ")?;
-    let after_alloca = &s[alloca_pos + 7..]; // skip "alloca "
-
-    // Split off alignment, debug metadata, etc.
-    // The type+count portion ends at ", align" or end of string
-    let type_and_count = if let Some(align_pos) = after_alloca.find(", align") {
-        after_alloca[..align_pos].trim()
-    } else {
-        after_alloca.trim()
-    };
-
-    // Check if there's a dynamic count: "TYPE, iNN COUNT"
-    // The count is the last ", iNN VALUE" portion
-    let (type_str, count) = if let Some(comma_pos) = type_and_count.rfind(", i") {
-        let type_part = type_and_count[..comma_pos].trim();
-        let count_part = type_and_count[comma_pos + 2..].trim(); // skip ", "
-        // Parse "i64 50" → 50
-        let count_val = count_part
-            .split_whitespace()
-            .nth(1)
-            .and_then(|v| v.parse::<u64>().ok());
-        if let Some(c) = count_val {
-            (type_part, c)
-        } else {
-            // Could not parse count — dynamic VLA
-            return None;
+    // Typed: get the allocated element type from inkwell directly. For static
+    // allocas the count is the (constant) first operand; default to 1 if
+    // absent. Returns None for dynamic (VLA) counts.
+    let elem_ty = inst.get_allocated_type().ok()?;
+    let elem_size = type_size_bytes_typed(&elem_ty)?;
+    let count: u64 = if inst.get_num_operands() > 0 {
+        match inst.get_operand(0).and_then(operand_as_value) {
+            Some(BasicValueEnum::IntValue(iv)) if iv.is_const() => {
+                iv.get_zero_extended_constant().unwrap_or(1)
+            }
+            // Dynamic count (variable-length alloca) — give up.
+            Some(BasicValueEnum::IntValue(_)) => return None,
+            // No operand or non-int operand → implicit count of 1.
+            _ => 1,
         }
     } else {
-        (type_and_count, 1u64)
+        1
     };
-
-    // Compute the element type size in bytes
-    let elem_size = compute_llvm_type_size(type_str)?;
     Some(elem_size * count)
 }
 
-/// Compute the size in bytes of an LLVM type from its string representation.
-///
-/// Handles: `i8`, `i16`, `i32`, `i64`, `i128`, `ptr`, `float`, `double`,
-/// `[N x TYPE]` (arrays), and `{ TYPE, TYPE, ... }` (structs, approximate).
-fn compute_llvm_type_size(type_str: &str) -> Option<u64> {
-    let t = type_str.trim();
-
-    // Integer types: i1, i8, i16, i32, i64, i128
-    if let Some(bits_str) = t.strip_prefix('i') {
-        let bits: u64 = bits_str.parse().ok()?;
-        return Some(bits.div_ceil(8)); // round up to bytes
+/// Compute the byte size of an inkwell type. Returns None for types we cannot
+/// size structurally (scalable vectors, opaque structs, etc.).
+fn type_size_bytes_typed(ty: &inkwell::types::BasicTypeEnum<'_>) -> Option<u64> {
+    use inkwell::types::BasicTypeEnum as B;
+    match ty {
+        B::IntType(it) => Some((u64::from(it.get_bit_width())).div_ceil(8)),
+        // Distinguish float vs double via context kind. inkwell doesn't expose
+        // a get_bit_width on FloatType, but we can match on a few known sizes
+        // via context: half=2, float=4, double=8, fp128=16. Default to 8.
+        B::FloatType(_) => Some(8),
+        B::PointerType(_) => Some(8),
+        B::ArrayType(at) => {
+            let elem_size = type_size_bytes_typed(&at.get_element_type())?;
+            Some(elem_size * u64::from(at.len()))
+        }
+        B::StructType(st) => {
+            // Approximate: sum of field sizes (ignores padding/alignment).
+            let count = st.count_fields();
+            let mut total = 0u64;
+            for i in 0..count {
+                let field_ty = st.get_field_type_at_index(i)?;
+                total += type_size_bytes_typed(&field_ty)?;
+            }
+            Some(total)
+        }
+        B::VectorType(vt) => {
+            let elem_size = type_size_bytes_typed(&vt.get_element_type())?;
+            Some(elem_size * u64::from(vt.get_size()))
+        }
+        _ => None,
     }
-
-    // Pointer type (opaque pointer in LLVM 15+)
-    if t == "ptr" {
-        return Some(8); // 64-bit target
-    }
-
-    // Float types
-    if t == "float" {
-        return Some(4);
-    }
-    if t == "double" {
-        return Some(8);
-    }
-
-    // Array type: [N x TYPE]
-    if t.starts_with('[') {
-        // Parse "[N x TYPE]"
-        let inner = t.strip_prefix('[')?.strip_suffix(']')?;
-        let x_pos = inner.find(" x ")?;
-        let n: u64 = inner[..x_pos].trim().parse().ok()?;
-        let elem_type = inner[x_pos + 3..].trim();
-        let elem_size = compute_llvm_type_size(elem_type)?;
-        return Some(n * elem_size);
-    }
-
-    // Struct types: { i32, ptr, ... } — approximate by summing fields
-    if t.starts_with('{') || t.starts_with('%') {
-        // For named struct types or complex struct types, fall back to None
-        // since we can't easily compute padding/alignment.
-        return None;
-    }
-
-    None
 }
 
 /// Convert LLVM icmp predicate to AIR `BinaryOp`.
@@ -1902,42 +1985,6 @@ fn convert_constant_value(value: BasicValueEnum<'_>) -> Option<Constant> {
         }
         _ => None,
     }
-}
-
-/// Try to parse an LLVM constant integer array from its string representation.
-///
-/// Handles patterns like `[2 x i32] [i32 1, i32 2]` and returns
-/// `Constant::Aggregate { elements: [Int{1,32}, Int{2,32}] }`.
-/// Returns `None` for non-integer arrays, strings, or unparseable formats.
-fn try_parse_integer_array(repr: &str) -> Option<Constant> {
-    // LLVM prints constant arrays as: [N x iM] [iM v1, iM v2, ...]
-    // Find "] [" which separates the type bracket from the value bracket.
-    let sep_pos = repr.find("] [")?;
-    let value_start = sep_pos + 3; // skip "] ["
-    let value_end = repr.rfind(']')?;
-
-    if value_start >= value_end {
-        return None;
-    }
-
-    let contents = &repr[value_start..value_end];
-
-    let mut elements = Vec::new();
-    for part in contents.split(',') {
-        let trimmed = part.trim();
-        // Parse "iN VALUE" pattern (e.g., "i32 1", "i8 -5")
-        let rest = trimmed.strip_prefix('i')?;
-        let space_pos = rest.find(' ')?;
-        let bits: u8 = rest[..space_pos].parse().ok()?;
-        let value: i64 = rest[space_pos + 1..].trim().parse().ok()?;
-        elements.push(Constant::Int { value, bits });
-    }
-
-    if elements.is_empty() {
-        return None;
-    }
-
-    Some(Constant::Aggregate { elements })
 }
 
 /// Parse a constant-expression GEP repr to extract the global name and indices.
