@@ -89,6 +89,13 @@ pub(crate) struct MappingContext<'ctx> {
     ///
     /// Set at the start of each function conversion from `module_local_var_names`.
     pub current_local_var_names: BTreeMap<String, String>,
+    /// Monotonic counter for non-constant SSA ValueIds — fast path that skips
+    /// `value.print_to_string()` + BLAKE3 for ordinary SSA values.
+    pub seq_counter: u64,
+    /// Module-wide constant cache (survives per-function `ptr_cache.clear()`).
+    /// LLVM constants have stable pointer identity across functions, so caching
+    /// them once avoids per-function re-hashing.
+    pub const_cache: FxHashMap<usize, ValueId>,
     /// Phantom data for the context lifetime.
     _phantom: std::marker::PhantomData<&'ctx ()>,
 }
@@ -112,6 +119,8 @@ impl MappingContext<'_> {
             type_interner: super::type_intern::TypeInterner::new(),
             module_local_var_names: BTreeMap::new(),
             current_local_var_names: BTreeMap::new(),
+            seq_counter: 0,
+            const_cache: FxHashMap::default(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -229,6 +238,34 @@ impl MappingContext<'_> {
         if let Some(&existing_id) = self.ptr_cache.get(&ptr_key) {
             return existing_id;
         }
+        // Check the module-wide constant cache. LLVM constants are uniqued —
+        // same constant has stable pointer identity across all functions.
+        // Caching them once saves per-function re-hashing on `ptr_cache.clear()`.
+        if let Some(&existing_id) = self.const_cache.get(&ptr_key) {
+            return existing_id;
+        }
+
+        // For non-constant SSA values, skip print_to_string entirely. Ordinary
+        // SSA values just need a unique deterministic ValueId — no global-name
+        // resolution required. Constants and globals still go through the full
+        // path below because they need name-based resolution.
+        let is_const = match value {
+            BasicValueEnum::IntValue(v) => v.is_const(),
+            BasicValueEnum::FloatValue(v) => v.is_const(),
+            BasicValueEnum::PointerValue(v) => v.is_const(),
+            BasicValueEnum::StructValue(v) => v.is_const(),
+            BasicValueEnum::ArrayValue(v) => v.is_const(),
+            BasicValueEnum::VectorValue(v) => v.is_const(),
+            _ => false,
+        };
+
+        if !is_const {
+            self.seq_counter += 1;
+            let data = format!("{:032x}seq{}", self.module_id.raw(), self.seq_counter);
+            let value_id = ValueId::derive(data.as_bytes());
+            self.ptr_cache.insert(ptr_key, value_id);
+            return value_id;
+        }
 
         // Cache miss — need string repr for ID derivation and global detection.
         let repr = value.print_to_string().to_string();
@@ -250,6 +287,7 @@ impl MappingContext<'_> {
                 ) {
                     if let Some(gep_result_id) = self.decompose_constant_gep(&repr) {
                         self.ptr_cache.insert(ptr_key, gep_result_id);
+                        self.const_cache.insert(ptr_key, gep_result_id);
                         return gep_result_id;
                     }
                 }
@@ -263,6 +301,7 @@ impl MappingContext<'_> {
             // Check global variables first
             if let Some(&existing_id) = self.global_value_ids.get(ref_name) {
                 self.ptr_cache.insert(ptr_key, existing_id);
+                self.const_cache.insert(ptr_key, existing_id);
                 return existing_id;
             }
 
@@ -272,6 +311,7 @@ impl MappingContext<'_> {
                 // Use the function's ID as the basis for consistency
                 let func_addr_id = ValueId::new(func_id.raw());
                 self.ptr_cache.insert(ptr_key, func_addr_id);
+                self.const_cache.insert(ptr_key, func_addr_id);
 
                 // Record a GlobalRef constant so MTA can resolve this function pointer
                 // The target is a synthetic ValueId representing the function's address
@@ -285,6 +325,10 @@ impl MappingContext<'_> {
 
         let value_id = ValueId::derive(repr.as_bytes());
         self.ptr_cache.insert(ptr_key, value_id);
+        // SPIKE v2: also persist constants in module-wide cache.
+        if is_const {
+            self.const_cache.insert(ptr_key, value_id);
+        }
 
         // Record constant value if applicable
         if let std::collections::btree_map::Entry::Vacant(e) = self.constants.entry(value_id) {
@@ -768,19 +812,38 @@ fn convert_instruction(
     let inst_id = ctx.create_inst_id(block_id);
     let opcode = inst.get_opcode();
 
-    // Check for intrinsic calls first.
-    // We must detect llvm.* intrinsics from the instruction string BEFORE
-    // calling get_operand(), because metadata operands (e.g. in llvm.dbg.declare)
-    // cause inkwell to panic with "The given type is not a basic type".
+    // Check for intrinsic calls and inline asm structurally.
+    //
+    // The callee is the last operand of a Call instruction (in LLVM, earlier
+    // operands are arguments, and the function pointer comes last). Reading
+    // just the last operand is safe even for metadata-laden intrinsics like
+    // `llvm.dbg.declare(metadata, metadata, metadata)`, because the function
+    // pointer itself is always a plain pointer value — only the *argument*
+    // operands are metadata. Going via the typed inkwell API avoids the
+    // expensive per-call `inst.print_to_string()` text materialization that
+    // used to dominate frontend wall-clock on `-g` IR.
     if opcode == InstructionOpcode::Call {
-        let inst_str = inst.print_to_string().to_string();
-        if let Some(intrinsic_name) = extract_llvm_intrinsic_from_str(&inst_str) {
-            return convert_intrinsic_call(inst, inst_id, &intrinsic_name, ctx);
-        }
-        // Skip inline assembly — not a function pointer call.
-        // Inline asm has no function name, so it would otherwise become `CallIndirect`.
-        if inst_str.contains(" asm ") {
-            return Ok(None);
+        let num_operands = inst.get_num_operands();
+        if num_operands > 0 {
+            if let Some(operand) = inst.get_operand(num_operands - 1) {
+                if let Some(BasicValueEnum::PointerValue(ptr)) = operand_as_value(operand) {
+                    // Inline asm has a PointerValue callee but it is not a
+                    // named global — check structurally via LLVMIsAInlineAsm.
+                    let val_ref = ptr.as_value_ref();
+                    let is_inline_asm = unsafe {
+                        !inkwell::llvm_sys::core::LLVMIsAInlineAsm(val_ref).is_null()
+                    };
+                    if is_inline_asm {
+                        return Ok(None);
+                    }
+                    let name = ptr.get_name().to_bytes();
+                    if name.starts_with(b"llvm.") {
+                        if let Ok(intrinsic_name) = std::str::from_utf8(name) {
+                            return convert_intrinsic_call(inst, inst_id, intrinsic_name, ctx);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -990,21 +1053,6 @@ fn convert_instruction(
     }
 
     Ok(Some(air_inst))
-}
-
-/// Extract an `llvm.*` intrinsic name from an instruction's string representation.
-///
-/// Parses strings like `call void @llvm.dbg.declare(metadata ...)` to extract
-/// `llvm.dbg.declare`. This avoids calling `get_operand()` on instructions with
-/// metadata operands, which causes inkwell to panic with
-/// "The given type is not a basic type".
-fn extract_llvm_intrinsic_from_str(inst_str: &str) -> Option<String> {
-    let marker = "@llvm.";
-    let start = inst_str.find(marker)?;
-    let name_start = start + 1; // Skip the '@'
-    let rest = &inst_str[name_start..];
-    let end = rest.find('(')?;
-    Some(rest[..end].to_string())
 }
 
 /// Get the called function name for a call/invoke instruction.
