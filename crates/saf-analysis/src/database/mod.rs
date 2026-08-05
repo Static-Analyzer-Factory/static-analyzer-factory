@@ -52,7 +52,7 @@ pub struct ProgramDatabase {
     module: Arc<AirModule>,
     call_graph: CallGraph,
     icfg: OnceLock<Icfg>,
-    pta_result: Option<PtaResult>,
+    pta_result: Option<Arc<PtaResult>>,
     defuse: DefUseGraph,
     valueflow: OnceLock<ValueFlowGraph>,
     valueflow_config: ValueFlowConfig,
@@ -76,7 +76,7 @@ impl ProgramDatabase {
             module: Arc::new(module),
             call_graph: pipeline.call_graph,
             icfg: OnceLock::new(),
-            pta_result: pipeline.pta_result,
+            pta_result: pipeline.pta_result.map(Arc::new),
             defuse: pipeline.defuse,
             valueflow: OnceLock::new(),
             valueflow_config: config.valueflow.clone(),
@@ -109,7 +109,7 @@ impl ProgramDatabase {
             module,
             call_graph,
             icfg: icfg_lock,
-            pta_result,
+            pta_result: pta_result.map(Arc::new),
             defuse,
             valueflow: vfg_lock,
             valueflow_config: ValueFlowConfig::default(),
@@ -149,7 +149,13 @@ impl ProgramDatabase {
 
     /// The PTA result (if PTA ran).
     pub fn pta_result(&self) -> Option<&PtaResult> {
-        self.pta_result.as_ref()
+        self.pta_result.as_deref()
+    }
+
+    /// Shared handle to the PTA result for consumers that need ownership
+    /// (e.g. `MemorySsa`) without deep-cloning the points-to map.
+    pub fn pta_result_arc(&self) -> Option<Arc<PtaResult>> {
+        self.pta_result.clone()
     }
 
     /// The def-use graph.
@@ -177,7 +183,7 @@ impl ProgramDatabase {
                 &self.module,
                 defuse,
                 &self.call_graph,
-                self.pta_result.as_ref(),
+                self.pta_result.as_deref(),
             )
         })
     }
@@ -319,7 +325,7 @@ impl ProgramDatabase {
     pub fn display_resolver(&self) -> crate::display::DisplayResolver<'_> {
         crate::display::DisplayResolver::with_analysis(
             &self.module,
-            self.pta_result.as_ref(),
+            self.pta_result.as_deref(),
             self.svfg.get(),
         )
     }
@@ -361,7 +367,7 @@ impl ProgramDatabase {
                 &self.defuse
             };
 
-            let mssa_pta = pta.clone();
+            let mssa_pta = Arc::clone(pta);
             let mut mssa = MemorySsa::build(&self.module, &cfgs, mssa_pta, &self.call_graph);
             let (mut svfg, _program_points) =
                 SvfgBuilder::new(&self.module, defuse, &self.call_graph, pta, &mut mssa).build();

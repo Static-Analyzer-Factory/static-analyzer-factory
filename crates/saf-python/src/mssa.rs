@@ -32,7 +32,7 @@ impl PyMemorySsa {
     pub fn build(module: &AirModule, callgraph: &CallGraph, pta: PtaResult) -> Self {
         let cfgs = crate::helpers::build_cfgs(module);
 
-        let mssa = MemorySsa::build(module, &cfgs, pta, callgraph);
+        let mssa = MemorySsa::build(module, &cfgs, std::sync::Arc::new(pta), callgraph);
         Self { inner: mssa }
     }
 }

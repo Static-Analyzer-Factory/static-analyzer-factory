@@ -283,8 +283,23 @@ fn refine_legacy(
     // 4c. Create solver and run initial fixed point
     let t_step = Timer::now();
 
+    // Field minting gives stack/heap objects on-demand field sensitivity
+    // (plan 190, fix 2.1). This path owns the factory, so the minted overlay
+    // is merged back below before the factory moves into the result.
+    //
+    // Opt-in (`SAF_PTA_FIELD_MINTING` env var) until the downstream phases
+    // can afford the larger location universe: minted cells multiply MSSA
+    // clobber-walk targets and SVFG size, measured at 4-9x end-to-end
+    // regressions on CruxBC (curl 2.3s -> 14.1s) even where Andersen
+    // precision improves (PTABen +5 exact / -4 unsound with minting on).
+    // Unblocking work: memory-region clobber partitioning (plan 190 fix
+    // 3.2c/d), cycle collapsing (3.3), dense-ID sets (phase 4).
+    let enable_minting = std::env::var("SAF_PTA_FIELD_MINTING").is_ok();
     let mut solver = GenericSolver::<FxHashPtsSet>::new(&prepared.reduced, &prepared.factory)
         .with_constants(&module.constants);
+    if enable_minting {
+        solver = solver.with_field_minting();
+    }
 
     let t_solver_init = t_step.elapsed();
 
@@ -328,6 +343,8 @@ fn refine_legacy(
     let t_step = Timer::now();
 
     let iteration_limit_hit = solver.iteration_limit_hit;
+    let (minted_cells, minted_summary) = solver.take_minted_overlay();
+    let minted_count = minted_cells.len();
 
     let pts_count = solver.pts.len();
     let mut pts: crate::pta::PointsToMap = solver
@@ -364,14 +381,20 @@ fn refine_legacy(
         iterations = iterations,
         pts_count = pts_count,
         hvn_mappings = hvn_mapping_count,
+        minted_cells = minted_count,
     );
+
+    // Merge solver-minted field cells into the factory so downstream
+    // consumers can resolve the minted LocIds appearing in points-to sets.
+    let mut factory = std::mem::replace(
+        &mut prepared.factory,
+        LocationFactory::new(FieldSensitivity::default()),
+    );
+    factory.merge_minted(minted_cells, minted_summary);
 
     PtaSolveResult {
         pts,
-        factory: std::mem::replace(
-            &mut prepared.factory,
-            LocationFactory::new(FieldSensitivity::default()),
-        ),
+        factory,
         resolved_calls: resolved_pta_calls,
         iterations,
         pta_solve_secs,

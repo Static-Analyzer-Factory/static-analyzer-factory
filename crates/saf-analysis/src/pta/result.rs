@@ -3,6 +3,7 @@
 //! Provides the analysis result with query methods for points-to sets
 //! and alias analysis.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -107,6 +108,23 @@ impl PtaResult {
             .get(&ptr)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Check membership in a value's points-to set without allocating.
+    ///
+    /// Hot-path alternative to `points_to(ptr).contains(&loc)`, which builds a
+    /// fresh `Vec` and scans it linearly on every call.
+    #[must_use]
+    pub fn points_to_contains(&self, ptr: ValueId, loc: LocId) -> bool {
+        self.pts.get(&ptr).is_some_and(|s| s.contains(&loc))
+    }
+
+    /// Borrow the points-to set for a value without allocating.
+    ///
+    /// Returns `None` when the value has no points-to entry.
+    #[must_use]
+    pub fn points_to_ref(&self, ptr: ValueId) -> Option<&BTreeSet<LocId>> {
+        self.pts.get(&ptr)
     }
 
     /// Check if a value is tracked in the points-to analysis.

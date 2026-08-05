@@ -876,6 +876,8 @@ impl AnalysisDriver {
                 cfg_build_secs: None,
                 pta_clone_secs: None,
                 defuse_local_secs: None,
+                fspta_iterations: None,
+                fspta_limit_hit: None,
             },
             ..Default::default()
         };
@@ -945,6 +947,61 @@ impl AnalysisDriver {
                             bench_stats.avg_pts_size_svf =
                                 total_pts as f64 / bench_stats.total_pointer_values as f64;
                         }
+                    }
+                }
+
+                // Temporary investigation dump (env-gated): points-to set size
+                // distribution and field-location composition.
+                if std::env::var("SAF_BENCH_DEBUG_DUMP").is_ok() {
+                    let mut by_size: Vec<(usize, &saf_core::ids::ValueId)> =
+                        pts_map.iter().map(|(v, s)| (s.len(), v)).collect();
+                    by_size.sort_by(|a, b| b.0.cmp(&a.0));
+                    eprintln!("[DUMP] top-20 pts sets:");
+                    for (sz, vid) in by_size.iter().take(20) {
+                        let sample: Vec<String> = pts_map[*vid]
+                            .iter()
+                            .take(4)
+                            .map(|l| format!("{:?}", pta.location(*l)))
+                            .collect();
+                        eprintln!("[DUMP]   {vid:?} size={sz} sample={sample:?}");
+                    }
+                    // Histogram of pts sizes
+                    let mut hist = std::collections::BTreeMap::new();
+                    for (sz, _) in &by_size {
+                        let bucket = match sz {
+                            0..=1 => "0-1",
+                            2..=4 => "2-4",
+                            5..=16 => "5-16",
+                            17..=64 => "17-64",
+                            65..=256 => "65-256",
+                            _ => ">256",
+                        };
+                        *hist.entry(bucket).or_insert(0usize) += 1;
+                    }
+                    eprintln!("[DUMP] pts size histogram: {hist:?}");
+                    // Field-location composition by object
+                    let mut per_obj: std::collections::BTreeMap<_, usize> =
+                        std::collections::BTreeMap::new();
+                    let mut depth_hist: std::collections::BTreeMap<usize, usize> =
+                        std::collections::BTreeMap::new();
+                    for loc in pta.locations().values() {
+                        *per_obj.entry(loc.obj).or_insert(0) += 1;
+                        *depth_hist.entry(loc.path.depth()).or_insert(0) += 1;
+                    }
+                    eprintln!("[DUMP] path depth histogram: {depth_hist:?}");
+                    let mut per_obj_v: Vec<(usize, _)> =
+                        per_obj.iter().map(|(o, c)| (*c, o)).collect();
+                    per_obj_v.sort_by(|a, b| b.0.cmp(&a.0));
+                    eprintln!("[DUMP] top-10 objects by field-location count:");
+                    for (cnt, obj) in per_obj_v.iter().take(10) {
+                        let sample: Vec<String> = pta
+                            .locations()
+                            .values()
+                            .filter(|l| l.obj == **obj)
+                            .take(3)
+                            .map(|l| format!("{:?}", l.path))
+                            .collect();
+                        eprintln!("[DUMP]   {obj:?} locs={cnt} sample_paths={sample:?}");
                     }
                 }
             }
@@ -1022,7 +1079,12 @@ impl AnalysisDriver {
                 result.stats.cfg_build_secs = Some(tcfg.elapsed().as_secs_f64());
 
                 let tclone = std::time::Instant::now();
-                let mssa_pta = pta.clone();
+                // Shared handle — no deep clone of the points-to map (GB-scale
+                // on large programs).
+                let mssa_pta = self
+                    .db
+                    .pta_result_arc()
+                    .expect("pta_result checked above in this branch");
                 result.stats.pta_clone_secs = Some(tclone.elapsed().as_secs_f64());
 
                 let mut mssa =
@@ -1059,16 +1121,24 @@ impl AnalysisDriver {
                 .build();
                 let mssa_svfg_secs = t0.elapsed().as_secs_f64();
                 result.stats.mssa_svfg_secs = Some(mssa_svfg_secs);
-                // Donate SVFG to ProgramDatabase so checkers can reuse it
-                // instead of rebuilding MSSA+SVFG from scratch.
-                self.db.set_svfg(svfg);
+                // Donate SVFG to ProgramDatabase only when checkers will run —
+                // otherwise it would sit resident through the FS-PTA solve
+                // (hundreds of MB on large programs) with no consumer.
+                if bench_config.analyses.checkers {
+                    self.db.set_svfg(svfg);
+                } else {
+                    drop(svfg);
+                }
                 drop(mssa);
 
                 let t1 = std::time::Instant::now();
-                let fs_config = FsPtaConfig {
+                let mut fs_config = FsPtaConfig {
                     skip_df_materialization: bench_config.analyses.fspta_skip_df,
                     ..FsPtaConfig::default()
                 };
+                if let Some(max) = bench_config.pta_config.fspta_max_iterations {
+                    fs_config.max_iterations = max;
+                }
                 let fs_result = solve_flow_sensitive(
                     self.db.module(),
                     &fs_svfg,
@@ -1078,6 +1148,8 @@ impl AnalysisDriver {
                 );
                 let load_pts = fs_result.compute_load_sensitive_pts(&fs_svfg);
                 result.stats.fspta_secs = Some(t1.elapsed().as_secs_f64());
+                result.stats.fspta_iterations = Some(fs_result.diagnostics().iterations);
+                result.stats.fspta_limit_hit = Some(fs_result.diagnostics().iteration_limit_hit);
                 // FS-SVFG no longer needed after solve
                 drop(fs_svfg);
                 (Some(fs_result), load_pts)

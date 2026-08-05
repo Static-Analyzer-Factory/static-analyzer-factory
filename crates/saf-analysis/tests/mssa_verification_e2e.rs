@@ -69,7 +69,7 @@ mod phase1_phi_placement {
         let callgraph = CallGraph::build(&module);
         let pta_result = run_pta(&module);
 
-        let mssa = MemorySsa::build(&module, &cfgs, pta_result, &callgraph);
+        let mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result), &callgraph);
 
         // Find diamond_phi function and count phi accesses
         let diamond_fn =
@@ -104,7 +104,7 @@ mod phase1_phi_placement {
         let callgraph = CallGraph::build(&module);
         let pta_result = run_pta(&module);
 
-        let mssa = MemorySsa::build(&module, &cfgs, pta_result, &callgraph);
+        let mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result), &callgraph);
 
         // For each phi, verify operand count equals predecessor count in CFG
         for access in mssa.accesses().values() {
@@ -154,7 +154,7 @@ mod phase2_dominator_computation {
 
         // Building MSSA successfully proves dominators are computed correctly
         // (MSSA uses dominators for phi placement)
-        let mssa = MemorySsa::build(&module, &cfgs, pta_result, &callgraph);
+        let mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result), &callgraph);
 
         // Find diamond_cfg function
         let diamond_fn =
@@ -187,7 +187,7 @@ mod phase3_modref_scc {
         let callgraph = CallGraph::build(&module);
         let pta_result = run_pta(&module);
 
-        let mssa = MemorySsa::build(&module, &cfgs, pta_result, &callgraph);
+        let mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result), &callgraph);
 
         // Find self_recursive function
         let self_rec_fn =
@@ -211,7 +211,7 @@ mod phase3_modref_scc {
         let callgraph = CallGraph::build(&module);
         let pta_result = run_pta(&module);
 
-        let mssa = MemorySsa::build(&module, &cfgs, pta_result, &callgraph);
+        let mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result), &callgraph);
 
         // Find func_a, func_b, func_c
         let func_a = find_function(&module, "func_a");
@@ -247,7 +247,7 @@ mod phase4_clobber_query {
         let callgraph = CallGraph::build(&module);
         let pta_result = run_pta(&module);
 
-        let mssa = MemorySsa::build(&module, &cfgs, pta_result, &callgraph);
+        let mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result), &callgraph);
 
         // Find no_alias_clobber function
         let no_alias_fn = find_function(&module, "no_alias_clobber")
@@ -283,7 +283,7 @@ mod phase4_clobber_query {
         let callgraph = CallGraph::build(&module);
         let pta_result = run_pta(&module);
 
-        let mssa = MemorySsa::build(&module, &cfgs, pta_result, &callgraph);
+        let mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result), &callgraph);
 
         // Find must_alias_clobber function
         let must_alias_fn = find_function(&module, "must_alias_clobber")
@@ -328,7 +328,7 @@ mod phase4_clobber_query {
         let callgraph = CallGraph::build(&module);
         let pta_result = run_pta(&module);
 
-        let mssa = MemorySsa::build(&module, &cfgs, pta_result, &callgraph);
+        let mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result), &callgraph);
 
         // Find clobber_with_phi function
         let phi_fn = find_function(&module, "clobber_with_phi")
@@ -370,7 +370,7 @@ mod phase5_svfg_store_load {
         let callgraph = CallGraph::build(&module);
         let defuse = DefUseGraph::build(&module);
         let pta_result = run_pta(&module);
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
 
         let svfg = {
             let (svfg, _pp) =
@@ -397,7 +397,7 @@ mod phase5_svfg_store_load {
         let callgraph = CallGraph::build(&module);
         let defuse = DefUseGraph::build(&module);
         let pta_result = run_pta(&module);
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
 
         let svfg = {
             let (svfg, _pp) =
@@ -427,7 +427,7 @@ mod phase6_memory_phi {
         let callgraph = CallGraph::build(&module);
         let defuse = DefUseGraph::build(&module);
         let pta_result = run_pta(&module);
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
 
         let svfg = {
             let (svfg, _pp) =
@@ -461,7 +461,7 @@ mod phase7_integration {
         let callgraph = CallGraph::build(&module);
         let defuse = DefUseGraph::build(&module);
         let pta_result = run_pta(&module);
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
 
         let svfg = {
             let (svfg, _pp) =
@@ -493,8 +493,8 @@ mod phase7_integration {
         let pta_result1 = run_pta(&module);
         let pta_result2 = run_pta(&module);
 
-        let mut mssa1 = MemorySsa::build(&module, &cfgs, pta_result1.clone(), &callgraph);
-        let mut mssa2 = MemorySsa::build(&module, &cfgs, pta_result2.clone(), &callgraph);
+        let mut mssa1 = MemorySsa::build(&module, &cfgs, Arc::new(pta_result1.clone()), &callgraph);
+        let mut mssa2 = MemorySsa::build(&module, &cfgs, Arc::new(pta_result2.clone()), &callgraph);
 
         let (svfg1, _pp1) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result1, &mut mssa1).build();
@@ -538,7 +538,7 @@ mod phase7_integration {
         let callgraph = CallGraph::build(&module);
         let defuse = DefUseGraph::build(&module);
         let pta_result = run_pta(&module);
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
 
         let svfg = {
             let (svfg, _pp) =
@@ -576,7 +576,8 @@ mod phase7_integration {
             let callgraph = CallGraph::build(&module);
             let defuse = DefUseGraph::build(&module);
             let pta_result = run_pta(&module);
-            let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+            let mut mssa =
+                MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
             let svfg = {
                 let (svfg, _pp) =
                     SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();

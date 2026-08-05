@@ -86,7 +86,7 @@ fn main() {
     let raw2 = ctx2.analyze(&module);
     let mssa_pta = PtaResult::new(raw2.pts, Arc::new(raw2.factory), raw2.diagnostics);
 
-    let mut mssa = MemorySsa::build(&module, &cfgs, mssa_pta, &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(mssa_pta), &callgraph);
     let svfg = SvfgBuilder::new(&module, &defuse, &callgraph, &pta1, &mut mssa).build();
 
     // PTA for FsSvfg builder
@@ -98,7 +98,7 @@ fn main() {
     let mut ctx4 = PtaContext::new(pta_config);
     let raw4 = ctx4.analyze(&module);
     let mssa_pta2 = PtaResult::new(raw4.pts, Arc::new(raw4.factory), raw4.diagnostics);
-    let mut mssa2 = MemorySsa::build(&module, &cfgs, mssa_pta2, &callgraph);
+    let mut mssa2 = MemorySsa::build(&module, &cfgs, Arc::new(mssa_pta2), &callgraph);
 
     let fs_svfg = FsSvfgBuilder::new(&module, &svfg, &pta3, &mut mssa2, &callgraph).build();
 

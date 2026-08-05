@@ -16,18 +16,19 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use indexmap::IndexMap;
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use saf_core::air::AirModule;
-use saf_core::ids::{LocId, ValueId};
+use saf_core::ids::{LocId, ObjId, ValueId};
 
 use super::config::IndexSensitivity;
 use super::constraint::{AddrConstraint, ConstraintSet, CopyConstraint};
 use super::constraint_index::{ConstraintIndex, IndexedConstraints};
 use super::hvn::HvnResult;
 use super::location::{
-    ConstantsTable, LocationFactory, merge_gep_with_base_path, resolve_gep_path,
+    ConstantsTable, FieldPath, Location, LocationFactory, PathStep, merge_gep_with_base_path,
+    resolve_gep_path,
 };
 use super::ptsset::{
     BTreePtsSet, BddPtsSet, ClusteringMode, FxHashPtsSet, IdBitSet, LocIdIndexer, PtsConfig,
@@ -497,9 +498,159 @@ pub(crate) struct GenericSolver<'a, P: PtsSet> {
     topo_order: FxIndexMap<ValueId, u32>,
     /// Whether the solver hit the iteration limit before reaching a fixed point.
     pub(crate) iteration_limit_hit: bool,
+    /// On-demand field-cell minting state (plan 190, fix 2.1). When enabled,
+    /// `handle_gep_constraints` creates missing field cells instead of
+    /// collapsing to the base object — giving stack/heap objects field
+    /// sensitivity. Opt-in: only the CG-refinement path enables it (it owns
+    /// the factory and merges the overlay back after solving).
+    /// Incompatible with frozen-indexer Roaring sets (unregistered `LocId`s).
+    minting: FieldMinting,
     /// Profiling statistics.
     /// Wrapped in `RefCell` for interior mutability in `find_rep(&self)`.
     stats: RefCell<SolverStats>,
+}
+
+/// On-demand field-cell overlay for the Andersen solver.
+///
+/// Kept as a separate struct (not loose solver fields) so
+/// `resolve_or_mint` can take `&mut self` alongside disjoint borrows of the
+/// solver's other fields (`loc_pts`, `factory`) without borrow conflicts.
+#[derive(Default)]
+struct FieldMinting {
+    /// Whether minting is enabled for this solve.
+    enabled: bool,
+    /// Minted cells: `(obj, path)` → content-addressed `LocId`.
+    by_key: FxHashMap<Location, LocId>,
+    /// Minted cells: `LocId` → `Location` (chained-GEP base resolution).
+    locations: FxHashMap<LocId, Location>,
+    /// Base cell → minted field cells of that object (store-to-base bridging).
+    fields_by_base: FxHashMap<LocId, SmallVec<[LocId; 8]>>,
+    /// Minted field cell → its object's base cell (store-to-field bridging).
+    base_of_field: FxHashMap<LocId, LocId>,
+    /// Minted-cell count per object (cap enforcement).
+    count_by_obj: FxHashMap<ObjId, u32>,
+    /// Objects whose minting hit the cap mid-solve (treated as summary).
+    summary_objects: FxHashSet<ObjId>,
+}
+
+impl FieldMinting {
+    /// Per-object minted-cell cap (mirrors `MAX_AGGREGATE_FIELD_ELEMENTS`).
+    /// Past it the object becomes a summary object.
+    const MAX_FIELDS_PER_OBJECT: u32 = 512;
+
+    /// Maximum base-set fan-out that still mints: a GEP whose base pointer
+    /// may target more than this many objects gains little precision from
+    /// per-object field cells (the destination unions them all anyway) while
+    /// multiplying cell count by the fan-out. Such GEPs use the legacy
+    /// base-collapse lookup instead — bounding total minted cells and the
+    /// read-expansion cost on programs with fat points-to sets (bash-class).
+    const MAX_MINT_BASE_FANOUT: usize = 16;
+
+    /// Global minted-cell ceiling (emergency stop for pathological inputs).
+    /// Past it, minting disables entirely and unresolved paths collapse.
+    const MAX_TOTAL_MINTED: usize = 500_000;
+
+    /// Resolve `(obj, wanted)` to a field cell, minting it when absent.
+    ///
+    /// Resolution order: factory truncation → base cell for empty paths →
+    /// factory exact hit → guards (index steps, chained bases, summary
+    /// objects → legacy lookup) → minted exact hit → cap check → mint.
+    ///
+    /// Newly minted cells inherit the base cell's load registrations so that
+    /// loads which already read the base (whole-object loads) are re-triggered
+    /// when the new cell later receives stores. Value visibility across
+    /// base/field cells is handled read-side in `handle_load_constraints` —
+    /// no points-to sets are duplicated at mint time.
+    fn resolve_or_mint(
+        &mut self,
+        factory: &LocationFactory,
+        load_loc_index: &mut FxIndexMap<LocId, FxHashSet<usize>>,
+        obj: ObjId,
+        wanted: &FieldPath,
+        base_is_empty: bool,
+        mint_allowed: bool,
+    ) -> Option<LocId> {
+        let eff = factory.effective_path(obj, wanted);
+        if eff.steps.is_empty() {
+            return factory.lookup(obj, &FieldPath::empty());
+        }
+        if let Some(id) = factory.lookup(obj, &eff) {
+            return Some(id);
+        }
+        // Minting must be SOUND BY CONSTRUCTION: every access to the same
+        // runtime slot must resolve to the same cell, or to the base cell
+        // (which the load handler's read expansion keeps visible both ways).
+        // Guards:
+        //
+        // 1. Array-index steps never mint — minting is field-sensitive but
+        //    array-SMASHED (all elements of an array share field cells).
+        //    Sibling index cells have no path-prefix relation, so `s[i]` vs
+        //    `s[0]` cells would give false NoAlias (PTABen `array-varIdx2`).
+        //    Constant-index alias precision comes from the Z3
+        //    index-refinement query layer.
+        // 2. Only single-hop accesses from the object's base cell mint.
+        //    Chained GEPs build DIFFERENT path depths for the same slot
+        //    than flat GEPs (`[F0,F0,F0]` vs `[F0,F0]`), so deep chains
+        //    route to the base cell instead of minting sibling cells.
+        // 3. The leading pointer-deref `Field(0)` is canonicalized away
+        //    (`gep %s, 0, k` appears both as `[F0,Fk]` and `[Fk]`), so both
+        //    forms share one cell.
+        if !base_is_empty || eff.steps.iter().any(|s| matches!(s, PathStep::Index(_))) {
+            return factory.lookup_approx(obj, &eff);
+        }
+        let canonical =
+            if eff.steps.len() >= 2 && matches!(eff.steps[0], PathStep::Field { index: 0 }) {
+                FieldPath {
+                    steps: eff.steps[1..].to_vec(),
+                }
+            } else {
+                eff
+            };
+        // Re-check the factory under the canonical form.
+        if let Some(id) = factory.lookup(obj, &canonical) {
+            return Some(id);
+        }
+        let eff = canonical;
+        // Reuse an already-minted cell regardless of the current fan-out so
+        // the same (obj, path) always resolves consistently.
+        let key = Location::new(obj, eff);
+        if let Some(&id) = self.by_key.get(&key) {
+            return Some(id);
+        }
+        if factory.is_summary_object(obj) || self.summary_objects.contains(&obj) {
+            return factory.lookup_approx(obj, &key.path);
+        }
+        if !mint_allowed || self.locations.len() >= Self::MAX_TOTAL_MINTED {
+            return factory.lookup_approx(obj, &key.path);
+        }
+        let count = self.count_by_obj.entry(obj).or_insert(0);
+        if *count >= Self::MAX_FIELDS_PER_OBJECT {
+            self.summary_objects.insert(obj);
+            return factory.lookup(obj, &FieldPath::empty());
+        }
+        *count += 1;
+        // Content-addressed ID: independent of (FxHash-iteration-driven) mint
+        // order, so identical inputs yield identical IDs (NFR-DET-001).
+        let mut payload = obj.raw().to_le_bytes().to_vec();
+        payload.extend_from_slice(format!("{:?}", key.path).as_bytes());
+        let id = LocId::new(saf_core::id::make_id("loc_field", &payload));
+        self.by_key.insert(key.clone(), id);
+        self.locations.insert(id, key);
+        // Read-expansion registration: link the cell to its base, and let
+        // loads already registered on the base re-trigger on this cell's
+        // future stores.
+        if let Some(base_id) = factory.lookup(obj, &FieldPath::empty()) {
+            self.base_of_field.insert(id, base_id);
+            self.fields_by_base.entry(base_id).or_default().push(id);
+            if let Some(base_regs) = load_loc_index.get(&base_id) {
+                if !base_regs.is_empty() {
+                    let regs = base_regs.clone();
+                    load_loc_index.insert(id, regs);
+                }
+            }
+        }
+        Some(id)
+    }
 }
 
 impl<'a, P: PtsSet> GenericSolver<'a, P> {
@@ -532,8 +683,26 @@ impl<'a, P: PtsSet> GenericSolver<'a, P> {
             rep: FxIndexMap::default(),
             topo_order: FxIndexMap::default(),
             iteration_limit_hit: false,
+            minting: FieldMinting::default(),
             stats: RefCell::new(SolverStats::default()),
         }
+    }
+
+    /// Enable on-demand field-cell minting (see the `minting` field).
+    pub(crate) fn with_field_minting(mut self) -> Self {
+        self.minting.enabled = true;
+        self
+    }
+
+    /// Take the minted overlay for merging into the owning `LocationFactory`.
+    ///
+    /// Returns `(minted cells, capped objects)`. Must be called (and merged)
+    /// whenever minting was enabled — minted `LocId`s appear in the solved
+    /// points-to sets and are unresolvable without the merge.
+    pub(crate) fn take_minted_overlay(&mut self) -> (Vec<(LocId, Location)>, Vec<ObjId>) {
+        let minted = self.minting.locations.drain().collect();
+        let summary = self.minting.summary_objects.drain().collect();
+        (minted, summary)
     }
 
     pub(crate) fn with_constants(mut self, constants: &'a ConstantsTable) -> Self {
@@ -1104,19 +1273,37 @@ impl<'a, P: PtsSet> GenericSolver<'a, P> {
 
         // Single pass over v_pts: accumulate loc_pts AND register load_loc_index.
         // (Plan 132: merged from two separate iterations.)
+        //
+        // Field-minting read expansion: a load from a minted field cell also
+        // reads the object's base cell (whole-object stores, e.g. memcpy-in,
+        // land there); a load from a base cell also reads the object's minted
+        // field cells (field stores must be visible to whole-object loads,
+        // e.g. memcpy-out). Registration is mirrored onto the counterpart
+        // cells so their future diffs re-trigger this load via
+        // `process_location`. Stores stay single-target — no set duplication.
         let mut accumulated = template.clone_empty();
         let mut any_loc_found = false;
+        let mut read_locs: SmallVec<[LocId; 8]> = SmallVec::new();
         for loc in v_pts.iter() {
             self.stats.get_mut().load_locs_iterated += 1;
-            if let Some(loc_set) = self.loc_pts.get(&loc) {
-                accumulated.union(loc_set);
-                any_loc_found = true;
+            read_locs.clear();
+            read_locs.push(loc);
+            if let Some(&base) = self.minting.base_of_field.get(&loc) {
+                read_locs.push(base);
+            } else if let Some(fields) = self.minting.fields_by_base.get(&loc) {
+                read_locs.extend(fields.iter().copied());
             }
-            // Register load constraint indices in the reverse index so
-            // `process_location` can find relevant constraints.
-            let entry = self.load_loc_index.entry(loc).or_default();
-            for &idx in indices {
-                entry.insert(idx);
+            for &read_loc in &read_locs {
+                if let Some(loc_set) = self.loc_pts.get(&read_loc) {
+                    accumulated.union(loc_set);
+                    any_loc_found = true;
+                }
+                // Register load constraint indices in the reverse index so
+                // `process_location` can find relevant constraints.
+                let entry = self.load_loc_index.entry(read_loc).or_default();
+                for &idx in indices {
+                    entry.insert(idx);
+                }
             }
         }
 
@@ -1225,6 +1412,9 @@ impl<'a, P: PtsSet> GenericSolver<'a, P> {
         let topo_order = &self.topo_order;
         let constants = self.constants;
         let index_sensitivity = self.index_sensitivity;
+        // Fat base sets gain little from per-object field cells but multiply
+        // cell count by the fan-out — route them to the legacy collapse.
+        let mint_allowed = v_pts.len() <= FieldMinting::MAX_MINT_BASE_FANOUT;
 
         for &i in indices {
             let gep_dst = self.indexed.gep[i].dst;
@@ -1242,19 +1432,46 @@ impl<'a, P: PtsSet> GenericSolver<'a, P> {
             let mut accumulated = template.clone_empty();
             for loc in v_pts.iter() {
                 self.stats.get_mut().gep_locs_iterated += 1;
-                if let Some(base_loc) = self.factory.get(loc) {
-                    let merged = merge_gep_with_base_path(base_loc, &resolved_path);
-                    let field_loc = merged
+                let factory = self.factory;
+                // Base location: factory cells by reference (hot path),
+                // minted cells by clone (chained GEPs off minted cells).
+                let minted_base;
+                let base_loc: &Location = if let Some(l) = factory.get(loc) {
+                    l
+                } else if let Some(l) = self.minting.locations.get(&loc) {
+                    minted_base = l.clone();
+                    &minted_base
+                } else {
+                    continue;
+                };
+
+                let merged = merge_gep_with_base_path(base_loc, &resolved_path);
+                let field_loc = if self.minting.enabled {
+                    // On-demand field sensitivity (plan 190, fix 2.1): create
+                    // the exact field cell instead of collapsing to base.
+                    let obj = base_loc.obj;
+                    let base_is_empty = base_loc.path.steps.is_empty();
+                    let wanted = merged.unwrap_or_else(|| base_loc.path.extend(&resolved_path));
+                    self.minting.resolve_or_mint(
+                        factory,
+                        &mut self.load_loc_index,
+                        obj,
+                        &wanted,
+                        base_is_empty,
+                        mint_allowed,
+                    )
+                } else {
+                    merged
                         .as_ref()
-                        .and_then(|p| self.factory.lookup_approx(base_loc.obj, p))
+                        .and_then(|p| factory.lookup_approx(base_loc.obj, p))
                         .or_else(|| {
                             let new_path = base_loc.path.extend(&resolved_path);
-                            self.factory.lookup_approx(base_loc.obj, &new_path)
-                        });
+                            factory.lookup_approx(base_loc.obj, &new_path)
+                        })
+                };
 
-                    if let Some(field_loc) = field_loc {
-                        accumulated.insert(field_loc);
-                    }
+                if let Some(field_loc) = field_loc {
+                    accumulated.insert(field_loc);
                 }
             }
 
@@ -1994,5 +2211,156 @@ mod tests {
             result.get(&ptr_j),
             "Different symbolic indices should resolve to different locations"
         );
+    }
+
+    // =========================================================================
+    // On-demand field minting (plan 190, fix 2.1)
+    // =========================================================================
+
+    /// Harness: stack object S with two pointer fields accessed via GEPs,
+    /// distinct pointers stored into each field.
+    ///
+    /// Values: pS=1 (&S), g1=2 (&S.f0), g2=3 (&S.f1), pX=4, pY=5,
+    /// l1=6 (load *g1), lb=7 (load *pS), pZ=8.
+    fn minting_test_constraints(
+        factory: &mut LocationFactory,
+    ) -> (ConstraintSet, LocId, LocId, LocId) {
+        let mut constraints = ConstraintSet::default();
+
+        let loc_s = factory.get_or_create(ObjId::new(100), FieldPath::empty());
+        let loc_x = factory.get_or_create(ObjId::new(200), FieldPath::empty());
+        let loc_y = factory.get_or_create(ObjId::new(300), FieldPath::empty());
+
+        constraints.addr.insert(AddrConstraint {
+            ptr: ValueId::new(1),
+            loc: loc_s,
+        });
+        constraints.addr.insert(AddrConstraint {
+            ptr: ValueId::new(4),
+            loc: loc_x,
+        });
+        constraints.addr.insert(AddrConstraint {
+            ptr: ValueId::new(5),
+            loc: loc_y,
+        });
+        // g1 = gep pS, [Field 0]; g2 = gep pS, [Field 1]
+        constraints.gep.insert(GepConstraint {
+            dst: ValueId::new(2),
+            src_ptr: ValueId::new(1),
+            path: FieldPath::field(0),
+            index_operands: vec![],
+        });
+        constraints.gep.insert(GepConstraint {
+            dst: ValueId::new(3),
+            src_ptr: ValueId::new(1),
+            path: FieldPath::field(1),
+            index_operands: vec![],
+        });
+        // *g1 = pX; *g2 = pY
+        constraints.store.insert(StoreConstraint {
+            dst_ptr: ValueId::new(2),
+            src: ValueId::new(4),
+        });
+        constraints.store.insert(StoreConstraint {
+            dst_ptr: ValueId::new(3),
+            src: ValueId::new(5),
+        });
+        // l1 = *g1
+        constraints.load.insert(LoadConstraint {
+            dst: ValueId::new(6),
+            src_ptr: ValueId::new(2),
+        });
+        // lb = *pS (whole-object load, e.g. memcpy read)
+        constraints.load.insert(LoadConstraint {
+            dst: ValueId::new(7),
+            src_ptr: ValueId::new(1),
+        });
+
+        (constraints, loc_s, loc_x, loc_y)
+    }
+
+    #[test]
+    fn minting_gives_field_precision_on_stack_objects() {
+        let mut factory = make_factory();
+        let (constraints, _loc_s, loc_x, loc_y) = minting_test_constraints(&mut factory);
+
+        let mut solver =
+            GenericSolver::<BTreePtsSet>::new(&constraints, &factory).with_field_minting();
+        solver.solve(1_000_000);
+
+        // l1 = *(&S.f0) sees X (stored to f0) but NOT Y (stored to f1).
+        let l1 = solver.pts.get(&ValueId::new(6)).expect("l1 has pts");
+        assert!(l1.contains(loc_x), "field load must see same-field store");
+        assert!(
+            !l1.contains(loc_y),
+            "field load must NOT see sibling-field store (field precision)"
+        );
+
+        // Distinct field cells were minted for f0 and f1.
+        let g1 = solver.pts.get(&ValueId::new(2)).expect("g1 has pts");
+        let g2 = solver.pts.get(&ValueId::new(3)).expect("g2 has pts");
+        assert_ne!(
+            g1.to_btreeset(),
+            g2.to_btreeset(),
+            "distinct fields must resolve to distinct cells"
+        );
+    }
+
+    #[test]
+    fn minting_field_store_visible_through_base_load() {
+        let mut factory = make_factory();
+        let (constraints, _loc_s, loc_x, loc_y) = minting_test_constraints(&mut factory);
+
+        let mut solver =
+            GenericSolver::<BTreePtsSet>::new(&constraints, &factory).with_field_minting();
+        solver.solve(1_000_000);
+
+        // lb = *(&S) — whole-object load (memcpy-out) must see BOTH field
+        // stores via the field→base bridge.
+        let lb = solver.pts.get(&ValueId::new(7)).expect("lb has pts");
+        assert!(lb.contains(loc_x), "base load must see field store (f0)");
+        assert!(lb.contains(loc_y), "base load must see field store (f1)");
+    }
+
+    #[test]
+    fn minting_base_store_visible_through_field_load() {
+        let mut factory = make_factory();
+        let (mut constraints, _loc_s, loc_x, _loc_y) = minting_test_constraints(&mut factory);
+
+        // *pS = pZ — whole-object store (memcpy-in) through the base cell.
+        let loc_z = factory.get_or_create(ObjId::new(400), FieldPath::empty());
+        constraints.addr.insert(AddrConstraint {
+            ptr: ValueId::new(8),
+            loc: loc_z,
+        });
+        constraints.store.insert(StoreConstraint {
+            dst_ptr: ValueId::new(1),
+            src: ValueId::new(8),
+        });
+
+        let mut solver =
+            GenericSolver::<BTreePtsSet>::new(&constraints, &factory).with_field_minting();
+        solver.solve(1_000_000);
+
+        // l1 = *(&S.f0) must see the base store via the base→field bridge
+        // (plus its own field store).
+        let l1 = solver.pts.get(&ValueId::new(6)).expect("l1 has pts");
+        assert!(l1.contains(loc_z), "field load must see base store");
+        assert!(l1.contains(loc_x), "field load keeps same-field store");
+    }
+
+    #[test]
+    fn minting_disabled_preserves_base_collapse() {
+        let mut factory = make_factory();
+        let (constraints, _loc_s, loc_x, loc_y) = minting_test_constraints(&mut factory);
+
+        let mut solver = GenericSolver::<BTreePtsSet>::new(&constraints, &factory);
+        solver.solve(1_000_000);
+
+        // Without minting, both field GEPs collapse to the base cell, so the
+        // field load sees BOTH stores (legacy behavior).
+        let l1 = solver.pts.get(&ValueId::new(6)).expect("l1 has pts");
+        assert!(l1.contains(loc_x));
+        assert!(l1.contains(loc_y), "legacy collapse: sibling store visible");
     }
 }

@@ -95,6 +95,15 @@ impl StrongUpdateInfo {
                     return false;
                 }
             }
+            // Condition 2b: not a summary object (capped field materialization)
+            // — its cells conflate multiple runtime slots, so a strong update
+            // would kill values that are still live in other slots.
+            if pta_result
+                .location_factory()
+                .is_summary_object(location.obj)
+            {
+                return false;
+            }
         }
 
         // Condition 3: not in a recursive function
@@ -151,6 +160,28 @@ mod tests {
         pts.insert(loc_base);
 
         assert!(info.can_strong_update(ValueId::new(1), FunctionId::new(1), &pts, &pta));
+    }
+
+    #[test]
+    fn summary_object_cell_rejects_strong_update() {
+        // Capped-aggregate (summary) cells conflate multiple runtime slots —
+        // a strong update through such a cell would kill live values.
+        let mut factory = LocationFactory::new(FieldSensitivity::StructFields { max_depth: 2 });
+        let obj = ObjId::new(7);
+        let loc = factory.get_or_create(obj, FieldPath::empty());
+        factory.mark_summary_object(obj);
+        let pta = PtaResult::new(
+            PointsToMap::new(),
+            Arc::new(factory),
+            PtaDiagnostics::default(),
+        );
+        let cg = make_empty_callgraph();
+        let info = StrongUpdateInfo::new(&cg);
+
+        let mut pts = BTreeSet::new();
+        pts.insert(loc);
+
+        assert!(!info.can_strong_update(ValueId::new(1), FunctionId::new(1), &pts, &pta));
     }
 
     #[test]

@@ -263,16 +263,16 @@ impl<'a> FsSvfgBuilder<'a> {
             .map(|(inst_id, (ptr, dst))| (*inst_id, *ptr, *dst))
             .collect();
 
+        let pta = self.pta;
         for (load_inst, load_ptr, load_result) in loads {
             let Some(use_id) = self.mssa.access_id_for(load_inst) else {
                 continue;
             };
-            let locations = self.pta.points_to(load_ptr);
-            if locations.is_empty() {
+            let Some(locations) = pta.points_to_ref(load_ptr) else {
                 continue;
-            }
+            };
 
-            for loc in locations {
+            for &loc in locations {
                 let clobber_id = self.mssa.clobber_for(use_id, loc);
                 let clobber_access = self.mssa.access(clobber_id).cloned();
                 if let Some(clobber_access) = clobber_access {
@@ -404,7 +404,7 @@ mod tests {
             .filter(|f| !f.is_declaration)
             .map(|f| (f.id, Cfg::build(f)))
             .collect();
-        let mut mssa = MemorySsa::build(module, &cfgs, mssa_pta, &callgraph);
+        let mut mssa = MemorySsa::build(module, &cfgs, Arc::new(mssa_pta), &callgraph);
         let (svfg, _program_points) =
             SvfgBuilder::new(module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -424,7 +424,7 @@ mod tests {
             Arc::new(pta_raw4.factory),
             pta_raw4.diagnostics,
         );
-        let mssa2 = MemorySsa::build(module, &cfgs, mssa_pta2, &callgraph);
+        let mssa2 = MemorySsa::build(module, &cfgs, Arc::new(mssa_pta2), &callgraph);
 
         (svfg, pta_for_fs, mssa2, callgraph)
     }

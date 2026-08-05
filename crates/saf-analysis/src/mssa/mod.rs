@@ -25,6 +25,7 @@ pub use export::MemorySsaExport;
 pub use modref::ModRefSummary;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use saf_core::ids::{BlockId, FunctionId, InstId, LocId, ValueId};
 
@@ -67,8 +68,11 @@ pub struct MemorySsa {
     clobber_cache: BTreeMap<(MemAccessId, LocId), MemAccessId>,
     /// Instruction metadata for clobber walker.
     pub(crate) inst_info: BTreeMap<InstId, InstInfo>,
-    /// Reference to PTA result (needed for clobber queries).
-    pta: PtaResult,
+    /// Shared PTA result (needed for clobber queries).
+    ///
+    /// `Arc` so callers share the (potentially GB-scale) points-to map
+    /// instead of deep-cloning it per consumer.
+    pta: Arc<PtaResult>,
 }
 
 impl MemorySsa {
@@ -83,7 +87,7 @@ impl MemorySsa {
     pub fn build(
         module: &saf_core::air::AirModule,
         cfgs: &BTreeMap<FunctionId, Cfg>,
-        pta: PtaResult,
+        pta: Arc<PtaResult>,
         callgraph: &CallGraph,
     ) -> Self {
         // Phase 5: Compute mod/ref summaries bottom-up on call graph

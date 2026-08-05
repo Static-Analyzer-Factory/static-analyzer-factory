@@ -16,13 +16,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexMap;
+use rustc_hash::FxHashMap;
 
 use saf_core::air::AirModule;
 use saf_core::ids::{FunctionId, LocId, ValueId};
+use saf_core::saf_log;
 
 use crate::PtaResult;
 use crate::callgraph::CallGraph;
-use crate::pta::ptsset::{BTreePtsSet, PtsSet};
+use crate::pta::ptsset::{BTreePtsSet, FxHashPtsSet, PtsRepresentation, PtsSet};
 use crate::svfg::SvfgNodeId;
 
 use super::StoreInfo;
@@ -35,8 +37,12 @@ use super::{FlowSensitivePtaResult, FsPtaConfig, FsPtaDiagnostics, FsSvfg};
 /// Builds on Andersen CI pre-analysis, propagating points-to information
 /// along the object-labeled `FsSvfg` with strong updates at singleton stores.
 ///
-/// Dispatches to the generic solver with `BTreePtsSet`. The generic
-/// infrastructure supports alternative representations for future extension.
+/// Dispatches on `config.pts_config.representation`: `BTreeSet` keeps the
+/// baseline representation; everything else (including `Auto`) uses
+/// `FxHashPtsSet` — O(1) membership/insert with results normalized to sorted
+/// `BTreeSet`s at the boundary, so outputs are identical. `Roaring`/`Bdd`
+/// currently also map to `FxHashPtsSet`: the frozen-indexer registration the
+/// Roaring path needs is not wired for FS-PTA yet (plan 190, fix 3.1).
 pub fn solve_flow_sensitive(
     module: &AirModule,
     fs_svfg: &FsSvfg,
@@ -44,7 +50,14 @@ pub fn solve_flow_sensitive(
     callgraph: &CallGraph,
     config: &FsPtaConfig,
 ) -> FlowSensitivePtaResult {
-    solve_flow_sensitive_generic::<BTreePtsSet>(module, fs_svfg, pta_result, callgraph, config)
+    match config.pts_config.representation {
+        PtsRepresentation::BTreeSet => solve_flow_sensitive_generic::<BTreePtsSet>(
+            module, fs_svfg, pta_result, callgraph, config,
+        ),
+        _ => solve_flow_sensitive_generic::<FxHashPtsSet>(
+            module, fs_svfg, pta_result, callgraph, config,
+        ),
+    }
 }
 
 /// Generic flow-sensitive solver parameterized over points-to set representation.
@@ -87,20 +100,36 @@ fn solve_flow_sensitive_generic<P: PtsSet>(
         ..FsPtaDiagnostics::default()
     };
 
+    // Topological priority: condense the FS-SVFG into SCCs (Tarjan returns
+    // reverse topological order — leaf SCCs first) and rank upstream SCCs
+    // lowest, so the worklist processes sources before sinks. Random
+    // (BLAKE3-id) pop order wastes pops re-propagating stale facts.
+    let node_rank = compute_topo_ranks(fs_svfg);
+    let rank_of = |n: SvfgNodeId| node_rank.get(&n).copied().unwrap_or(u32::MAX);
+
     // Seed worklist with all nodes that have non-empty points_to (value nodes only)
-    let mut worklist: BTreeSet<SvfgNodeId> = BTreeSet::new();
+    let mut worklist: BTreeSet<(u32, SvfgNodeId)> = BTreeSet::new();
     for node in fs_svfg.nodes() {
         if let SvfgNodeId::Value(vid) = node {
             if points_to.get(vid).is_some_and(|s| !s.is_empty()) {
-                worklist.insert(*node);
+                worklist.insert((rank_of(*node), *node));
             }
         }
     }
 
     // Step 2: Process worklist
+    //
+    // Effective cap: `max_iterations == 0` means auto — scale with graph size so
+    // large-but-healthy programs converge (bash needs ~103K pops, tmux ~125K)
+    // while pathological inputs still terminate.
+    let max_iterations = if config.max_iterations == 0 {
+        100_000.max(fs_svfg.node_count().saturating_mul(50))
+    } else {
+        config.max_iterations
+    };
     let mut iterations = 0usize;
-    while let Some(node) = worklist.pop_first() {
-        if iterations >= config.max_iterations {
+    while let Some((_, node)) = worklist.pop_first() {
+        if iterations >= max_iterations {
             diagnostics.iteration_limit_hit = true;
             break;
         }
@@ -129,9 +158,7 @@ fn solve_flow_sensitive_generic<P: PtsSet>(
         // Propagate to successors
         for edge in fs_svfg.successors_of(node) {
             let changed = if edge.kind.is_direct() {
-                propagate_direct(node, edge.target, &points_to).is_some_and(|ref new_pt_set| {
-                    union_points_to(&mut points_to, edge.target, new_pt_set)
-                })
+                propagate_direct(node, edge.target, &mut points_to)
             } else {
                 propagate_indirect(
                     node,
@@ -144,13 +171,36 @@ fn solve_flow_sensitive_generic<P: PtsSet>(
             };
 
             if changed {
-                worklist.insert(edge.target);
+                worklist.insert((rank_of(edge.target), edge.target));
             }
         }
     }
 
     diagnostics.iterations = iterations;
     diagnostics.version_count = ver_table.len();
+    diagnostics.converged = !diagnostics.iteration_limit_hit;
+
+    // SOUNDNESS GATE: a truncated solve leaves `df_in`/`df_out` strictly below
+    // the fixpoint (an under-approximation), which would make `may_alias_at`
+    // return false `NoAlias`. Discard the mid-flight state entirely: re-seed
+    // `pts` from the Andersen result and drop the df maps. `pts`-backed
+    // queries (`points_to`, `points_to_map`) and `may_alias_at` then fall back
+    // to the sound flow-insensitive answer; `points_to_at`, `df_in`/`df_out`,
+    // and `compute_load_sensitive_pts` return EMPTY on truncation — callers
+    // needing per-program-point facts must gate on `diagnostics.converged`.
+    if diagnostics.iteration_limit_hit {
+        saf_log!(fspta::solve, truncated,
+            "iteration limit hit; discarding partial df state, falling back to flow-insensitive pts";
+            iterations = iterations, limit = max_iterations);
+        points_to = IndexMap::new();
+        for (vid, locs) in pta_result.points_to_map() {
+            if !locs.is_empty() {
+                points_to.insert(*vid, P::from_btreeset(locs));
+            }
+        }
+        // `ver_in`/`ver_out` need no reset: the df conversion below is gated on
+        // `iteration_limit_hit`, so the partial version maps are never exposed.
+    }
 
     // Convert VFS state to public BTreeMap/BTreeSet representation
     let pts_btree: BTreeMap<ValueId, BTreeSet<LocId>> = points_to
@@ -158,14 +208,15 @@ fn solve_flow_sensitive_generic<P: PtsSet>(
         .map(|(k, v)| (k, v.to_btreeset()))
         .collect();
 
-    let (df_in_btree, df_out_btree) = if config.skip_df_materialization {
-        (BTreeMap::new(), BTreeMap::new())
-    } else {
-        (
-            convert_ver_map(&ver_in, &ver_table),
-            convert_ver_map(&ver_out, &ver_table),
-        )
-    };
+    let (df_in_btree, df_out_btree) =
+        if config.skip_df_materialization || diagnostics.iteration_limit_hit {
+            (BTreeMap::new(), BTreeMap::new())
+        } else {
+            (
+                convert_ver_map(&ver_in, &ver_table),
+                convert_ver_map(&ver_out, &ver_table),
+            )
+        };
 
     FlowSensitivePtaResult {
         pts: pts_btree,
@@ -349,34 +400,89 @@ fn process_load<P: PtsSet>(
     }
 }
 
-/// Propagate top-level `points_to` along a direct edge.
+/// Propagate top-level `points_to` along a direct edge, in place.
 ///
-/// Returns the set to union into the target's `points_to`, or `None` if no propagation.
+/// Unions the source's missing elements into the target's set (subset
+/// pre-check + diff in one pass — no full-set clone per edge visit).
+/// Returns `true` if the target's set changed.
 fn propagate_direct<P: PtsSet>(
     src: SvfgNodeId,
-    _target: SvfgNodeId,
-    points_to: &IndexMap<ValueId, P>,
-) -> Option<P> {
-    let SvfgNodeId::Value(src_vid) = src else {
-        return None;
-    };
-    points_to.get(&src_vid).cloned()
-}
-
-/// Union a set into a target value's `points_to`. Returns true if anything changed.
-fn union_points_to<P: PtsSet>(
-    points_to: &mut IndexMap<ValueId, P>,
     target: SvfgNodeId,
-    new_pt_set: &P,
+    points_to: &mut IndexMap<ValueId, P>,
 ) -> bool {
+    let SvfgNodeId::Value(src_vid) = src else {
+        return false;
+    };
     let SvfgNodeId::Value(target_vid) = target else {
         return false;
     };
-    if new_pt_set.is_empty() {
+    if src_vid == target_vid {
+        return false;
+    }
+    let Some(src_set) = points_to.get(&src_vid) else {
+        return false;
+    };
+    if src_set.is_empty() {
+        return false;
+    }
+    // Subset pre-check + diff in one pass: collect only the elements missing
+    // from the target instead of cloning the whole source set per edge visit.
+    // In the converged tail most visits change nothing, so this is the common
+    // case.
+    let missing: Vec<LocId> = match points_to.get(&target_vid) {
+        Some(target_set) => {
+            if src_set.is_subset(target_set) {
+                return false;
+            }
+            src_set
+                .iter()
+                .filter(|&loc| !target_set.contains(loc))
+                .collect()
+        }
+        None => src_set.iter().collect(),
+    };
+    if missing.is_empty() {
         return false;
     }
     let entry = points_to.entry(target_vid).or_insert_with(P::empty);
-    entry.union(new_pt_set)
+    let mut changed = false;
+    for loc in missing {
+        changed |= entry.insert(loc);
+    }
+    changed
+}
+
+/// Compute topological priority ranks for FS-SVFG nodes.
+///
+/// Condenses the graph into SCCs with Tarjan (deterministic: iteration is
+/// driven by the `BTreeSet` node order) and assigns upstream SCCs the lowest
+/// ranks so the worklist processes sources before sinks.
+fn compute_topo_ranks(fs_svfg: &FsSvfg) -> FxHashMap<SvfgNodeId, u32> {
+    let mut adj: BTreeMap<SvfgNodeId, BTreeSet<SvfgNodeId>> = BTreeMap::new();
+    for node in fs_svfg.nodes() {
+        let succs: BTreeSet<SvfgNodeId> = fs_svfg
+            .successors_of(*node)
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        if !succs.is_empty() {
+            adj.insert(*node, succs);
+        }
+    }
+    let sccs = crate::graph_algo::tarjan_scc(fs_svfg.nodes(), &adj);
+    let scc_count = sccs.len();
+    let mut ranks = FxHashMap::default();
+    for (i, scc) in sccs.iter().enumerate() {
+        // Tarjan returns reverse topological order (leaf SCCs first);
+        // invert so sources get rank 0.
+        // INVARIANT: SCC count is bounded by node count < 2^32
+        #[allow(clippy::cast_possible_truncation)]
+        let rank = (scc_count - 1 - i) as u32;
+        for n in scc {
+            ranks.insert(*n, rank);
+        }
+    }
+    ranks
 }
 
 /// Propagate address-taken objects along an indirect edge using VFS version IDs.
@@ -517,6 +623,13 @@ mod tests {
     }
 
     fn run_full_pipeline(module: &AirModule) -> FlowSensitivePtaResult {
+        run_full_pipeline_with_config(module, &super::super::FsPtaConfig::default())
+    }
+
+    fn run_full_pipeline_with_config(
+        module: &AirModule,
+        config: &super::super::FsPtaConfig,
+    ) -> FlowSensitivePtaResult {
         let defuse = DefUseGraph::build(module);
         let callgraph = CallGraph::build(module);
         let pta_config = PtaConfig::default();
@@ -537,7 +650,7 @@ mod tests {
             .filter(|f| !f.is_declaration)
             .map(|f| (f.id, Cfg::build(f)))
             .collect();
-        let mut mssa = MemorySsa::build(module, &cfgs, mssa_pta, &callgraph);
+        let mut mssa = MemorySsa::build(module, &cfgs, Arc::new(mssa_pta), &callgraph);
         let (svfg, _program_points) =
             SvfgBuilder::new(module, &defuse, &callgraph, &pta1, &mut mssa).build();
 
@@ -550,12 +663,11 @@ mod tests {
         let mut ctx4 = PtaContext::new(pta_config);
         let raw4 = ctx4.analyze(module);
         let mssa_pta2 = PtaResult::new(raw4.pts, Arc::new(raw4.factory), raw4.diagnostics);
-        let mut mssa2 = MemorySsa::build(module, &cfgs, mssa_pta2, &callgraph);
+        let mut mssa2 = MemorySsa::build(module, &cfgs, Arc::new(mssa_pta2), &callgraph);
 
         let fs_svfg = FsSvfgBuilder::new(module, &svfg, &pta3, &mut mssa2, &callgraph).build();
 
-        let config = super::super::FsPtaConfig::default();
-        solve_flow_sensitive(module, &fs_svfg, &pta3, &callgraph, &config)
+        solve_flow_sensitive(module, &fs_svfg, &pta3, &callgraph, config)
     }
 
     #[test]
@@ -618,5 +730,55 @@ mod tests {
 
         // Solver should produce a valid result (even if empty for simple AIR)
         assert!(!result.diagnostics().iteration_limit_hit);
+    }
+
+    #[test]
+    fn truncated_solve_falls_back_to_andersen() {
+        let alloca = Instruction::new(InstId::new(100), Operation::Alloca { size_bytes: None })
+            .with_dst(ValueId::new(10));
+        let store = Instruction::new(InstId::new(101), Operation::Store)
+            .with_operands(vec![ValueId::new(1), ValueId::new(10)]);
+        let load = Instruction::new(InstId::new(102), Operation::Load)
+            .with_operands(vec![ValueId::new(10)])
+            .with_dst(ValueId::new(20));
+
+        let func = make_function(
+            1,
+            "test",
+            vec![AirParam::new(ValueId::new(1), 0)],
+            vec![AirBlock {
+                id: BlockId::new(1),
+                label: None,
+                instructions: vec![
+                    alloca,
+                    store,
+                    load,
+                    Instruction::new(InstId::new(103), Operation::Ret),
+                ],
+            }],
+        );
+
+        let module = make_module(vec![func]);
+        let config = super::super::FsPtaConfig {
+            max_iterations: 1,
+            ..Default::default()
+        };
+        let truncated = run_full_pipeline_with_config(&module, &config);
+
+        assert!(truncated.diagnostics().iteration_limit_hit);
+        assert!(!truncated.diagnostics().converged);
+        // Partial df state must be discarded, not exposed.
+        assert!(truncated.df_in().is_empty());
+
+        // The truncated pts must equal the Andersen seed (analysis is
+        // deterministic, so a fresh run reproduces the seed exactly).
+        let mut ctx = PtaContext::new(PtaConfig::default());
+        let raw = ctx.analyze(&module);
+        let expected: BTreeMap<_, _> = raw
+            .pts
+            .into_iter()
+            .filter(|(_, locs)| !locs.is_empty())
+            .collect();
+        assert_eq!(truncated.points_to_map(), &expected);
     }
 }
