@@ -58,7 +58,7 @@ fn dda_basic_query_builds_and_queries() {
     let module = load_ll_fixture("dda_basic_query");
     let (pta_result, cfgs, callgraph, defuse, index) = build_dda_prereqs(&module);
 
-    let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
     let svfg = {
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
@@ -85,7 +85,7 @@ fn dda_basic_query_finds_malloc() {
     let module = load_ll_fixture("dda_basic_query");
     let (pta_result, cfgs, callgraph, defuse, index) = build_dda_prereqs(&module);
 
-    let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
     let svfg = {
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
@@ -117,7 +117,7 @@ fn dda_context_sensitive_builds() {
     let module = load_ll_fixture("dda_context_sensitive");
     let (pta_result, cfgs, callgraph, defuse, index) = build_dda_prereqs(&module);
 
-    let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
     let svfg = {
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
@@ -146,7 +146,7 @@ fn dda_strong_update_with_enabled() {
     let module = load_ll_fixture("dda_strong_update");
     let (pta_result, cfgs, callgraph, defuse, index) = build_dda_prereqs(&module);
 
-    let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
     let svfg = {
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
@@ -175,7 +175,7 @@ fn dda_strong_update_with_disabled() {
     let module = load_ll_fixture("dda_strong_update");
     let (pta_result, cfgs, callgraph, defuse, index) = build_dda_prereqs(&module);
 
-    let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
     let svfg = {
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
@@ -206,7 +206,7 @@ fn dda_budget_fallback_with_deep_calls() {
     let module = load_ll_fixture("dda_budget_fallback");
     let (pta_result, cfgs, callgraph, defuse, index) = build_dda_prereqs(&module);
 
-    let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
     let svfg = {
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
@@ -236,7 +236,7 @@ fn dda_budget_fallback_unlimited() {
     let module = load_ll_fixture("dda_budget_fallback");
     let (pta_result, cfgs, callgraph, defuse, index) = build_dda_prereqs(&module);
 
-    let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
     let svfg = {
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
@@ -265,7 +265,7 @@ fn dda_cache_reuse_builds() {
     let module = load_ll_fixture("dda_cache_reuse");
     let (pta_result, cfgs, callgraph, defuse, index) = build_dda_prereqs(&module);
 
-    let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
     let svfg = {
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
@@ -293,7 +293,7 @@ fn dda_recursion_detects_recursive_scc() {
     let module = load_ll_fixture("dda_recursion");
     let (pta_result, cfgs, callgraph, defuse, index) = build_dda_prereqs(&module);
 
-    let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
     let svfg = {
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
@@ -321,7 +321,7 @@ fn dda_export_is_serializable() {
     let module = load_ll_fixture("dda_basic_query");
     let (pta_result, cfgs, callgraph, defuse, index) = build_dda_prereqs(&module);
 
-    let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
     let svfg = {
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
@@ -351,7 +351,7 @@ fn dda_export_is_deterministic() {
     let module = load_ll_fixture("dda_basic_query");
     let (pta_result, cfgs, callgraph, defuse, index) = build_dda_prereqs(&module);
 
-    let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
     let svfg = {
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();

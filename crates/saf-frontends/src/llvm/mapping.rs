@@ -89,13 +89,20 @@ pub(crate) struct MappingContext<'ctx> {
     ///
     /// Set at the start of each function conversion from `module_local_var_names`.
     pub current_local_var_names: BTreeMap<String, String>,
-    /// Monotonic counter for non-constant SSA ValueIds — fast path that skips
+    /// Monotonic counter for non-constant SSA `ValueId`s — fast path that skips
     /// `value.print_to_string()` + BLAKE3 for ordinary SSA values.
     pub seq_counter: u64,
     /// Module-wide constant cache (survives per-function `ptr_cache.clear()`).
     /// LLVM constants have stable pointer identity across functions, so caching
     /// them once avoids per-function re-hashing.
     pub const_cache: FxHashMap<usize, ValueId>,
+    /// Decompose non-vtable constant-array initializers whose element type
+    /// contains pointers (plan 190, fix 1.2). Opt-in via the
+    /// `SAF_DECOMPOSE_POINTER_ARRAYS` env var until on-demand field
+    /// sensitivity (plan 190, fix 2.1) lands: exposing dispatch-table
+    /// fan-outs without field-sensitive stack/heap analysis makes large
+    /// fp-table programs (tmux, bash) several times slower.
+    pub decompose_pointer_arrays: bool,
     /// Phantom data for the context lifetime.
     _phantom: std::marker::PhantomData<&'ctx ()>,
 }
@@ -121,6 +128,7 @@ impl MappingContext<'_> {
             current_local_var_names: BTreeMap::new(),
             seq_counter: 0,
             const_cache: FxHashMap::default(),
+            decompose_pointer_arrays: std::env::var("SAF_DECOMPOSE_POINTER_ARRAYS").is_ok(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -231,6 +239,10 @@ impl MappingContext<'_> {
     /// If the value is a function reference (e.g., `@func_name`), creates a
     /// consistent `ValueId` and records a `GlobalRef` constant so MTA and PTA
     /// can resolve function pointers (e.g., for `pthread_create` targets).
+    // NOTE: Tiered cache-lookup fast paths (pointer cache, constant cache,
+    // sequence counter) and the constant fallback form one dispatch chain;
+    // splitting would obscure the lookup order that the caches depend on.
+    #[allow(clippy::too_many_lines)]
     pub fn get_or_create_value_id(&mut self, value: BasicValueEnum<'_>) -> ValueId {
         // Fast path: check pointer-keyed cache first (no FFI call).
         // LLVM SSA values have stable pointer identity within a module context.
@@ -256,7 +268,7 @@ impl MappingContext<'_> {
             BasicValueEnum::StructValue(v) => v.is_const(),
             BasicValueEnum::ArrayValue(v) => v.is_const(),
             BasicValueEnum::VectorValue(v) => v.is_const(),
-            _ => false,
+            BasicValueEnum::ScalableVectorValue(_) => false,
         };
 
         if !is_const {
@@ -551,9 +563,18 @@ pub fn convert_module(
         }
     }
 
-    // Collect all global IDs
+    // Collect all global IDs — including value IDs, so initializer
+    // decomposition can resolve FORWARD references (a table may reference a
+    // global defined later in the module; LLVM imposes no definition order).
+    // The value ID derives from module_id + name only, so pre-registration is
+    // order-insensitive.
     for global in module.get_globals() {
         ctx.get_or_create_global_obj_id(global);
+        if let Ok(name) = global.get_name().to_str() {
+            let data = format!("{:032x}global{}", ctx.module_id.raw(), name);
+            let value_id = ValueId::derive(data.as_bytes());
+            ctx.global_value_ids.insert(name.to_string(), value_id);
+        }
     }
 
     // Convert globals
@@ -614,13 +635,33 @@ fn convert_global(global: GlobalValue<'_>, ctx: &mut MappingContext<'_>) -> Opti
     air_global.is_constant = global.is_constant();
 
     // Try to convert initializer.
-    // For vtable globals (_ZTV*, _ZTC*, _ZTT*), use context-aware conversion
-    // that decomposes array elements to capture function pointer references.
+    // Decompose array initializers whenever the element type is or contains a
+    // pointer (dispatch tables like `[20 x ptr]` or `[77 x %struct]` with
+    // pointer fields) — previously only vtable globals (_ZTV*/_ZTC*/_ZTT*)
+    // were decomposed, leaving e.g. libcurl's `@protocols` handler table and
+    // bash's builtin table invisible to PTA (plan 190, fix 1.2). Pure data
+    // arrays (ints/floats) keep the cheap non-decomposed path.
     if let Some(init) = global.get_initializer() {
         let is_vtable_global = air_global.name.starts_with("_ZTV")
             || air_global.name.starts_with("_ZTC")
             || air_global.name.starts_with("_ZTT");
-        air_global.init = convert_constant_with_context(init, ctx, is_vtable_global);
+        let has_pointer_elements = ctx.decompose_pointer_arrays
+            && match init {
+                inkwell::values::BasicValueEnum::ArrayValue(av) => {
+                    type_contains_pointer(av.get_type().get_element_type())
+                }
+                // Pointer arrays wrapped in a struct global (e.g.
+                // `{ [N x ptr], i32 }` handler tables) — the StructValue arm
+                // recurses into the nested array with decompose enabled.
+                inkwell::values::BasicValueEnum::StructValue(sv) => sv
+                    .get_type()
+                    .get_field_types()
+                    .into_iter()
+                    .any(type_contains_pointer),
+                _ => false,
+            };
+        air_global.init =
+            convert_constant_with_context(init, ctx, is_vtable_global || has_pointer_elements);
 
         // Store initializer for constant-expression GEP resolution (Plan 084 Phase B).
         if let Some(ref init_constant) = air_global.init {
@@ -630,6 +671,53 @@ fn convert_global(global: GlobalValue<'_>, ctx: &mut MappingContext<'_>) -> Opti
     }
 
     Some(air_global)
+}
+
+/// Does this LLVM type (transitively) contain a pointer?
+///
+/// Drives initializer decomposition: arrays whose element type contains
+/// pointers get element-wise conversion so PTA sees the referenced globals
+/// and functions. Recursion terminates because pointer fields return `true`
+/// without descending and value-type nesting is finite.
+fn type_contains_pointer(ty: inkwell::types::BasicTypeEnum<'_>) -> bool {
+    use inkwell::types::BasicTypeEnum;
+    match ty {
+        BasicTypeEnum::PointerType(_) => true,
+        BasicTypeEnum::StructType(st) => {
+            st.get_field_types().into_iter().any(type_contains_pointer)
+        }
+        BasicTypeEnum::ArrayType(at) => type_contains_pointer(at.get_element_type()),
+        _ => false,
+    }
+}
+
+/// Does this converted constant (transitively) reference a global or function?
+fn constant_contains_ref(constant: &Constant) -> bool {
+    match constant {
+        Constant::GlobalRef(_) => true,
+        Constant::Aggregate { elements } => elements.iter().any(constant_contains_ref),
+        _ => false,
+    }
+}
+
+/// Convert a pointer-typed aggregate element to a `GlobalRef` when it names a
+/// known function or global.
+fn pointer_elem_to_ref(
+    ptr: inkwell::values::PointerValue<'_>,
+    ctx: &MappingContext<'_>,
+) -> Option<Constant> {
+    let name_bytes = ptr.get_name().to_bytes();
+    if name_bytes.is_empty() {
+        return None;
+    }
+    let name = std::str::from_utf8(name_bytes).ok()?;
+    if let Some(&func_id) = ctx.function_ids.get(name) {
+        return Some(Constant::GlobalRef(ValueId::new(func_id.raw())));
+    }
+    if let Some(&val_id) = ctx.global_value_ids.get(name) {
+        return Some(Constant::GlobalRef(val_id));
+    }
+    None
 }
 
 /// Extract the name of a global that a pointer constant references.
@@ -652,6 +740,9 @@ fn extract_global_ref_name(ptr: inkwell::values::PointerValue<'_>) -> Option<Str
 /// Unlike [`convert_constant_value`] which only handles scalars, this function
 /// properly converts struct aggregate initializers to `Constant::Aggregate`
 /// with `GlobalRef` elements for function/global pointer fields.
+// NOTE: The struct/array/pointer arms share the decompose-mode element walk;
+// splitting them would duplicate the named-ref resolution and recursion logic.
+#[allow(clippy::too_many_lines)]
 fn convert_constant_with_context(
     value: BasicValueEnum<'_>,
     ctx: &MappingContext<'_>,
@@ -708,7 +799,9 @@ fn convert_constant_with_context(
             }
             let arr_len = av.get_type().len();
             if arr_len == 0 {
-                return Some(Constant::Aggregate { elements: Vec::new() });
+                return Some(Constant::Aggregate {
+                    elements: Vec::new(),
+                });
             }
             let val_ref = av.as_value_ref();
 
@@ -721,32 +814,42 @@ fn convert_constant_with_context(
                 let mut elements = Vec::with_capacity(arr_len as usize);
                 let mut has_named_ref = false;
                 for i in 0..arr_len {
-                    let elem_ref = unsafe {
-                        inkwell::llvm_sys::core::LLVMGetAggregateElement(val_ref, i)
-                    };
+                    let elem_ref =
+                        unsafe { inkwell::llvm_sys::core::LLVMGetAggregateElement(val_ref, i) };
                     if elem_ref.is_null() {
                         elements.push(Constant::Null);
                         continue;
                     }
                     let elem: BasicValueEnum<'_> = unsafe { BasicValueEnum::new(elem_ref) };
-                    if let BasicValueEnum::PointerValue(ptr) = elem {
-                        let name_bytes = ptr.get_name().to_bytes();
-                        if !name_bytes.is_empty() {
-                            if let Ok(name) = std::str::from_utf8(name_bytes) {
-                                if let Some(&func_id) = ctx.function_ids.get(name) {
-                                    elements.push(Constant::GlobalRef(ValueId::new(func_id.raw())));
-                                    has_named_ref = true;
-                                    continue;
-                                }
-                                if let Some(&val_id) = ctx.global_value_ids.get(name) {
-                                    elements.push(Constant::GlobalRef(val_id));
-                                    has_named_ref = true;
-                                    continue;
-                                }
+                    match elem {
+                        BasicValueEnum::PointerValue(ptr) => {
+                            if let Some(c) = pointer_elem_to_ref(ptr, ctx) {
+                                elements.push(c);
+                                has_named_ref = true;
+                                continue;
+                            }
+                            elements.push(Constant::Null);
+                        }
+                        // Arrays of structs (dispatch tables, builtin tables):
+                        // recurse so pointer fields inside each element become
+                        // GlobalRefs instead of the whole element flattening
+                        // to Null.
+                        BasicValueEnum::StructValue(_) | BasicValueEnum::ArrayValue(_) => {
+                            if let Some(c) = convert_constant_with_context(elem, ctx, true) {
+                                has_named_ref |= constant_contains_ref(&c);
+                                elements.push(c);
+                            } else {
+                                elements.push(Constant::Null);
+                            }
+                        }
+                        _ => {
+                            if let Some(c) = convert_constant_value(elem) {
+                                elements.push(c);
+                            } else {
+                                elements.push(Constant::Null);
                             }
                         }
                     }
-                    elements.push(Constant::Null);
                 }
                 if has_named_ref {
                     return Some(Constant::Aggregate { elements });
@@ -755,8 +858,7 @@ fn convert_constant_with_context(
 
             // Integer array decomposition (replaces `try_parse_integer_array`).
             // Walk elements typedly via `LLVMGetAggregateElement`.
-            if let inkwell::types::BasicTypeEnum::IntType(int_ty) =
-                av.get_type().get_element_type()
+            if let inkwell::types::BasicTypeEnum::IntType(int_ty) = av.get_type().get_element_type()
             {
                 let bw = int_ty.get_bit_width();
                 // INVARIANT: LLVM int bit widths fit in u8.
@@ -765,9 +867,8 @@ fn convert_constant_with_context(
                 let mut elements = Vec::with_capacity(arr_len as usize);
                 let mut all_ok = true;
                 for i in 0..arr_len {
-                    let elem_ref = unsafe {
-                        inkwell::llvm_sys::core::LLVMGetAggregateElement(val_ref, i)
-                    };
+                    let elem_ref =
+                        unsafe { inkwell::llvm_sys::core::LLVMGetAggregateElement(val_ref, i) };
                     if elem_ref.is_null() {
                         all_ok = false;
                         break;
@@ -951,9 +1052,8 @@ fn convert_instruction(
                     // Inline asm has a PointerValue callee but it is not a
                     // named global — check structurally via LLVMIsAInlineAsm.
                     let val_ref = ptr.as_value_ref();
-                    let is_inline_asm = unsafe {
-                        !inkwell::llvm_sys::core::LLVMIsAInlineAsm(val_ref).is_null()
-                    };
+                    let is_inline_asm =
+                        unsafe { !inkwell::llvm_sys::core::LLVMIsAInlineAsm(val_ref).is_null() };
                     if is_inline_asm {
                         return Ok(None);
                     }
@@ -1857,11 +1957,9 @@ fn type_size_bytes_typed(ty: &inkwell::types::BasicTypeEnum<'_>) -> Option<u64> 
     use inkwell::types::BasicTypeEnum as B;
     match ty {
         B::IntType(it) => Some((u64::from(it.get_bit_width())).div_ceil(8)),
-        // Distinguish float vs double via context kind. inkwell doesn't expose
-        // a get_bit_width on FloatType, but we can match on a few known sizes
-        // via context: half=2, float=4, double=8, fp128=16. Default to 8.
-        B::FloatType(_) => Some(8),
-        B::PointerType(_) => Some(8),
+        // Floats: inkwell doesn't expose a bit width on FloatType (half=2,
+        // float=4, double=8, fp128=16) — default to 8, same as pointers.
+        B::FloatType(_) | B::PointerType(_) => Some(8),
         B::ArrayType(at) => {
             let elem_size = type_size_bytes_typed(&at.get_element_type())?;
             Some(elem_size * u64::from(at.len()))
@@ -1880,7 +1978,8 @@ fn type_size_bytes_typed(ty: &inkwell::types::BasicTypeEnum<'_>) -> Option<u64> 
             let elem_size = type_size_bytes_typed(&vt.get_element_type())?;
             Some(elem_size * u64::from(vt.get_size()))
         }
-        _ => None,
+        // Scalable vectors have no static size.
+        B::ScalableVectorType(_) => None,
     }
 }
 

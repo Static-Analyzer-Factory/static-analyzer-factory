@@ -217,7 +217,12 @@ impl<'a> AnalysisContext<'a> {
         let mut ctx = PtaContext::new(pta_config);
         let raw = ctx.analyze(self.module);
         let mssa_pta = PtaResult::new(raw.pts, Arc::new(raw.factory), raw.diagnostics);
-        let mut mssa = MemorySsa::build(self.module, self.cfgs(), mssa_pta, self.callgraph());
+        let mut mssa = MemorySsa::build(
+            self.module,
+            self.cfgs(),
+            Arc::new(mssa_pta),
+            self.callgraph(),
+        );
 
         // Build SVFG with program points
         SvfgBuilder::new(

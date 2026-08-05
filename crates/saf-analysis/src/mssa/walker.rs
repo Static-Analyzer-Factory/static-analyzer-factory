@@ -206,7 +206,7 @@ fn is_clobber(
 
     if let Some(info) = inst_info.get(&inst_id) {
         match info {
-            InstInfo::Store { ptr } => pta.points_to(*ptr).contains(&loc),
+            InstInfo::Store { ptr } => pta.points_to_contains(*ptr, loc),
             InstInfo::Call { callee } => {
                 // Check mod/ref: does callee modify loc?
                 if let Some(callee_fid) = callee {
@@ -218,7 +218,7 @@ fn is_clobber(
                 true
             }
             InstInfo::Memcpy { dst_ptr } | InstInfo::Memset { dst_ptr } => {
-                pta.points_to(*dst_ptr).contains(&loc)
+                pta.points_to_contains(*dst_ptr, loc)
             }
         }
     } else {

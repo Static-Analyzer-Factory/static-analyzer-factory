@@ -141,6 +141,9 @@ pub struct BenchPtaConfig {
     pub entry_point_strategy: String,
     #[serde(default = "default_refinement_iters")]
     pub refinement_max_iterations: usize,
+    /// Maximum FS-PTA worklist iterations. `None` uses `FsPtaConfig::default()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fspta_max_iterations: Option<usize>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if requires &T
@@ -177,6 +180,7 @@ impl Default for BenchPtaConfig {
             solver: default_solver(),
             entry_point_strategy: default_entry_strategy(),
             refinement_max_iterations: default_refinement_iters(),
+            fspta_max_iterations: None,
         }
     }
 }
@@ -292,6 +296,12 @@ pub struct BenchStats {
     /// Time spent building `DefUseGraph` for SVFG (seconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defuse_local_secs: Option<f64>,
+    /// FS-PTA solver iterations (worklist pops), if FS-PTA ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fspta_iterations: Option<usize>,
+    /// Whether the FS-PTA solver hit its iteration limit (truncated solve).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fspta_limit_hit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

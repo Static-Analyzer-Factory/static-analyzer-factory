@@ -184,6 +184,13 @@ pub struct AnalysisStats {
     pub indirect_calls_resolved: usize,
     /// Number of `CallIndirect` sites in the AIR (before resolution).
     pub ind_call_sites: usize,
+    // -- FS-PTA convergence --
+    /// FS-PTA solver iterations (worklist pops).
+    #[serde(default)]
+    pub fspta_iterations: usize,
+    /// Whether FS-PTA hit its iteration limit (truncated, non-converged solve).
+    #[serde(default)]
+    pub fspta_limit_hit: bool,
 }
 
 // =============================================================================
@@ -395,6 +402,9 @@ fn error_result(name: &str, category: &str, error: String) -> ProgramResult {
 }
 
 /// Inner analysis logic — delegates to `saf run --bench-config` via subprocess.
+// NOTE: Linear mapping of BenchResult fields into ProgramResult; splitting
+// would scatter the field-by-field correspondence without aiding readability.
+#[allow(clippy::too_many_lines)]
 fn run_program_inner(prog: &CruxBcProgram, solver: PtaSolver) -> Result<ProgramResult> {
     let analysis_start = Instant::now();
 
@@ -498,6 +508,8 @@ fn run_program_inner(prog: &CruxBcProgram, solver: PtaSolver) -> Result<ProgramR
             cg_callsite_edges: s.cg_callsite_edges,
             indirect_calls_resolved: s.indirect_calls_resolved,
             ind_call_sites: s.ind_call_sites,
+            fspta_iterations: bench_result.stats.fspta_iterations.unwrap_or(0),
+            fspta_limit_hit: bench_result.stats.fspta_limit_hit.unwrap_or(false),
         })
         .unwrap_or_default();
 
@@ -559,7 +571,13 @@ pub fn print_human(summary: &CruxBcSummary) {
         let mssa = fmt_phase("mssa_svfg");
         let fspta = fmt_phase("fs_pta");
 
-        let status = if pr.error.is_some() { " ERR" } else { "" };
+        let status = if pr.error.is_some() {
+            " ERR"
+        } else if pr.stats.fspta_limit_hit {
+            " fs:TRUNC"
+        } else {
+            ""
+        };
 
         eprintln!(
             "{:<20} {:>6} {:>8}  {:>8} {:>8} {:>8} {:>9} {:>8} {:>7.2}s{}",

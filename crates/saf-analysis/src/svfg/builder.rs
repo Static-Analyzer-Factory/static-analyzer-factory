@@ -308,13 +308,12 @@ impl<'a> SvfgBuilder<'a> {
             return;
         };
 
-        // Get locations this pointer may point to
-        let locations = pta.points_to(load_ptr);
-        if locations.is_empty() {
+        // Get locations this pointer may point to (borrow, no allocation)
+        let Some(locations) = pta.points_to_ref(load_ptr) else {
             return;
-        }
+        };
 
-        for loc in locations {
+        for &loc in locations {
             // Query clobber: who last wrote to this location before this load?
             let clobber_id = mssa.clobber_for(use_id, loc);
 
@@ -904,7 +903,7 @@ mod tests {
             .filter(|f| !f.is_declaration)
             .map(|f| (f.id, Cfg::build(f)))
             .collect();
-        let mssa = MemorySsa::build(module, &cfgs, mssa_pta, &callgraph);
+        let mssa = MemorySsa::build(module, &cfgs, Arc::new(mssa_pta), &callgraph);
 
         (defuse, callgraph, pta_result, mssa)
     }

@@ -419,14 +419,14 @@ impl Project {
     fn flow_sensitive_pta(&self, pts_repr: &str) -> PyResult<PyFlowSensitivePtaResult> {
         let repr = parse_pts_repr(pts_repr)?;
         let mssa_pta = (*self.pta_result).clone();
-        Ok(PyFlowSensitivePtaResult::build_with_repr(
+        PyFlowSensitivePtaResult::build_with_repr(
             &self.module,
             &self.callgraph,
             &self.defuse,
             &self.pta_result,
             mssa_pta,
             repr,
-        ))
+        )
     }
 
     /// Run context-sensitive pointer analysis (k-CFA).

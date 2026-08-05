@@ -70,7 +70,7 @@ fn main() {
     );
 
     // Step 5: Build Memory SSA
-    let mssa = MemorySsa::build(&module, &cfgs, pta_result, &callgraph);
+    let mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result), &callgraph);
     println!("Memory SSA built successfully");
     println!("  Total memory accesses: {}", mssa.access_count());
 

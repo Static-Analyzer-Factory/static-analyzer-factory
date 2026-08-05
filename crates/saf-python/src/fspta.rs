@@ -30,14 +30,18 @@ pub struct PyFlowSensitivePtaResult {
 
 impl PyFlowSensitivePtaResult {
     /// Build from project internals.
-    #[allow(clippy::must_use_candidate)]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a Python warning filter escalates the FS-PTA
+    /// truncation `UserWarning` to an exception.
     pub fn build(
         module: &AirModule,
         callgraph: &CallGraph,
         defuse: &DefUseGraph,
         pta: &PtaResult,
         mssa_pta: PtaResult,
-    ) -> Self {
+    ) -> PyResult<Self> {
         Self::build_with_repr(
             module,
             callgraph,
@@ -49,7 +53,12 @@ impl PyFlowSensitivePtaResult {
     }
 
     /// Build from project internals with specific representation.
-    #[allow(clippy::similar_names, clippy::must_use_candidate)]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a Python warning filter escalates the FS-PTA
+    /// truncation `UserWarning` to an exception.
+    #[allow(clippy::similar_names)]
     pub fn build_with_repr(
         module: &AirModule,
         callgraph: &CallGraph,
@@ -57,23 +66,38 @@ impl PyFlowSensitivePtaResult {
         pta: &PtaResult,
         mssa_pta: PtaResult,
         repr: PtsRepresentation,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let cfgs = crate::helpers::build_cfgs(module);
 
         // Build SVFG (needs its own MSSA)
-        let mut mssa = MemorySsa::build(module, &cfgs, mssa_pta, callgraph);
+        let mut mssa = MemorySsa::build(module, &cfgs, std::sync::Arc::new(mssa_pta), callgraph);
         let (svfg, _program_points) =
             SvfgBuilder::new(module, defuse, callgraph, pta, &mut mssa).build();
 
         // Build FsSvfg (needs its own MSSA + PTA)
-        let mssa_pta2 = pta.clone();
+        let mssa_pta2 = std::sync::Arc::new(pta.clone());
         let mut mssa2 = MemorySsa::build(module, &cfgs, mssa_pta2, callgraph);
         let fs_svfg = FsSvfgBuilder::new(module, &svfg, pta, &mut mssa2, callgraph).build();
 
         let config = FsPtaConfig::default().with_pts_representation(repr);
         let result = fspta::solve_flow_sensitive(module, &fs_svfg, pta, callgraph, &config);
 
-        Self { inner: result }
+        if result.diagnostics().iteration_limit_hit {
+            // stacklevel 1: this is a C-implemented method with no
+            // intermediate Python frame, so level 1 attributes the warning to
+            // the caller's flow_sensitive_pta() call site. Propagate the error
+            // so `warnings.simplefilter("error")` users see the escalation.
+            Python::with_gil(|py| {
+                PyErr::warn(
+                    py,
+                    &py.get_type::<pyo3::exceptions::PyUserWarning>(),
+                    c"flow-sensitive PTA hit its iteration limit; results fall back to flow-insensitive (Andersen) points-to",
+                    1,
+                )
+            })?;
+        }
+
+        Ok(Self { inner: result })
     }
 }
 
@@ -139,6 +163,7 @@ impl PyFlowSensitivePtaResult {
         let dict = PyDict::new(py);
         dict.set_item("iterations", diag.iterations)?;
         dict.set_item("iteration_limit_hit", diag.iteration_limit_hit)?;
+        dict.set_item("converged", diag.converged)?;
         dict.set_item("strong_updates", diag.strong_updates)?;
         dict.set_item("weak_updates", diag.weak_updates)?;
         dict.set_item("fs_svfg_nodes", diag.fs_svfg_nodes)?;

@@ -3,7 +3,7 @@
 //! A location represents an abstract memory region, consisting of an allocation
 //! object and an optional field path for field-sensitive analysis.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_hash::FxHashMap;
 use saf_core::air::Constant;
@@ -423,6 +423,12 @@ pub struct LocationFactory {
     regions: BTreeMap<ObjId, MemoryRegion>,
     /// Allocation multiplicity classification per base object.
     multiplicities: BTreeMap<ObjId, AllocationMultiplicity>,
+    /// Objects whose field materialization was capped (summary objects).
+    ///
+    /// Their cells conflate multiple runtime slots, so consumers must treat
+    /// them weakly: no strong updates, and `lookup_approx` routes path misses
+    /// to the base cell instead of a sibling element's exact cell.
+    summary_objects: BTreeSet<ObjId>,
 }
 
 impl LocationFactory {
@@ -437,7 +443,52 @@ impl LocationFactory {
             collapse_warnings: Vec::new(),
             regions: BTreeMap::new(),
             multiplicities: BTreeMap::new(),
+            summary_objects: BTreeSet::new(),
         }
+    }
+
+    /// Mark an object as a summary object (capped field materialization).
+    pub fn mark_summary_object(&mut self, obj: ObjId) {
+        self.summary_objects.insert(obj);
+    }
+
+    /// Apply this factory's field-sensitivity truncation to a path without
+    /// creating a location. Used by the solver's on-demand field minting so
+    /// minted cells honor the same depth cap as factory-created cells.
+    #[must_use]
+    pub fn effective_path(&self, obj: ObjId, path: &FieldPath) -> FieldPath {
+        self.apply_sensitivity(obj, path).0
+    }
+
+    /// Merge solver-minted field cells into the factory.
+    ///
+    /// Called after an Andersen solve that ran with on-demand field minting:
+    /// the minted `LocId`s appear in points-to sets, so the factory must be
+    /// able to resolve them for all downstream consumers (MSSA, SVFG, FS-PTA,
+    /// display). Minted IDs are BLAKE3 content-addressed, so insertion order
+    /// is irrelevant and re-merging an existing key is a no-op.
+    pub fn merge_minted(
+        &mut self,
+        minted: impl IntoIterator<Item = (LocId, Location)>,
+        summary_objects: impl IntoIterator<Item = ObjId>,
+    ) {
+        for (id, location) in minted {
+            if let Some(&existing) = self.id_map.get(&location) {
+                debug_assert_eq!(existing, id, "minted cell collides with factory cell");
+                continue;
+            }
+            self.locations.insert(id, location.clone());
+            self.id_map.insert(location, id);
+        }
+        for obj in summary_objects {
+            self.summary_objects.insert(obj);
+        }
+    }
+
+    /// Whether this object's cells conflate multiple runtime slots.
+    #[must_use]
+    pub fn is_summary_object(&self, obj: ObjId) -> bool {
+        self.summary_objects.contains(&obj)
     }
 
     /// Get or create a location ID for the given object and field path.
@@ -522,6 +573,13 @@ impl LocationFactory {
         // 1. Exact match
         if let Some(id) = self.lookup(obj, path) {
             return Some(id);
+        }
+        // Summary objects: a path miss must NOT resolve via the parent step —
+        // for `[Field{0}, Field{k}]` the parent is `[Field{0}]`, which is
+        // element 0's exact cell (a sibling slot), not a containing cell.
+        // Route straight to the base cell instead.
+        if self.summary_objects.contains(&obj) {
+            return self.lookup(obj, &FieldPath::empty());
         }
         // 2. Parent path (truncate last step)
         if !path.steps.is_empty() {
@@ -1107,6 +1165,32 @@ mod tests {
         );
         // Exact lookup returns None for non-existent
         assert_eq!(factory.lookup(obj, &FieldPath::field(9)), None);
+    }
+
+    #[test]
+    fn lookup_approx_summary_object_routes_misses_to_base() {
+        // For a summary (capped) object, [Field{0}, Field{k}] misses must NOT
+        // resolve to the parent [Field{0}] — that is element 0's exact cell
+        // (a sibling slot), not a containing cell. They go to the base cell.
+        let config = FieldSensitivity::StructFields { max_depth: 3 };
+        let mut factory = LocationFactory::new(config);
+        let obj = ObjId::new(1);
+
+        let base_loc = factory.get_or_create(obj, FieldPath::empty());
+        let f0_loc = factory.get_or_create(obj, FieldPath::field(0));
+        factory.mark_summary_object(obj);
+        assert!(factory.is_summary_object(obj));
+
+        // Exact hits still resolve precisely.
+        assert_eq!(
+            factory.lookup_approx(obj, &FieldPath::field(0)),
+            Some(f0_loc)
+        );
+        // A miss on [Field{0}, Field{7}] routes to base, not to sibling f0.
+        assert_eq!(
+            factory.lookup_approx(obj, &FieldPath::field(0).extend(&FieldPath::field(7))),
+            Some(base_loc)
+        );
     }
 
     // =========================================================================

@@ -210,6 +210,12 @@ impl Default for FsSvfg {
 #[derive(Debug, Clone)]
 pub struct FsPtaConfig {
     /// Maximum worklist iterations before giving up.
+    ///
+    /// `0` means auto: the solver scales the cap with the FS-SVFG size
+    /// (`max(100_000, 50 × node_count)`), so large-but-healthy programs
+    /// converge while pathological inputs still terminate. On truncation the
+    /// partial flow-sensitive state is discarded (see
+    /// `FsPtaDiagnostics::converged`).
     pub max_iterations: usize,
     /// Points-to set representation configuration.
     ///
@@ -234,7 +240,9 @@ pub struct FsPtaConfig {
 impl Default for FsPtaConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 100_000,
+            // Auto: scale the cap with graph size. bash converges at ~103K
+            // pops and tmux at ~125K — a flat 100K cap silently truncated both.
+            max_iterations: 0,
             pts_config: PtsConfig::default(),
             compact_interval: 10_000,
             skip_df_materialization: false,
@@ -484,6 +492,11 @@ pub struct FsPtaDiagnostics {
     pub iterations: usize,
     /// Whether the iteration limit was hit.
     pub iteration_limit_hit: bool,
+    /// Whether the solve ran to a fixpoint. When `false`, the partial
+    /// flow-sensitive state was discarded and `pts` equals the Andersen
+    /// (flow-insensitive) seed, with empty `df_in`/`df_out`.
+    #[serde(default)]
+    pub converged: bool,
     /// Number of strong updates performed.
     pub strong_updates: usize,
     /// Number of weak updates performed.
@@ -625,6 +638,7 @@ mod tests {
     #[test]
     fn fs_pta_config_default() {
         let config = FsPtaConfig::default();
-        assert_eq!(config.max_iterations, 100_000);
+        // 0 = auto: the solver scales the cap with FS-SVFG size.
+        assert_eq!(config.max_iterations, 0);
     }
 }

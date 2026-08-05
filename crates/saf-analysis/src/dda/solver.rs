@@ -825,6 +825,18 @@ impl<'a> DdaPta<'a> {
             }
         }
 
+        // Summary objects (capped field materialization) conflate multiple
+        // runtime slots — a strong update would kill live values.
+        if let Some(location) = self.ci_pta.location(loc) {
+            if self
+                .ci_pta
+                .location_factory()
+                .is_summary_object(location.obj)
+            {
+                return false;
+            }
+        }
+
         // Check if the location is an array (heuristic: look for GEP in the def)
         if self.is_array_location(loc) {
             return false;
@@ -1093,7 +1105,7 @@ mod tests {
         let module = make_minimal_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1115,7 +1127,7 @@ mod tests {
         let module = make_minimal_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1142,7 +1154,7 @@ mod tests {
         let module = make_minimal_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1169,7 +1181,7 @@ mod tests {
         let module = make_minimal_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1198,7 +1210,7 @@ mod tests {
         let module = make_minimal_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1322,7 +1334,7 @@ mod tests {
         let module = make_load_store_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1349,7 +1361,7 @@ mod tests {
         let module = make_load_store_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1382,7 +1394,7 @@ mod tests {
         let module = make_load_store_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1405,7 +1417,7 @@ mod tests {
         let module = make_load_store_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1429,7 +1441,7 @@ mod tests {
         let module = make_load_store_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1460,7 +1472,7 @@ mod tests {
         let module = make_minimal_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1483,7 +1495,7 @@ mod tests {
         let module = make_minimal_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1508,7 +1520,7 @@ mod tests {
         let module = make_minimal_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1536,7 +1548,7 @@ mod tests {
         let module = make_minimal_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 
@@ -1568,7 +1580,7 @@ mod tests {
         let module = make_minimal_module();
         let (pta_result, cfgs, callgraph, defuse, index) = run_analyses(&module);
 
-        let mut mssa = MemorySsa::build(&module, &cfgs, pta_result.clone(), &callgraph);
+        let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result.clone()), &callgraph);
         let (svfg, _pp) =
             SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();
 

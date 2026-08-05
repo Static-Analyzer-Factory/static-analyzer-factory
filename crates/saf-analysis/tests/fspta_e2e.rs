@@ -51,7 +51,7 @@ fn run_flow_sensitive(module: &AirModule) -> (FlowSensitivePtaResult, PtaResult)
         .map(|f| (f.id, Cfg::build(f)))
         .collect();
 
-    let mut mssa = MemorySsa::build(module, &cfgs, mssa_pta, &callgraph);
+    let mut mssa = MemorySsa::build(module, &cfgs, Arc::new(mssa_pta), &callgraph);
     let (svfg, _program_points) =
         SvfgBuilder::new(module, &defuse, &callgraph, &pta1, &mut mssa).build();
 
@@ -64,7 +64,7 @@ fn run_flow_sensitive(module: &AirModule) -> (FlowSensitivePtaResult, PtaResult)
     let mut ctx4 = PtaContext::new(pta_config);
     let raw4 = ctx4.analyze(module);
     let mssa_pta2 = PtaResult::new(raw4.pts, Arc::new(raw4.factory), raw4.diagnostics);
-    let mut mssa2 = MemorySsa::build(module, &cfgs, mssa_pta2, &callgraph);
+    let mut mssa2 = MemorySsa::build(module, &cfgs, Arc::new(mssa_pta2), &callgraph);
 
     let fs_svfg = FsSvfgBuilder::new(module, &svfg, &pta3, &mut mssa2, &callgraph).build();
 

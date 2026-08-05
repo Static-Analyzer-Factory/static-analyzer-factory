@@ -164,6 +164,10 @@ fn extract_global_addr_constraints(
 ) {
     use saf_core::air::Constant;
 
+    // Known function IDs, for the pointer-relevance filter on large aggregates
+    // (function addresses appear as raw-ID integers in initializers).
+    let func_ids: BTreeSet<u128> = module.functions.iter().map(|f| f.id.raw()).collect();
+
     for global in &module.globals {
         let loc = factory.get_or_create(global.obj, FieldPath::empty());
         factory.set_region(global.obj, MemoryRegion::Global);
@@ -187,8 +191,115 @@ fn extract_global_addr_constraints(
         // because the solver only searches existing locations — it doesn't create
         // new ones. We create one location per element so the solver's
         // `find_or_approximate_location` can find exact matches.
+        //
+        // Large aggregates are capped at 512 elements: blanket per-element
+        // materialization of e.g. a `[51770 x i8]` data blob would create
+        // 100K+ locations that can never hold pointers, inflating every
+        // downstream loc-universe consumer (mod/ref bitsets, GEP lookups,
+        // MSSA). Past the cap only pointer-relevant elements get exact
+        // locations. The object is marked as a SUMMARY object: `lookup_approx`
+        // routes path misses to the base cell (not a sibling element's cell),
+        // and strong updates are blocked on its cells — they conflate multiple
+        // runtime slots, so a strong update would unsoundly kill live values.
         if let Some(Constant::Aggregate { elements }) = &global.init {
-            create_aggregate_field_locations(global.obj, elements, &[], factory);
+            if count_aggregate_elements(elements) <= MAX_AGGREGATE_FIELD_ELEMENTS {
+                create_aggregate_field_locations(global.obj, elements, &[], factory);
+            } else {
+                factory.mark_summary_object(global.obj);
+                create_pointer_relevant_field_locations(
+                    global.obj,
+                    elements,
+                    &[],
+                    &func_ids,
+                    factory,
+                );
+            }
+        }
+    }
+}
+
+/// Blanket per-element location materialization cap for aggregate globals.
+/// Larger aggregates fall back to pointer-relevant-only materialization with
+/// summary-object semantics.
+const MAX_AGGREGATE_FIELD_ELEMENTS: usize = 512;
+
+/// Count aggregate initializer elements recursively (nested aggregates count
+/// as one element plus their contents).
+fn count_aggregate_elements(elements: &[saf_core::air::Constant]) -> usize {
+    elements
+        .iter()
+        .map(|e| match e {
+            saf_core::air::Constant::Aggregate { elements: nested } => {
+                1 + count_aggregate_elements(nested)
+            }
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Does this initializer element (transitively) hold a pointer?
+///
+/// Mirrors the predicate `extract_aggregate_elements` uses to generate
+/// constraints: `GlobalRef`, or a non-zero `Int` matching a known function ID
+/// (function addresses appear as raw-ID integers in vtables/tables).
+fn element_is_pointer_relevant(
+    element: &saf_core::air::Constant,
+    func_ids: &BTreeSet<u128>,
+) -> bool {
+    use saf_core::air::Constant;
+    match element {
+        Constant::GlobalRef(_) => true,
+        Constant::Int { value, .. } if *value != 0 => {
+            // INVARIANT: Reinterpret i64 as u128 for ID comparison — the bit
+            // pattern is what matters, not the signed interpretation.
+            #[allow(clippy::cast_sign_loss)]
+            let raw = *value as u128;
+            func_ids.contains(&raw)
+        }
+        Constant::Aggregate { elements } => elements
+            .iter()
+            .any(|e| element_is_pointer_relevant(e, func_ids)),
+        _ => false,
+    }
+}
+
+/// Like [`create_aggregate_field_locations`] but materializes locations only
+/// for pointer-relevant elements. Used for aggregates larger than
+/// [`MAX_AGGREGATE_FIELD_ELEMENTS`].
+// INVARIANT: Aggregate element indices fit in u32 (< 2^32 elements).
+#[allow(clippy::cast_possible_truncation)]
+fn create_pointer_relevant_field_locations(
+    obj: ObjId,
+    elements: &[saf_core::air::Constant],
+    prefix: &[PathStep],
+    func_ids: &BTreeSet<u128>,
+    factory: &mut LocationFactory,
+) {
+    for (i, element) in elements.iter().enumerate() {
+        if !element_is_pointer_relevant(element, func_ids) {
+            continue;
+        }
+        let mut path_steps: Vec<PathStep> = prefix.to_vec();
+        path_steps.push(PathStep::Field { index: i as u32 });
+
+        factory.get_or_create(
+            obj,
+            FieldPath {
+                steps: path_steps.clone(),
+            },
+        );
+
+        // GEP-prefixed variant, mirroring create_aggregate_field_locations.
+        if prefix.is_empty() {
+            let gep_path = vec![
+                PathStep::Field { index: 0 },
+                PathStep::Field { index: i as u32 },
+            ];
+            factory.get_or_create(obj, FieldPath { steps: gep_path });
+        }
+
+        if let saf_core::air::Constant::Aggregate { elements: nested } = element {
+            create_pointer_relevant_field_locations(obj, nested, &path_steps, func_ids, factory);
         }
     }
 }
@@ -349,15 +460,15 @@ pub fn extract_global_initializers(
 ///
 /// Used in aggregate initializer processing to create unique `ValueId`s for
 /// function pointers, field pointers, and global reference pointers.
-fn make_synthetic_value(kind: &str, global_obj: ObjId, index: usize) -> ValueId {
-    ValueId::new(saf_core::id::make_id(
-        kind,
-        &[
-            global_obj.raw().to_le_bytes(),
-            (index as u128).to_le_bytes(),
-        ]
-        .concat(),
-    ))
+fn make_synthetic_value(kind: &str, global_obj: ObjId, path: &FieldPath) -> ValueId {
+    // Key by the FULL field path, not the local element index: sibling nested
+    // aggregates share local indices, and keying by index alone conflated
+    // every element's same-position field into one synthetic pointer.
+    // Debug formatting of `FieldPath` is deterministic (derived), giving a
+    // stable, order-independent byte encoding.
+    let mut payload = global_obj.raw().to_le_bytes().to_vec();
+    payload.extend_from_slice(format!("{path:?}").as_bytes());
+    ValueId::new(saf_core::id::make_id(kind, &payload))
 }
 
 fn extract_aggregate_elements(
@@ -403,14 +514,16 @@ fn extract_aggregate_elements(
                     let func_obj = ObjId::new(func_id.raw());
                     let func_loc = factory.get_or_create(func_obj, FieldPath::empty());
 
-                    let synthetic_value = make_synthetic_value("synth_fptr", global_obj, i);
+                    let synthetic_value =
+                        make_synthetic_value("synth_fptr", global_obj, &field_path);
                     constraints.addr.insert(AddrConstraint {
                         ptr: synthetic_value,
                         loc: func_loc,
                     });
 
                     let field_loc = factory.get_or_create(global_obj, field_path.clone());
-                    let field_ptr = make_synthetic_value("synth_field_ptr", global_obj, i);
+                    let field_ptr =
+                        make_synthetic_value("synth_field_ptr", global_obj, &field_path);
                     constraints.addr.insert(AddrConstraint {
                         ptr: field_ptr,
                         loc: field_loc,
@@ -424,7 +537,7 @@ fn extract_aggregate_elements(
                     // Also store at GEP-prefixed path
                     if let Some(gep) = &gep_path {
                         let gep_loc = factory.get_or_create(global_obj, gep.clone());
-                        let gep_ptr = make_synthetic_value("synth_gep_field_ptr", global_obj, i);
+                        let gep_ptr = make_synthetic_value("synth_gep_field_ptr", global_obj, gep);
                         constraints.addr.insert(AddrConstraint {
                             ptr: gep_ptr,
                             loc: gep_loc,
@@ -438,7 +551,8 @@ fn extract_aggregate_elements(
             }
             Constant::GlobalRef(target_id) => {
                 let field_loc = factory.get_or_create(global_obj, field_path.clone());
-                let field_ptr = make_synthetic_value("synth_globalref_ptr", global_obj, i);
+                let field_ptr =
+                    make_synthetic_value("synth_globalref_ptr", global_obj, &field_path);
                 constraints.addr.insert(AddrConstraint {
                     ptr: field_ptr,
                     loc: field_loc,
@@ -452,7 +566,7 @@ fn extract_aggregate_elements(
                 // Also store at GEP-prefixed path
                 if let Some(gep) = &gep_path {
                     let gep_loc = factory.get_or_create(global_obj, gep.clone());
-                    let gep_ptr = make_synthetic_value("synth_gep_globalref_ptr", global_obj, i);
+                    let gep_ptr = make_synthetic_value("synth_gep_globalref_ptr", global_obj, gep);
                     constraints.addr.insert(AddrConstraint {
                         ptr: gep_ptr,
                         loc: gep_loc,

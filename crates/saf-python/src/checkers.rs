@@ -319,7 +319,7 @@ pub(crate) fn build_svfg_for_checker(
 ) -> Svfg {
     let cfgs = crate::helpers::build_cfgs(module);
 
-    let mut mssa = MemorySsa::build(module, &cfgs, mssa_pta, callgraph);
+    let mut mssa = MemorySsa::build(module, &cfgs, std::sync::Arc::new(mssa_pta), callgraph);
     let (svfg, _program_points) =
         SvfgBuilder::new(module, defuse, callgraph, pta, &mut mssa).build();
     svfg

@@ -74,7 +74,11 @@ tests/benchmarks/sv-benchmarks/juliet-results*.json
 tests/benchmarks/cruxbc/.compiled/
 tests/benchmarks/cruxbc/*.json
 tests/benchmarks/cruxbc/*.txt
+tests/benchmarks/cruxbc/*.log
+tests/benchmarks/cruxbc/*.err
 tests/benchmarks/cruxbc/multi-run/
+tests/benchmarks/cruxbc/svf-logs/
+tests/benchmarks/cruxbc/exp/
 .claude/
 
 # Incremental analysis benchmarks (generated on-demand)

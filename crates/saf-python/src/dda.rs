@@ -111,7 +111,7 @@ impl PyDdaPtaResult {
         let mut mssa = MemorySsa::build(
             &owned_module,
             &cfgs,
-            owned_pta_result.clone(),
+            std::sync::Arc::new(owned_pta_result.clone()),
             &owned_callgraph,
         );
 

@@ -66,7 +66,7 @@ fn main() {
         .filter(|f| !f.is_declaration)
         .map(|f| (f.id, Cfg::build(f)))
         .collect();
-    let mut mssa = MemorySsa::build(&module, &cfgs, mssa_pta, &callgraph);
+    let mut mssa = MemorySsa::build(&module, &cfgs, Arc::new(mssa_pta), &callgraph);
 
     // Step 4: Build the SVFG
     let svfg = SvfgBuilder::new(&module, &defuse, &callgraph, &pta_result, &mut mssa).build();

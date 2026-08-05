@@ -42,7 +42,7 @@ fn build_mssa(module: &AirModule) -> MemorySsa {
         pta_result_raw.diagnostics,
     );
 
-    MemorySsa::build(module, &cfgs, pta_result, &callgraph)
+    MemorySsa::build(module, &cfgs, Arc::new(pta_result), &callgraph)
 }
 
 // ── Test 1: Basic store/load disambiguation ──────────────────────────────

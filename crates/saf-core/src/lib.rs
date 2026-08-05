@@ -26,6 +26,7 @@ saf_log_module! {
     valueflow { build, query },
     defuse { build },
     mssa { build },
+    fspta { solve },
     checker { memleak, uaf, nullptr, pathsens },
     absint { interproc, transfer, escape, nullness },
     frontend { ingest },

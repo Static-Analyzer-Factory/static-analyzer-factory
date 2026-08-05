@@ -1,0 +1,3536 @@
+{
+  "suite": "PTABen",
+  "total": 846,
+  "exact": 2270,
+  "sound": 337,
+  "to_verify": 35,
+  "unsound": 137,
+  "skip": 104,
+  "by_category": [
+    {
+      "category": "ae_assert_tests",
+      "exact": 70,
+      "sound": 0,
+      "to_verify": 0,
+      "unsound": 17,
+      "skip": 22,
+      "skip_reason": "No oracle calls found",
+      "timing_secs": 1.1838005730000003,
+      "pass": 70,
+      "fail": 17
+    },
+    {
+      "category": "ae_assert_tests_fail",
+      "exact": 18,
+      "sound": 31,
+      "to_verify": 0,
+      "unsound": 0,
+      "skip": 13,
+      "skip_reason": "Assertion condition unknown (unreachable or unanalyzable)",
+      "timing_secs": 0.7948983540000001,
+      "pass": 49
+    },
+    {
+      "category": "ae_nullptr_deref_tests",
+      "exact": 145,
+      "sound": 0,
+      "to_verify": 0,
+      "unsound": 5,
+      "skip": 0,
+      "timing_secs": 1.310834325,
+      "pass": 145,
+      "fail": 5
+    },
+    {
+      "category": "ae_nullptr_deref_tests_failed",
+      "exact": 12,
+      "sound": 4,
+      "to_verify": 0,
+      "unsound": 0,
+      "skip": 2,
+      "skip_reason": "No oracle calls found",
+      "timing_secs": 0.19437124199999997,
+      "pass": 16
+    },
+    {
+      "category": "ae_overflow_tests",
+      "exact": 199,
+      "sound": 0,
+      "to_verify": 0,
+      "unsound": 34,
+      "skip": 0,
+      "timing_secs": 1.2481205689999997,
+      "pass": 199,
+      "fail": 34
+    },
+    {
+      "category": "ae_overflow_tests_fail",
+      "exact": 6,
+      "sound": 2,
+      "to_verify": 0,
+      "unsound": 0,
+      "skip": 0,
+      "timing_secs": 0.0428667,
+      "pass": 8
+    },
+    {
+      "category": "ae_recursion_tests",
+      "exact": 23,
+      "sound": 0,
+      "to_verify": 0,
+      "unsound": 10,
+      "skip": 0,
+      "timing_secs": 0.5472333229999999,
+      "pass": 23,
+      "fail": 10
+    },
+    {
+      "category": "ae_recursion_tests_fail",
+      "exact": 0,
+      "sound": 0,
+      "to_verify": 0,
+      "unsound": 0,
+      "skip": 2,
+      "skip_reason": "No oracle calls found",
+      "timing_secs": 3.581e-6
+    },
+    {
+      "category": "ae_wto_assert",
+      "exact": 8,
+      "sound": 0,
+      "to_verify": 0,
+      "unsound": 1,
+      "skip": 6,
+      "skip_reason": "Assertion condition unknown (unreachable or unanalyzable)",
+      "timing_secs": 0.070450978,
+      "pass": 8,
+      "fail": 1
+    },
+    {
+      "category": "basic_c_tests",
+      "exact": 97,
+      "sound": 1,
+      "to_verify": 14,
+      "unsound": 0,
+      "skip": 4,
+      "skip_reason": "No oracle calls found",
+      "timing_secs": 1.6499378040000006,
+      "pass": 98
+    },
+    {
+      "category": "basic_cpp_tests",
+      "exact": 119,
+      "sound": 0,
+      "to_verify": 1,
+      "unsound": 0,
+      "skip": 2,
+      "skip_reason": "No oracle calls found",
+      "timing_secs": 5.836357957,
+      "pass": 119
+    },
+    {
+      "category": "complex_tests",
+      "exact": 149,
+      "sound": 0,
+      "to_verify": 12,
+      "unsound": 0,
+      "skip": 4,
+      "skip_reason": "No oracle calls found",
+      "timing_secs": 0.5898977769999997,
+      "pass": 149
+    },
+    {
+      "category": "cpp_types",
+      "exact": 0,
+      "sound": 0,
+      "to_verify": 0,
+      "unsound": 0,
+      "skip": 1,
+      "skip_reason": "No oracle calls found",
+      "timing_secs": 2.658e-6
+    },
+    {
+      "category": "cs_tests",
+      "exact": 113,
+      "sound": 0,
+      "to_verify": 1,
+      "unsound": 2,
+      "skip": 1,
+      "skip_reason": "No oracle calls found",
+      "timing_secs": 0.43779279499999996,
+      "pass": 113,
+      "fail": 2
+    },
+    {
+      "category": "double_free",
+      "exact": 151,
+      "sound": 0,
+      "to_verify": 0,
+      "unsound": 27,
+      "skip": 0,
+      "timing_secs": 1.4640324939999998,
+      "pass": 151,
+      "fail": 27
+    },
+    {
+      "category": "failed_tests",
+      "exact": 99,
+      "sound": 3,
+      "to_verify": 0,
+      "unsound": 0,
+      "skip": 2,
+      "skip_reason": "No oracle calls found",
+      "timing_secs": 2.364284901,
+      "pass": 102
+    },
+    {
+      "category": "fs_tests",
+      "exact": 47,
+      "sound": 0,
+      "to_verify": 5,
+      "unsound": 0,
+      "skip": 2,
+      "skip_reason": "No oracle calls found",
+      "timing_secs": 0.33745973800000006,
+      "pass": 47
+    },
+    {
+      "category": "mem_leak",
+      "exact": 96,
+      "sound": 9,
+      "to_verify": 0,
+      "unsound": 41,
+      "skip": 3,
+      "skip_reason": "No oracle calls found",
+      "timing_secs": 1.6551449040000001,
+      "pass": 105,
+      "fail": 41
+    },
+    {
+      "category": "mta",
+      "exact": 826,
+      "sound": 287,
+      "to_verify": 0,
+      "unsound": 0,
+      "skip": 0,
+      "timing_secs": 0.7519501569999998,
+      "pass": 1113
+    },
+    {
+      "category": "non_annotated_tests",
+      "exact": 0,
+      "sound": 0,
+      "to_verify": 0,
+      "unsound": 0,
+      "skip": 35,
+      "skip_reason": "Tests without oracles",
+      "timing_secs": 0.000029032000000000003
+    },
+    {
+      "category": "objtype_tests",
+      "exact": 0,
+      "sound": 0,
+      "to_verify": 0,
+      "unsound": 0,
+      "skip": 5,
+      "skip_reason": "Object type tests not implemented",
+      "timing_secs": 6.993000000000001e-6
+    },
+    {
+      "category": "path_tests",
+      "exact": 92,
+      "sound": 0,
+      "to_verify": 2,
+      "unsound": 0,
+      "skip": 0,
+      "timing_secs": 0.31403558099999995,
+      "pass": 92
+    }
+  ],
+  "unsound_details": [
+    {
+      "file": "ae_assert_tests/BASIC_array_struct_0-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x2347bb544a5de20d59347f1b09d974ef) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/BASIC_array_varIdx_1-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xe3686c592cccd6155d360db59fc3ac87) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/BASIC_arraycopy1-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x679be35c1f49ecea3863034c2ca64ad6) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/BASIC_arraycopy2-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x6d46735bb85db46b2d73473b0301e88f) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/BASIC_ptr_func_0-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xd4aa679e82d58f89ec56cad7504b8c43) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/BASIC_struct_array_0-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xc87296405c19a0867a5873fa3bf2d1ad) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/CWE127_har_alloc-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x6989fd2b5e0cd771bd37760c9e8b9c73) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/INTERVAL_test_19-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xc6e260aac78001ebf6154c2e705c4415) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/INTERVAL_test_2-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x20c61b80e60851ba93bd41cc458e4531) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/INTERVAL_test_20-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xc7044268ea1f84b56630cf0bee3045f5) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/INTERVAL_test_49-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x4f326c27f649c650e183cecc403cf239) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/LOOP_for01-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xd8eaccfc892a29712bdd7f1970b6b99b) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/LOOP_for_call-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x409fe28e4550efa5a31109613dea6c94) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/LOOP_for_inc-0.ll",
+      "expectation": "AssertEq { left: ValueId(0x7cb1e13739dc877b30879bc9e1429ca5), right: ValueId(0x34ce77f6fff38ded71b38b7087049e7b), call_site: InstId(0xae969dd7292cc4f049eb86e39eaaa836) }",
+      "expected": "Intervals should overlap (assert_eq)",
+      "actual": "No overlap: left=[0, 0], right=[0, 0]"
+    },
+    {
+      "file": "ae_assert_tests/cwe121_int64_alloc-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x358a122ba2f1382c5456f3681029a414) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/cwe121_int_alloc-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xf2ba6e7a3878ba5d4d849a7a50fa4f5f) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_assert_tests/cwe121_struct_alloc-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xf9e51e41389ab3a97633af8d483b7125) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_nullptr_deref_tests/array_2d_small_partial_null.ll",
+      "expectation": "NullCheck { kind: Unsafe, ptr: ValueId(0x44abfe52bd6d49097f2e48b48f7a3a2b), call_site: InstId(0xc4e793ea2dccb1e386cfd38e979fb5af) }",
+      "expected": "Pointer may be null",
+      "actual": "Pointer is not null"
+    },
+    {
+      "file": "ae_nullptr_deref_tests/array_2d_small_partial_null.ll",
+      "expectation": "NullCheck { kind: Unsafe, ptr: ValueId(0x5d699d90cfcbec581bdabb30870f0567), call_site: InstId(0x284ab0fd137fe7bccf9e1dc60ff3538f) }",
+      "expected": "Pointer may be null",
+      "actual": "Pointer is not null"
+    },
+    {
+      "file": "ae_nullptr_deref_tests/array_of_struct.ll",
+      "expectation": "NullCheck { kind: Safe, ptr: ValueId(0x14d30e542538c164bec743f8fa1499bb), call_site: InstId(0x880098f1b7196d82b2ebafd27ac55573) }",
+      "expected": "Pointer is not null",
+      "actual": "Pointer may be null"
+    },
+    {
+      "file": "ae_nullptr_deref_tests/array_of_struct_func_ptr.ll",
+      "expectation": "NullCheck { kind: Safe, ptr: ValueId(0xc9f51e0534088b33659be3c82820936d), call_site: InstId(0xb970a9fb2f0790cb4c3144e95bfd535c) }",
+      "expected": "Pointer is not null",
+      "actual": "Pointer may be null"
+    },
+    {
+      "file": "ae_nullptr_deref_tests/dangleptr_safe_branch.ll",
+      "expectation": "NullCheck { kind: Safe, ptr: ValueId(0x07443d23e232d35079a228998a28d872), call_site: InstId(0x52095d3a1cdabe078f82bb4ab4904af0) }",
+      "expected": "Pointer is not null",
+      "actual": "Pointer may be null"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__CWE129_fgets_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x1dfd11fc7c882bd23b2dae5e698bfd52), size: ValueId(0xefdc075922478be6a572ea7777e13a08), call_site: InstId(0x2319c364a5cef27954cc50690cacb4ac) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__CWE129_listen_socket_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xa4cdebb2b20d80118afd6d2d3d048ac1), size: ValueId(0xb9b7c18ef09c26e58ee1ddd837410c58), call_site: InstId(0xffb92ff5ae5565854d088f780c447a01) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__CWE129_rand_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xc97a9656fa144a335d2969607b91a3b6), size: ValueId(0xbdad02911fe331877118fae5e26064d6), call_site: InstId(0xd9d7b256f5fd61b777633fcb9de66c1c) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__CWE131_loop_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x8e445628fbb5560e71be6ae492e89b4c), size: ValueId(0x5977c39ed3da95faf09fa1c3bbc05483), call_site: InstId(0x773197ad28211d7de54e2180f28c00af) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__CWE805_char_alloca_loop_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x47e3ab0f1be049b22a34c1e79221ebcb), size: ValueId(0x373b75c500e30d0305f7a4fbc0baf7ed), call_site: InstId(0x750b574246ca3ea7f862fa25fdaff569) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__CWE805_int64_t_declare_loop_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x8467aca969390620b8f2b11fdfb88f62), size: ValueId(0x086ba3988ee33245c971b7b72aba435e), call_site: InstId(0xbbd8f6b2478ede06a8ec696209a79d20) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__CWE805_int_alloca_loop_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xc986f6c85e23708efb3576a9e1061ea9), size: ValueId(0xf7b4bc1d225a4a7fe2aa822c64117a18), call_site: InstId(0x340df4522b2e918098e4a928069681b0) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__CWE805_wchar_t_alloca_loop_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xe24737d71ddfa65bb8b904a8e263aeb1), size: ValueId(0xf5a26af982561f4f15cd2d5d1b37c62f), call_site: InstId(0x6c30e64f831c85c1baf9564f6054ed6d) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__CWE805_wchar_t_declare_loop_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xf78573a69e5f85012cb3359acb64a116), size: ValueId(0x7eca0af5a5da3b166bf5a14d9e78345a), call_site: InstId(0xa96437f423c8c92a00070f3dce0daebc) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__CWE806_char_declare_loop_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xe90319072732a25c352287e1fc40fd5d), size: ValueId(0x994d46f14732ac4f9e220309a7ea06f5), call_site: InstId(0x7621d8b25b456781b150630233af1134) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__CWE806_char_declare_ncpy_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x5e58b9fcf1ebc753c6d5f3d8486b199f), size: ValueId(0x6ab826fdd9cee75633d6e94a36b0ceee), call_site: InstId(0x3c09e4155deb237b963e13f060e3c4cf) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__CWE806_wchar_t_declare_memcpy_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xdb07309889fe3b767519e923d5f4e34a), size: ValueId(0x5c6671dd4a3a86f485121b44b23d82f2), call_site: InstId(0xcb9d262515efc50ee99dd16061077234) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__src_char_alloca_cpy_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xf100dc5fe2aee217e0e0251de27b4054), size: ValueId(0x481fbf47ccb544150c760a86a36a2b2a), call_site: InstId(0x27c8eeed9c6d82ddf2395887e71d70c1) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE121_Stack_Based_Buffer_Overflow__src_wchar_t_declare_cpy_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xd769154c55265d28da601e6dd1e5c264), size: ValueId(0x590cc29528410d2a5bdfe6e703c2026e), call_site: InstId(0xf620c1ba9d7cdc81669d44f6f292afdf) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE122_Heap_Based_Buffer_Overflow__CWE131_loop_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x633b0ac4e0213356592d7af768e30b83), size: ValueId(0x6653c3e9f011e8b33d104780b98897e4), call_site: InstId(0xbdd384e0e39e2edf405bbf0de03cbd8e) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE122_Heap_Based_Buffer_Overflow__c_CWE806_char_memmove_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xe43cd960de6315fc37292733ae3e246b), size: ValueId(0x247e7aa85e787b103f2eb9ba9a54a17d), call_site: InstId(0xb1ff6e4674d5a4db7598ffb39c18f0e0) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE122_Heap_Based_Buffer_Overflow__c_CWE806_wchar_t_memmove_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xf6c5f14c710b4f1df06acb505c4de90a), size: ValueId(0x0e35728b1a5e29fce1327ec349b9e24e), call_site: InstId(0x52880dcb23732d708ddbf24e04eac9b0) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE122_Heap_Based_Buffer_Overflow__c_src_char_cpy_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x1aa2a67d6ca6f3ea4a1fefd0a5aab1ad), size: ValueId(0xd4adaf343295f710887e339d29abd390), call_site: InstId(0xf06cfab840f006baabeb70f5f3b932f5) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE126_Buffer_Overread__CWE129_fgets_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x479dd120b2c66c96390602269a741331), size: ValueId(0x8dcc4179147aa12d33d1abd8023ba2c4), call_site: InstId(0x8fdc297ef2d232a3649ef28c6bc52b40) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE126_Buffer_Overread__CWE129_fscanf_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xa7f60bf5d4be268d80dbc911b3ae3e86), size: ValueId(0x5a5f5bbe0db3a596a91f70b979c02c63), call_site: InstId(0x66e36d22d21e1c8b5e323088f3cf5bba) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE126_Buffer_Overread__CWE129_listen_socket_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x313d833429a9e9e3a9b04495a894e442), size: ValueId(0xe4b8efcd28143761c1671b8aca83dfc4), call_site: InstId(0xddb191d92045de9571b00a70bf8b80eb) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE126_Buffer_Overread__char_alloca_memcpy_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x1922f0887063d531d76fbcc0b540d5d5), size: ValueId(0x4500c9076dd3cba0412008e6f4ab7055), call_site: InstId(0xce452256adbbe0f03094f90e1498b36b) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE126_Buffer_Overread__char_declare_loop_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x8893085530be8ac5b6cf636e3053dc1d), size: ValueId(0xd71ef829c8dd6c083cf9ba498bf24001), call_site: InstId(0x9909e4d232c8c50ffbd8b139689690a6) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE126_Buffer_Overread__char_declare_memcpy_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x8b28fb53215a57fc8f6577d600fb8fb6), size: ValueId(0xafdecf4600abaa57c4b7609868b42648), call_site: InstId(0x7c90c40e59d8bc53ae1ecb5b7f07a219) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE126_Buffer_Overread__malloc_char_loop_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xd390bb47f1365c787c99022e652ffe9a), size: ValueId(0x45f5e745e375bb108198673b407c877c), call_site: InstId(0x2724aa023d165a1d982d2c2dc615c7c5) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE126_Buffer_Overread__malloc_char_memmove_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x070c6aca6bf885dd5385adb5fcf82b1d), size: ValueId(0x0cb8857eb9cc1b3e7011d29a919cc869), call_site: InstId(0xc900ad1a7bf644f16605875f181419e5) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE126_Buffer_Overread__malloc_wchar_t_loop_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xe3317981f935d894bc1646420dbc0f10), size: ValueId(0x10f70430498218e9a9a765e26af6bbc8), call_site: InstId(0x54c35fddadd3d008be7b5ca76e3258fe) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE126_Buffer_Overread__malloc_wchar_t_memmove_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x1bad89c33f36cd167e2bac90080a0995), size: ValueId(0x69c7e07f8b10d672b9cd30c9c16a3806), call_site: InstId(0x511bde26c4ebabeea08284be4917e4f2) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE126_Buffer_Overread__wchar_t_declare_loop_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x0d6a2dab8eda8fadcd4c0a46fd776a1f), size: ValueId(0x01394f513ca5fa36f7e450ebc6fb395b), call_site: InstId(0x181d283c572d169e513a71832da7b88f) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/CWE126_Buffer_Overread__wchar_t_declare_memmove_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x7f49b1d4b285ce8c36c16a6e3b63ab86), size: ValueId(0x11fc2c7412ab43a09d4ce3a3d1c4d4b6), call_site: InstId(0xfe62544b1ae96aeaa7d90e4b5b444454) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/ExtAPI_strcat_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xca5407abae0ef8f7f52dc571608fa779), size: ValueId(0x1859b0d848b6f915218784e89e5b386c), call_site: InstId(0x58a95ca3e7c2757b65e9bcc393f6909d) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/ExtAPI_strcat_02.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xc3e68efcbc7d422ce18b4fe31c02d2d6), size: ValueId(0xb62718bb98fd1b6b8a90d80131609e11), call_site: InstId(0xdfa2af945bccac67a2d147b1f01126ef) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/ExtAPI_strcat_03.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xfd7fddcd09ddc534776b4b23eddf96bc), size: ValueId(0xbe663f863d5d551102f555c70049bf44), call_site: InstId(0x7aa6ee03e395aa181b0fc418210f17a9) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_overflow_tests/ExtAPI_strcat_04.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0x464f237b455bd6860e33fb23e57ddd60), size: ValueId(0x208e9e92cb0356effc9e5dfb28238e30), call_site: InstId(0x9be2548fdb8e868a308f481c2440dab1) }",
+      "expected": "Buffer overflow finding",
+      "actual": "No buffer overflow finding"
+    },
+    {
+      "file": "ae_recursion_tests/demo.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x050fe12f69e6e2d588ea4ab5598137b4) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_recursion_tests/recursive_afterrec_4.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x87682bfd9c637b3353e75b8cca28ebcb) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_recursion_tests/recursive_mc91_0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x040f06a5ef457303b6b5efab89c729ad) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_recursion_tests/recursive_mc91_1.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x1f5fe8ef69fecc68b9350492dba606c1) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_recursion_tests/recursive_mc91_2.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xa0400ed07230be9edf87bc1438df98a6) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_recursion_tests/recursive_mc91_3.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xf06a4cf1d4b5e2a8416fca7068c639d6) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_recursion_tests/recursive_mc91_5.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xb5dbb49c660d4c6aa03d319f3c4bbed5) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_recursion_tests/recursive_mc91_6.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xa56d550d71e584551355b33638824dd2) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_recursion_tests/recursive_mc91_7.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x541c8de7e507119808fa720ce3895fe3) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_recursion_tests/recursive_mc91_8.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x635ce691e22ed8f834bc1b417d985db4) }",
+      "expected": "Condition proven",
+      "actual": "Condition not proven"
+    },
+    {
+      "file": "ae_wto_assert/wto_assert_05.ll",
+      "expectation": "AssertEq { left: ValueId(0x915b46ce1815e1acbc84a60de70186a5), right: ValueId(0x7ea42fd7e44ed040e24b5cee2348e4d1), call_site: InstId(0xfabc340b8b242556c6d4e527f0ad1faf) }",
+      "expected": "Intervals should overlap (assert_eq)",
+      "actual": "No overlap: left=[0, 0], right=[0, 0]"
+    },
+    {
+      "file": "cs_tests/recur4.ll",
+      "expectation": "Alias { kind: NoAlias, ptr_a: ValueId(0x232504ac7edbe41f5f2f7cb1a32abe61), ptr_b: ValueId(0x5ed16cb2890e91a3cea28f89bf29f92f), oracle_block: Some(BlockId(0x5e99340a446c2dda6003789711d79d08)), oracle_function: Some(FunctionId(0x4330e16a90bd2f984bd28ad76d559fca)) }",
+      "expected": "NoAlias",
+      "actual": "Partial"
+    },
+    {
+      "file": "cs_tests/recur4.ll",
+      "expectation": "Alias { kind: NoAlias, ptr_a: ValueId(0xfe3adf826d20674cc43a17f5556562c9), ptr_b: ValueId(0x6ffd4a5ad2058a1684730f092b52748c), oracle_block: Some(BlockId(0x0c819af93a6dfa72c2b21334cf558b46)), oracle_function: Some(FunctionId(0x4330e16a90bd2f984bd28ad76d559fca)) }",
+      "expected": "NoAlias",
+      "actual": "Partial"
+    },
+    {
+      "file": "double_free/df10.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x64423fc545537fb18a94ef2c175ac3e8), call_site: InstId(0x7ff02d8cf0f31cefbfaaacb425748245) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df14.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xf70b4b5cf017417d4e5d94f105bf4970), call_site: InstId(0x164f91cd5be84544cb06df647de9fdb5) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df15.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x58630895399561a6d2a0251d7a9d4293), call_site: InstId(0x10e79bfeab1a2ea891d796d9e619be1a) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df16.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x82a077d9b3a7c7cd3338b87ccb01e590), call_site: InstId(0xba0726796726bde5b3db35cbec94d482) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df22.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x72a171e185c937932285ef6fc8fce1f6), call_site: InstId(0xf94ef1727b9b7e7c3e73b0014d7ed194) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df22.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xd92262f150dd63647f5f34d350828fcc), call_site: InstId(0x05685e51fa4202d80e2143531226ca40) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df24.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x49fc7148383a286f749abdbfd71ef132), call_site: InstId(0xd0195aca2a0bc636cee7702e9c890fe4) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df24.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xf57f216faffd33988b4836322644d9e5), call_site: InstId(0x48cc7b5c439c114c772121ffe509ef04) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df28.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xe40379158e45e51482960bca77accb23), call_site: InstId(0x692e9afe3629ed72295ab4e5f755a156) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df28.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x4de8e304b4bf8ddb28b186ba4a52c980), call_site: InstId(0xb0f32a21d514c85e51fa1627a9ef6d19) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df29.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xf303cb1cca331fcf9d49cbf23dbc1080), call_site: InstId(0x85e8eb14a3c7c3c243c04fc7907af401) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df30.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xe35eeea3f0fc58e3a7aa3581dbd5cf2a), call_site: InstId(0x9b17893fb4f86290287887dcd6f60a79) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df30.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x1f5e1c4173913c9c87dca9b1a7d8ab45), call_site: InstId(0x1bf462e424030c2a48195b6e96e723ee) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df31.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xff66ddb761ce864bee1f449be5236b45), call_site: InstId(0x4d5362b5cbf04622a9f81b3f4a36dc5b) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df31.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x0cd46970cfe43a95e93039634eca4858), call_site: InstId(0xb41d5656f165e128a393e27f14e2c9d2) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df33.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x965d2e4d960e0eb8a08c8d4033f9d6ef), call_site: InstId(0x976f5d3bf4b2992e99fcf5ef9d619f87) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df33.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xeb1e8f774b6481c058f2f535aad47214), call_site: InstId(0x8de69ffc06040dac4973f7f55c22b8c7) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df34.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xd22e5b2a5d12b165ed1637116847306d), call_site: InstId(0x2ef9941ce6e076c5afacd2bbf6c3eba8) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df34.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x8df2a2b94b6b2a3566b823082b539dd1), call_site: InstId(0x8ad18f0c9df06c2aa038c717efc69ea3) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df35.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xcdd57b9dbc57c9a9d99cac365cf69ef1), call_site: InstId(0x8366532e2bf4b1511df21fe66f13652e) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df35.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xfcf6f8a956ee52e98fe0f8804aef1461), call_site: InstId(0x22eb66c4a52763a8a24984b7f3bce362) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df37.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x9d1dc82c4715c6704e8330265ed5826e), call_site: InstId(0x4fc78d4cdacf2207f9c96c6236b274fe) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df37.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x462a68e8318f6eddef2f654075b494a0), call_site: InstId(0x01a5914140046967f47ab820d4a7230b) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df41.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x189206585940eb2448ec7cd941312313), call_site: InstId(0x0a25b076bbb7b86ad228656df3caedf9) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df44.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x5a8ba341646ea4177712ce076160d350), call_site: InstId(0x101cc806351329e0a06104fd79236890) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df46.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x3e0dcee2ff7c740eb5d185cc612da592), call_site: InstId(0x03061c3fc7762f13e1b2184e6198e273) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "double_free/df8.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x06b5e10866d237fc2a0d7b1e8ef43863), call_site: InstId(0x515ee750c97b77fe09cc76ea4ffe3066) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc13.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xe3a8e84bccfe786b0e647588ee29525b), call_site: InstId(0x86a1b6dc047b69332d11112ab2d422bb) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc16.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x7adca7fcc5a4af60677f8f1a183c51ce), call_site: InstId(0x5261f7c9193fa3377d61a343a6dd8d18) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc16.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x7eccb0c567f138c356fa57d34fd0738f), call_site: InstId(0x61f526011366e971a9f468880ab23e8b) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc16.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xbceb5f1c6ae218fb64ebac4ad6098203), call_site: InstId(0xb6510f352b643fba5bb42d10e5b855de) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc19.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x3fce4d905355441b83b23cfcd12f9cef), call_site: InstId(0x396ef396bcdd2e463784ec3e443d6885) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc20.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0x8d01778f013c4662e1db2667ef4dd0fc), call_site: InstId(0x01847b88ccca4f023d69e075b40f2598) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/malloc24.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0x3e497946d47c151911d35ce4e1bcb6f1), call_site: InstId(0x3a2f7623c999d0d47b32c4d8a75265c1) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/malloc27.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x7ea51c067087e61b14219d8bf62d4e2c), call_site: InstId(0x13c5ade129037e10b04a5b30407362e7) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc28.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xe5bc4c4c295e4f4b148b9e9af0e394a6), call_site: InstId(0xd09964fbe5196238243234fd04c4b803) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc29.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x3304500a76f25d7dd5f0391e6656c8e7), call_site: InstId(0xfc458f724cfd928d6b492db9ab62dc5a) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc34.ll",
+      "expectation": "MemLeak { kind: NeverFree, alloc_site: ValueId(0x6a44dff3892662f515c6dbb082bde4ec), call_site: InstId(0xda99fa15967e449c1eea37d9ad660fee) }",
+      "expected": "Memory leak finding (NeverFree)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/malloc37.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xe062c03a67890952ca3ef352ae4d5775), call_site: InstId(0x2bee7feb9a104e6d9147a9dd8f002d7d) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc38.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x57a6ec348b0e5c25570274028c180f56), call_site: InstId(0x397f448050265cc8889e504d924c4809) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc38.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xc1e7384483c906147ed070f307763e15), call_site: InstId(0x9dc04aa88c78ee77ba0e0bb3b527c4d7) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc4.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xb147f4c0bb1f709ea90e3ad89e359165), call_site: InstId(0xabff9082f4f901a90977f2e77e1d1e86) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc43.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x24b687850bbc9f5b77f2f38e675225a5), call_site: InstId(0xa4fd4de9a758812a3f61d13c3fac7a28) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc44.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x8593d0e8c608fde10dc5111a6a8f96e5), call_site: InstId(0x1e85a64b7b77ffec2d64e19cd211cda1) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc45.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xba4892c8415edc8eade3d4073a78a0c6), call_site: InstId(0xa42a3498fefb2d7ac6a914a707fcc514) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc47.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0x0718bfd48c1d5f6ad67ba3b472c3636c), call_site: InstId(0x87cfdbe2b91ac16654e75d238e844302) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/malloc48.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0xcd28e0b7a3e8e370d80e35ad0b60f0bf), call_site: InstId(0x84e6e49a8e19124c00394ed22d584502) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/malloc49.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0xf312f8c02a248a37723213f1b245aad7), call_site: InstId(0xafbf61e79eba950a70433445b03c03b5) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/malloc50.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0xa8e4f4c6a1441abd8f6f52ca74c44253), call_site: InstId(0x3c8450e8a7ee283d63a7d348d6822a98) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/malloc53.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0xff60ef85ab39be8aa3d788a343c4e224), call_site: InstId(0xa8881bd585c6f4b0992a8af6539472e2) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/malloc53.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0xb470ca5c0bc715a7f2d24c81723b7743), call_site: InstId(0xeba1095c9b76b832c590a6ef1a6b5823) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/malloc53.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0x7371afa418ebb03ff480c9f632b0da38), call_site: InstId(0xc520c0628970a79ccdbb3104a71a7ea4) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/malloc58.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xc571c1ee64a75a70f2ec90ae0cbedc89), call_site: InstId(0x5cfaf08a7239bfe0db2faa0c06af0f7f) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc58.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xdad30aea246a0b6c9d3b63ae2ce043d0), call_site: InstId(0x67766c606e1c79231d658306a2f97405) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/malloc7.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x34bd8cddf488243a8cab38a559cf676b), call_site: InstId(0x22c4777c57fc62e50ab1d425e7cc1568) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/sp1.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xa9cd4f97816eaf0d244ef06524286629), call_site: InstId(0xd7cd0e79a4b5a36b0ad2cb4ac1ad9247) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/sp10.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x9aa19a381fc44035cd77519b3f5abf4e), call_site: InstId(0xfe9c4d0b7b2124ee5651911cf4f98b0e) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/sp12.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0x3f5cc0c6eb2014c31d755c941093766d), call_site: InstId(0x7705ae48404e6e025111588f95540fe3) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/sp12a.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0xc62a7db52f23fde272d0db19dc470c08), call_site: InstId(0x0c82705ea2937a8e3380277d1547fcd3) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/sp13a.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xc359537c6f20b95cef95418c238a6ee5), call_site: InstId(0xfc7c2754ef3dfb8131df02710c0c8f01) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/sp14.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x02a377c6f0a35ae1d49b6e7bd6836e1e), call_site: InstId(0x347da1f8c0ce2ef71eadd6597a2a2c51) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/sp2a.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0x027ebe6089dd85de2b9b682eae8c9fa5), call_site: InstId(0x972baae5577f70020c49728823d58e43) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    },
+    {
+      "file": "mem_leak/sp3.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xab329871894027efc82cba6671e97d2b), call_site: InstId(0x54a082bee09bb1f78b9514ef49713150) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/sp4.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0xe4026a6f904292820a85befca283432d), call_site: InstId(0x6be57a5cf9a8eae257f1145d72bae3f9) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/sp41.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x1bc233b14f7dc5e459fa8ff198f910eb), call_site: InstId(0xa2230d58346dc5f3fcf35f424f4a3f48) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/sp4a.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x422ff09f3709a5cf21a115fd713cf5a9), call_site: InstId(0xb685ea7ce7536285578fed75f98d9038) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/sp7.ll",
+      "expectation": "MemLeak { kind: Safe, alloc_site: ValueId(0x72661b4b14bbf98c824a19ad9bf0a71f), call_site: InstId(0x96e395514612ae17f08e9f27f6a46d39) }",
+      "expected": "No memory leak (safe allocation)",
+      "actual": "memory-leak finding reported for this allocation"
+    },
+    {
+      "file": "mem_leak/sp9.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0xcbc3daf6c1551a36145722067d59a950), call_site: InstId(0x278e0e2d7cfbf0e996e6dff3e56ac343) }",
+      "expected": "Memory leak finding (PartialLeak)",
+      "actual": "No memory-leak finding in CLI output"
+    }
+  ],
+  "to_verify_details": [
+    {
+      "file": "basic_c_tests/array-constIdx.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x87adf00e9298c30843e073418199f778), ptr_b: ValueId(0x7622569667ae8108d43a13df936cae56), oracle_block: Some(BlockId(0x927b5965721fe8bd23ffc3d44bf0bb3c)), oracle_function: Some(FunctionId(0x963c5e454129818759e9651cb7498b76)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/arraycopy1.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x02794050ec83fef19f6845995ae80599), ptr_b: ValueId(0xe57be2e2fffa70392272064b82818ef8), oracle_block: Some(BlockId(0x104c8b447331bf5bf597758bbe641f6a)), oracle_function: Some(FunctionId(0x87cd11ad48f9be9d6d29b6250dbb8411)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/constraint-cycle-copy.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x69cce6ab81ab7acce4b2fc34bab176bd), ptr_b: ValueId(0xd0b0e50698574c37a588da4e40725fa6), oracle_block: Some(BlockId(0xa43fcdb8dae6983b4c84913790bfbf04)), oracle_function: Some(FunctionId(0x6d1c9c0be181f2bc77f79d96ac120aa7)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/ptr-dereference1.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x989b4a7405284df4902caab73adcd563), ptr_b: ValueId(0xcc84e86b64197d55568918d156fea907), oracle_block: Some(BlockId(0x32a03169b21908f5e0457c723e9f3162)), oracle_function: Some(FunctionId(0x3ea3073d41052de46008f45c3954669c)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/spec-gap.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x042375af8807cf6207d1ffa0689f5f12), ptr_b: ValueId(0xf75b50441e447deb7e087cf254942298), oracle_block: Some(BlockId(0xc8ad93871d38052d94a5f95834c2fd80)), oracle_function: Some(FunctionId(0x1cd7502e2724e9f582c9cc34872dcdd9)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/struct-array.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x4a9121a508d9b39ac63c97cd9cc4b35e), ptr_b: ValueId(0xe7d983e0655b8dec06f554c160c599a1), oracle_block: Some(BlockId(0x3518cb00542b2881a84ff1fbfff26e75)), oracle_function: Some(FunctionId(0xab49f015c01edfc8b5b0ba316e74480c)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/struct-array.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x1af87a3eefc876b5b8b3cb9a48ede655), ptr_b: ValueId(0x9c9cb6e579c621382a12ca8ee58be7b9), oracle_block: Some(BlockId(0x3518cb00542b2881a84ff1fbfff26e75)), oracle_function: Some(FunctionId(0xab49f015c01edfc8b5b0ba316e74480c)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/struct-array.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xcaf02d9a1fd9babb798cb86e1ad1fc26), ptr_b: ValueId(0x6cc0f510f490ceb8cdb0fddc10e5f78d), oracle_block: Some(BlockId(0x3518cb00542b2881a84ff1fbfff26e75)), oracle_function: Some(FunctionId(0xab49f015c01edfc8b5b0ba316e74480c)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/struct-incompab-typecast-nested.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xa29be03822aac65f48f5253deeda0e5f), ptr_b: ValueId(0x3275b950ad940ef0189a88aed606dffb), oracle_block: Some(BlockId(0xef0a7c74b27fe8df040538446e4f10dd)), oracle_function: Some(FunctionId(0xb220cee83b89daa619cefe82432b7247)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/struct-nested-array1.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xf440a1ffb87b3371342288a7e12cb1c8), ptr_b: ValueId(0x46a605e37a7e3be4b842e64af60a722b), oracle_block: Some(BlockId(0xa41946e1889ed3385b38d5b39626147d)), oracle_function: Some(FunctionId(0xae2a9752ce325e4abcc5f1c2e8b4ffa6)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/struct-nested-array1.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xd48dfc1c3985e07f1aaea71aefcaf744), ptr_b: ValueId(0xaaa735c5a021d3d81dee1baa394d5647), oracle_block: Some(BlockId(0xa41946e1889ed3385b38d5b39626147d)), oracle_function: Some(FunctionId(0xae2a9752ce325e4abcc5f1c2e8b4ffa6)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/struct-nested-array2.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xf89c77f5b144387245b22a1825bc82fc), ptr_b: ValueId(0x3c1d2c5db34b8dd21674eed433c331a1), oracle_block: Some(BlockId(0xa2e8c753c8d1ad923538412ad316f280)), oracle_function: Some(FunctionId(0xb084c8494e46a8a1416b9bcdd67f1bbb)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/struct-nested-array3.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xb78a959b80cef53ae2d7a260f770fdce), ptr_b: ValueId(0x9984ed6b95891eb2db36bc490e87cc5e), oracle_block: Some(BlockId(0xd9942ef8a36e8dcd0770a1ebbe939b18)), oracle_function: Some(FunctionId(0xd3be90e7f5622a95fcf214417ea1d43e)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_c_tests/struct-nested-array3.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x602aa8757b0820b31809590d7cf41dc4), ptr_b: ValueId(0xab5e50a21c210ed6b4094f6f07f7cd09), oracle_block: Some(BlockId(0xd9942ef8a36e8dcd0770a1ebbe939b18)), oracle_function: Some(FunctionId(0xd3be90e7f5622a95fcf214417ea1d43e)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "basic_cpp_tests/static-return2.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x9dde6769f8cb8e343374e7ede55dce5e), ptr_b: ValueId(0x2117c6385f97717f41dc06212c5a0961), oracle_block: Some(BlockId(0xed565df0ddb7bb0d7bd073df231c479c)), oracle_function: Some(FunctionId(0xfe9efc65ec6f445e6203e4d959c1f477)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "complex_tests/swap-array.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xd53d188e6ac4b4b5884a705118c5ffad), ptr_b: ValueId(0x9b165fa6380e95d8b449c902829df60d), oracle_block: Some(BlockId(0x40568137200aad322f5cf2c5f84ed772)), oracle_function: Some(FunctionId(0xd0ffa62444f343e30d9601c7e878d13f)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "complex_tests/swap-array.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x0663d76d5c1dfa65fc59a5b818bd10f1), ptr_b: ValueId(0x519c020a03141cbff8d1723b25ec9fc9), oracle_block: Some(BlockId(0x40568137200aad322f5cf2c5f84ed772)), oracle_function: Some(FunctionId(0xd0ffa62444f343e30d9601c7e878d13f)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "complex_tests/swap-funcptr.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x3d8d04ad41ca3febb0ad9d8df2238d41), ptr_b: ValueId(0xa684991b324ca730a83877c13f38b3ee), oracle_block: Some(BlockId(0x9cac978a34a66d416c16415755877101)), oracle_function: Some(FunctionId(0x3d077545678eef02f9092f545874946d)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "complex_tests/swap-funcptr2.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x0038976a103c44beabc28ee6da4704af), ptr_b: ValueId(0xb9bec2743fb3113a9e72341c02bc0dec), oracle_block: Some(BlockId(0xac62e76a8f279a7c0b1beb6f885c7a4d)), oracle_function: Some(FunctionId(0xf962121dee1d467aa9a73d6f18a3b0ad)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "complex_tests/swap-global.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xb82de0f8bc2f5d90dbb60f297a2f68d8), ptr_b: ValueId(0x66697fb36a6c18770e8b51ac8c233f45), oracle_block: Some(BlockId(0x3fb460a1fea08e16f9ded4ee275c1cd6)), oracle_function: Some(FunctionId(0x1209f8e57c34798bc876b041d1095920)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "complex_tests/swap-global.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x83c40ae4940f92634b93d1894b5e182c), ptr_b: ValueId(0xd923a51701a883e6ab9d1228e4ac4848), oracle_block: Some(BlockId(0x3fb460a1fea08e16f9ded4ee275c1cd6)), oracle_function: Some(FunctionId(0x1209f8e57c34798bc876b041d1095920)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "complex_tests/swap-struct.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xa90641c64c5fbf0a6254471aa8d69821), ptr_b: ValueId(0x4e47eccb1b3aa52a6f29892fa1398f64), oracle_block: Some(BlockId(0x6131f1f1615912bc03652a63fb68d0a1)), oracle_function: Some(FunctionId(0x9aa7d54c2648a8b59e963183f85869c5)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "complex_tests/swap-struct1.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x5cf318587a3b7e8958cfb4382889e2d7), ptr_b: ValueId(0xaf1a2dbbd8bf1ec82c2242a94642a221), oracle_block: Some(BlockId(0x2a90e082d471908ebec5981b0921c04e)), oracle_function: Some(FunctionId(0x9facbf780a27998c592215556242f7c8)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "complex_tests/test-recursive.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xbdd0cf135278904cd7f66efc80d4ddba), ptr_b: ValueId(0x89e0313ef60f97d5aa7dd11bab8505a1), oracle_block: Some(BlockId(0x8a9953fe8b251d89d348627f9f676825)), oracle_function: Some(FunctionId(0x5f819b0186cacf55ea7a0942aef553cd)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "complex_tests/test-recursive0.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x142f50b4f2450c0974b8528b4ad3b47a), ptr_b: ValueId(0xeac429ae6a63abbe7ed82c257185be4c), oracle_block: Some(BlockId(0x4096e670b0ac810d14052361c0b8b26a)), oracle_function: Some(FunctionId(0xd07173d0f9b924fe70f0081841ae3059)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "complex_tests/test-recursive2.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xa727427b3d8638b6e2895d79cdff1e85), ptr_b: ValueId(0x86996e72157be036bd8ca97a8f707e02), oracle_block: Some(BlockId(0x17c42a667efc09ac143c3207baaad2e1)), oracle_function: Some(FunctionId(0x5acdf02d4a4f9d533ec557f48a88c125)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "complex_tests/test1.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x5503b6ed77fb37cb83a250fc874721f4), ptr_b: ValueId(0xb1885929302a3dd73deb708bd031dfc8), oracle_block: Some(BlockId(0xe3cc244598ec8130d2abdb17f7029091)), oracle_function: Some(FunctionId(0x1a7bdd40141801de1bd6f5737dc68d25)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "cs_tests/recur8.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xe7a3ef27aa020297f76d6ea87f83d79c), ptr_b: ValueId(0x7d5e882d9da36ad544aa0af698755254), oracle_block: Some(BlockId(0x7d72efc958c4cad23a387cae71e16303)), oracle_function: Some(FunctionId(0xadd25337380c1b54dc4695c1f6134de3)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "fs_tests/array_alias_2.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xb7024ed7428441b420985281fdd489b6), ptr_b: ValueId(0x670b38d138d48c57b8053d2a9498e7ad), oracle_block: Some(BlockId(0xc580c816d9dc7345500bd967c0d9e84c)), oracle_function: Some(FunctionId(0x3872484e90aca61258f2d8f2c1052151)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "fs_tests/array_alias_2.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x21db9836b500623d0f11caa06b308728), ptr_b: ValueId(0x494aa921c6c35260ea9d09e695db912a), oracle_block: Some(BlockId(0xc580c816d9dc7345500bd967c0d9e84c)), oracle_function: Some(FunctionId(0x3872484e90aca61258f2d8f2c1052151)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "fs_tests/array_alias_2.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x31dc6e5d206cb45c5d8b82052dad7751), ptr_b: ValueId(0x49d5e7c627be0daa39954ffc0ad334c2), oracle_block: Some(BlockId(0xc580c816d9dc7345500bd967c0d9e84c)), oracle_function: Some(FunctionId(0x3872484e90aca61258f2d8f2c1052151)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "fs_tests/array_alias_2.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0xf66df9e4afb00ea3379ddf07285bbbbf), ptr_b: ValueId(0xb837e665fdde0857274bca01e7b169e0), oracle_block: Some(BlockId(0x258169d6ed8927d98c3a78bb190f5fe4)), oracle_function: Some(FunctionId(0x3872484e90aca61258f2d8f2c1052151)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "fs_tests/array_alias_5.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x9d36ed21d4029e4107f20f3d140676ef), ptr_b: ValueId(0x0b42ff55eae99f074bb6815c5e47992b), oracle_block: Some(BlockId(0xf1031615d5132b00872599b1e4ee28be)), oracle_function: Some(FunctionId(0xae86655b08e938ab47794a04a299c4de)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "path_tests/path2.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x3827c11b0ba147b6fe4de18b9a10aad3), ptr_b: ValueId(0x0a71230d51b229ccfdb816a817f10808), oracle_block: Some(BlockId(0x6ce8d5199e558d9aa2adf066c2f96d81)), oracle_function: Some(FunctionId(0xc7612211b28b8d4e932e1bd0815f475c)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    },
+    {
+      "file": "path_tests/path2.ll",
+      "expectation": "Alias { kind: MayAlias, ptr_a: ValueId(0x3827c11b0ba147b6fe4de18b9a10aad3), ptr_b: ValueId(0x402d1b55d2bc4fadc0f39ee7957c2144), oracle_block: Some(BlockId(0x6ce8d5199e558d9aa2adf066c2f96d81)), oracle_function: Some(FunctionId(0xc7612211b28b8d4e932e1bd0815f475c)) }",
+      "floor": "MayAlias",
+      "actual": "NoAlias",
+      "note": "SAF reports NoAlias where baseline expects MayAlias. If correct: SAF proved non-aliasing (e.g., via context-sensitivity). If incorrect: SAF has a soundness bug (missed an alias)."
+    }
+  ],
+  "sound_details": [
+    {
+      "file": "ae_assert_tests_fail/BASIC_array_func_1-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x6537808c4c71122e33401a323a041437) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/BASIC_extapi_strcat_0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x07be9fa279ca629a635e78a5d0de1609) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_18-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xc70e6b93db8855c3dc7033eb238e819b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_23-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xa8ebb44baaa0dd716daa4f52b0d4477e) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_26-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x3449e948ec1ee205c4c4bfeae640fdf1) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_27-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x70d69884eb4cd9ed1d08ca8fb470df62) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_27-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xa52b725e673cff83f545fe534c19e962) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_29-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x785e9dde1d6894a1423901d5560b7c42) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_30-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x8b1549c7239d624ec89b9e343ed4f795) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_31-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xde65d4c18c0396430f679ebc7b0540cf) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_35-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x70df2e21a0fde93859d707bd298a395b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_39-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x4b75938bd268e639ffa48746284c778a) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_4-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x37ab930e08d0da7fd022ec07c54a332f) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_4-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x60b6e6fec998edd74466314b34cfc4e8) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_40-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x8a52dff8b33df22d6fddbf59549b41e8) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_41-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xa8dd330717723b7db9a331978892abfd) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_42-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x2dde1b25a0e6ca75bd8a4776995a1961) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_44-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xbc8100689a543d9fa1192db387f30468) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_46-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x1970f802fdaa1bfd9d130bf96ebc7bea) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_46-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x8af9c632d07e40a912eef0f0ed4d90a4) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_46-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x0dfa3b4570f60255309dbddff4504671) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_47-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x071af2d7ba8c9c948f67850886610817) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_47-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x27f202b99d0be3e718b921fbbf192eb9) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_48-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x0d231c4d8ef7d1bbceffe602a5668db5) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_50-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xc5f1ace42382105d3f1a274b100542bd) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_57-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x4cb56b3c942406fb43f015563761ea15) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_60-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xee4d0066d9f0366154c035e7510a8253) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/INTERVAL_test_60-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x93cbb2948057332e84bdb2234175b933) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/LOOP_for_nested-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0x19105ff117ad8c50ab459f690f6a89ea) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/LOOP_while_nested-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xa80a7501870e0c2f4d0eebbf589f3712) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_assert_tests_fail/UAF_uaf_0-0.ll",
+      "expectation": "Assert { kind: ShouldPass, call_site: InstId(0xea6eb0da4c7b479760e514c78cf720d9) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_nullptr_deref_tests_failed/array_1d_big.ll",
+      "expectation": "NullCheck { kind: Safe, ptr: ValueId(0x5ddef14e9619c8cdec76e3614628f344), call_site: InstId(0xf2f22be4ae9556789abf97149efda897) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_nullptr_deref_tests_failed/array_2d_big_partial_null.ll",
+      "expectation": "NullCheck { kind: Unsafe, ptr: ValueId(0x4752199211ae9b5874fc9567d264b2c0), call_site: InstId(0xd62cf56d29c89a733f0a3370883d6dfc) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_nullptr_deref_tests_failed/array_of_struct_func_ptr.ll",
+      "expectation": "NullCheck { kind: Safe, ptr: ValueId(0x7569ef7e60321551b1ac0dd261efd2a7), call_site: InstId(0x4cc5459c407370f49d6a5bd80a11e61c) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_nullptr_deref_tests_failed/recursive_safe.ll",
+      "expectation": "NullCheck { kind: Safe, ptr: ValueId(0x1d672585a357efed35a7b378b54c1e04), call_site: InstId(0xc13a00c82cce8208c329a0076fbcf793) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_overflow_tests_fail/CWE122_Heap_Based_Buffer_Overflow__char_type_overrun_memmove_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xde15824d2e85d28fa7d156fe52efff00), size: ValueId(0x258e1a92e90a4c927ff077392a965b2f), call_site: InstId(0xdb7f02b980fa230aae3da01b1f824fce) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "ae_overflow_tests_fail/CWE122_Heap_Based_Buffer_Overflow__wchar_t_type_overrun_memmove_01.ll",
+      "expectation": "BufferAccess { kind: Unsafe, ptr: ValueId(0xf8cd159ba1835ea0230b0c7a2e513f5b), size: ValueId(0x030c62ed7518c46c9f1a82214e8dc601), call_site: InstId(0x41e1df0123e8d5c9fbca052e897aacaa) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "basic_c_tests/field-ptr-arith-constIdx.ll",
+      "expectation": "Alias { kind: ExpectedFailMayAlias, ptr_a: ValueId(0x99836791747cef2699c8f81a517376e5), ptr_b: ValueId(0x69b4dd224544397750f206b83ea75181), oracle_block: Some(BlockId(0x52d2f4323f009ae4ad422febcaea670b)), oracle_function: Some(FunctionId(0x25f2fc1cd85374dd76cbe79ee4255d7d)) }",
+      "ci": "PartialAlias",
+      "cs": "Unknown",
+      "fs": "MustAlias",
+      "ci_pts_a": 2,
+      "ci_pts_b": 1,
+      "fs_pts_a": 1,
+      "fs_pts_b": 1,
+      "ps": "MustAlias",
+      "ps_perpath": "MustAlias",
+      "ps_guard": "PartialAlias",
+      "ps_dead_code": false
+    },
+    {
+      "file": "failed_tests/multi-inheritance-1.ll",
+      "expectation": "Alias { kind: MustAlias, ptr_a: ValueId(0x4beb64bbe475cfd7e8b27cba8c67e9ff), ptr_b: ValueId(0x53d1b61a84bd4ee5c3b0a1864c73fe8b), oracle_block: Some(BlockId(0x39a4b1777acbb0d7ff0efa1e4ec1e68a)), oracle_function: Some(FunctionId(0x5da780f9cc2e9374b240b1dd1d0ca918)) }",
+      "ci": "PartialAlias",
+      "cs": "Unknown",
+      "fs": "PartialAlias",
+      "ci_pts_a": 1,
+      "ci_pts_b": 2,
+      "fs_pts_a": 1,
+      "fs_pts_b": 2,
+      "ps": "NoAlias",
+      "ps_perpath": "NoAlias",
+      "ps_guard": "PartialAlias",
+      "ps_dead_code": false
+    },
+    {
+      "file": "failed_tests/multi-inheritance-2.ll",
+      "expectation": "Alias { kind: MustAlias, ptr_a: ValueId(0x6ce0b0f821bdd46d5ddec1c7949d8dd8), ptr_b: ValueId(0xb5f4e474198499b250ae3c50455e0262), oracle_block: Some(BlockId(0x10ccb665fd934adddb0a6a3b2fd132a5)), oracle_function: Some(FunctionId(0x03ba92fbed5330d9aa0ad1b282dafec6)) }",
+      "ci": "PartialAlias",
+      "cs": "Unknown",
+      "fs": "PartialAlias",
+      "ci_pts_a": 1,
+      "ci_pts_b": 2,
+      "fs_pts_a": 1,
+      "fs_pts_b": 2,
+      "ps": "NoAlias",
+      "ps_perpath": "NoAlias",
+      "ps_guard": "PartialAlias",
+      "ps_dead_code": false
+    },
+    {
+      "file": "failed_tests/multi-inheritance-2.ll",
+      "expectation": "Alias { kind: MustAlias, ptr_a: ValueId(0x3b0d5c40438321415eed42434af0c67f), ptr_b: ValueId(0x21cb55c55e12e2061229709f8c97a60f), oracle_block: Some(BlockId(0x93245d6447522836de8a0df6b48c12c3)), oracle_function: Some(FunctionId(0x59215d4876d3a8a3dd68c5cf4ed7513e)) }",
+      "ci": "PartialAlias",
+      "cs": "Unknown",
+      "fs": "PartialAlias",
+      "ci_pts_a": 1,
+      "ci_pts_b": 2,
+      "fs_pts_a": 1,
+      "fs_pts_b": 2,
+      "ps": "NoAlias",
+      "ps_perpath": "NoAlias",
+      "ps_guard": "PartialAlias",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mem_leak/malloc26.ll",
+      "expectation": "MemLeak { kind: PartialLeakFP, alloc_site: ValueId(0xfbe1ac0166eb35f64ebe8f3f266da04e), call_site: InstId(0xfe64e0852aecf48d1a98ac2674ac6fa1) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mem_leak/malloc36.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0x5ce01a7be833ab1a94325666d9a79c6c), call_site: InstId(0xfc27ad352dc60186160d40f06407f6f9) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mem_leak/malloc4.ll",
+      "expectation": "MemLeak { kind: NeverFree, alloc_site: ValueId(0x8c36ef76503a15c15da92147ee2a9cdf), call_site: InstId(0xe4411061f03fc67c95019eae380e6f6a) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mem_leak/malloc61.ll",
+      "expectation": "MemLeak { kind: PartialLeakFP, alloc_site: ValueId(0xab9f690c9c11da1bfd8866d221a5c1fb), call_site: InstId(0x0a4b8bdf50a860a57cfbea9fd123e39c) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mem_leak/malloc62.ll",
+      "expectation": "MemLeak { kind: PartialLeakFP, alloc_site: ValueId(0x79b1b93d11093a551e222016c6ed6478), call_site: InstId(0x50a2659c0ad12b416e7bce030ea88ebc) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mem_leak/malloc63.ll",
+      "expectation": "MemLeak { kind: PartialLeakFP, alloc_site: ValueId(0xb575124895362cf6be4e70da885edd97), call_site: InstId(0xcc94f2d3b0d959e26e879070cc9d9443) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mem_leak/sp14a.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0x704524097fb4cbbf9a977d5c416f47fb), call_site: InstId(0x1de5170604179245c534fe1a12272f69) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mem_leak/sp8.ll",
+      "expectation": "MemLeak { kind: PartialLeakFP, alloc_site: ValueId(0x214a443157668fb6af1b35c8ac8370c3), call_site: InstId(0xbc9a51dcb04cecf23d6298fd5001b1a3) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mem_leak/sp8.ll",
+      "expectation": "MemLeak { kind: PartialLeak, alloc_site: ValueId(0xbfc5b5507b472c08d9e200a0ec3af064), call_site: InstId(0xd970a1b204427f981c758559397bc162) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x1a5474dd78d1cfb48c9b69f487624a3d) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 1, context: \"\", expected_interleaving: \"\", call_site: InstId(0xfb9718b38020dea1dd0ea47d433e4b0d) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 1, context: \"\", expected_interleaving: \"\", call_site: InstId(0xfdbc1d2ab24af80e53177e2b17a69bc6) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 1, context: \"\", expected_interleaving: \"\", call_site: InstId(0x29f97fdbbc9c84ac868f082112433857) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_1.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x182a190eac329ff971fdc455c59a0b2e) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_1.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xc3d58ff68c796378185e5f5979d52b34) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x628373d0ac6172c3b30c5e87d3c56cae) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 1, context: \"\", expected_interleaving: \"\", call_site: InstId(0xe80d53d5481b3be181b9db85bb897bad) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 1, context: \"\", expected_interleaving: \"\", call_site: InstId(0xcab9e23434b21f29a1c69d2a25474b3b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 1, context: \"\", expected_interleaving: \"\", call_site: InstId(0x2a2b875a3278860c0c21183c8c6d457c) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_2.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x3b308417e49b03d6cb8475cf752050d9) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_2.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x5ce72697a10512ec60da65264ec25a27) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x8f44af294e5abc8611d0599778c1820b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 7, context: \"\", expected_interleaving: \"\", call_site: InstId(0x5d84587bc87b2661acb9357532974dce) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 6, context: \"\", expected_interleaving: \"\", call_site: InstId(0xbfc3fcfbafe44d47b937b2cc9d872e76) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xefbba369d411258a1d9da23e3f961d58) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x523691080a177c1f76a4370363de4545) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 1, context: \"\", expected_interleaving: \"\", call_site: InstId(0x763f499be0476d3ea2d6a5d26c526a67) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 1, context: \"\", expected_interleaving: \"\", call_site: InstId(0xad17835ae600b512fd8a6523b893b0db) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 1, context: \"\", expected_interleaving: \"\", call_site: InstId(0x69e2c1f4237e807c5298ad5004f0bdfd) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_3.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x69fb6b2d3d5da47481c430a8a473280d) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_3.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x45e70c9e15256e9753e90073ba03506b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_3.ll",
+      "expectation": "TctAccess { thread_id: 2, accessible_threads: \"\", call_site: InstId(0xd3d687e18b2c1b44f2e51e446d694a95) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_indfork_3.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0xcea392a8dd8ab82cbf6fc484a8f6bb26) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_join_4.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x5bcf88c4f6645ccc4fda637bd8872482) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_join_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 1, context: \"\", expected_interleaving: \"\", call_site: InstId(0xed5d6dd5a6f81b963d748fad1109864e) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_join_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x778542329715c1e3b667f140d8d1f726) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_join_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x2f31f27ee9c46a69b3141cfa0992da8b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_join_5.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xe906006dd50d5aacb658d2b91b7c896d) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_loop_5.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x4a3a05e7cec2dde4700f6f993d10d8af) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_loop_5.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x3552469df4e45e76f9601e591d6d1e73) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_loop_5.ll",
+      "expectation": "TctAccess { thread_id: 2, accessible_threads: \"\", call_site: InstId(0xcd069f56afd8f1559e1531459a7b85cf) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_loop_5.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0xbe6f27b2b450943dd5a43467cc2e6ce2) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_offspring_5.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x486e1da9432529b37eed665eb3dc9d21) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_offspring_5.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xf2fc9d8adf6a7fa50c884ed892a936a4) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_recur_2.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x6fe45b97a5a3509bec06c6d26c921ae7) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_recur_2.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x1ffd019aea41d1bebbb2965be9cae4d3) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_recur_3.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x89935e604547bc67581b8eff5d746f23) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_recur_3.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x47247fa900c076dcd79b61f28add9aa2) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_recur_5.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x5f7ecc4563c0222cdaf4865b41a9d612) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_recur_5.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xe82908c3c75a682504b2959e4ad3816d) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_recur_6.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x7480b95e715de7322c99395d69cf310c) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_recur_6.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x58ba54375d5418d039d5b7b60a0839f8) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_10.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x39c123acb86aee56622fb1653637a699) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_10.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x277cc8f6bb188e055c876175752b0a62) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_10.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x9e73d636e1e4afa2e76772d2b1099c5e) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_10.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xfa8ea1959db16a12330dbeb88e38a2b3) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_10.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x4224a789eb7d80c95ea8062524009c44) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_10.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xb08c182c40e588d8308778ccdabff4e1) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_10.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0x84ab400f8fb59b0fc48960ccfbfef0b8) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_3.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xb5331d517bf28c2bc13eae8babc9e51e) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_3.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xaa63b9d471f39be91546374fb0029b34) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x132f4e200c19a2ff273e5ec9c042688c) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x04e3e7dcd4ef1f2ae370627412972f22) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xdd99a14ab46675c3dfca0927c0da7466) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x719fb6b28d18cd1a6620c3ee14001f78) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_1.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xfed92cd4fb51f68d248aa3d77a1b2015) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_1.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xa8ae878b9c266e4ea38ab9496cd67bfc) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_1.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0x5b7b78000f7da2f50331d73b7a03a006) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xe527b84ab11eff6916859f17777e3047) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x7ffbda7b8972bc5e0713e8d94b85e457) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x514a141fa1e19d3f80b8d08c724367d2) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x2fd6d6cb2bff131972d95f6e9df370f5) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_2.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xb3b9a7cacca12eeb7d08c535d8e36caf) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_2.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x9789046b7fcd5378e94874c784f981ea) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_4_2.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0x900e16d3adf8a67ec0dced6cab836024) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_8_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xdc6f88df3ea400d2c8499a067499aee6) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_8_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x9989b1500f5339f6eedcda2341b0f381) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_8_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xdb7b1945c987b87c09c4ba19766186f6) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_8_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x8bd857649d2d803d1eb6afb1827b857b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_8_2.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x5b927c00124fa9d441a93148ec745fda) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_8_2.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x26b426a7f0b5c6474a15dd7032504bbf) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_8_2.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0x6d3a4bc9e458bf24005c0017b6b2c861) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_9.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x2e9c8eb858e3a10b582e421a1394c808) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_9.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x98e22b60da95c38136d8e84bb7144fd0) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_9.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x7c8722866d82e4d506ec82af1592d5b3) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_9.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xdfba2b248bb6517d1e41806dbe25dbc1) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_9.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xd6bcee5732e4a727fb605632cbb0c669) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_9.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x1820c10e9eeea4cde6a01ad59cb7052f) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/imprecise_cxt_thdindex_9.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0x7fda34d8a24d7ba71bdea7777694d0f2) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_branch_1.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x86daa395d4948f769abbb5736777b317) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_branch_2.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x55cc3e838ca214043fe29061069b13af) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_branch_3.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x6238d8d7da38afe718effc2c5f384523) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_branch_4.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xd55e9fbd4548a87b4a0d5d0aee5cbda5) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_branch_5.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x5a5aa24d91fcf171695faa42d2eebd37) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_cand_1.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x5ee50811b3f9a1567508a35c077d60fe) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_cand_2.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xe1d80da685826b7929ec6b4c58ea34e0) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_cand_3.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xa74d6d07031135c6f5b3f9cc43392b4a) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_1.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xaa9cb6debb6bb1e158965cb0f229fee7) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_1.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x042ff40225d83283a761e8adba91ec21) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x13997f65510d801b6c0a62665e0f286d) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xe250ee40b3ed9c1759eea76886126ef3) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x6730f31c4b081694cee5b150381d0baa) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xcde1678e1ec2cf5f8e60ff7ff096e486) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0xd4f54915dbd8c3e4823c67d25ac6c517) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0xbbc70621b7e2c9e3d56843f4cc4b47df) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x60935ca9c986f8283c8c403152a22dfd) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0x36b70470f0b7dd1a64f967548f4fdba3) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0x91f137890623abd687b3918fc3e24fd8) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0x6e6ffc81aa4403ecc2e059a181a5a304) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xc6ce1847c0d065b01a757d7d951302ab) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xfd2c7fc9f953168504591edddf985856) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "TctAccess { thread_id: 2, accessible_threads: \"\", call_site: InstId(0xdabc299f4b7be639bf715116acd508a3) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "TctAccess { thread_id: 4, accessible_threads: \"\", call_site: InstId(0x5856b25b5f483a7619c083e987cb490a) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_2.ll",
+      "expectation": "TctAccess { thread_id: 5, accessible_threads: \"\", call_site: InstId(0xbff9269799828758be179fb8380e49d3) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x796da64e138bf289204bb612cabb5d51) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xd7790882cfaacb44b7d369921f9c8432) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x17238d343fb7b726ee8ed05484722c32) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x8c9bb469e2423bd4af1b13acaede9a76) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0xa13a7a1beb16f86286038bcce927ec73) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x04160bedeebdd9ebd8f47b8c2f5613fd) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x3f3f0254dbe58436650f340f091cd9cf) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0x4d04bee5468ab79e6143bab48e8b2f79) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0x92815630d2e6d2c5138e5816f26b9bba) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0x23c8c1ffdc74c63fcceac79235855859) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0xe5ae4e6cb5c16a858b4d1e57e24769dd) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0x37b0130a52d747c193126815ee853f1e) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x2220d50a32c0d64b3741de02f193869d) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x51ff512fea5ef3685447ac797879092c) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "TctAccess { thread_id: 2, accessible_threads: \"\", call_site: InstId(0x76979f72419edf1d6b7211aa6b533a49) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "TctAccess { thread_id: 4, accessible_threads: \"\", call_site: InstId(0x6368607f0684e43b0c885f06bc3f08a9) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_join_3.ll",
+      "expectation": "TctAccess { thread_id: 5, accessible_threads: \"\", call_site: InstId(0x4422830c6bab527b329db01dd08dcd55) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_1.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xb0b2be00b61ff683a7dc83909274250f) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_1.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xd2894db392bdf3c5eb63f636269032b9) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_2.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xf8c2914a127ccf815c632665ba84a923) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_2.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xfde05f89192a882798f6ddcfe67a1acf) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_2.ll",
+      "expectation": "TctAccess { thread_id: 2, accessible_threads: \"\", call_site: InstId(0xaccdfe9baceec95a28d70992366cf016) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_2.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0xa5d41cd4d569d3e2e7d58600518b771f) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_3.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xe0191b027e73310d2d8e25ed3eda6af1) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_3.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xfe3e2f27f449c47ec4f0524b0272c20c) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_3.ll",
+      "expectation": "TctAccess { thread_id: 2, accessible_threads: \"\", call_site: InstId(0x4cc70132dafb4cc10b082edaeed029e1) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_3.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0xb9d088d699d5bc5e2319dd8fb5c9f14b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_6.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x1ac6e2433025aeacefb27892c8a18574) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_6.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xcc2a3b45b6f125562a60ded3a167633b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_8.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xf16e163df7d7ff3116b2283bde341934) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_loop_8.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x6ee97de12f910eda4e2c16034d150562) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_offspring_1.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xa4836d33bebd06c78e58e67f9855b90b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_offspring_1.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x09153908f06aaeac569eefe0a59e2440) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_offspring_2.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x2df253f97f183befa08b34f30be957be) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_offspring_2.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xb15642c29d15992718f352630746f562) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_offspring_3.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x0cda792360740efe70e610c4b8c48dad) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_offspring_3.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x06e299ce942b7a15da6f777493048c54) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_offspring_4.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xf3b6f888b44eed3ab1125afdc83b572f) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_offspring_4.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x25ac76e40f8e008a39ff20d6fdb27f70) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_recur_4.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xcac589e749db86d13353336b4dcb8993) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_recur_4.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x271b67790528b13d8216615536bdb3e9) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_recur_7.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xf3f8eb5240bf00380e26556ea49824e1) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_recur_7.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x0a7307d2033706178cdfdbc6b7f2cc20) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_recur_index_1.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x96a5ae99b36a13c2ce25f2b44bc2a465) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_recur_index_1.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x228d4367dabb53c9650abfe8d1f60468) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x23f114245652049b21ecf26f20e7fea4) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x59dd7111445f4983395ffe44eb5b712d) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x246fe6c4e3115ee60590deac5fbd1483) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x4be69973043a2eb069c8764374cf5861) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_1.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x1968507cf2bfb331e28f032c1118ebb6) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_1.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x44d9dc41668fc460f07a571aae246bef) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_1.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0x4da1868fc1fdd069440281567099a408) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x3516d85c972929a2d27c3790b7c9ef92) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x90dbf016a331919b3f64dc4a8a8407c1) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xadca77f1c486660b8ddf3d406a633ee8) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x3327f597890c139497c8033d1707d771) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_2.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xa43b226d0c01657e238c498c48b835c8) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_2.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x2eb9c97d4a6eb3c778eabe63defdbf89) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_2.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0x97037a065fda0bd7dcaa4f4130a27464) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x519839e494783c13073b40ea7fc6c3ca) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x1ecfe3d73df18c9f757f58a5135c7c84) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x9d574b53ad5ddaae818f02cbd42551d2) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x2b593fabba16ff0a3b67bfd61d6a1b1a) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_3.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x20fdc0f2b76985e4a1b6c2b0ba15aca0) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_3.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x4bd0950e92aa1708eef8aec72d3db368) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_3.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0x06e7e471b15aaa2383a5a7f63b888982) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_4.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x21e8f8729ce3925fd9d3376d96e8afd0) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_4.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x0ad12fbb137f48c8b7a6c26da4b0d215) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_4.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x9ab5b9e1b6c2034b92fc08fa51762da9) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_4.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xe36155d3f59f2ac896bcc27230f17da3) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_4.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xead19fd0de24b2113630bf3e7f8ba6b3) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_4.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x7d5882ccce4aa950aeed1203365dd2f7) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_4.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0x038312602df537fed4f102b9fee41fb4) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xc70169b45069db12993f45b2130698a2) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x2be39e4362bf93e6a695ad76bdd1552e) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xdc28149294a12d35188a1222029dc578) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xb4fd2e117919516fd64b4fd962168c02) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0xcab71474da218ab7ac61409f02307357) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x7582e0ed44cfea940f31381824f207e2) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x38141c959649778421d4b803d8cf6a48) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0xe136e5c9110b6ea98412b669945d17ef) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0x454b369ea94216d2183caa02b0e1f849) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0xa6b890fc6fb36ae1e10ee6d61e110224) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xe210ff4618ec5fbf38104544afc99383) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xa92c8ea2e8dc2edf5e09ee21d230d8ea) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "TctAccess { thread_id: 2, accessible_threads: \"\", call_site: InstId(0xd6bab1ad096304d36ac17b884e18ea84) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "TctAccess { thread_id: 4, accessible_threads: \"\", call_site: InstId(0x798e1fc745e828a13414f5384fb7ea0a) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_5.ll",
+      "expectation": "TctAccess { thread_id: 5, accessible_threads: \"\", call_site: InstId(0xd8a67e1c69b8121d55d25d000fe75a6f) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x359a259a72abeb19e17066e471d02183) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x0117d8a916eac9dcd90f69996fa4a9cd) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xc37132d5dea990c976072f25ba46c9c3) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x1f5d4e353fa3a3b3706477804770ae45) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x28aa11389c9bb7cbff527a34e791f02b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x956e5b14f686d77ce8951d531df8bb27) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x0f08bdb57a0f700c46bc4bdda4f12c7a) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0xcd33348a0f390f0d335adc1156146483) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0xca3f235b6c2e756a7261dafc9c2a7d13) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0xea18283aef276d914655f07da62def5d) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xcfbed5c284d9b4255aa52d716b989e56) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x0d86e235e41dd85bef878339bcaf9af0) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "TctAccess { thread_id: 2, accessible_threads: \"\", call_site: InstId(0x7a493e82d37ee576eb57dda0cc2d0884) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "TctAccess { thread_id: 4, accessible_threads: \"\", call_site: InstId(0x1a5a41907d243f03b8ab41000c2380a8) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_6.ll",
+      "expectation": "TctAccess { thread_id: 5, accessible_threads: \"\", call_site: InstId(0x1ce889403535b51a930a3258081f6ca6) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x20cbc8e84571027b4f22ff6f2941b5eb) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xcf7fcc5c44d0c3000380c9d28f019f13) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xab188290bbae69feda135961a006a814) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xfad77c8ef496fbbad84ceb9703ae3a69) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x599f7e555b271504eb7c34aae69a8cf0) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0xf834396b4a73990447e7cc44b1e93d5f) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x10443fdacd267b706d96bcc1c0d9521a) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0x3388a5d3a26846aa31d0db2268859700) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0xdc5214e0358522d6836145991ddb41fc) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0x45a82c4c7f399a407e7c894b467beb50) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x464e7a54af3d850af63c7f6660e2a95d) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xeec61a57e002f205b19a0338105bedc4) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "TctAccess { thread_id: 2, accessible_threads: \"\", call_site: InstId(0xc3b9b29786bc967edd91778a83f19483) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "TctAccess { thread_id: 4, accessible_threads: \"\", call_site: InstId(0x2c0a0a8db88be2b694f1951e85d576da) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_7.ll",
+      "expectation": "TctAccess { thread_id: 5, accessible_threads: \"\", call_site: InstId(0xe606cf5f938516c1a62393c2b62aa179) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xee871948fc08416e39a264feab057f52) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x37dfb94e9e76e94b36bf99b7f986dc46) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xd6fc6cf6f220e0c3e6f62f18f1e33632) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x6da4eb3ca1b04fa45deff30fbe3e3407) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x5372e9b5c5fd34ea7f8936389f60032b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x2d7534d565b708a7a95a29a69c826380) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "InterleavingAccess { thread_id: 5, context: \"\", expected_interleaving: \"\", call_site: InstId(0x8dd0230db165b8e98af02adc0fd4d2c4) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0x84f5799ca3cbb316e140577c818f5eec) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0x052e91e5fc5bb2872a58c2a23e1b7387) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "InterleavingAccess { thread_id: 4, context: \"\", expected_interleaving: \"\", call_site: InstId(0xe1078ab0ffac5a419ffe79c4c50d460c) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xa45afbd6f110cd41aae748bff7f6e03f) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x38187c4bfd4e6fc39731e2a161466a07) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "TctAccess { thread_id: 2, accessible_threads: \"\", call_site: InstId(0x60e63a6fec6f6bc4d361771ac928f16a) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "TctAccess { thread_id: 4, accessible_threads: \"\", call_site: InstId(0x045976a4a80c5a917e7c7b1022ea9d53) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_sibling_8.ll",
+      "expectation": "TctAccess { thread_id: 5, accessible_threads: \"\", call_site: InstId(0xa1b2c7b54eece01aa86d0adaa65238bc) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_simple_1.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x590d2f40225049428c6e574d130fe296) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_simple_2.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xfd0e8c2abc3cd1743b85b5c3e8201d78) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_simple_3.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x8d6e7d382358c1294e4c48d30195ec7e) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_synthesis_1.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x3f6ffe4b483927c1186670ccd4665b18) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_synthesis_1.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x22706d8c006f78eaab7c0228efb8a803) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x16c7efe0843abab205178c56a4bcb155) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x5da2e93b2454b7bf5a75cdebb34c4a0a) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x19fcf07a2afdbc9b636e9a9f35bd236e) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_2.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xf2df99ea5bb41ff62d9a3e16d1b0ed0b) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_2.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x9c78e97c6e8bf82c9971d5ab042f26dd) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_2.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x69c9cdd0feb0bedb240abd2e292afe5a) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_2.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0xea359757439d09b5f5dcdd79cf5cd9e6) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x72ebaad27705ada367101ce88ce195ef) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x0722b1891a1a94f2b9eea40151288f31) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x0750c9ba6a4661762f1992a71ced38e0) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_7.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x78de028f9682310f1340f71ff125ec8e) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_7.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x8e54a3fbfc66987102fed136bb8b51c1) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_7.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x5b52c2508efa6579c805eb8ebb8695de) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_7.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0xe6be0a53a957b6f08e9a2274176b11b4) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x353050e1bd6a699eba52c14a79df5128) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x57abf05a708a50b61b13ce82cfd49874) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x8a6f45edf9f66bff4e080c34e2bb52dc) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_1.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x7c5ed57ef7a6cf08957dbcecf633dd54) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_1.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x11e067189f0b8572fe1ec9b61a6e490a) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_1.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xfc57d2f8212a5614ba602afdc4495545) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_1.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0x5d37360285b845293745a0cc58d87591) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x3b991098d2686f86753d0f4c6a2315ee) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xfdc9b6686ec01f63ae07c6f1ec720c34) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xa13d23087ca6fcb3ab866f1065796b29) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_3.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x5f5840ec8f57a30b375ef79971f4c561) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_3.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xe653d91ace3d5380e42c638b10798c34) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_3.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0xa6b6ea939bfeeb3e2ba929ce78968ecc) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_3.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0x11e7a3de1e153d9e79dda8dc704a1c06) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_4.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0x32d3379c30647695c9260393e5fd5516) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_4.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xf75d81988be31c6672f19c5cc0f0fe4e) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_4.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xc23a44265e2534635e2040282e621a23) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_4.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xfde966167e651ef59f01817c746973b5) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_4.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x171d73885c92c5774777a8a16d221aa4) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_4.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x9d38f99b4a2d8d4b9e3c2374b7a7c2a1) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/succ_cxt_thdindex_8_4.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0xf9b0b22e49bcdcdaa97cc169713c4e17) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/unsound_cxt_loop_7.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0xe52fe3d4b3f63f353e3e504e5f461140) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/unsound_cxt_loop_7.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x6dd1367f44cd95ba9aa04bd2124f3ac9) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/unsound_cxt_thdindex_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 2, context: \"\", expected_interleaving: \"\", call_site: InstId(0xa61f2768a5b32b75d6636571f87a82c4) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/unsound_cxt_thdindex_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xbd015b126e1b903495c69bf5374d6570) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/unsound_cxt_thdindex_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0x86a829174fbdf7082f1e869616b3ed08) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/unsound_cxt_thdindex_6.ll",
+      "expectation": "InterleavingAccess { thread_id: 3, context: \"\", expected_interleaving: \"\", call_site: InstId(0xb6b8f5de81568268eac1d33d392a5274) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/unsound_cxt_thdindex_6.ll",
+      "expectation": "TctAccess { thread_id: 0, accessible_threads: \"\", call_site: InstId(0x215254535cd791fa2b1047ad26b03236) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/unsound_cxt_thdindex_6.ll",
+      "expectation": "TctAccess { thread_id: 1, accessible_threads: \"\", call_site: InstId(0x4204fd9b667a29f271e06290eab611ab) }",
+      "ci": "",
+      "ps_dead_code": false
+    },
+    {
+      "file": "mta/unsound_cxt_thdindex_6.ll",
+      "expectation": "TctAccess { thread_id: 3, accessible_threads: \"\", call_site: InstId(0x575e67c2b4720dff5e00d045e48e836c) }",
+      "ci": "",
+      "ps_dead_code": false
+    }
+  ],
+  "skipped": [
+    {
+      "category": "ae_assert_tests",
+      "reason": "No oracle calls found",
+      "count": 22
+    },
+    {
+      "category": "ae_assert_tests_fail",
+      "reason": "Assertion condition unknown (unreachable or unanalyzable)",
+      "count": 13
+    },
+    {
+      "category": "ae_nullptr_deref_tests_failed",
+      "reason": "No oracle calls found",
+      "count": 2
+    },
+    {
+      "category": "ae_recursion_tests_fail",
+      "reason": "No oracle calls found",
+      "count": 2
+    },
+    {
+      "category": "ae_wto_assert",
+      "reason": "Assertion condition unknown (unreachable or unanalyzable)",
+      "count": 6
+    },
+    {
+      "category": "basic_c_tests",
+      "reason": "No oracle calls found",
+      "count": 4
+    },
+    {
+      "category": "basic_cpp_tests",
+      "reason": "No oracle calls found",
+      "count": 2
+    },
+    {
+      "category": "complex_tests",
+      "reason": "No oracle calls found",
+      "count": 4
+    },
+    {
+      "category": "cpp_types",
+      "reason": "No oracle calls found",
+      "count": 1
+    },
+    {
+      "category": "cs_tests",
+      "reason": "No oracle calls found",
+      "count": 1
+    },
+    {
+      "category": "failed_tests",
+      "reason": "No oracle calls found",
+      "count": 2
+    },
+    {
+      "category": "fs_tests",
+      "reason": "No oracle calls found",
+      "count": 2
+    },
+    {
+      "category": "mem_leak",
+      "reason": "No oracle calls found",
+      "count": 3
+    },
+    {
+      "category": "non_annotated_tests",
+      "reason": "Tests without oracles",
+      "count": 35
+    },
+    {
+      "category": "objtype_tests",
+      "reason": "Object type tests not implemented",
+      "count": 5
+    }
+  ],
+  "timing_secs": 1.764124728,
+  "expectedfail_total": 20,
+  "expectedfail_exact": 14,
+  "expectedfail_details": [
+    {
+      "file": "basic_c_tests/int2pointer.ll",
+      "expectation": "Alias { kind: ExpectedFailMayAlias, ptr_a: ValueId(0x0102a015ebe2571df6c513db630e9fe4), ptr_b: ValueId(0x82bc62ae82d386ed97850c36c5eec745), oracle_block: Some(BlockId(0x3ae7f1be5c5971d57be0a8a8f5c80339)), oracle_function: Some(FunctionId(0xd1e767cb05ff3c2597d63fe18142b575)) }",
+      "result": "Proved NoAlias (SVF reports MayAlias)"
+    },
+    {
+      "file": "basic_c_tests/struct-incompab-typecast.ll",
+      "expectation": "Alias { kind: ExpectedFailMayAlias, ptr_a: ValueId(0xdaee903423162c7faaf9688edbcb88a7), ptr_b: ValueId(0x84ca2715640c7de87556a5fa1313a592), oracle_block: Some(BlockId(0x9273ded3b02276063308bc13d9b57ea1)), oracle_function: Some(FunctionId(0x5e7ffbe3b7e531d93d044c222e309f49)) }",
+      "result": "Proved NoAlias (SVF reports MayAlias)"
+    },
+    {
+      "file": "basic_c_tests/struct-incompab-typecast.ll",
+      "expectation": "Alias { kind: ExpectedFailMayAlias, ptr_a: ValueId(0xf7247b87ef782a45b92d3fb441fab304), ptr_b: ValueId(0x944630f91df3c37375223c6f59239e96), oracle_block: Some(BlockId(0x9273ded3b02276063308bc13d9b57ea1)), oracle_function: Some(FunctionId(0x5e7ffbe3b7e531d93d044c222e309f49)) }",
+      "result": "Proved NoAlias (SVF reports MayAlias)"
+    },
+    {
+      "file": "basic_c_tests/struct-instance-return.ll",
+      "expectation": "Alias { kind: ExpectedFailMayAlias, ptr_a: ValueId(0x1b5b5ca2bbe0ed80cc414f7442a4838a), ptr_b: ValueId(0x74e367d474677542a2e46a39a1b23749), oracle_block: Some(BlockId(0x924c8eaf645a89b5a5d97ae95b54700b)), oracle_function: Some(FunctionId(0x8fbd815b021617cb5cad0a22d73fd5d2)) }",
+      "result": "Proved NoAlias (SVF reports MayAlias)"
+    },
+    {
+      "file": "cs_tests/recur5.ll",
+      "expectation": "Alias { kind: ExpectedFailNoAlias, ptr_a: ValueId(0x328b4bbef9b1b93a2c65b9c34e450572), ptr_b: ValueId(0xb2cbc1ac319ced41f42e0de47c674ef8), oracle_block: Some(BlockId(0x0d484db09be00bf63a19624e14f3f7c8)), oracle_function: Some(FunctionId(0x3adf1c77bdf1281f1b81ea6e336b5d71)) }",
+      "result": "Found aliasing (SVF reports NoAlias)"
+    },
+    {
+      "file": "cs_tests/recur5.ll",
+      "expectation": "Alias { kind: ExpectedFailNoAlias, ptr_a: ValueId(0x544d8774d24bd629643843207f42935d), ptr_b: ValueId(0xb2cbc1ac319ced41f42e0de47c674ef8), oracle_block: Some(BlockId(0x0d484db09be00bf63a19624e14f3f7c8)), oracle_function: Some(FunctionId(0x3adf1c77bdf1281f1b81ea6e336b5d71)) }",
+      "result": "Found aliasing (SVF reports NoAlias)"
+    },
+    {
+      "file": "cs_tests/recur6.ll",
+      "expectation": "Alias { kind: ExpectedFailNoAlias, ptr_a: ValueId(0x9b54d93c8044da1a4d177419acd3b941), ptr_b: ValueId(0xee4a18ef409cc5e93b4bcca59fc88a7e), oracle_block: Some(BlockId(0x449192361b075d0ef249714979ca9612)), oracle_function: Some(FunctionId(0x9974e92b9af480562a827149c1733104)) }",
+      "result": "Found aliasing (SVF reports NoAlias)"
+    },
+    {
+      "file": "cs_tests/recur9.ll",
+      "expectation": "Alias { kind: ExpectedFailNoAlias, ptr_a: ValueId(0x2af816158a28e9bf8f29c141a3992015), ptr_b: ValueId(0x34befdafc7f91ac00d45018174c27451), oracle_block: Some(BlockId(0x11bd2fa3562bf2bae3b34ee795df2954)), oracle_function: Some(FunctionId(0xe685129e5d7c09deb5259eb913c650f5)) }",
+      "result": "Found aliasing (SVF reports NoAlias)"
+    },
+    {
+      "file": "mem_leak/malloc31.ll",
+      "expectation": "MemLeak { kind: FalseNegative, alloc_site: ValueId(0xaa44bd00fa193741226720f11a43a389), call_site: InstId(0x5a8a2d3a15bbf5bb866b2927d93ea231) }",
+      "result": "Found leak (SVF misses it)"
+    },
+    {
+      "file": "mem_leak/malloc32.ll",
+      "expectation": "MemLeak { kind: FalseNegative, alloc_site: ValueId(0x5e0d4f4bbf3be85e1705a41e64e4ef19), call_site: InstId(0x5ab2a1fc7f1efc020689dee62b2e9693) }",
+      "result": "Found leak (SVF misses it)"
+    },
+    {
+      "file": "mem_leak/malloc33.ll",
+      "expectation": "MemLeak { kind: FalseNegative, alloc_site: ValueId(0xa73522624e01b3fffd70fabe8b0157f3), call_site: InstId(0xe8dd4e994aaee37f6031f626049cbff8) }",
+      "result": "Found leak (SVF misses it)"
+    },
+    {
+      "file": "mem_leak/malloc60.ll",
+      "expectation": "MemLeak { kind: PartialLeakFP, alloc_site: ValueId(0x0b8476cca65f1178f304e427ca1b4b5a), call_site: InstId(0x3b5084393b4d18c9f1bce853cf463abc) }",
+      "result": "No false positive (SVF incorrectly reports leak)"
+    },
+    {
+      "file": "mem_leak/sp8.ll",
+      "expectation": "MemLeak { kind: PartialLeakFP, alloc_site: ValueId(0x58bc896f9fa21967206d606893707614), call_site: InstId(0x712f02e3b23e2c0e89ecd44597f8feac) }",
+      "result": "No false positive (SVF incorrectly reports leak)"
+    },
+    {
+      "file": "mem_leak/sp8.ll",
+      "expectation": "MemLeak { kind: PartialLeakFP, alloc_site: ValueId(0x635d79f92b25a03a0e176ce29eec793e), call_site: InstId(0x43bf6be548dfc00667caf82105b607ea) }",
+      "result": "No false positive (SVF incorrectly reports leak)"
+    }
+  ],
+  "pass": 2607,
+  "fail": 137,
+  "precision_improvements": 35
+}

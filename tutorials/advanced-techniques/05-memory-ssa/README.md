@@ -146,7 +146,7 @@ summary = mssa.mod_ref(modify_fn.id)
 ```rust
 use saf_analysis::mssa::MemorySsa;
 
-let mssa = MemorySsa::build(&module, &cfgs, pta_result, &callgraph);
+let mssa = MemorySsa::build(&module, &cfgs, Arc::new(pta_result), &callgraph);
 
 // Query mod/ref
 if let Some(summary) = mssa.mod_ref(modify_fn.id) {
