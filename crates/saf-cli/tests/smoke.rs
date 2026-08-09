@@ -103,3 +103,73 @@ fn run_on_fixture_succeeds() {
         .assert()
         .success();
 }
+
+// ---------------------------------------------------------------------------
+// verify command tests (SV-COMP blind entry point, plan 192)
+// ---------------------------------------------------------------------------
+
+/// Writes a throwaway `.prp` file with the given contents and returns the handle
+/// (kept alive by the caller so the path stays valid during the command run).
+fn write_prp(contents: &str) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut f = tempfile::NamedTempFile::new().expect("create temp .prp");
+    write!(f, "{contents}").expect("write .prp");
+    f
+}
+
+/// `verify` appears in the top-level help.
+#[test]
+fn help_lists_verify() {
+    cargo_bin_cmd!("saf")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("verify"));
+}
+
+/// `saf verify` prints exactly one verdict line on stdout (nothing else) and
+/// exits 0. The slice-0 skeleton always emits the safe `unknown`. This locks the
+/// verdict-only stdout contract required by `BenchExec`.
+#[test]
+fn verify_prints_verdict_only_on_stdout() {
+    let prp = write_prp("CHECK( init(main()), LTL(G ! call(reach_error())) )");
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.path().to_str().unwrap(),
+            "--data-model",
+            "LP64",
+            "dummy.c",
+        ])
+        .assert()
+        .success()
+        .stdout("unknown\n");
+}
+
+/// The property file is a required parameter.
+#[test]
+fn verify_requires_property() {
+    cargo_bin_cmd!("saf")
+        .args(["verify", "dummy.c"])
+        .assert()
+        .failure();
+}
+
+/// `--data-model` accepts the SV-COMP spellings ILP32 / LP64.
+#[test]
+fn verify_accepts_ilp32_data_model() {
+    let prp = write_prp("CHECK( init(main()), LTL(G ! call(reach_error())) )");
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.path().to_str().unwrap(),
+            "--data-model",
+            "ILP32",
+            "dummy.c",
+        ])
+        .assert()
+        .success()
+        .stdout("unknown\n");
+}

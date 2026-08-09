@@ -32,6 +32,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Index(args) => commands::index(&args),
         Commands::Run(args) => commands::run(&args),
+        Commands::Verify(args) => commands::verify(&args),
         Commands::Query(args) => commands::query(&args),
         Commands::Export(args) => commands::export(&args),
         Commands::Schema(args) => commands::schema(&args),

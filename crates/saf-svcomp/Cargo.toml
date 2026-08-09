@@ -1,0 +1,19 @@
+[package]
+name = "saf-svcomp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SV-COMP verification engine for SAF: property analysis, violation/correctness witnesses, .prp parsing"
+
+[lib]
+name = "saf_svcomp"
+path = "src/lib.rs"
+
+[dependencies]
+saf-core = { workspace = true }
+saf-analysis = { workspace = true, features = ["z3-solver", "analysis-mta"] }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = "0.10"
+tracing = { workspace = true }

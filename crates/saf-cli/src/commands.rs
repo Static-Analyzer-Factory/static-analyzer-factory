@@ -299,6 +299,27 @@ impl fmt::Display for CliExportFormat {
     }
 }
 
+/// Data model for `saf verify` (SV-COMP). Selects clang `-m32`/`-m64` and the
+/// LLVM target; passed by `BenchExec` per category.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliDataModel {
+    /// 32-bit pointers and `long` (ILP32).
+    #[value(name = "ILP32")]
+    Ilp32,
+    /// 64-bit pointers and `long` (LP64).
+    #[value(name = "LP64")]
+    Lp64,
+}
+
+impl From<CliDataModel> for saf_svcomp::DataModel {
+    fn from(v: CliDataModel) -> Self {
+        match v {
+            CliDataModel::Ilp32 => Self::ILP32,
+            CliDataModel::Lp64 => Self::LP64,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CLI struct definitions
 // ---------------------------------------------------------------------------
@@ -331,6 +352,8 @@ pub enum Commands {
     Index(IndexArgs),
     /// Run analysis passes on indexed AIR.
     Run(RunArgs),
+    /// Verify a C program against an SV-COMP property (blind; prints `true`/`false(p)`/`unknown`).
+    Verify(VerifyArgs),
     /// Query analysis results.
     Query(QueryArgs),
     /// Export graphs or findings.
@@ -356,6 +379,31 @@ pub struct IndexArgs {
     pub frontend: CliFrontend,
 
     /// Write AIR-JSON output to file instead of stdout.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+/// Arguments for `saf verify` — the blind SV-COMP verifier entry point (plan 192).
+#[derive(Args)]
+pub struct VerifyArgs {
+    /// The C program under verification (`.c` or preprocessed `.i`).
+    #[arg(required = true)]
+    pub input: PathBuf,
+
+    /// SV-COMP property file (`.prp`). Parsed for the `CHECK(... LTL ...)` form,
+    /// never the filename.
+    #[arg(long, required = true)]
+    pub property: PathBuf,
+
+    /// Data model; selects clang `-m32`/`-m64` and the LLVM target.
+    #[arg(long, value_enum, default_value_t = CliDataModel::Lp64)]
+    pub data_model: CliDataModel,
+
+    /// Where to write the violation witness (YAML 2.0). `BenchExec` passes `${witness}`.
+    #[arg(long, default_value = "witness.yml")]
+    pub witness: PathBuf,
+
+    /// Optional full machine-readable report (JSON) to a file; stdout stays verdict-only.
     #[arg(long)]
     pub output: Option<PathBuf>,
 }
@@ -685,6 +733,44 @@ pub fn index(args: &IndexArgs) -> anyhow::Result<()> {
     } else {
         println!("{json}");
     }
+    Ok(())
+}
+
+/// Run `saf verify` — the blind SV-COMP verifier entry point (plan 192).
+///
+/// Prints exactly one verdict line to stdout — `true`, `false(<prop>)`, or
+/// `unknown` — and nothing else (tracing/diagnostics go to stderr). It never
+/// reads an expected verdict. This is the slice-0 skeleton: it pins the
+/// determinism-affecting env toggles, parses the `.prp` (real `CHECK/LTL` form),
+/// and emits `unknown`; the analysis pipeline (in-tool clang -> reconnected
+/// `analyze_property` -> witness) lands in slice 1.
+pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    // Determinism pins (plan 192 §2.3): make verdicts independent of these
+    // verdict-affecting env toggles regardless of the competition environment.
+    for var in ["SAF_PTA_FIELD_MINTING", "SAF_DECOMPOSE_POINTER_ARRAYS"] {
+        if std::env::var_os(var).is_some() {
+            eprintln!("saf verify: ignoring env {var} (pinned off for deterministic verdicts)");
+            // SAFETY: called at process start, before any analysis threads are
+            // spawned, so there is no concurrent access to the environment.
+            unsafe { std::env::remove_var(var) };
+        }
+    }
+
+    let prp = std::fs::read_to_string(&args.property)
+        .with_context(|| format!("failed to read property file {}", args.property.display()))?;
+    let property = saf_svcomp::Property::from_prp(&prp);
+    let data_model: saf_svcomp::DataModel = args.data_model.into();
+    eprintln!(
+        "saf verify: input={} property={property:?} data_model={data_model:?} witness={} (slice-0 skeleton)",
+        args.input.display(),
+        args.witness.display(),
+    );
+
+    // Slice-0 skeleton: analysis lands in slice 1. Never emit an unsound verdict —
+    // default to the safe `unknown`.
+    println!("unknown");
     Ok(())
 }
 

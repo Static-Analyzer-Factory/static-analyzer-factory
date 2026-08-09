@@ -2119,6 +2119,7 @@ dependencies = [
  "saf-cli",
  "saf-core",
  "saf-frontends",
+ "saf-svcomp",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2141,9 +2142,11 @@ dependencies = [
  "saf-analysis",
  "saf-core",
  "saf-frontends",
+ "saf-svcomp",
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "tracing-subscriber",
 ]
 
@@ -2207,6 +2210,18 @@ dependencies = [
  "saf-frontends",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "saf-svcomp"
+version = "0.1.0"
+dependencies = [
+ "saf-analysis",
+ "saf-core",
+ "serde",
+ "serde_yaml",
+ "sha2",
+ "tracing",
 ]
 
 [[package]]

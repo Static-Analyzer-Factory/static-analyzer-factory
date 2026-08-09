@@ -10,8 +10,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use super::property::PropertyResult;
-use super::task::{Property, SvCompTask};
+use super::task::SvCompTask;
+use saf_svcomp::{Property, PropertyResult};
 
 /// Verdict produced by SAF for a property.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,8 +391,8 @@ mod tests {
             bitcode_path: PathBuf::from("test.bc"),
             input_files: vec![],
             properties: vec![],
-            language: super::super::task::Language::C,
-            data_model: super::super::task::DataModel::LP64,
+            language: saf_svcomp::Language::C,
+            data_model: saf_svcomp::DataModel::LP64,
             category: "test".into(),
         };
 

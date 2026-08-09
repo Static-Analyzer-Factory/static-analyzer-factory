@@ -37,12 +37,8 @@
 //! - FALSE incorrect: -16 points (false alarm)
 //! - UNKNOWN: 0 points
 
-pub mod fast_paths;
-pub mod property;
 pub mod scoring;
-pub mod summaries;
 pub mod task;
-pub mod witness;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -55,10 +51,12 @@ use walkdir::WalkDir;
 
 use crate::runner;
 
-pub use property::{PropertyAnalysisConfig, PropertyResult, analyze_property};
+pub use saf_svcomp::{
+    DataModel, Language, Property, PropertyAnalysisConfig, PropertyResult, Witness, WitnessEdge,
+    WitnessNode, WitnessType, analyze_property,
+};
 pub use scoring::{CategorySummary, SvCompOutcome, SvCompSummary, SvCompVerdict, TaskResult};
-pub use task::{DataModel, Language, Property, PropertySpec, SvCompTask};
-pub use witness::{Witness, WitnessEdge, WitnessNode, WitnessType};
+pub use task::{PropertySpec, SvCompTask};
 
 /// Configuration for running SV-COMP benchmarks.
 #[derive(Debug, Clone)]

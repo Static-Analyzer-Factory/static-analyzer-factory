@@ -8,6 +8,7 @@ members = [
   "crates/saf-python",
   "crates/saf-test-utils",
   "crates/saf-bench",
+  "crates/saf-svcomp",
   "crates/saf-wasm",
   "crates/saf-trace",
   "crates/saf-datalog",
@@ -22,6 +23,7 @@ license = "MIT OR Apache-2.0"
 saf-core = { path = "crates/saf-core" }
 saf-frontends = { path = "crates/saf-frontends", default-features = false }
 saf-analysis = { path = "crates/saf-analysis", default-features = false }
+saf-svcomp = { path = "crates/saf-svcomp" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 blake3 = "1.8"

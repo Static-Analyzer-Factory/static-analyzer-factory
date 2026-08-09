@@ -6,8 +6,14 @@
 //! - Properties to verify
 //! - Expected verdicts
 //! - Compilation options (data model, language)
+//!
+//! The property/data-model/language enums live in the shared `saf-svcomp` engine
+//! crate ([`saf_svcomp::property_kind`]); this module keeps the benchmark-only
+//! task model (`SvCompTask`, `PropertySpec` incl. `expected_verdict`) and its
+//! YAML parsing.
 
 use anyhow::{Context, Result, bail};
+use saf_svcomp::{DataModel, Language, Property};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -51,117 +57,6 @@ pub struct PropertySpec {
 
     /// Subproperty for composite properties (e.g., "valid-free" for memsafety).
     pub subproperty: Option<String>,
-}
-
-/// SV-COMP property types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Property {
-    /// `unreach-call`: `reach_error()` is never called.
-    UnreachCall,
-
-    /// `valid-memsafety`: No memory safety violations (valid-free, valid-deref, valid-memtrack).
-    ValidMemsafety,
-
-    /// `valid-memcleanup`: All memory is freed (no leaks).
-    ValidMemcleanup,
-
-    /// `no-overflow`: No signed integer overflows.
-    NoOverflow,
-
-    /// `no-data-race`: No data races in concurrent programs.
-    NoDataRace,
-
-    /// `termination`: Program terminates.
-    Termination,
-
-    /// Coverage property (not a verification property).
-    Coverage,
-
-    /// Unknown/unsupported property.
-    Unknown,
-}
-
-impl Property {
-    /// Parse a property from its file path or content.
-    pub fn from_property_file(path: &Path) -> Self {
-        let filename = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default();
-
-        if filename.contains("unreach-call") {
-            Self::UnreachCall
-        } else if filename.contains("valid-memsafety") {
-            Self::ValidMemsafety
-        } else if filename.contains("valid-memcleanup") {
-            Self::ValidMemcleanup
-        } else if filename.contains("no-overflow") {
-            Self::NoOverflow
-        } else if filename.contains("no-data-race") {
-            Self::NoDataRace
-        } else if filename.contains("termination") {
-            Self::Termination
-        } else if filename.contains("coverage") {
-            Self::Coverage
-        } else {
-            Self::Unknown
-        }
-    }
-
-    /// Human-readable name of the property.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::UnreachCall => "unreach-call",
-            Self::ValidMemsafety => "valid-memsafety",
-            Self::ValidMemcleanup => "valid-memcleanup",
-            Self::NoOverflow => "no-overflow",
-            Self::NoDataRace => "no-data-race",
-            Self::Termination => "termination",
-            Self::Coverage => "coverage",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    /// Returns true if SAF supports this property.
-    pub fn is_supported(&self) -> bool {
-        matches!(
-            self,
-            Self::UnreachCall
-                | Self::ValidMemsafety
-                | Self::ValidMemcleanup
-                | Self::NoOverflow
-                | Self::NoDataRace
-        )
-    }
-}
-
-/// Programming language.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum Language {
-    #[default]
-    C,
-    Cpp,
-}
-
-/// Data model (affects pointer and integer sizes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum DataModel {
-    /// 32-bit pointers, 32-bit int, 32-bit long
-    ILP32,
-
-    /// 64-bit pointers, 32-bit int, 64-bit long
-    #[default]
-    LP64,
-}
-
-impl DataModel {
-    /// Returns the clang flag for this data model.
-    pub fn clang_flag(&self) -> &'static str {
-        match self {
-            Self::ILP32 => "-m32",
-            Self::LP64 => "-m64",
-        }
-    }
 }
 
 /// Raw YAML structure for deserialization.

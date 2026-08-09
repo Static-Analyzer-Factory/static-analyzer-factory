@@ -44,7 +44,7 @@ use super::fast_paths::{
     reachable_has_heap_allocations, reachable_is_loop_free,
 };
 use super::summaries::{ErrorSummary, compute_error_summaries};
-use super::task::Property;
+use crate::property_kind::Property;
 
 /// Result of analyzing a single property.
 #[derive(Debug, Clone, Serialize, Deserialize)]
