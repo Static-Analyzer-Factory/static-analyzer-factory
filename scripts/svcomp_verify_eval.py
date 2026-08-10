@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SVB = Path("tests/benchmarks/sv-benchmarks/c")
@@ -20,6 +21,15 @@ SAF = os.environ.get("SAF_BIN", "target/release/saf")
 VERIFY_TIMEOUT = os.environ.get("EVAL_VERIFY_TIMEOUT", "25")  # --timeout per task
 KILL_AFTER = int(os.environ.get("EVAL_KILL_AFTER", "45"))     # hard subprocess kill (s)
 N_PER_CLASS = int(os.environ.get("EVAL_N_PER_CLASS", "20"))
+
+# Witness-confirmation mode (plan 194 R2/Slice G): when EVAL_CONFIRM_WITNESS=1,
+# `saf verify` writes a YAML witness per task and each emitted FALSE is run
+# through scripts/validate_witness.sh (witnesslint + CPAchecker) to measure the
+# confirmed-witness % — the C.FalseOverall score predictor.
+CONFIRM = os.environ.get("EVAL_CONFIRM_WITNESS", "0") == "1"
+CONFIRM_TIMEOUT = int(os.environ.get("EVAL_CONFIRM_TIMEOUT", "150"))
+VALIDATE_SH = os.environ.get("SAF_VALIDATE_WITNESS", "scripts/validate_witness.sh")
+WITNESS_DIR = tempfile.mkdtemp(prefix="saf_witness_eval_") if CONFIRM else None
 
 DM_RE = re.compile(r"data_model:\s*'?(ILP32|LP64)")
 INPUT_RE = re.compile(r"input_files:\s*['\"]?([^'\"\n]+)")
@@ -82,20 +92,50 @@ def collect():
     return tasks
 
 
-def run_one(t):
+def run_one(t, idx):
+    """Run `saf verify` on task `t`; return (verdict, witness_path_or_None)."""
     dm = "ILP32" if t["data_model"].upper() == "ILP32" else "LP64"
     cmd = [SAF, "verify", "--property", t["prop"], "--data-model", dm,
-           "--timeout", VERIFY_TIMEOUT, t["src"]]
+           "--timeout", VERIFY_TIMEOUT]
+    witness = None
+    if CONFIRM:
+        assert WITNESS_DIR is not None  # set whenever CONFIRM is true
+        witness = os.path.join(WITNESS_DIR, f"w_{idx}.yml")
+        cmd += ["--witness", witness]
+    cmd.append(t["src"])
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=KILL_AFTER)
         out = r.stdout.strip()
     except subprocess.TimeoutExpired:
-        return "unknown"
+        return "unknown", None
     if out.startswith("false("):
-        return "false"
+        return "false", (witness if witness and os.path.exists(witness) else None)
     if out == "true":
-        return "true"
-    return "unknown"
+        return "true", None
+    return "unknown", None
+
+
+def confirm_witness(t, witness):
+    """Validate an emitted witness via validate_witness.sh. Returns one of
+    CONFIRMED / NOT_CONFIRMED / LINT_FAIL / LINT_ONLY (CPAchecker unavailable) /
+    TIMEOUT / NO_WITNESS / ERROR."""
+    if not witness:
+        return "NO_WITNESS"
+    cmd = ["bash", VALIDATE_SH, witness, t["src"], t["prop"], t["data_model"]]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=CONFIRM_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT"
+    o = r.stdout + r.stderr
+    if "LINT_FAIL" in o:
+        return "LINT_FAIL"
+    if "CPACHECKER_ABSENT" in o or "CPACHECKER_SKIPPED" in o:
+        return "LINT_ONLY"
+    if "NOT_CONFIRMED" in o:
+        return "NOT_CONFIRMED"
+    if "CONFIRMED" in o:
+        return "CONFIRMED"
+    return "ERROR"
 
 
 def stride(lst, n):
@@ -121,15 +161,21 @@ def main():
 
     conf = {}
     false_alarms = []
-    for t in sample:
-        verdict = run_one(t)
+    confirmations = {}
+    for idx, t in enumerate(sample):
+        verdict, witness = run_one(t, idx)
         conf[(t["expected"], verdict)] = conf.get((t["expected"], verdict), 0) + 1
         tag = "true " if t["expected"] else "false"
         flag = ""
         if t["expected"] and verdict == "false":
             false_alarms.append(t["src"])
             flag = "  <-- FALSE ALARM"
-        print(f"  expected={tag} verdict={verdict:<8} {Path(t['src']).name}{flag}")
+        cstat = ""
+        if CONFIRM and verdict == "false":
+            status = confirm_witness(t, witness)
+            confirmations[status] = confirmations.get(status, 0) + 1
+            cstat = f"  witness={status}"
+        print(f"  expected={tag} verdict={verdict:<8} {Path(t['src']).name}{flag}{cstat}")
 
     print("\n=== confusion (expected \\ verdict) ===")
     for exp in (True, False):
@@ -147,6 +193,16 @@ def main():
         print("\nFALSE ALARM tasks:")
         for fa in false_alarms:
             print("  ", fa)
+
+    if CONFIRM:
+        print("\n=== witness confirmation (witnesslint + CPAchecker) ===")
+        for k in sorted(confirmations):
+            print(f"  {k:<14} {confirmations[k]}")
+        confirmed = confirmations.get("CONFIRMED", 0)
+        total_w = sum(confirmations.values())
+        pct = (100.0 * confirmed / total_w) if total_w else 0.0
+        print(f"confirmed-witness: {confirmed}/{total_w} ({pct:.0f}%) of emitted FALSE")
+
     ok = (len(false_alarms) == 0 and emitted_true == 0)
     print("\nRESULT:", "PASS (sound: no false alarms, no TRUE)" if ok else "FAIL")
     sys.exit(0 if ok else 1)

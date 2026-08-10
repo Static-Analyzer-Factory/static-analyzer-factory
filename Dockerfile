@@ -96,6 +96,24 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 # Install maturin
 RUN pip3 install --break-system-packages "maturin>=1.7"
 
+# SV-COMP witness validation tooling (plan 194). witnesslint is the YAML 2.0
+# witness syntactic gate; it needs lxml/yaml/pycparser/jsonschema/clang under the
+# SYSTEM python (`/usr/bin/python3`), not the maturin venv. A headless JRE is for
+# CPAchecker, which `scripts/validate_witness.sh` provisions lazily to a
+# persistent path (it is too large to bake into this shared image). The linter is
+# cloned to a fixed location so `saf verify` output can be validated in-container.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-lxml \
+        python3-yaml \
+        python3-pycparser \
+        python3-jsonschema \
+        python3-clang \
+        openjdk-21-jre-headless \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 https://gitlab.com/sosy-lab/benchmarking/sv-witnesses.git /opt/sv-witnesses \
+    && chmod -R a+rX /opt/sv-witnesses
+ENV SAF_SVWITNESSES=/opt/sv-witnesses
+
 WORKDIR /workspace
 
 # Pre-create volume mount points with permissive permissions so that

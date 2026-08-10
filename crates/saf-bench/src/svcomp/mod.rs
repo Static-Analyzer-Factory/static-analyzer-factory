@@ -52,8 +52,7 @@ use walkdir::WalkDir;
 use crate::runner;
 
 pub use saf_svcomp::{
-    DataModel, Language, Property, PropertyAnalysisConfig, PropertyResult, Witness, WitnessEdge,
-    WitnessNode, WitnessType, analyze_property,
+    DataModel, Language, Property, PropertyAnalysisConfig, PropertyResult, analyze_property,
 };
 pub use scoring::{CategorySummary, SvCompOutcome, SvCompSummary, SvCompVerdict, TaskResult};
 pub use task::{PropertySpec, SvCompTask};

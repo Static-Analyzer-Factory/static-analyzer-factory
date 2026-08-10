@@ -2216,6 +2216,7 @@ dependencies = [
 name = "saf-svcomp"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "saf-analysis",
  "saf-core",
  "serde",

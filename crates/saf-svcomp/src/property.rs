@@ -1645,7 +1645,7 @@ enum MustResult {
 }
 
 /// Error-call target names for the unreach-call property.
-const REACH_ERROR_NAMES: &[&str] = &["reach_error", "__VERIFIER_error"];
+pub(crate) const REACH_ERROR_NAMES: &[&str] = &["reach_error", "__VERIFIER_error"];
 
 /// Assumption intrinsics. An assumption conditions all downstream execution
 /// (`assume(false)` blocks the path entirely), so nothing after one is
@@ -1665,6 +1665,46 @@ const NORETURN_FUNCTIONS: &[&str] = &[
     "longjmp",
     "siglongjmp",
 ];
+
+/// External declarations we trust to return normally.
+///
+/// `must_reach_body` may walk *past* a call only if that call is guaranteed to
+/// return; otherwise nothing sequenced after it is unconditionally reached. Any
+/// declaration NOT on this list is therefore treated as `Indeterminate` — it
+/// might diverge / `exit` / `longjmp` — which closes the optimistic-external
+/// unsound-FALSE hole (plan 194 R3). Known *noreturn* externals are handled
+/// separately by [`NORETURN_FUNCTIONS`]; the `__VERIFIER_nondet_*` family always
+/// returns.
+fn is_known_returning_external(name: &str) -> bool {
+    is_scalar_integer_nondet(name)
+        || matches!(
+            name,
+            "__VERIFIER_nondet_float"
+                | "__VERIFIER_nondet_double"
+                | "__VERIFIER_nondet_pointer"
+                | "__VERIFIER_nondet_unsigned"
+                | "__VERIFIER_nondet_u32"
+                | "printf"
+                | "puts"
+                | "putchar"
+                | "fputc"
+                | "fprintf"
+                | "sprintf"
+                | "snprintf"
+                | "malloc"
+                | "calloc"
+                | "realloc"
+                | "free"
+                | "memcpy"
+                | "memmove"
+                | "memset"
+                | "strlen"
+                | "strcpy"
+                | "strncpy"
+                | "strcmp"
+                | "strncmp"
+        )
+}
 
 /// Sound *must-reach* check for the unreach-call property.
 ///
@@ -1712,9 +1752,14 @@ fn must_reach_body(
         return MustResult::Indeterminate;
     };
     if func.is_declaration {
-        // Opaque external: assume it returns normally. (Residual: a diverging
-        // external not listed in NORETURN_FUNCTIONS is modeled optimistically.)
-        return MustResult::Returns;
+        // Opaque external. Only functions we KNOW return normally may be walked
+        // past; any other declaration might diverge / exit / longjmp, so
+        // treating it as returning would be an unsound-FALSE hole (plan 194 R3).
+        return if is_known_returning_external(&func.name) {
+            MustResult::Returns
+        } else {
+            MustResult::Indeterminate
+        };
     }
     // The LLVM frontend leaves `entry_block` unset and uses blocks[0] as the
     // entry (mirroring `Cfg::build`'s own fallback), so fall back to it here.
@@ -1741,6 +1786,12 @@ fn must_reach_body(
         };
 
         for inst in &block.instructions {
+            // An indirect call may target a noreturn function (`exit`/`abort`/…)
+            // we cannot see through, so nothing sequenced after it is guaranteed
+            // to execute. Bail rather than walk past it (plan 194 R3).
+            if matches!(inst.op, Operation::CallIndirect { .. }) {
+                return MustResult::Indeterminate;
+            }
             let Operation::CallDirect { callee } = &inst.op else {
                 continue;
             };
@@ -2192,6 +2243,93 @@ mod must_reach_tests {
         m.functions.push(decl(abort_id, "abort"));
         m.functions.push(decl(err_id, "reach_error"));
         assert!(must_reach_error(&m).is_none());
+    }
+
+    // ---- plan 194 R3: conservative bail (close the two Stage-1 −16 holes) ----
+
+    /// `main() { (*fp)(); reach_error(); }` — an INDIRECT call precedes the error.
+    /// Its target could be noreturn, so we cannot claim the error is reached
+    /// (was walked past by the old `CallDirect`-only loop). → NOT must-reach.
+    #[test]
+    fn indirect_call_before_error_is_not_must_reach() {
+        let (main_id, err_id) = (FunctionId::new(1), FunctionId::new(2));
+        let entry = BlockId::new(10);
+        let indirect = Instruction::new(
+            InstId::new(1),
+            Operation::CallIndirect {
+                expected_signature: None,
+            },
+        );
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(entry, vec![indirect, call(2, err_id), ret(3)])],
+            entry,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert!(must_reach_error(&m).is_none());
+    }
+
+    /// `main() { maybe_diverges(); reach_error(); }` where `maybe_diverges` is an
+    /// opaque external NOT on the known-returning allowlist — it might diverge,
+    /// so the error is not unconditionally reached (was modeled optimistically as
+    /// returning). → NOT must-reach.
+    #[test]
+    fn unknown_external_before_error_is_not_must_reach() {
+        let (main_id, ext_id, err_id) =
+            (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let entry = BlockId::new(10);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(entry, vec![call(1, ext_id), call(2, err_id), ret(3)])],
+            entry,
+        ));
+        m.functions.push(decl(ext_id, "maybe_diverges"));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert!(must_reach_error(&m).is_none());
+    }
+
+    /// `main() { printf(...); reach_error(); }` — an allow-listed known-returning
+    /// external before the error still yields must-reach (no recall lost).
+    #[test]
+    fn known_returning_external_before_error_is_must_reach() {
+        let (main_id, printf_id, err_id) =
+            (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let entry = BlockId::new(10);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(
+                entry,
+                vec![call(1, printf_id), call(2, err_id), ret(3)],
+            )],
+            entry,
+        ));
+        m.functions.push(decl(printf_id, "printf"));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert!(must_reach_error(&m).is_some());
+    }
+
+    /// `main() { __VERIFIER_nondet_int(); reach_error(); }` — a nondet external
+    /// always returns, so the error stays unconditionally reached. → must-reach.
+    #[test]
+    fn nondet_external_before_error_is_must_reach() {
+        let (main_id, nd_id, err_id) = (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let entry = BlockId::new(10);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(entry, vec![call(1, nd_id), call(2, err_id), ret(3)])],
+            entry,
+        ));
+        m.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert!(must_reach_error(&m).is_some());
     }
 }
 

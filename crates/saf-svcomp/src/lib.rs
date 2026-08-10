@@ -17,11 +17,16 @@ pub mod fast_paths;
 pub mod property;
 pub mod property_kind;
 pub mod summaries;
-pub mod witness;
+pub mod witness_lower;
+pub mod witness_yaml;
 
 pub use property::{
     AnalysisContext, FalseCandidate, NondetCall, PropertyAnalysisConfig, PropertyResult,
     analyze_property, analyze_property_with_context, enumerate_false_candidates, must_reach_error,
 };
 pub use property_kind::{DataModel, Language, Property};
-pub use witness::{Witness, WitnessEdge, WitnessNode, WitnessType};
+pub use witness_lower::{lower_candidate, lower_must_reach, span_to_location};
+pub use witness_yaml::{
+    Action, Constraint, SourceWaypoint, ViolationWitness, WaypointKind, WitnessMeta,
+    compute_file_hash,
+};

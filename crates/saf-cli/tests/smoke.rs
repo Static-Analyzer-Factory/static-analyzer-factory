@@ -384,3 +384,102 @@ fn verify_ignores_pta_env_toggles() {
         .expect("run saf verify");
     assert_eq!(out.stdout, b"false(unreach-call)\n");
 }
+
+// ---------------------------------------------------------------------------
+// verify witness emission (plan 194) — YAML 2.0 violation witness written to
+// `--witness`, only alongside a `false` verdict.
+// ---------------------------------------------------------------------------
+
+/// Run `saf verify <fixture> --witness <path>` and return the `Assert`.
+fn verify_unreach_witness(
+    fixture: &str,
+    data_model: &str,
+    witness: &std::path::Path,
+) -> assert_cmd::assert::Assert {
+    let prp = unreach_prp();
+    let fx = svcomp_fixture(fixture);
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.as_str(),
+            "--data-model",
+            data_model,
+            "--witness",
+            witness.to_str().unwrap(),
+            fx.as_str(),
+        ])
+        .assert()
+        .success()
+}
+
+/// A `false` verdict writes a YAML 2.0 violation witness to `--witness`.
+#[test]
+#[ignore]
+fn verify_false_direct_writes_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().join("w.yml");
+    verify_unreach_witness("unreach_false_direct.c", "LP64", &w).stdout("false(unreach-call)\n");
+    let yaml = std::fs::read_to_string(&w).expect("witness written for a false verdict");
+    assert!(yaml.contains("entry_type: violation_sequence"), "{yaml}");
+    assert!(yaml.contains("type: target"), "{yaml}");
+    assert!(yaml.contains("format_version:"), "{yaml}");
+    assert!(
+        yaml.contains("creation_time: 2024-01-01T00:00:00Z"),
+        "{yaml}"
+    );
+}
+
+/// An `unknown` verdict (reach_error present but unreachable) writes NO witness.
+#[test]
+#[ignore]
+fn verify_unknown_writes_no_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().join("w.yml");
+    verify_unreach_witness("unreach_true_simple.c", "LP64", &w).stdout("unknown\n");
+    assert!(
+        !w.exists(),
+        "no witness may be written for an unknown verdict"
+    );
+}
+
+/// The emitted witness is byte-identical across re-runs (NFR-DET determinism).
+#[test]
+#[ignore]
+fn verify_witness_is_byte_stable() {
+    let dir = tempfile::tempdir().unwrap();
+    let w1 = dir.path().join("w1.yml");
+    let w2 = dir.path().join("w2.yml");
+    verify_unreach_witness("unreach_false_direct.c", "LP64", &w1).stdout("false(unreach-call)\n");
+    verify_unreach_witness("unreach_false_direct.c", "LP64", &w2).stdout("false(unreach-call)\n");
+    assert_eq!(
+        std::fs::read(&w1).expect("w1"),
+        std::fs::read(&w2).expect("w2"),
+        "witness bytes must be deterministic across runs"
+    );
+}
+
+/// The emitted witness passes `witnesslint` (the SV-COMP 2.0 witness syntactic
+/// gate, baked into the dev image at `$SAF_SVWITNESSES`). Runs the syntactic
+/// stage of `scripts/validate_witness.sh` (CPAchecker skipped).
+#[test]
+#[ignore]
+fn verify_witness_passes_witnesslint() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().join("w.yml");
+    let fx = svcomp_fixture("unreach_false_direct.c");
+    verify_unreach_witness("unreach_false_direct.c", "LP64", &w).stdout("false(unreach-call)\n");
+    let out = std::process::Command::new("bash")
+        .arg(ws("scripts/validate_witness.sh"))
+        .arg(&w)
+        .arg(&fx)
+        .env("SAF_SKIP_CPACHECKER", "1")
+        .output()
+        .expect("run validate_witness.sh");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("LINT_OK"),
+        "witnesslint rejected the emitted witness:\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
+    );
+}

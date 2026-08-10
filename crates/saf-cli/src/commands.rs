@@ -772,55 +772,82 @@ pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
     }
 
     // Parse the property from the `.prp` contents (never the filename). Any read
-    // problem is non-fatal: default to the safe `unknown`.
-    let property = match std::fs::read_to_string(&args.property) {
-        Ok(prp) => saf_svcomp::Property::from_prp(&prp),
-        Err(e) => {
-            eprintln!(
-                "saf verify: cannot read property file {}: {e}",
-                args.property.display()
-            );
-            None
-        }
-    };
+    // problem is non-fatal: default to the safe `unknown`. The raw text is also
+    // the witness `specification` field.
+    let prp_text = std::fs::read_to_string(&args.property).unwrap_or_else(|e| {
+        eprintln!(
+            "saf verify: cannot read property file {}: {e}",
+            args.property.display()
+        );
+        String::new()
+    });
+    let property = saf_svcomp::Property::from_prp(&prp_text);
     let data_model: saf_svcomp::DataModel = args.data_model.into();
 
-    // Slice 1 scope: only unreach-call is analyzed; everything else -> unknown.
-    if property != Some(saf_svcomp::Property::UnreachCall) {
-        if let Some(p) = property {
-            eprintln!(
-                "saf verify: property `{}` not analyzed in this build -> unknown",
-                p.name()
-            );
-        } else {
-            eprintln!("saf verify: unrecognized property -> unknown");
-        }
+    // Verdict-dispatch table (plan 194): a property is analyzed only if it has a
+    // registered strategy; everything else is the safe `unknown`. New properties
+    // (memsafety/overflow/…) plug in by adding a `strategy_for` arm.
+    let Some(property) = property else {
+        eprintln!("saf verify: unrecognized property -> unknown");
+        println!("unknown");
+        return Ok(());
+    };
+    if strategy_for(property).is_none() {
+        eprintln!(
+            "saf verify: property `{}` not analyzed in this build -> unknown",
+            property.name()
+        );
         println!("unknown");
         return Ok(());
     }
 
-    // Run compile -> ingest -> analyze on a worker thread under a wall-clock
+    // Run compile -> ingest -> strategy on a worker thread under a wall-clock
     // budget. On timeout (or a worker panic, which drops the sender) emit the
     // safe `unknown` and exit 0, gracefully beating BenchExec's SIGKILL. The
     // watchdog only ever yields UNKNOWN, so it can never produce an unsound
     // verdict.
     let input = args.input.clone();
+    let specification = prp_text.trim().to_string();
     let deadline = std::time::Duration::from_secs(args.timeout);
     let (tx, rx) = std::sync::mpsc::channel();
     let _worker = std::thread::spawn(move || {
-        let _ = tx.send(unreach_verdict(&input, data_model));
+        let _ = tx.send(run_verdict(&input, data_model, property, specification));
     });
 
-    let verdict = if let Ok(v) = rx.recv_timeout(deadline) {
-        v
+    let outcome = if let Ok(o) = rx.recv_timeout(deadline) {
+        o
     } else {
         eprintln!(
             "saf verify: analysis exceeded {}s budget (or worker failed) -> unknown",
             args.timeout
         );
-        "unknown".to_string()
+        unknown_outcome()
     };
-    println!("{verdict}");
+
+    // Write the violation witness ONLY for a `false` verdict received before the
+    // deadline — never on timeout/unknown/true — so a witness is emitted only
+    // alongside a sound FALSE. The verdict is printed regardless: a `false`
+    // whose witness is missing/unwritable is still sound (it just scores 0).
+    if outcome.verdict.starts_with("false") {
+        if let Some(witness) = &outcome.witness {
+            match witness.to_yaml_string() {
+                Ok(yaml) => match std::fs::write(&args.witness, yaml) {
+                    Ok(()) => eprintln!(
+                        "saf verify: wrote violation witness to {}",
+                        args.witness.display()
+                    ),
+                    Err(e) => eprintln!(
+                        "saf verify: failed to write witness to {}: {e} (verdict still emitted)",
+                        args.witness.display()
+                    ),
+                },
+                Err(e) => eprintln!(
+                    "saf verify: witness serialization failed: {e:#} (verdict still emitted)"
+                ),
+            }
+        }
+    }
+    println!("{}", outcome.verdict);
     Ok(())
 }
 
@@ -927,65 +954,176 @@ fn compile_to_ir(
     Ok(ir)
 }
 
-/// Compile, ingest, and analyze `input` for unreach-call, returning the SV-COMP
-/// verdict line. Any internal failure maps to `unknown` (with a diagnostic on
-/// stderr); this function never errors, so the caller keeps exit code 0.
-fn unreach_verdict(input: &Path, data_model: saf_svcomp::DataModel) -> String {
-    use saf_svcomp::Property;
+/// The result of a verdict computation: the stdout line plus an optional
+/// violation witness (present only for a sound `false`).
+struct VerdictOutcome {
+    verdict: String,
+    witness: Option<saf_svcomp::ViolationWitness>,
+}
 
+/// The safe fallback: `unknown` with no witness.
+fn unknown_outcome() -> VerdictOutcome {
+    VerdictOutcome {
+        verdict: "unknown".to_string(),
+        witness: None,
+    }
+}
+
+/// Everything a per-property strategy needs. Compile+ingest is shared; execution
+/// (native replay) stays in `saf-cli`, while the pure engine lives in `saf-svcomp`.
+struct VerifyCtx<'a> {
+    input: &'a Path,
+    data_model: saf_svcomp::DataModel,
+    module: &'a saf_core::air::AirModule,
+    meta: &'a saf_svcomp::WitnessMeta,
+    stub: &'a Path,
+    tempdir: &'a Path,
+    clang: &'a str,
+}
+
+/// A per-property `propose -> concrete-confirm -> witness` pipeline.
+type StrategyFn = fn(&VerifyCtx) -> VerdictOutcome;
+
+/// The verdict-dispatch table (plan 194 extensibility spine). Today only
+/// `unreach-call` is wired; memsafety/overflow/… add an arm here, each with its
+/// own concrete confirmer, reusing the shared orchestration and witness emitter.
+fn strategy_for(property: saf_svcomp::Property) -> Option<StrategyFn> {
+    match property {
+        saf_svcomp::Property::UnreachCall => Some(unreach_strategy),
+        _ => None,
+    }
+}
+
+/// Shared orchestration: compile -> ingest -> build witness metadata -> dispatch
+/// to the property strategy. Any internal failure maps to `unknown` (diagnostic
+/// on stderr); never errors, so the caller keeps exit code 0.
+fn run_verdict(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    property: saf_svcomp::Property,
+    specification: String,
+) -> VerdictOutcome {
+    let Some(strategy) = strategy_for(property) else {
+        return unknown_outcome();
+    };
     let Some(stub) = resolve_svcomp_stub() else {
         eprintln!("saf verify: could not locate share/saf/stubs/sv-comp-stubs.h -> unknown");
-        return "unknown".to_string();
+        return unknown_outcome();
     };
     let dir = match tempfile::tempdir() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("saf verify: could not create temp dir: {e} -> unknown");
-            return "unknown".to_string();
+            return unknown_outcome();
         }
     };
     let ir = match compile_to_ir(input, data_model, &stub, dir.path()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("saf verify: compilation failed: {e:#} -> unknown");
-            return "unknown".to_string();
+            return unknown_outcome();
         }
     };
     let bundle = match driver::AnalysisDriver::ingest(&[ir], CliFrontend::Llvm) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("saf verify: ingestion failed: {e:#} -> unknown");
-            return "unknown".to_string();
+            return unknown_outcome();
         }
     };
+    let clang = std::env::var("SAF_CLANG").unwrap_or_else(|_| DEFAULT_CLANG.to_string());
+    let meta = saf_svcomp::WitnessMeta {
+        producer_version: env!("CARGO_PKG_VERSION").to_string(),
+        specification,
+        data_model,
+        language: saf_svcomp::Language::C,
+        input_file: input.to_path_buf(),
+    };
+    let ctx = VerifyCtx {
+        input,
+        data_model,
+        module: &bundle.module,
+        meta: &meta,
+        stub: &stub,
+        tempdir: dir.path(),
+        clang: &clang,
+    };
+    strategy(&ctx)
+}
 
-    // Sound must-reach FALSE (plan 192 §1.6, revised after the slice-1 blind eval):
-    // the Z3 feasibility engine *over*-approximates reachability, so its FALSE is
-    // unsound as a verdict (a wrong `false` scores -16). Emit `false` only when
-    // reach_error is UNCONDITIONALLY reachable; everything else -> unknown. We also
-    // never emit `true`, so -32 exposure stays zero.
-    // Stage 1 (sound, cheap): reach_error UNCONDITIONALLY reached ⇒ a guaranteed
-    // violation, no execution needed.
-    if saf_svcomp::must_reach_error(&bundle.module).is_some() {
-        return format!("false({})", Property::UnreachCall.name());
+/// Assemble a violation witness from a lowered waypoint list, logging (but not
+/// failing the verdict) on any assembly error.
+fn build_witness(
+    ctx: &VerifyCtx,
+    waypoints: Option<Vec<saf_svcomp::SourceWaypoint>>,
+) -> Option<saf_svcomp::ViolationWitness> {
+    let waypoints = waypoints?;
+    match saf_svcomp::ViolationWitness::assemble(ctx.meta, &waypoints) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("saf verify: witness assembly failed: {e:#}");
+            None
+        }
+    }
+}
+
+/// The `unreach-call` FALSE pipeline (plan 192 §1.6 / slice 1c), now emitting a
+/// violation witness alongside each sound FALSE.
+///
+/// Soundness (unchanged): emit `false` only when `reach_error` is UNCONDITIONALLY
+/// reachable (Stage 1, `must_reach_error`) or a concrete native replay reaches it
+/// (Stage 2/3). Never emits `true`. The witness is a *side output* of an
+/// already-sound verdict — a `false` is still returned when the witness cannot be
+/// constructed (e.g. a missing span), it just scores 0 like `unknown`.
+fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
+    use saf_svcomp::Property;
+
+    // Stage 1 (sound, cheap): reach_error UNCONDITIONALLY reached.
+    if let Some(chain) = saf_svcomp::must_reach_error(ctx.module) {
+        let witness = build_witness(ctx, saf_svcomp::lower_must_reach(ctx.module, &chain));
+        if witness.is_none() {
+            eprintln!(
+                "saf verify: FALSE (must-reach) but witness unconstructible (missing span) -> emitting false without a witness"
+            );
+        }
+        return VerdictOutcome {
+            verdict: format!("false({})", Property::UnreachCall.name()),
+            witness,
+        };
     }
 
-    // Stage 2 + 3 (slice 1c): must-reach is silent on *guarded* violations.
-    // Enumerate over-approximate FALSE candidates from the Z3 path engine (each
-    // with a satisfying nondet model), then CONFIRM each by concrete native
-    // replay — pin the nondet inputs to the model and run the real program.
-    // Only a run that actually reaches reach_error is a violation, so the
-    // over-approximation's false alarms are filtered out (they do not
+    // Stage 2 + 3: enumerate over-approximate candidates, CONFIRM by concrete
+    // native replay. Only a run that actually reaches reach_error is a violation,
+    // so the over-approximation's false alarms are filtered out (they do not
     // reproduce), and we still never emit `true`.
     let config = saf_svcomp::PropertyAnalysisConfig {
         conservative: false,
         ..Default::default()
     };
-    let candidates = saf_svcomp::enumerate_false_candidates(&bundle.module, &config);
-    let clang = std::env::var("SAF_CLANG").unwrap_or_else(|_| DEFAULT_CLANG.to_string());
+    let candidates = saf_svcomp::enumerate_false_candidates(ctx.module, &config);
     for (idx, candidate) in candidates.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
-        match replay_confirms_false(input, data_model, &stub, dir.path(), &clang, idx, candidate) {
-            Ok(true) => return format!("false({})", Property::UnreachCall.name()),
+        match replay_confirms_false(
+            ctx.input,
+            ctx.data_model,
+            ctx.stub,
+            ctx.tempdir,
+            ctx.clang,
+            idx,
+            candidate,
+        ) {
+            Ok(true) => {
+                let witness =
+                    build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, candidate));
+                if witness.is_none() {
+                    eprintln!(
+                        "saf verify: FALSE (replay-confirmed) but witness unconstructible -> emitting false without a witness"
+                    );
+                }
+                return VerdictOutcome {
+                    verdict: format!("false({})", Property::UnreachCall.name()),
+                    witness,
+                };
+            }
             Ok(false) => {}
             Err(e) => eprintln!("saf verify: replay of candidate {idx} errored: {e:#} -> continue"),
         }
@@ -1003,7 +1141,7 @@ fn unreach_verdict(input: &Path, data_model: saf_svcomp::DataModel) -> String {
             candidates.len()
         );
     }
-    "unknown".to_string()
+    unknown_outcome()
 }
 
 /// Cap on how many candidates to replay per task — bounds worst-case native

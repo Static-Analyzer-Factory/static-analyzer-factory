@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 saf-core = { workspace = true }
 saf-analysis = { workspace = true, features = ["z3-solver", "analysis-mta"] }
+anyhow = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = "0.10"

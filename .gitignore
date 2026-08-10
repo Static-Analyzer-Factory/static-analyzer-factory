@@ -88,3 +88,9 @@ tests/benchmarks/incremental/*/.compiled/
 
 # Git worktrees
 .worktrees/
+
+# SV-COMP witness-validation scratch (plan 194): witnesslint clone + CPAchecker
+# download + stray default witnesses written by `saf verify` during tests.
+.svwitnesses/
+.svtools/
+/witness.yml
