@@ -11,7 +11,7 @@ use saf_core::ids::{BlockId, FunctionId};
 use crate::cfg::Cfg;
 
 use super::solver::{FeasibilityResult, PathFeasibilityChecker, Z3FilterDiagnostics};
-use crate::guard::{ValueLocationIndex, extract_guards_from_blocks};
+use crate::guard::{ValueLocationIndex, extract_assume_guards, extract_guards_from_blocks};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -85,7 +85,17 @@ pub fn check_path_reachable(
 
         let block_seq: Vec<(FunctionId, BlockId)> = path.iter().map(|&b| (func_id, b)).collect();
 
-        let pc = extract_guards_from_blocks(&block_seq, &index);
+        let mut pc = extract_guards_from_blocks(&block_seq, &index);
+        // The `max_guards` complexity bound applies to branch guards (path
+        // conditions); assume constraints are folded in on top and are exempt.
+        let branch_guards = pc.guards.len();
+
+        // Fold in `__VERIFIER_assume(cond)` constraints along this path so
+        // infeasible (assume-blocked) error paths are pruned. This must run
+        // before the is_empty() short-circuit below, otherwise a guard-free path
+        // carrying only an assume would be reported Reachable without Z3.
+        pc.guards
+            .extend(extract_assume_guards(&block_seq, module, &index));
         diagnostics.guards_extracted += pc.guards.len();
 
         if pc.is_empty() {
@@ -97,7 +107,7 @@ pub fn check_path_reachable(
             };
         }
 
-        if pc.guards.len() > max_guards {
+        if branch_guards > max_guards {
             diagnostics.unknown_count += 1;
             diagnostics.skipped_too_many_guards += 1;
             continue;
@@ -181,4 +191,175 @@ fn enumerate_paths(from: BlockId, to: BlockId, cfg: &Cfg, max_paths: usize) -> V
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod assume_tests {
+    use super::*;
+    use saf_core::air::{
+        AirBlock, AirFunction, BinaryOp, CastKind, Constant, Instruction, Operation,
+    };
+    use saf_core::ids::{InstId, ModuleId, ValueId};
+    use std::collections::BTreeMap;
+
+    // Value / block / function ids shared by the fixtures below.
+    fn ids() -> (FunctionId, FunctionId, BlockId, BlockId, BlockId) {
+        (
+            FunctionId::new(1), // main
+            FunctionId::new(2), // __VERIFIER_assume (declaration)
+            BlockId::new(10),   // entry
+            BlockId::new(11),   // error
+            BlockId::new(12),   // exit
+        )
+    }
+
+    fn decl_assume(assume_id: FunctionId) -> AirFunction {
+        AirFunction {
+            id: assume_id,
+            name: "__VERIFIER_assume".to_string(),
+            params: vec![],
+            blocks: vec![],
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    fn ret_block(id: BlockId, inst: u128) -> AirBlock {
+        AirBlock {
+            id,
+            label: None,
+            instructions: vec![Instruction::new(InstId::new(inst), Operation::Ret)],
+        }
+    }
+
+    /// A `main` whose entry block branches to `error` on `x != 0`, optionally
+    /// preceded by `__VERIFIER_assume(x == 0)`. Returns the module.
+    fn build_module(with_assume: bool) -> AirModule {
+        let (main_id, assume_id, entry, error, exit) = ids();
+
+        let x = ValueId::new(100);
+        let zero = ValueId::new(101);
+        let cond_eq = ValueId::new(102);
+        let conv = ValueId::new(103);
+        let cond_ne = ValueId::new(104);
+
+        let mut insts = Vec::new();
+        if with_assume {
+            // %cond_eq = icmp eq i32 %x, 0
+            insts.push(
+                Instruction::new(
+                    InstId::new(1000),
+                    Operation::BinaryOp {
+                        kind: BinaryOp::ICmpEq,
+                    },
+                )
+                .with_operands(vec![x, zero])
+                .with_dst(cond_eq),
+            );
+            // %conv = zext i1 %cond_eq to i32   (this is what `assume(x == 0)` lowers to)
+            insts.push(
+                Instruction::new(
+                    InstId::new(1001),
+                    Operation::Cast {
+                        kind: CastKind::ZExt,
+                        target_bits: Some(32),
+                    },
+                )
+                .with_operands(vec![cond_eq])
+                .with_dst(conv),
+            );
+            // call void @__VERIFIER_assume(i32 %conv)
+            insts.push(
+                Instruction::new(
+                    InstId::new(1002),
+                    Operation::CallDirect { callee: assume_id },
+                )
+                .with_operands(vec![conv]),
+            );
+        }
+        // %cond_ne = icmp ne i32 %x, 0
+        insts.push(
+            Instruction::new(
+                InstId::new(1003),
+                Operation::BinaryOp {
+                    kind: BinaryOp::ICmpNe,
+                },
+            )
+            .with_operands(vec![x, zero])
+            .with_dst(cond_ne),
+        );
+        // condbr %cond_ne, error, exit
+        insts.push(
+            Instruction::new(
+                InstId::new(1004),
+                Operation::CondBr {
+                    then_target: error,
+                    else_target: exit,
+                },
+            )
+            .with_operands(vec![cond_ne]),
+        );
+
+        let entry_block = AirBlock {
+            id: entry,
+            label: Some("entry".to_string()),
+            instructions: insts,
+        };
+
+        let main = AirFunction {
+            id: main_id,
+            name: "main".to_string(),
+            params: vec![],
+            blocks: vec![entry_block, ret_block(error, 1005), ret_block(exit, 1006)],
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+
+        let mut module = AirModule::new(ModuleId::new(1));
+        module
+            .constants
+            .insert(zero, Constant::Int { value: 0, bits: 32 });
+        module.functions.push(main);
+        module.functions.push(decl_assume(assume_id));
+        module
+    }
+
+    /// Sanity: without any assume, the `x != 0` error block IS reachable.
+    #[test]
+    fn error_reachable_without_assume() {
+        let (main_id, _assume, entry, error, _exit) = ids();
+        let module = build_module(false);
+
+        let result = check_path_reachable(entry, error, main_id, &module, 5000, 50, 1000);
+        assert!(
+            matches!(result.result, PathReachability::Reachable(_)),
+            "x != 0 error path should be reachable when unconstrained; got {:?}",
+            result.result
+        );
+    }
+
+    /// `__VERIFIER_assume(x == 0)` must prune the `x != 0` error path: the
+    /// conjunction `x == 0 ∧ x != 0` is UNSAT, so the error is Unreachable.
+    #[test]
+    fn assume_prunes_infeasible_error_path() {
+        let (main_id, _assume, entry, error, _exit) = ids();
+        let module = build_module(true);
+
+        let result = check_path_reachable(entry, error, main_id, &module, 5000, 50, 1000);
+        assert!(
+            matches!(result.result, PathReachability::Unreachable),
+            "assume(x == 0) must make the x != 0 error path Unreachable; got {:?}",
+            result.result
+        );
+    }
 }

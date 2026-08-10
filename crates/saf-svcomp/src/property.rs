@@ -1619,6 +1619,423 @@ fn analyze_memcleanup(ctx: &AnalysisContext<'_>) -> PropertyResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sound must-reach analysis for unreach-call (plan 192 §1.6, revised after the
+// slice-1 blind eval).
+//
+// The Z3 path-feasibility engine *over*-approximates reachability (it models a
+// guard's operands as unconstrained fresh variables, ignoring the arithmetic /
+// casts / pointer-identity that define them, and does not compose caller↔callee
+// argument constraints). "SAT" therefore means "could not prove infeasible", not
+// "provably feasible" — sound for dropping false positives in a bug *reporter*,
+// but UNSOUND as grounds for emitting a FALSE verdict (a wrong `false` scores
+// −16 in SV-COMP). This function is the dual, *under*-approximate check: it
+// reports a violation only when `reach_error` is guaranteed to execute.
+// ---------------------------------------------------------------------------
+
+/// Result of the unconditional (must-execute) reachability walk of a function.
+#[derive(Debug, Clone)]
+enum MustResult {
+    /// `reach_error` is unconditionally reached; carries the block path witness.
+    ReachesError(Vec<BlockId>),
+    /// The function unconditionally runs to a normal return.
+    Returns,
+    /// Neither can be established (a branch, loop, recursion, or opaque call).
+    Indeterminate,
+}
+
+/// Error-call target names for the unreach-call property.
+const REACH_ERROR_NAMES: &[&str] = &["reach_error", "__VERIFIER_error"];
+
+/// Assumption intrinsics. An assumption conditions all downstream execution
+/// (`assume(false)` blocks the path entirely), so nothing after one is
+/// *unconditionally* reached — the must-reach walk stops at an assume.
+const ASSUME_FUNCTIONS: &[&str] = &["__VERIFIER_assume", "__CPROVER_assume"];
+
+/// Functions that never return — execution stops before anything after the call.
+const NORETURN_FUNCTIONS: &[&str] = &[
+    "exit",
+    "_exit",
+    "_Exit",
+    "abort",
+    "__assert_fail",
+    "__assert_rtn",
+    "__builtin_unreachable",
+    "__builtin_trap",
+    "longjmp",
+    "siglongjmp",
+];
+
+/// Sound *must-reach* check for the unreach-call property.
+///
+/// Returns the unconditionally-executed block path to a `reach_error` /
+/// `__VERIFIER_error` call if — and only if — that call is guaranteed to execute
+/// on every run from `main`: it follows forced single-successor CFG edges and
+/// unconditionally-executed calls, and stops (yielding "no proof") at any branch,
+/// loop back-edge, recursion cycle, or no-return call. A `Some` result is a
+/// genuine, guard-free violation, so emitting `false(unreach-call)` on it cannot
+/// be a false alarm. Returns `None` otherwise (the caller then emits `unknown`).
+#[must_use]
+pub fn must_reach_error(module: &AirModule) -> Option<Vec<BlockId>> {
+    let main = module.function_by_name("main")?;
+    let mut visiting = BTreeSet::new();
+    match must_reach_fn(main.id, module, &mut visiting) {
+        MustResult::ReachesError(path) if !path.is_empty() => Some(path),
+        _ => None,
+    }
+}
+
+/// Recursion-guarded wrapper around [`must_reach_body`].
+fn must_reach_fn(
+    func_id: FunctionId,
+    module: &AirModule,
+    visiting: &mut BTreeSet<FunctionId>,
+) -> MustResult {
+    if !visiting.insert(func_id) {
+        // Recursion cycle: cannot establish that this call must return, so we
+        // cannot claim anything after it is must-reached.
+        return MustResult::Indeterminate;
+    }
+    let result = must_reach_body(func_id, module, visiting);
+    visiting.remove(&func_id);
+    result
+}
+
+/// Walk the unconditional (forced single-successor) block chain of one function,
+/// scanning unconditionally-executed instructions in order.
+fn must_reach_body(
+    func_id: FunctionId,
+    module: &AirModule,
+    visiting: &mut BTreeSet<FunctionId>,
+) -> MustResult {
+    let Some(func) = module.function(func_id) else {
+        return MustResult::Indeterminate;
+    };
+    if func.is_declaration {
+        // Opaque external: assume it returns normally. (Residual: a diverging
+        // external not listed in NORETURN_FUNCTIONS is modeled optimistically.)
+        return MustResult::Returns;
+    }
+    // The LLVM frontend leaves `entry_block` unset and uses blocks[0] as the
+    // entry (mirroring `Cfg::build`'s own fallback), so fall back to it here.
+    let Some(entry) = func
+        .entry_block
+        .or_else(|| func.blocks.first().map(|b| b.id))
+    else {
+        return MustResult::Indeterminate;
+    };
+
+    let cfg = Cfg::build(func);
+    let mut path = Vec::new();
+    let mut visited_blocks = BTreeSet::new();
+    let mut block_id = entry;
+
+    loop {
+        if !visited_blocks.insert(block_id) {
+            // Loop back-edge: may not terminate, so nothing past it is must-reached.
+            return MustResult::Indeterminate;
+        }
+        path.push(block_id);
+        let Some(block) = func.blocks.iter().find(|b| b.id == block_id) else {
+            return MustResult::Indeterminate;
+        };
+
+        for inst in &block.instructions {
+            let Operation::CallDirect { callee } = &inst.op else {
+                continue;
+            };
+            let name = module.function(*callee).map_or("", |f| f.name.as_str());
+            if REACH_ERROR_NAMES.contains(&name) {
+                return MustResult::ReachesError(path);
+            }
+            if NORETURN_FUNCTIONS.contains(&name) {
+                // Execution stops here; any later error is not reached.
+                return MustResult::Indeterminate;
+            }
+            if ASSUME_FUNCTIONS.contains(&name) {
+                // An assumption conditions the rest of the path (it may block it),
+                // so nothing after it is *unconditionally* reached.
+                return MustResult::Indeterminate;
+            }
+            match must_reach_fn(*callee, module, visiting) {
+                MustResult::ReachesError(mut sub) => {
+                    path.append(&mut sub);
+                    return MustResult::ReachesError(path);
+                }
+                // Callee returns normally: continue scanning after the call.
+                MustResult::Returns => {}
+                // Callee may not return: cannot claim anything after it.
+                MustResult::Indeterminate => return MustResult::Indeterminate,
+            }
+        }
+
+        let Some(succs) = cfg.successors.get(&block_id) else {
+            // No successors recorded (a `ret`/`unreachable` terminator): returns.
+            return MustResult::Returns;
+        };
+        match succs.len() {
+            // A `ret`/`unreachable` terminator: the function returns.
+            0 => return MustResult::Returns,
+            // Exactly one successor: a forced edge — follow it.
+            1 => block_id = *succs.iter().next().expect("len == 1 has an element"),
+            // A branch (CondBr/Switch): the chain is no longer unconditional.
+            _ => return MustResult::Indeterminate,
+        }
+    }
+}
+
+#[cfg(test)]
+mod must_reach_tests {
+    use super::*;
+    use saf_core::air::{AirBlock, AirFunction, BinaryOp, Constant, Instruction};
+    use saf_core::ids::ModuleId;
+
+    fn decl(id: FunctionId, name: &str) -> AirFunction {
+        AirFunction {
+            id,
+            name: name.into(),
+            params: vec![],
+            blocks: vec![],
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    fn func(id: FunctionId, name: &str, blocks: Vec<AirBlock>, entry: BlockId) -> AirFunction {
+        AirFunction {
+            id,
+            name: name.into(),
+            params: vec![],
+            blocks,
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    fn blk(id: BlockId, instructions: Vec<Instruction>) -> AirBlock {
+        AirBlock {
+            id,
+            label: None,
+            instructions,
+        }
+    }
+
+    fn call(iid: u128, callee: FunctionId) -> Instruction {
+        Instruction::new(InstId::new(iid), Operation::CallDirect { callee })
+    }
+
+    fn ret(iid: u128) -> Instruction {
+        Instruction::new(InstId::new(iid), Operation::Ret)
+    }
+
+    /// `main() { reach_error(); }` — unconditional → must-reach.
+    #[test]
+    fn unconditional_direct_is_must_reach() {
+        let (main_id, err_id) = (FunctionId::new(1), FunctionId::new(2));
+        let entry = BlockId::new(10);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(entry, vec![call(1, err_id), ret(2)])],
+            entry,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert!(must_reach_error(&m).is_some());
+    }
+
+    /// `main() { if (x != 0) reach_error(); }` — guarded → NOT must-reach.
+    #[test]
+    fn guarded_is_not_must_reach() {
+        let (main_id, err_id) = (FunctionId::new(1), FunctionId::new(2));
+        let (entry, err_blk, exit) = (BlockId::new(10), BlockId::new(11), BlockId::new(12));
+        let (x, zero, cond) = (ValueId::new(100), ValueId::new(101), ValueId::new(102));
+        let e = blk(
+            entry,
+            vec![
+                Instruction::new(
+                    InstId::new(1),
+                    Operation::BinaryOp {
+                        kind: BinaryOp::ICmpNe,
+                    },
+                )
+                .with_operands(vec![x, zero])
+                .with_dst(cond),
+                Instruction::new(
+                    InstId::new(2),
+                    Operation::CondBr {
+                        then_target: err_blk,
+                        else_target: exit,
+                    },
+                )
+                .with_operands(vec![cond]),
+            ],
+        );
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.constants
+            .insert(zero, Constant::Int { value: 0, bits: 32 });
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![
+                e,
+                blk(err_blk, vec![call(3, err_id), ret(4)]),
+                blk(exit, vec![ret(5)]),
+            ],
+            entry,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert!(must_reach_error(&m).is_none());
+    }
+
+    /// `main() { bug(); }  bug() { reach_error(); }` — interprocedural must-reach.
+    #[test]
+    fn unconditional_interproc_is_must_reach() {
+        let (main_id, bug_id, err_id) =
+            (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let (m_entry, b_entry) = (BlockId::new(10), BlockId::new(20));
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(m_entry, vec![call(1, bug_id), ret(2)])],
+            m_entry,
+        ));
+        m.functions.push(func(
+            bug_id,
+            "bug",
+            vec![blk(b_entry, vec![call(3, err_id), ret(4)])],
+            b_entry,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert!(must_reach_error(&m).is_some());
+    }
+
+    /// `f(n){ if(n<3) return; else ERROR: reach_error(); }  main(){ f(2); }` —
+    /// the error is behind a guard in the callee → NOT must-reach (afterrec-2 shape).
+    #[test]
+    fn guarded_callee_is_not_must_reach() {
+        let (main_id, f_id, err_id) = (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let (m_entry, f_entry, f_ret, f_err) = (
+            BlockId::new(10),
+            BlockId::new(20),
+            BlockId::new(21),
+            BlockId::new(22),
+        );
+        let (n, three, cond) = (ValueId::new(100), ValueId::new(101), ValueId::new(102));
+        let fe = blk(
+            f_entry,
+            vec![
+                Instruction::new(
+                    InstId::new(3),
+                    Operation::BinaryOp {
+                        kind: BinaryOp::ICmpSlt,
+                    },
+                )
+                .with_operands(vec![n, three])
+                .with_dst(cond),
+                Instruction::new(
+                    InstId::new(4),
+                    Operation::CondBr {
+                        then_target: f_ret,
+                        else_target: f_err,
+                    },
+                )
+                .with_operands(vec![cond]),
+            ],
+        );
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.constants
+            .insert(three, Constant::Int { value: 3, bits: 32 });
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(m_entry, vec![call(1, f_id), ret(2)])],
+            m_entry,
+        ));
+        m.functions.push(func(
+            f_id,
+            "f",
+            vec![
+                fe,
+                blk(f_ret, vec![ret(5)]),
+                blk(f_err, vec![call(6, err_id), ret(7)]),
+            ],
+            f_entry,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert!(must_reach_error(&m).is_none());
+    }
+
+    /// The LLVM frontend leaves `entry_block` unset (blocks[0] is the entry), so
+    /// must_reach must fall back to the first block. Regression for the slice-1
+    /// blind-eval fix (the real IR gave `entry_block = None`).
+    #[test]
+    fn entry_block_none_uses_first_block() {
+        let (main_id, err_id) = (FunctionId::new(1), FunctionId::new(2));
+        let entry = BlockId::new(10);
+        let mut main = func(
+            main_id,
+            "main",
+            vec![blk(entry, vec![call(1, err_id), ret(2)])],
+            entry,
+        );
+        main.entry_block = None; // mimic the real frontend
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(main);
+        m.functions.push(decl(err_id, "reach_error"));
+        assert!(must_reach_error(&m).is_some());
+    }
+
+    /// `main() { __VERIFIER_assume(c); reach_error(); }` — the assumption
+    /// conditions the path (assume(false) would block it), so the error is NOT
+    /// unconditionally reached.
+    #[test]
+    fn assume_before_error_is_not_must_reach() {
+        let (main_id, assume_id, err_id) =
+            (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let entry = BlockId::new(10);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(
+                entry,
+                vec![call(1, assume_id), call(2, err_id), ret(3)],
+            )],
+            entry,
+        ));
+        m.functions.push(decl(assume_id, "__VERIFIER_assume"));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert!(must_reach_error(&m).is_none());
+    }
+
+    /// `main() { abort(); reach_error(); }` — a no-return call precedes the error
+    /// → NOT must-reach (execution stops at `abort`).
+    #[test]
+    fn noreturn_before_error_is_not_must_reach() {
+        let (main_id, abort_id, err_id) =
+            (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let entry = BlockId::new(10);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(entry, vec![call(1, abort_id), call(2, err_id), ret(3)])],
+            entry,
+        ));
+        m.functions.push(decl(abort_id, "abort"));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert!(must_reach_error(&m).is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

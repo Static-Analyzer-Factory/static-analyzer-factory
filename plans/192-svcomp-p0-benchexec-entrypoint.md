@@ -209,6 +209,43 @@ exits 0 in-container. **Acceptance:** slice-0 refactor guardrail (§1.4) + these
 be none — we emit no TRUE) and **ZERO false alarms** on the `expected_verdict==true` subset (audited
 *after* the blind run). Re-running a task yields a byte-identical verdict (determinism).
 
+### Slice 1 — implementation record & correction (2026-08-10, VM-verified, uncommitted)
+
+Implemented TDD; all builds on the VM. Corrections to this plan's assumptions, found by the code
+map and the blind eval:
+
+1. **`analyze_property`'s FALSE is UNSOUND (the pivotal finding).** 1.2/1.6 assumed the engine's
+   reachability was sound enough to emit FALSE after a cross-check. It is not: `check_path_reachable`
+   is a feasibility *over*-approximation — it models a guard's operands as unconstrained fresh Z3
+   variables (ignoring the arithmetic/casts/pointer-identity that define them) and does not compose
+   caller↔callee argument constraints, so Z3 "SAT" means *"couldn't prove infeasible"*, not
+   *"provably feasible"*. A blind 40-task sample gave **14/20 false alarms** (0 unsound TRUE); root
+   causes: bit-arithmetic (`integerpromotion-2`), uncomposed recursion argument (`afterrec-2`),
+   pointer identity (`test01`). **Decision (user): must-reach only.** The verdict now comes from a
+   sound *under*-approximate **`saf_svcomp::must_reach_error`** — emit `false(unreach-call)` only when
+   `reach_error` is *unconditionally* reachable (forced single-successor CFG chain + unconditionally-
+   executed calls; stop at any branch, loop back-edge, recursion cycle, no-return call, or
+   `__VERIFIER_assume`). Re-blind: **0 false alarms, 0 TRUE** (sound) — but **low recall** (catches
+   only unconditional reaches). `analyze_property`/assume-modeling remain in-tree (tested) for the
+   future TRUE side, but do **not** feed the verdict.
+2. **`__VERIFIER_assume` modeled (1.3).** `guard.rs` propagates `ConditionInfo` across `zext`/`sext`
+   of an icmp (clang lowers `assume(x==0)` to `zext(icmp)`), and a new `extract_assume_guards` is
+   folded into `check_path_reachable` before the `is_empty` short-circuit and exempt from `max_guards`.
+   **Nondet-spec extension DROPPED** — those interval specs feed only the absint analyzers, never the
+   reachability path, so they are a no-op for unreach-call.
+3. **Determinism (1.4)** = `rlimit`(5,000,000) + `random_seed`(0) pinned in `PathFeasibilityChecker`
+   (a checker-level constant, not threaded through config — deferred). Both still map to `Unknown`,
+   never FALSE.
+4. **1.1/1.5 as planned:** in-tool `clang-18`+`opt-18 mem2reg` → `AnalysisDriver::ingest`; stub bundled
+   at `share/saf/stubs/sv-comp-stubs.h` (with `#include <stddef.h>`) resolved via a `current_exe()`-
+   ancestor walk (+`$SAF_SVCOMP_STUBS`); wall-clock watchdog on a worker thread. `tempfile` promoted
+   to a real dep. (Frontend gotcha: the LLVM frontend leaves `AirFunction::entry_block = None`, so
+   `must_reach_error` falls back to `blocks[0]` like `Cfg::build` — regression-tested.)
+5. **Deferred:** bench `run_task` in-process switch (**1.2b**); higher-recall **sound FALSE via
+   concrete replay** (extract the Z3 model → synthesise + run a harness → confirm `reach_error`
+   executes; plan 191 **P1.2** / 1b-b) — this is the real next step, since must-reach alone scores
+   almost nothing on the (uniformly guarded) benchmark set; YAML witness 2.0 (**1b-a**).
+
 ### Slice 1b — YAML violation witness + confirmation (P1.1)
 
 - **1b-a (target + metadata):** new `saf-svcomp/src/witness_yaml.rs` emitting witness format 2.0:
@@ -229,6 +266,66 @@ be none — we emit no TRUE) and **ZERO false alarms** on the `expected_verdict=
 **TDD (slice 1b):** golden-file test that a known `false` fixture emits a byte-stable witness that
 `witnesslint` accepts; then the CPAchecker confirmation-rate harness (1b-b).
 
+### Slice 1c — sound FALSE by concrete replay (higher recall; re-scopes 1.6 / plan 191 P1.2)
+
+**Why (from the slice-1 blind eval).** Slice 1's verdict is the sound *under*-approximate
+`must_reach_error` (only unconditional reaches → `false`). It is sound (0 false alarms, 0 TRUE) but
+**near-zero recall**: real `unreach-call` tasks almost always guard `reach_error` behind ≥1 branch,
+so must-reach yields `unknown`. The over-approximate `analyze_property` FALSE would find those
+candidates but is **unsound** (14/20 blind false alarms — Z3 "SAT" over the fresh-variable path
+abstraction ≠ a real execution, because operand-defining arithmetic/casts/pointer-identity are
+unmodeled). Slice 1c closes the gap **soundly** by *executing* a candidate: a concrete run that
+actually calls `reach_error` is an irrefutable violation, so the false alarms (which do **not**
+reproduce at runtime) are filtered out. This is the correct reading of item **1.6 / P1.2** now that
+must-reach replaced 1.6's original "span-resolvable" guard.
+
+**Verdict pipeline in `verify` (ordered; each stage may only *strengthen* to FALSE, never to TRUE):**
+1. `must_reach_error` → if `Some`, emit `false` immediately (cheap, sound, no execution).
+2. Else run `analyze_property(UnreachCall)` (the over-approx engine) to enumerate **FALSE
+   *candidates*** with, for each, the Z3 **model** (nondet `ValueId` → concrete int) and the block
+   path. (Requires exposing the model — see below.)
+3. For each candidate: **synthesize a harness** that pins the program's nondet inputs to the model
+   values, **compile it natively and run it sandboxed**; if the run reaches `reach_error`, emit
+   `false(unreach-call)` (the concrete trace is the witness) and stop. 
+4. If no candidate reproduces (or none exists / model absent / program not closed) → `unknown`.
+
+**Components (with the layering constraint — `saf-svcomp` does NO subprocess; execution lives in
+`saf-cli`):**
+- **Z3 model extraction (pure; `saf-analysis`/`saf-svcomp`, shared with 1b-b).** Extend
+  `PathFeasibilityChecker`/`check_path_reachable` to return the satisfying model on `Sat`
+  (`solver.get_model()` + `model.eval(v_{vid})`), and thread a `FalseCandidate { reach_error_inst,
+  block_path, assignments: BTreeMap<ValueId, i64> }` out of `analyze_unreachability` (today it throws
+  the model away and stringifies the path to `block_{n}`). Map each assignment's `ValueId` back to
+  the `__VERIFIER_nondet_*` **call** that produced it, in **execution order** (the harness must return
+  the values in the order the program calls nondet).
+- **Harness synthesis + native run (`saf-cli`).** Emit a small driver that overrides each
+  `__VERIFIER_nondet_*` to return the model sequence (a per-function counter indexing a fixed array),
+  and overrides `reach_error`/`__VERIFIER_error` (and `__assert_fail`/`abort`) to write a sentinel and
+  `_exit(k)`. Compile the *original* program **natively** (`clang -O0`, no `-emit-llvm`) linked with
+  the driver, run under `--timeout`/`rlimit`/no-network (already offline) in a `tempdir`; a sentinel
+  exit ⇒ confirmed FALSE. Everything else (normal exit, timeout, crash, non-reproduction) ⇒ `unknown`.
+
+**Soundness (the whole point).** A confirmed FALSE is backed by a *real* execution reaching
+`reach_error` ⇒ genuine violation ⇒ **cannot** be a false alarm. Non-reproducing candidates (the
+14/20) → `unknown`. Still emits **no TRUE**. So Slice 1c preserves "0 false alarms, 0 TRUE" while
+recovering the guarded/nondet detections must-reach drops.
+
+**Scope / residuals (keep the first cut tight, all sound):** restrict to **closed** programs whose
+only inputs are scalar `__VERIFIER_nondet_*` (skip argv/file/pointer/array/float nondet → `unknown`);
+one model per candidate (no model diversification yet); the abstract path's model may not reproduce
+when unmodeled arithmetic breaks the correspondence — that is *fine* (→ `unknown`, sound). Non-scalar
+nondet and model-guided input search are later refinements.
+
+**TDD (slice 1c):**
+- Unit (`saf-analysis`/`saf-svcomp`): model extraction returns concrete assignments for a nondet
+  path; `FalseCandidate` carries them in call order.
+- e2e (`saf-cli`, `#[ignore]`, Docker): `unreach_false_nondet.c` (guarded, model `x=6`) now
+  **reproduces → `false`** (recovering the recall must-reach dropped); `assume_guards_error.c` and
+  the 3 over-approx false-alarm shapes (`integerpromotion-2`, `test01`, `afterrec-2`) **do not
+  reproduce → `unknown`** (soundness preserved).
+- **Blind re-eval:** same harness (`scripts/svcomp_verify_eval.py`); target **recall ↑ materially**
+  over must-reach while holding **0 false alarms, 0 TRUE**.
+
 ---
 
 ## 4. Soundness & determinism invariants (must hold; mapped to code)
@@ -242,7 +339,11 @@ be none — we emit no TRUE) and **ZERO false alarms** on the `expected_verdict=
 5. **Verdict = deterministic function of (program, property, envelope).** Env toggles pinned (2.3),
    specs binary-relative (2.3), no RNG / no `HashMap`-iteration / no `SystemTime` in the verdict
    path (confirmed by the map). Witness bytes deterministic (fixed timestamp, 1b-a).
-6. **Every FALSE is cross-checked** (Z3-feasible + witness-constructible) or downgraded (1.6).
+6. **Every FALSE is sound.** Slice 1 emits FALSE only via `must_reach_error` (under-approximate
+   must-reach). The Z3 path engine's FALSE is *over*-approximate and **must not** feed the verdict on
+   its own (it caused 14/20 blind false alarms); Slice 1c re-admits its candidates only after
+   **concrete-execution replay** confirms them (a real run reaching `reach_error`). Non-reproducing
+   candidates → `unknown`.
 
 ---
 
@@ -330,13 +431,14 @@ here — a Docker dev build on the VM is sufficient for P0 measurement.
 - [ ] **0.2** `.prp` parser + unit tests (6 forms).
 - [ ] **0.3** `saf verify` skeleton (args, dispatch, determinism pins, prints `unknown`) + CLI tests.
 - [ ] **0.4** `benchexec/tools/saf.py` + `smoketest.sh` + pytest.
-- [ ] **1.1** In-tool clang+mem2reg → ingest; bundle stubs binary-relative.
-- [ ] **1.2** Reconnect `analyze_property` in verify + in `saf-bench` `run_task`.
-- [ ] **1.3** Model `__VERIFIER_assume`; complete nondet interval specs.
-- [ ] **1.4** Z3 `rlimit` (deterministic); keep Unknown→UNKNOWN.
-- [ ] **1.5** Step-bounds + wall-clock watchdog → graceful `unknown`.
-- [ ] **1.6** FALSE cross-check / downgrade guard.
-- [ ] **1.1–1.6 fixtures** + blind-run acceptance (§7.1, §7.3).
+- [x] **1.1** In-tool clang+mem2reg → ingest; stubs bundled at `share/saf/stubs/` (ancestor-walk resolver).
+- [x] **1.2** Verdict wired in `verify` (via `must_reach_error`, not the unsound `analyze_property` FALSE — see record). Bench `run_task` switch → **deferred (1.2b)**.
+- [x] **1.3** Model `__VERIFIER_assume` (cast-peel + `extract_assume_guards`). Nondet interval specs → **dropped** (no-op for unreach-call).
+- [x] **1.4** Z3 `rlimit`+`random_seed` in `PathFeasibilityChecker`; Unknown→UNKNOWN preserved.
+- [x] **1.5** Wall-clock watchdog (worker thread, `--timeout`) → graceful `unknown`.
+- [x] **1.6** Superseded by the sound **must-reach** verdict (`analyze_property` FALSE is unsound). Concrete-replay cross-check for higher recall → **deferred (P1.2 / 1b-b)**.
+- [x] **1.1–1.6 fixtures** + blind-run acceptance (§7.1, §7.3): 0 false alarms, 0 TRUE (sound; low recall).
+- [ ] **1c** Sound FALSE by concrete replay (Z3 model → harness → native run → confirm) — recovers recall must-reach drops, holding 0 false alarms / 0 TRUE. Shares model extraction with 1b-b. **← recommended next.**
 - [ ] **1b-a** YAML witness 2.0 (target + metadata, byte-stable) + witnesslint gate.
 - [ ] **1b-b** Z3 model extraction → assumption/branching waypoints; CPAchecker confirmation %.
 - [ ] Update `plans/PROGRESS.md`.

@@ -56,20 +56,39 @@ pub struct Z3FilterDiagnostics {
 // Path feasibility checker
 // ---------------------------------------------------------------------------
 
+/// Default Z3 resource limit (deterministic work budget).
+///
+/// `rlimit` is an internal conflict/decision counter, so a query stops at the
+/// same point on every machine — unlike the wall-clock `timeout`, which we keep
+/// only as a backstop. Both outcomes map to `Unknown` (never a verdict), so this
+/// affects only *which* queries are undecided, never soundness. The value is a
+/// first calibration; it is generous enough that the small queries on the
+/// unreach-call path always terminate with a definite Sat/Unsat.
+const DEFAULT_Z3_RLIMIT: u32 = 5_000_000;
+
+/// Fixed Z3 random seed, pinned for byte-identical results across runs (NFR-DET).
+const Z3_RANDOM_SEED: u32 = 0;
+
 /// Z3-based path feasibility checker.
 ///
 /// Translates `PathCondition` guards into Z3 AST, conjoins them, and
 /// checks satisfiability. Fresh Z3 variables are created for unknown operands.
 pub struct PathFeasibilityChecker {
-    /// Timeout per check in milliseconds.
+    /// Timeout per check in milliseconds (wall-clock backstop).
     timeout_ms: u64,
+    /// Deterministic Z3 resource limit (work budget), independent of the machine.
+    rlimit: u32,
 }
 
 impl PathFeasibilityChecker {
-    /// Create a new checker with the given per-finding timeout.
+    /// Create a new checker with the given per-finding timeout and the default
+    /// deterministic resource limit.
     #[must_use]
     pub fn new(timeout_ms: u64) -> Self {
-        Self { timeout_ms }
+        Self {
+            timeout_ms,
+            rlimit: DEFAULT_Z3_RLIMIT,
+        }
     }
 
     /// Check whether a path condition is feasible.
@@ -106,6 +125,10 @@ impl PathFeasibilityChecker {
         #[allow(clippy::cast_possible_truncation)]
         // Z3 API uses u32; values >> u32::MAX are impractical
         params.set_u32("timeout", self.timeout_ms as u32);
+        // Deterministic work budget + fixed seed (NFR-DET): make the verdict a
+        // function of the query, not the machine's speed or Z3's RNG.
+        params.set_u32("rlimit", self.rlimit);
+        params.set_u32("random_seed", Z3_RANDOM_SEED);
         solver.set_params(&params);
 
         let mut var_cache: BTreeMap<ValueId, z3::ast::Int> = BTreeMap::new();
@@ -165,6 +188,9 @@ impl PathFeasibilityChecker {
         let mut params = z3::Params::new();
         #[allow(clippy::cast_possible_truncation)]
         params.set_u32("timeout", self.timeout_ms as u32);
+        // Deterministic work budget + fixed seed (NFR-DET).
+        params.set_u32("rlimit", self.rlimit);
+        params.set_u32("random_seed", Z3_RANDOM_SEED);
         solver.set_params(&params);
 
         let mut var_cache: BTreeMap<ValueId, z3::ast::Int> = BTreeMap::new();

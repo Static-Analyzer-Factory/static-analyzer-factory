@@ -173,3 +173,137 @@ fn verify_accepts_ilp32_data_model() {
         .success()
         .stdout("unknown\n");
 }
+
+// ---------------------------------------------------------------------------
+// verify end-to-end (slice 1) — compile C → analyze → real unreach-call verdict.
+//
+// These require clang-18/opt-18 + LLVM 18 (only in Docker), so they are
+// #[ignore]d and run via `make test`. Paths are workspace-root-relative (the CWD
+// under `make test`), matching `run_on_fixture_succeeds` above.
+// ---------------------------------------------------------------------------
+
+/// Resolve a workspace-root-relative path to an absolute one. Tests run with
+/// CWD = the crate dir, so relative paths handed to the `saf` binary won't
+/// resolve; `CARGO_MANIFEST_DIR` (this crate) is two levels below the root.
+fn ws(rel: &str) -> String {
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop(); // crates/saf-cli -> crates
+    p.pop(); // crates -> workspace root
+    p.join(rel).to_string_lossy().into_owned()
+}
+
+fn unreach_prp() -> String {
+    ws("tests/programs/c/svcomp/unreach-call.prp")
+}
+
+fn svcomp_fixture(name: &str) -> String {
+    ws(&format!("tests/programs/c/svcomp/{name}"))
+}
+
+/// Run `saf verify <fixture>` against the unreach-call property, asserting exit 0,
+/// and return the `Assert` so the caller can lock the exact stdout verdict line.
+fn verify_unreach(fixture: &str) -> assert_cmd::assert::Assert {
+    let prp = unreach_prp();
+    let fx = svcomp_fixture(fixture);
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.as_str(),
+            "--data-model",
+            "LP64",
+            fx.as_str(),
+        ])
+        .assert()
+        .success()
+}
+
+/// `main()` calls `reach_error()` unconditionally → `false(unreach-call)`.
+#[test]
+#[ignore]
+fn verify_false_direct() {
+    verify_unreach("unreach_false_direct.c").stdout("false(unreach-call)\n");
+}
+
+/// Nondet-guarded reachable error → `unknown`. The violation is real (x can be
+/// > 5), but it is behind a branch, so the sound must-reach criterion cannot
+/// prove it is *unconditionally* reached and conservatively yields `unknown`
+/// rather than risk a false alarm.
+#[test]
+#[ignore]
+fn verify_nondet_guarded_is_unknown() {
+    verify_unreach("unreach_false_nondet.c").stdout("unknown\n");
+}
+
+/// Error in a callee reachable from main → `false(unreach-call)` (interprocedural,
+/// requires aggressive/conservative=false).
+#[test]
+#[ignore]
+fn verify_false_interproc() {
+    verify_unreach("unreach_false_interproc.c").stdout("false(unreach-call)\n");
+}
+
+/// `reach_error()` present but provably unreachable → we never emit `true`, so
+/// the verdict is `unknown`.
+#[test]
+#[ignore]
+fn verify_true_simple_is_unknown() {
+    verify_unreach("unreach_true_simple.c").stdout("unknown\n");
+}
+
+/// `__VERIFIER_assume(x == 0)` makes the `x != 0` error path infeasible — must
+/// NOT be a false alarm. The verdict is `unknown` (never `false`).
+#[test]
+#[ignore]
+fn verify_assume_guarded_error_is_not_false() {
+    verify_unreach("assume_guards_error.c").stdout("unknown\n");
+}
+
+/// Re-running a task yields a byte-identical verdict (determinism / NFR-DET).
+#[test]
+#[ignore]
+fn verify_is_deterministic() {
+    let prp = unreach_prp();
+    let fx = svcomp_fixture("unreach_false_direct.c");
+    let run = || {
+        cargo_bin_cmd!("saf")
+            .args([
+                "verify",
+                "--property",
+                prp.as_str(),
+                "--data-model",
+                "LP64",
+                fx.as_str(),
+            ])
+            .output()
+            .expect("run saf verify")
+            .stdout
+    };
+    let a = run();
+    let b = run();
+    assert_eq!(a, b, "verdict must be byte-identical across runs");
+    assert_eq!(a, b"false(unreach-call)\n");
+}
+
+/// The verdict-affecting env toggles are pinned off, so setting them does not
+/// change the verdict (plan 192 §2.3 determinism pins).
+#[test]
+#[ignore]
+fn verify_ignores_pta_env_toggles() {
+    let prp = unreach_prp();
+    let fx = svcomp_fixture("unreach_false_direct.c");
+    let out = cargo_bin_cmd!("saf")
+        .env("SAF_PTA_FIELD_MINTING", "1")
+        .env("SAF_DECOMPOSE_POINTER_ARRAYS", "1")
+        .args([
+            "verify",
+            "--property",
+            prp.as_str(),
+            "--data-model",
+            "LP64",
+            fx.as_str(),
+        ])
+        .output()
+        .expect("run saf verify");
+    assert_eq!(out.stdout, b"false(unreach-call)\n");
+}

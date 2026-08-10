@@ -21,7 +21,7 @@ pub mod witness;
 
 pub use property::{
     AnalysisContext, PropertyAnalysisConfig, PropertyResult, analyze_property,
-    analyze_property_with_context,
+    analyze_property_with_context, must_reach_error,
 };
 pub use property_kind::{DataModel, Language, Property};
 pub use witness::{Witness, WitnessEdge, WitnessNode, WitnessType};

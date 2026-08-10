@@ -403,6 +403,11 @@ pub struct VerifyArgs {
     #[arg(long, default_value = "witness.yml")]
     pub witness: PathBuf,
 
+    /// Wall-clock budget in seconds. On expiry, print `unknown` and exit 0 — a
+    /// graceful UNKNOWN before `BenchExec`'s SIGKILL. Only ever yields UNKNOWN.
+    #[arg(long, default_value_t = 850)]
+    pub timeout: u64,
+
     /// Optional full machine-readable report (JSON) to a file; stdout stays verdict-only.
     #[arg(long)]
     pub output: Option<PathBuf>,
@@ -736,19 +741,27 @@ pub fn index(args: &IndexArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run `saf verify` — the blind SV-COMP verifier entry point (plan 192).
+/// Run `saf verify` — the blind SV-COMP verifier entry point (plan 192, slice 1).
 ///
-/// Prints exactly one verdict line to stdout — `true`, `false(<prop>)`, or
-/// `unknown` — and nothing else (tracing/diagnostics go to stderr). It never
-/// reads an expected verdict. This is the slice-0 skeleton: it pins the
-/// determinism-affecting env toggles, parses the `.prp` (real `CHECK/LTL` form),
-/// and emits `unknown`; the analysis pipeline (in-tool clang -> reconnected
-/// `analyze_property` -> witness) lands in slice 1.
+/// Prints exactly one verdict line to stdout — `false(<prop>)` or `unknown`
+/// (never `true`; a proof of safety maps to `unknown`, so `-32` exposure is
+/// zero) — and nothing else (all diagnostics go to stderr). It never reads an
+/// expected verdict, and always exits 0 once a verdict is printed.
+///
+/// Pipeline: pin determinism-affecting env toggles, parse the `.prp` (real
+/// `CHECK/LTL` form), then — for unreach-call — compile the C in-tool with
+/// clang+`opt -passes=mem2reg`, ingest the IR, and run the reconnected
+/// `analyze_property`, all under a wall-clock watchdog that degrades to
+/// `unknown` on timeout. Non-unreach-call properties map to `unknown` in this
+/// slice.
+// The handler is infallible by contract (it always prints a verdict and exits
+// 0), but the `Result` return is required by the `Commands` dispatch signature.
+#[allow(clippy::unnecessary_wraps)]
 pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
-    use anyhow::Context;
-
     // Determinism pins (plan 192 §2.3): make verdicts independent of these
     // verdict-affecting env toggles regardless of the competition environment.
+    // Must run before the worker thread is spawned (the unsafe `remove_var`
+    // requires no concurrent environment access).
     for var in ["SAF_PTA_FIELD_MINTING", "SAF_DECOMPOSE_POINTER_ARRAYS"] {
         if std::env::var_os(var).is_some() {
             eprintln!("saf verify: ignoring env {var} (pinned off for deterministic verdicts)");
@@ -758,20 +771,205 @@ pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
         }
     }
 
-    let prp = std::fs::read_to_string(&args.property)
-        .with_context(|| format!("failed to read property file {}", args.property.display()))?;
-    let property = saf_svcomp::Property::from_prp(&prp);
+    // Parse the property from the `.prp` contents (never the filename). Any read
+    // problem is non-fatal: default to the safe `unknown`.
+    let property = match std::fs::read_to_string(&args.property) {
+        Ok(prp) => saf_svcomp::Property::from_prp(&prp),
+        Err(e) => {
+            eprintln!(
+                "saf verify: cannot read property file {}: {e}",
+                args.property.display()
+            );
+            None
+        }
+    };
     let data_model: saf_svcomp::DataModel = args.data_model.into();
-    eprintln!(
-        "saf verify: input={} property={property:?} data_model={data_model:?} witness={} (slice-0 skeleton)",
-        args.input.display(),
-        args.witness.display(),
+
+    // Slice 1 scope: only unreach-call is analyzed; everything else -> unknown.
+    if property != Some(saf_svcomp::Property::UnreachCall) {
+        if let Some(p) = property {
+            eprintln!(
+                "saf verify: property `{}` not analyzed in this build -> unknown",
+                p.name()
+            );
+        } else {
+            eprintln!("saf verify: unrecognized property -> unknown");
+        }
+        println!("unknown");
+        return Ok(());
+    }
+
+    // Run compile -> ingest -> analyze on a worker thread under a wall-clock
+    // budget. On timeout (or a worker panic, which drops the sender) emit the
+    // safe `unknown` and exit 0, gracefully beating BenchExec's SIGKILL. The
+    // watchdog only ever yields UNKNOWN, so it can never produce an unsound
+    // verdict.
+    let input = args.input.clone();
+    let deadline = std::time::Duration::from_secs(args.timeout);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _worker = std::thread::spawn(move || {
+        let _ = tx.send(unreach_verdict(&input, data_model));
+    });
+
+    let verdict = if let Ok(v) = rx.recv_timeout(deadline) {
+        v
+    } else {
+        eprintln!(
+            "saf verify: analysis exceeded {}s budget (or worker failed) -> unknown",
+            args.timeout
+        );
+        "unknown".to_string()
+    };
+    println!("{verdict}");
+    Ok(())
+}
+
+/// Clang / opt binaries matching the LLVM this binary links against, overridable
+/// via `$SAF_CLANG` / `$SAF_OPT`.
+#[cfg(feature = "llvm-22")]
+const DEFAULT_CLANG: &str = "clang-22";
+#[cfg(feature = "llvm-22")]
+const DEFAULT_OPT: &str = "opt-22";
+#[cfg(not(feature = "llvm-22"))]
+const DEFAULT_CLANG: &str = "clang-18";
+#[cfg(not(feature = "llvm-22"))]
+const DEFAULT_OPT: &str = "opt-18";
+
+/// Locate the bundled SV-COMP stub header, independently of the CWD.
+///
+/// Checks, in order: the `$SAF_SVCOMP_STUBS` override; every ancestor of the
+/// running binary joined with `share/saf/stubs/sv-comp-stubs.h` (covers both an
+/// installed `<prefix>/bin/saf` -> `<prefix>/share/...` layout and a dev
+/// `target/<profile>/saf` -> workspace-root `share/...` layout); and finally a
+/// `./share/...` fallback.
+fn resolve_svcomp_stub() -> Option<PathBuf> {
+    const REL: &str = "share/saf/stubs/sv-comp-stubs.h";
+
+    if let Some(p) = std::env::var_os("SAF_SVCOMP_STUBS") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            let candidate = ancestor.join(REL);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let cwd_rel = PathBuf::from(REL);
+    if cwd_rel.is_file() {
+        return Some(cwd_rel);
+    }
+    None
+}
+
+/// Compile a C program to mem2reg'd LLVM IR in `dir`, returning the `.ll` path.
+///
+/// Mirrors the offline SV-COMP recipe: clang emits `-O0` IR with
+/// `-disable-O0-optnone` (so `opt`'s mem2reg pass is not a no-op), the data-model
+/// flag, and the `-include`d stub header; then `opt -passes=mem2reg` promotes
+/// allocas to SSA. Subprocess stdout is discarded so the parent's stdout stays
+/// verdict-only; stderr is inherited (diagnostics).
+fn compile_to_ir(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    stub: &Path,
+    dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+
+    let clang = std::env::var("SAF_CLANG").unwrap_or_else(|_| DEFAULT_CLANG.to_string());
+    let opt = std::env::var("SAF_OPT").unwrap_or_else(|_| DEFAULT_OPT.to_string());
+    let ir = dir.join("input.ll");
+    let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
+
+    let clang_status = Command::new(&clang)
+        .args([
+            "-g",
+            "-S",
+            "-emit-llvm",
+            "-O0",
+            "-Xclang",
+            "-disable-O0-optnone",
+            "-Wno-everything",
+        ])
+        .arg(data_model.clang_flag())
+        .arg("-include")
+        .arg(stub)
+        .arg("-I")
+        .arg(srcdir)
+        .arg(input)
+        .arg("-o")
+        .arg(&ir)
+        .stdout(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to spawn {clang}"))?;
+    anyhow::ensure!(
+        clang_status.success(),
+        "{clang} failed to compile {}",
+        input.display()
     );
 
-    // Slice-0 skeleton: analysis lands in slice 1. Never emit an unsound verdict —
-    // default to the safe `unknown`.
-    println!("unknown");
-    Ok(())
+    let opt_status = Command::new(&opt)
+        .args(["-S", "-passes=mem2reg"])
+        .arg(&ir)
+        .arg("-o")
+        .arg(&ir)
+        .stdout(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to spawn {opt}"))?;
+    anyhow::ensure!(opt_status.success(), "{opt} mem2reg pass failed");
+
+    Ok(ir)
+}
+
+/// Compile, ingest, and analyze `input` for unreach-call, returning the SV-COMP
+/// verdict line. Any internal failure maps to `unknown` (with a diagnostic on
+/// stderr); this function never errors, so the caller keeps exit code 0.
+fn unreach_verdict(input: &Path, data_model: saf_svcomp::DataModel) -> String {
+    use saf_svcomp::Property;
+
+    let Some(stub) = resolve_svcomp_stub() else {
+        eprintln!("saf verify: could not locate share/saf/stubs/sv-comp-stubs.h -> unknown");
+        return "unknown".to_string();
+    };
+    let dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("saf verify: could not create temp dir: {e} -> unknown");
+            return "unknown".to_string();
+        }
+    };
+    let ir = match compile_to_ir(input, data_model, &stub, dir.path()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("saf verify: compilation failed: {e:#} -> unknown");
+            return "unknown".to_string();
+        }
+    };
+    let bundle = match driver::AnalysisDriver::ingest(&[ir], CliFrontend::Llvm) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("saf verify: ingestion failed: {e:#} -> unknown");
+            return "unknown".to_string();
+        }
+    };
+
+    // Sound must-reach FALSE (plan 192 §1.6, revised after the slice-1 blind eval):
+    // the Z3 feasibility engine *over*-approximates reachability, so its FALSE is
+    // unsound as a verdict (a wrong `false` scores -16). Emit `false` only when
+    // reach_error is UNCONDITIONALLY reachable; everything else -> unknown. We also
+    // never emit `true`, so -32 exposure stays zero.
+    if saf_svcomp::must_reach_error(&bundle.module).is_some() {
+        format!("false({})", Property::UnreachCall.name())
+    } else {
+        eprintln!("saf verify: reach_error not proven unconditionally reachable -> unknown");
+        "unknown".to_string()
+    }
 }
 
 pub fn run(args: &RunArgs) -> anyhow::Result<()> {

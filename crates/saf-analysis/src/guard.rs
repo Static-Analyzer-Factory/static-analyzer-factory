@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use saf_core::air::{AirModule, BinaryOp, Constant, Operation};
+use saf_core::air::{AirModule, BinaryOp, CastKind, Constant, Operation};
 use saf_core::ids::{BlockId, FunctionId, InstId, ObjId, ValueId};
 
 use crate::svfg::SvfgNodeId;
@@ -152,6 +152,23 @@ impl ValueLocationIndex {
                                             rhs,
                                         },
                                     );
+                                }
+                            }
+                        }
+                    }
+
+                    // Propagate condition info through boolean-preserving casts of
+                    // a comparison result (e.g. `zext i1 %cmp to i32`). This lets an
+                    // `__VERIFIER_assume(x == 0)` argument — which clang lowers to
+                    // `zext(icmp)` — resolve back to the underlying comparison, so
+                    // the assume can be asserted against the same SSA variables as
+                    // the branch guards. Instructions are in SSA/program order, so
+                    // the comparison is already indexed by the time its cast appears.
+                    if let Operation::Cast { kind, .. } = &inst.op {
+                        if matches!(kind, CastKind::ZExt | CastKind::SExt) {
+                            if let (Some(dst), Some(&src)) = (inst.dst, inst.operands.first()) {
+                                if let Some(cond) = value_to_condition.get(&src).cloned() {
+                                    value_to_condition.insert(dst, cond);
                                 }
                             }
                         }
@@ -498,6 +515,68 @@ pub fn extract_guards_from_blocks(
     }
 
     PathCondition { guards }
+}
+
+/// Function names whose single integer argument is an assumed predicate that
+/// constrains all downstream paths.
+pub const ASSUME_FUNCTIONS: &[&str] = &["__VERIFIER_assume", "__CPROVER_assume"];
+
+/// Extract assumption constraints along a block sequence.
+///
+/// For each `__VERIFIER_assume(cond)` call in the blocks on the path, emit a
+/// [`Guard`] asserting `cond` holds (`branch_taken = true`). The assumed value
+/// is resolved to a [`ConditionInfo`] through [`ValueLocationIndex`] — directly
+/// when it is an ICmp result, or through a boolean-preserving cast of one (see
+/// [`ValueLocationIndex::build`], which propagates condition info across
+/// `zext`/`sext`).
+///
+/// Assumes whose argument is not a comparison are skipped (best-effort). This is
+/// sound for reachability: dropping an assume only makes a path look *more*
+/// feasible, never less, so it can never turn a real violation into a spurious
+/// proof of safety.
+#[must_use]
+pub fn extract_assume_guards(
+    blocks: &[(FunctionId, BlockId)],
+    module: &AirModule,
+    index: &ValueLocationIndex,
+) -> Vec<Guard> {
+    let mut guards = Vec::new();
+
+    for &(func_id, block_id) in blocks {
+        let Some(func) = module.function(func_id) else {
+            continue;
+        };
+        let Some(block) = func.blocks.iter().find(|b| b.id == block_id) else {
+            continue;
+        };
+        for inst in &block.instructions {
+            let Operation::CallDirect { callee } = &inst.op else {
+                continue;
+            };
+            let is_assume = module
+                .function(*callee)
+                .is_some_and(|f| ASSUME_FUNCTIONS.contains(&f.name.as_str()));
+            if !is_assume {
+                continue;
+            }
+            let Some(&arg) = inst.operands.first() else {
+                continue;
+            };
+            // Only model the assume when the argument resolves to a comparison
+            // (directly, or through a zext/sext registered in the index). Other
+            // shapes (e.g. a raw integer) are skipped — see the doc comment.
+            if index.condition_info(arg).is_some() {
+                guards.push(Guard {
+                    block: block_id,
+                    function: func_id,
+                    condition: arg,
+                    branch_taken: true,
+                });
+            }
+        }
+    }
+
+    guards
 }
 
 // ---------------------------------------------------------------------------
