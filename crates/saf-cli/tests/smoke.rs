@@ -225,14 +225,15 @@ fn verify_false_direct() {
     verify_unreach("unreach_false_direct.c").stdout("false(unreach-call)\n");
 }
 
-/// Nondet-guarded reachable error → `unknown`. The violation is real (x can be
-/// > 5), but it is behind a branch, so the sound must-reach criterion cannot
-/// prove it is *unconditionally* reached and conservatively yields `unknown`
-/// rather than risk a false alarm.
+/// Nondet-guarded reachable error → `false(unreach-call)` via slice-1c concrete
+/// replay. must-reach yields `unknown` (the error is behind a branch), but the
+/// Z3 model (`x = 6` satisfies `x > 5`) seeds a native run that pins
+/// `__VERIFIER_nondet_int` to `6` and actually reaches `reach_error` — an
+/// irrefutable, sound FALSE.
 #[test]
 #[ignore]
-fn verify_nondet_guarded_is_unknown() {
-    verify_unreach("unreach_false_nondet.c").stdout("unknown\n");
+fn verify_nondet_guarded_reproduces_false() {
+    verify_unreach("unreach_false_nondet.c").stdout("false(unreach-call)\n");
 }
 
 /// Error in a callee reachable from main → `false(unreach-call)` (interprocedural,
@@ -257,6 +258,82 @@ fn verify_true_simple_is_unknown() {
 #[ignore]
 fn verify_assume_guarded_error_is_not_false() {
     verify_unreach("assume_guards_error.c").stdout("unknown\n");
+}
+
+// ---------------------------------------------------------------------------
+// Over-approx false-alarm shapes (slice 1c soundness): the Z3 path engine
+// PROPOSES each as a FALSE candidate, but concrete native replay does NOT reach
+// reach_error, so the verdict is `unknown`. The stderr assertion confirms a
+// candidate was actually enumerated and rejected by replay (guarding against a
+// trivial `unknown` from, e.g., a compile failure).
+// ---------------------------------------------------------------------------
+
+/// Bit-arithmetic false alarm (integerpromotion-2 shape): Z3 models `x & 0xFF`
+/// as a fresh variable and proposes FALSE, but the real run computes
+/// `0 & 0xFF == 0 != 256` → `unknown`.
+#[test]
+#[ignore]
+fn verify_bitarith_false_alarm_is_unknown() {
+    verify_unreach("false_alarm_bitarith.c")
+        .stdout("unknown\n")
+        .stderr(predicate::str::contains("candidate(s) enumerated"));
+}
+
+/// Pointer-identity false alarm (test01 shape): Z3 models `p == q` as equal
+/// fresh integers, but distinct objects never alias at runtime → `unknown`.
+#[test]
+#[ignore]
+fn verify_ptrid_false_alarm_is_unknown() {
+    verify_unreach("false_alarm_ptrid.c")
+        .stdout("unknown\n")
+        .stderr(predicate::str::contains("candidate(s) enumerated"));
+}
+
+/// Uncomposed-recursion false alarm (afterrec-2 shape): intraprocedural Z3 sees
+/// `n < 0` as satisfiable, but the composed chain f(5)->..->f(0) never makes n
+/// negative at runtime → `unknown`.
+#[test]
+#[ignore]
+fn verify_recursion_false_alarm_is_unknown() {
+    verify_unreach("false_alarm_recursion.c")
+        .stdout("unknown\n")
+        .stderr(predicate::str::contains("candidate(s) enumerated"));
+}
+
+/// A task that DEFINES its own `reach_error` (via `__assert_fail`) — the
+/// canonical sv-benchmarks pattern. The replay driver's `reach_error` is weak
+/// (yields to the task's) and `__assert_fail` is intercepted, so the guarded
+/// nondet violation still reproduces → `false(unreach-call)`. Regression for the
+/// link collision the blind eval exposed.
+#[test]
+#[ignore]
+fn verify_selfdefined_reach_error_reproduces_false() {
+    verify_unreach("unreach_false_selfdef_nondet.c").stdout("false(unreach-call)\n");
+}
+
+/// ILP32 replay: the native harness must link a 32-bit binary (`clang -m32`),
+/// which requires 32-bit multilib in the image. The guarded nondet violation
+/// reproduces under ILP32 the same as under LP64 → `false(unreach-call)`.
+/// Regression for the 32-bit-multilib requirement the blind eval exposed (most
+/// sv-benchmarks unreach-call tasks are ILP32, so without multilib the `-m32`
+/// link fails and every ILP32 replay is silently inconclusive).
+#[test]
+#[ignore]
+fn verify_ilp32_nondet_reproduces_false() {
+    let prp = unreach_prp();
+    let fx = svcomp_fixture("unreach_false_nondet.c");
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.as_str(),
+            "--data-model",
+            "ILP32",
+            fx.as_str(),
+        ])
+        .assert()
+        .success()
+        .stdout("false(unreach-call)\n");
 }
 
 /// Re-running a task yields a byte-identical verdict (determinism / NFR-DET).

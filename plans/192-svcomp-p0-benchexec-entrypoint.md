@@ -326,6 +326,112 @@ nondet and model-guided input search are later refinements.
 - **Blind re-eval:** same harness (`scripts/svcomp_verify_eval.py`); target **recall ↑ materially**
   over must-reach while holding **0 false alarms, 0 TRUE**.
 
+### Slice 1c — implementation record & correction (2026-08-10, VM-verified, uncommitted)
+
+Implemented TDD, bottom-up, all builds on the VM. The ordered verdict pipeline is live in
+`unreach_verdict` (`saf-cli/commands.rs`): `must_reach_error` → if `None`, `enumerate_false_candidates`
+→ for each candidate, `replay_confirms_false` → `false(unreach-call)` only on a sentinel; else `unknown`.
+
+1. **Z3 model extraction (`saf-analysis`).** `PathFeasibilityChecker::check_feasibility_with_model`
+   (`solver.rs`) returns `(FeasibilityResult, BTreeMap<ValueId,i64>)` — on `Sat` it reads
+   `solver.get_model()` + `model.eval(int,true).as_i64()` over the ValueId-keyed `var_cache`
+   (deterministic order). Threaded up via a new `model` field on `PathReachabilityResult`
+   (`reachability.rs`; empty for guard-free/Unsat/Unknown). `check_feasibility`/`check_joint_feasibility`
+   refactored onto a shared `new_solver()`.
+2. **Candidate enumeration (`saf-svcomp`).** New `FalseCandidate { reach_error_inst, block_path,
+   assignments, nondet_sequence }` + `NondetCall { func_name, value }` + `enumerate_false_candidates`.
+   For each `reach_error`/`__VERIFIER_error` site it Z3-checks intraprocedural reachability within the
+   site's function and, on `Reachable`, resolves the **scalar-integer** nondet calls along `block_path`
+   in execution order, each pinned to its model value **or `0` when unconstrained** (keeps the harness's
+   per-function counter aligned). `analyze_property`/`analyze_unreachability` are **untouched**
+   (saf-bench's single-`PropertyResult` contract preserved).
+3. **Harness synthesis + native replay (`saf-cli`).** `synthesize_driver` emits a C driver defining all
+   15 nondet generators (scalar-int replay the model array via a per-fn counter; float/double/pointer →
+   `0`/`NULL`), `__VERIFIER_assume` honored at runtime (`assume(false) → _exit(0)`, no sentinel), and the
+   error sinks. `replay_confirms_false` compiles the ORIGINAL program natively with the driver
+   (`clang -O0`, no `-emit-llvm`, `-include` the stub), runs it under a pure-std try-wait timeout
+   (`$SAF_VERIFY_REPLAY_TIMEOUT`, default 10 s), and confirms FALSE iff a **sentinel file** is written.
+   Everything else (normal exit / crash / timeout / compile-or-link failure) ⇒ `unknown`.
+
+**Correction to decision D1 (found by the blind eval).** The premise "override only
+`reach_error`/`__VERIFIER_error`; libc override risks multiple-def" was **backwards**: the canonical
+sv-benchmarks task *defines its own* `reach_error(){ __assert_fail(...); }`, so a strong driver
+`reach_error` collides (`multiple definition`) and the replay never links. Fix: the driver's
+`reach_error`/`__VERIFIER_error` are **weak** (the task's strong def wins; ours supplies the symbol when
+the task only declares it) **and `__assert_fail` is overridden** (a *safe* libc override — libc is a
+shared object, no multiple-def) so the task-defined `reach_error → __assert_fail` path still trips the
+sentinel. `abort` is deliberately **not** overridden (too generic to attribute to the property soundly).
+Regression fixture: `unreach_false_selfdef_nondet.c`.
+
+**Environment fix (the dominant recall blocker on the blind sample).** The dev image had **no 32-bit
+multilib**, so the `-m32` native replay link-failed (`cannot find crtn.o`) on **ILP32** tasks — and
+**~8/9 of the sampled unreach-call tasks are ILP32** — silently masking every ILP32 replay as `unknown`.
+Fix: Dockerfile `base` stage installs `gcc-multilib libc6-dev-i386`. Also fixed `.dockerignore` (it did
+**not** exclude the ~12 GB `tests/benchmarks/` submodule, stalling the image build on context transfer).
+Regression fixture/test: `verify_ilp32_nondet_reproduces_false`.
+
+**Blind eval (post-fix, `svcomp_verify_eval.py`, 20+20 stride sample, `--timeout 25s`):**
+**0 false alarms, 0 TRUE (SOUND) ✓; recall 1/20** (`data_structures_set_multi_proc_ground-1.i` → `false`,
+a real ILP32 violation must-reach could not catch). The recall win is real but **narrow**: 1c's first cut
+handles the *same-function scalar-nondet-guarded* shape (proven by 6 e2e fixtures + this benchmark task);
+the other 19/20 need **interprocedural model composition** (main's steering nondet threaded into callee
+error sites — the deferred residual), or hit heap/loop/concurrency reasoning, or **pre-existing**
+IR-compile failures / LLVM-frontend **ingest segfaults** (confirmed pre-existing via `saf index`, e.g.
+`tdg_vm_wr…` — *not* a 1c regression). Gates: nextest **2224** + pytest **94**, clippy `-D warnings` + fmt
+clean, **16 verify/false-alarm e2e** pass, byte-identical re-runs.
+
+**Deferred → now specified as Slice 1d (below):** interprocedural model composition. Also deferred:
+frontend-ingest robustness on very large `.i` files; bench `run_task` in-process switch (1.2b);
+YAML witness 2.0 (1b-a).
+
+### Slice 1d — interprocedural model composition (higher-recall replay steering)
+
+**Why (from the slice-1c blind eval).** 1c's concrete replay confirmed only **1/20** expected-false
+tasks because `enumerate_false_candidates` computes the Z3 model **intraprocedurally**, within the
+`reach_error` site's own function `F`. When the error is in a callee but the **steering inputs** (the
+nondet reads whose values decide whether `main` reaches `F` and takes the error branch) live in `main`
+or intermediate callers, the intraprocedural model pins only `F`'s local nondet; `main`'s steering
+nondet defaults to `0`, so the native run usually never reaches `F`'s error path → non-reproduction →
+`unknown` (sound, but a recall miss). This is the **dominant** blind-sample shape — candidates *are*
+enumerated but none reproduce (`dll-queue-2`, `aws_hash_table…`, `batchnorm…`, `pals_floodmax…`).
+Slice 1d closes it by producing a **whole-program** nondet input sequence that steers
+`main → … → reach_error`.
+
+**Approaches (choose in brainstorming before implementing):**
+- **(A) Interprocedural joint model — principled, recommended.** Build an interprocedural path from
+  `main`'s entry to the error call over the ICFG/callgraph, extract the guards along the *whole* path
+  **composing caller→callee argument bindings** (the exact constraint today's over-approx engine drops
+  — see the slice-1 record: "does not compose caller↔callee argument constraints"), and solve them
+  jointly with Z3 for **one model spanning all nondet calls** across `main` and callees. Order the
+  nondet sequence globally in execution order (extends `resolve_nondet_sequence` across the call
+  chain). New work lands in `saf-analysis` (bounded k-depth inlining, or summary-based interprocedural
+  path conditions); it **reuses 1c's** `check_feasibility_with_model`, `FalseCandidate`, driver
+  synthesis, and native replay verbatim.
+- **(B) Model-guided bounded concrete search — cheap, complementary.** Keep the intraprocedural
+  candidate but replay a **small bounded set** of nondet assignments per candidate (the Z3 model plus
+  boundary / small-int / index-seeded variants) instead of one, confirming FALSE if *any* run reaches
+  `reach_error`. Sidesteps interprocedural analysis; sound (execution-gated); recovers shallow steering
+  the single intraprocedural model misses; will not crack deep/narrow conditions. Can layer on top of
+  (A).
+
+**Soundness (unchanged).** Execution stays the sole arbiter — a confirmed FALSE is still backed by a
+real run reaching `reach_error`; non-reproducing candidates → `unknown`; no `true` ever. (A)/(B) change
+only *which candidates get a steering input that reproduces*, never the confirmation rule.
+
+**Scope / residuals.** Still **scalar-integer** nondet and **closed** programs; bound the
+interprocedural depth/paths so worst-case CPU stays under the watchdog. Heap-shape, loop-invariant
+(multi-iteration), and concurrency reachability remain **out** (separate levers). Native replay still
+requires the 32-bit-multilib image (slice 1c).
+
+**TDD.** New fixture `unreach_false_interproc_nondet.c` — `main` reads a nondet, guards on it, and calls
+a buggy callee whose `reach_error` is behind the caller-supplied argument (the composed shape;
+**currently `unknown`, target `false`**). The heap/concurrency non-reproducers (`dll-queue`-style) must
+stay `unknown` (soundness). Unit: an interprocedural path condition composes a caller argument into a
+callee guard, and the joint model assigns the **caller's** nondet.
+
+**Acceptance.** Blind recall (`scripts/svcomp_verify_eval.py`, same sample) **↑ over slice 1c's 1/20**,
+holding **0 false alarms, 0 TRUE**, byte-identical re-runs.
+
 ---
 
 ## 4. Soundness & determinism invariants (must hold; mapped to code)
@@ -438,7 +544,8 @@ here — a Docker dev build on the VM is sufficient for P0 measurement.
 - [x] **1.5** Wall-clock watchdog (worker thread, `--timeout`) → graceful `unknown`.
 - [x] **1.6** Superseded by the sound **must-reach** verdict (`analyze_property` FALSE is unsound). Concrete-replay cross-check for higher recall → **deferred (P1.2 / 1b-b)**.
 - [x] **1.1–1.6 fixtures** + blind-run acceptance (§7.1, §7.3): 0 false alarms, 0 TRUE (sound; low recall).
-- [ ] **1c** Sound FALSE by concrete replay (Z3 model → harness → native run → confirm) — recovers recall must-reach drops, holding 0 false alarms / 0 TRUE. Shares model extraction with 1b-b. **← recommended next.**
+- [x] **1c** Sound FALSE by concrete replay (Z3 model → harness → native run → confirm). Live in `unreach_verdict`; **0 false alarms / 0 TRUE**, blind recall **1/20** (real ILP32 task `data_structures…` recovered). Needed a 32-bit-multilib image fix (most tasks are ILP32) + weak-`reach_error`/`__assert_fail`-override driver (tasks self-define `reach_error`). Next lever specified as **Slice 1d**.
+- [ ] **1d** Interprocedural model composition (§3): steer `main`'s nondet into callee/caller-guarded error sites so the dominant blind-sample shape reproduces — approach (A) interprocedural joint model (compose caller↔callee args), and/or (B) model-guided bounded concrete search. Reuses 1c's model/driver/replay. Acceptance: blind recall ↑ over 1c's 1/20, holding 0 false alarms / 0 TRUE. **← recommended next.**
 - [ ] **1b-a** YAML witness 2.0 (target + metadata, byte-stable) + witnesslint gate.
 - [ ] **1b-b** Z3 model extraction → assumption/branching waypoints; CPAchecker confirmation %.
 - [ ] Update `plans/PROGRESS.md`.

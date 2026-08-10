@@ -20,8 +20,8 @@ pub mod summaries;
 pub mod witness;
 
 pub use property::{
-    AnalysisContext, PropertyAnalysisConfig, PropertyResult, analyze_property,
-    analyze_property_with_context, must_reach_error,
+    AnalysisContext, FalseCandidate, NondetCall, PropertyAnalysisConfig, PropertyResult,
+    analyze_property, analyze_property_with_context, enumerate_false_candidates, must_reach_error,
 };
 pub use property_kind::{DataModel, Language, Property};
 pub use witness::{Witness, WitnessEdge, WitnessNode, WitnessType};

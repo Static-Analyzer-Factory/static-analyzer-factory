@@ -120,17 +120,7 @@ impl PathFeasibilityChecker {
             }
         }
 
-        let solver = z3::Solver::new();
-        let mut params = z3::Params::new();
-        #[allow(clippy::cast_possible_truncation)]
-        // Z3 API uses u32; values >> u32::MAX are impractical
-        params.set_u32("timeout", self.timeout_ms as u32);
-        // Deterministic work budget + fixed seed (NFR-DET): make the verdict a
-        // function of the query, not the machine's speed or Z3's RNG.
-        params.set_u32("rlimit", self.rlimit);
-        params.set_u32("random_seed", Z3_RANDOM_SEED);
-        solver.set_params(&params);
-
+        let solver = self.new_solver();
         let mut var_cache: BTreeMap<ValueId, z3::ast::Int> = BTreeMap::new();
 
         for guard in &path_condition.guards {
@@ -145,6 +135,95 @@ impl PathFeasibilityChecker {
             z3::SatResult::Unsat => FeasibilityResult::Infeasible,
             z3::SatResult::Unknown => FeasibilityResult::Unknown,
         }
+    }
+
+    /// Like [`Self::check_feasibility`], but on a feasible path also returns a
+    /// satisfying model: a map from each symbolic operand `ValueId` to a
+    /// concrete `i64`.
+    ///
+    /// This is the *seed* for slice-1c concrete replay — the values are one
+    /// valid witness (Z3 `Int` is unbounded and signed/unsigned-agnostic, so
+    /// they are neither canonical nor bit-accurate); the native execution is
+    /// the arbiter of soundness. The model is empty when the path is
+    /// infeasible/unknown, and also for the guard-free and pre-Z3
+    /// short-circuit cases (no solver is built, so any assignment is valid).
+    pub fn check_feasibility_with_model(
+        &self,
+        path_condition: &PathCondition,
+        index: &ValueLocationIndex,
+    ) -> (FeasibilityResult, BTreeMap<ValueId, i64>) {
+        if path_condition.is_empty() {
+            return (FeasibilityResult::Feasible, BTreeMap::new());
+        }
+
+        // Pre-Z3 quick check: self-contradictory guards (same as
+        // `check_feasibility`) — infeasible without a solver, hence no model.
+        for i in 0..path_condition.guards.len() {
+            for j in (i + 1)..path_condition.guards.len() {
+                if path_condition.guards[i].condition == path_condition.guards[j].condition
+                    && path_condition.guards[i].branch_taken
+                        != path_condition.guards[j].branch_taken
+                {
+                    return (FeasibilityResult::Infeasible, BTreeMap::new());
+                }
+            }
+        }
+
+        let solver = self.new_solver();
+        let mut var_cache: BTreeMap<ValueId, z3::ast::Int> = BTreeMap::new();
+
+        for guard in &path_condition.guards {
+            if let Some(expr) = self.translate_guard(guard, index, &mut var_cache) {
+                solver.assert(&expr);
+            }
+        }
+
+        match solver.check() {
+            z3::SatResult::Sat => (
+                FeasibilityResult::Feasible,
+                Self::extract_model(&solver, &var_cache),
+            ),
+            z3::SatResult::Unsat => (FeasibilityResult::Infeasible, BTreeMap::new()),
+            z3::SatResult::Unknown => (FeasibilityResult::Unknown, BTreeMap::new()),
+        }
+    }
+
+    /// Build a Z3 solver with the deterministic parameters pinned (NFR-DET):
+    /// wall-clock `timeout` backstop, deterministic `rlimit` work budget, and a
+    /// fixed `random_seed`.
+    fn new_solver(&self) -> z3::Solver {
+        let solver = z3::Solver::new();
+        let mut params = z3::Params::new();
+        #[allow(clippy::cast_possible_truncation)]
+        // Z3 API uses u32; values >> u32::MAX are impractical
+        params.set_u32("timeout", self.timeout_ms as u32);
+        params.set_u32("rlimit", self.rlimit);
+        params.set_u32("random_seed", Z3_RANDOM_SEED);
+        solver.set_params(&params);
+        solver
+    }
+
+    /// Read a satisfying assignment for every cached operand from Z3's model.
+    ///
+    /// Iterates `var_cache` in `ValueId` order (it is a `BTreeMap`) so the
+    /// extracted map is deterministic. `model_completion = true` fills any
+    /// variable Z3 left unconstrained with a default (`0`). A value that does
+    /// not fit in `i64` is skipped (harmless: the replay harness pins the
+    /// remaining nondet inputs to `0`).
+    fn extract_model(
+        solver: &z3::Solver,
+        var_cache: &BTreeMap<ValueId, z3::ast::Int>,
+    ) -> BTreeMap<ValueId, i64> {
+        let Some(model) = solver.get_model() else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        for (vid, var) in var_cache {
+            if let Some(v) = model.eval(var, true).and_then(|n| n.as_i64()) {
+                out.insert(*vid, v);
+            }
+        }
+        out
     }
 
     /// Check whether two path conditions can hold simultaneously.
@@ -184,15 +263,7 @@ impl PathFeasibilityChecker {
             }
         }
 
-        let solver = z3::Solver::new();
-        let mut params = z3::Params::new();
-        #[allow(clippy::cast_possible_truncation)]
-        params.set_u32("timeout", self.timeout_ms as u32);
-        // Deterministic work budget + fixed seed (NFR-DET).
-        params.set_u32("rlimit", self.rlimit);
-        params.set_u32("random_seed", Z3_RANDOM_SEED);
-        solver.set_params(&params);
-
+        let solver = self.new_solver();
         let mut var_cache: BTreeMap<ValueId, z3::ast::Int> = BTreeMap::new();
 
         // Assert all guards from path A
@@ -564,6 +635,95 @@ mod tests {
         assert_eq!(diag.feasible_count, 0);
         assert_eq!(diag.infeasible_count, 0);
         assert_eq!(diag.unknown_count, 0);
+    }
+
+    // ---- model extraction (slice 1c) ----
+
+    #[test]
+    fn model_extracted_for_feasible_path() {
+        // A single nondet operand `x` guarded by `x > 5` is feasible, and the
+        // extracted model must assign `x` a concrete value satisfying the guard
+        // (the seed a concrete-replay harness pins the nondet input to).
+        let checker = make_checker();
+        let x = ValueId::new(1);
+        let cond = ValueId::new(100);
+        let index = make_index_with_conditions(vec![(
+            cond,
+            BinaryOp::ICmpSgt,
+            OperandInfo::Value(x),
+            OperandInfo::IntConst(5),
+        )]);
+        let pc = PathCondition {
+            guards: vec![Guard {
+                block: saf_core::ids::BlockId::new(1),
+                function: saf_core::ids::FunctionId::new(1),
+                condition: cond,
+                branch_taken: true, // x > 5
+            }],
+        };
+
+        let (result, model) = checker.check_feasibility_with_model(&pc, &index);
+        assert_eq!(result, FeasibilityResult::Feasible);
+        let v = model
+            .get(&x)
+            .copied()
+            .expect("x should have a concrete model value");
+        assert!(v > 5, "model value {v} must satisfy the guard x > 5");
+    }
+
+    #[test]
+    fn model_empty_for_infeasible_path() {
+        // Contradictory guards (x == 0 AND x != 0) are infeasible; no model.
+        let checker = make_checker();
+        let x = ValueId::new(1);
+        let cond1 = ValueId::new(100);
+        let cond2 = ValueId::new(101);
+        let index = make_index_with_conditions(vec![
+            (
+                cond1,
+                BinaryOp::ICmpEq,
+                OperandInfo::Value(x),
+                OperandInfo::IntConst(0),
+            ),
+            (
+                cond2,
+                BinaryOp::ICmpNe,
+                OperandInfo::Value(x),
+                OperandInfo::IntConst(0),
+            ),
+        ]);
+        let pc = PathCondition {
+            guards: vec![
+                Guard {
+                    block: saf_core::ids::BlockId::new(1),
+                    function: saf_core::ids::FunctionId::new(1),
+                    condition: cond1,
+                    branch_taken: true,
+                },
+                Guard {
+                    block: saf_core::ids::BlockId::new(2),
+                    function: saf_core::ids::FunctionId::new(1),
+                    condition: cond2,
+                    branch_taken: true,
+                },
+            ],
+        };
+
+        let (result, model) = checker.check_feasibility_with_model(&pc, &index);
+        assert_eq!(result, FeasibilityResult::Infeasible);
+        assert!(model.is_empty(), "infeasible path must yield no model");
+    }
+
+    #[test]
+    fn model_empty_for_guardless_feasible_path() {
+        // A guard-free path is feasible with no constraints — empty model.
+        let checker = make_checker();
+        let index = make_index_with_conditions(vec![]);
+        let pc = PathCondition::empty();
+
+        let (result, model) = checker.check_feasibility_with_model(&pc, &index);
+        assert_eq!(result, FeasibilityResult::Feasible);
+        assert!(model.is_empty(), "guard-free path constrains nothing");
     }
 
     // ---- joint feasibility tests ----

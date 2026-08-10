@@ -1,4 +1,5 @@
 target/
+target-maturin/
 .git/
 .venv/
 __pycache__/
@@ -8,3 +9,10 @@ __pycache__/
 .DS_Store
 plans/
 .cache/
+# Large / VM-only paths that must never enter the Docker build context.
+# tests/benchmarks holds the ~12GB sv-benchmarks + PTABen submodules; the dev
+# image build does not need them (they are bind-mounted at runtime), and
+# shipping them as build context stalls the build.
+tests/benchmarks/
+node_modules/
+*.log

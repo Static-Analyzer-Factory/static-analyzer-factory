@@ -964,12 +964,259 @@ fn unreach_verdict(input: &Path, data_model: saf_svcomp::DataModel) -> String {
     // unsound as a verdict (a wrong `false` scores -16). Emit `false` only when
     // reach_error is UNCONDITIONALLY reachable; everything else -> unknown. We also
     // never emit `true`, so -32 exposure stays zero.
+    // Stage 1 (sound, cheap): reach_error UNCONDITIONALLY reached ⇒ a guaranteed
+    // violation, no execution needed.
     if saf_svcomp::must_reach_error(&bundle.module).is_some() {
-        format!("false({})", Property::UnreachCall.name())
-    } else {
-        eprintln!("saf verify: reach_error not proven unconditionally reachable -> unknown");
-        "unknown".to_string()
+        return format!("false({})", Property::UnreachCall.name());
     }
+
+    // Stage 2 + 3 (slice 1c): must-reach is silent on *guarded* violations.
+    // Enumerate over-approximate FALSE candidates from the Z3 path engine (each
+    // with a satisfying nondet model), then CONFIRM each by concrete native
+    // replay — pin the nondet inputs to the model and run the real program.
+    // Only a run that actually reaches reach_error is a violation, so the
+    // over-approximation's false alarms are filtered out (they do not
+    // reproduce), and we still never emit `true`.
+    let config = saf_svcomp::PropertyAnalysisConfig {
+        conservative: false,
+        ..Default::default()
+    };
+    let candidates = saf_svcomp::enumerate_false_candidates(&bundle.module, &config);
+    let clang = std::env::var("SAF_CLANG").unwrap_or_else(|_| DEFAULT_CLANG.to_string());
+    for (idx, candidate) in candidates.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
+        match replay_confirms_false(input, data_model, &stub, dir.path(), &clang, idx, candidate) {
+            Ok(true) => return format!("false({})", Property::UnreachCall.name()),
+            Ok(false) => {}
+            Err(e) => eprintln!("saf verify: replay of candidate {idx} errored: {e:#} -> continue"),
+        }
+    }
+
+    if candidates.is_empty() {
+        eprintln!(
+            "saf verify: no FALSE candidate proposed (reach_error not proven reachable) -> unknown"
+        );
+    } else {
+        // A candidate was over-approximated as FALSE but did not reproduce under
+        // concrete replay — the soundness filter that keeps false alarms out.
+        eprintln!(
+            "saf verify: {} candidate(s) enumerated; none reproduced reach_error at runtime -> unknown",
+            candidates.len()
+        );
+    }
+    "unknown".to_string()
+}
+
+/// Cap on how many candidates to replay per task — bounds worst-case native
+/// compile+run time; a real violation almost always surfaces in the first
+/// candidate. Dropped candidates are logged implicitly by not confirming.
+const MAX_REPLAY_CANDIDATES: usize = 16;
+
+/// Scalar-integer nondet functions and their C return types, in a fixed order.
+/// The replay driver always defines all of them (so the native link succeeds
+/// regardless of which the program references); the ones with model values
+/// replay their sequence, the rest return `0`.
+const SCALAR_NONDET: &[(&str, &str)] = &[
+    ("__VERIFIER_nondet_int", "int"),
+    ("__VERIFIER_nondet_uint", "unsigned int"),
+    ("__VERIFIER_nondet_long", "long"),
+    ("__VERIFIER_nondet_ulong", "unsigned long"),
+    ("__VERIFIER_nondet_longlong", "long long"),
+    ("__VERIFIER_nondet_ulonglong", "unsigned long long"),
+    ("__VERIFIER_nondet_short", "short"),
+    ("__VERIFIER_nondet_ushort", "unsigned short"),
+    ("__VERIFIER_nondet_char", "char"),
+    ("__VERIFIER_nondet_uchar", "unsigned char"),
+    ("__VERIFIER_nondet_bool", "_Bool"),
+    ("__VERIFIER_nondet_size_t", "size_t"),
+];
+
+/// Internal per-candidate replay timeout (seconds), overridable via
+/// `$SAF_VERIFY_REPLAY_TIMEOUT`. Short by design so a runaway harness cannot eat
+/// the whole wall-clock budget; on expiry the candidate is inconclusive.
+fn replay_timeout() -> std::time::Duration {
+    let secs = std::env::var("SAF_VERIFY_REPLAY_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Escape a filesystem path for embedding in a C string literal.
+fn escape_c_string(p: &Path) -> String {
+    let mut out = String::new();
+    for c in p.to_string_lossy().chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Build the replay driver C source for `candidate`.
+///
+/// It defines every SV-COMP special function the program may reference (so the
+/// native link succeeds): the scalar-integer nondet generators replay the model
+/// sequence (a per-function counter over a fixed array; exhausted ⇒ `0`);
+/// pointer/float/double nondet return `0`/`NULL`; `__VERIFIER_assume` blocks
+/// assumed-false paths at runtime (so an assume-pruned error can never be a
+/// false confirmation); and `reach_error`/`__VERIFIER_error` drop the sentinel
+/// file and `_exit`.
+fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) -> String {
+    use std::fmt::Write as _;
+
+    let mut s = String::new();
+    let _ = writeln!(s, "/* slice-1c concrete-replay driver (generated) */");
+    let _ = writeln!(
+        s,
+        "#define __SAF_SENTINEL \"{}\"",
+        escape_c_string(sentinel)
+    );
+    s.push_str("#include <stddef.h>\n");
+    s.push_str("#include <stdio.h>\n");
+    s.push_str("extern void _exit(int) __attribute__((noreturn));\n");
+
+    for (fname, cty) in SCALAR_NONDET {
+        let suffix = fname.trim_start_matches("__VERIFIER_nondet_");
+        let values: Vec<i64> = candidate
+            .nondet_sequence
+            .iter()
+            .filter(|n| n.func_name == *fname)
+            .map(|n| n.value)
+            .collect();
+        // A length-0 C array is illegal, so emit a dummy element when empty; the
+        // count gate (`__saf_n`) makes it unreachable.
+        let elems = if values.is_empty() {
+            "0".to_string()
+        } else {
+            values
+                .iter()
+                .map(|v| format!("{v}LL"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let _ = writeln!(s, "static long long __saf_arr_{suffix}[] = {{ {elems} }};");
+        let _ = writeln!(
+            s,
+            "static unsigned long __saf_n_{suffix} = {};",
+            values.len()
+        );
+        let _ = writeln!(s, "static unsigned long __saf_i_{suffix} = 0;");
+        let _ = writeln!(
+            s,
+            "{cty} __VERIFIER_nondet_{suffix}(void) {{ return (__saf_i_{suffix} < __saf_n_{suffix}) ? ({cty})__saf_arr_{suffix}[__saf_i_{suffix}++] : ({cty})0; }}"
+        );
+    }
+
+    // Non-integer / pointer nondet: legal defaults so the program links + runs.
+    s.push_str("void* __VERIFIER_nondet_pointer(void) { return (void*)0; }\n");
+    s.push_str("float __VERIFIER_nondet_float(void) { return 0.0f; }\n");
+    s.push_str("double __VERIFIER_nondet_double(void) { return 0.0; }\n");
+    s.push_str("void __VERIFIER_atomic_begin(void) { }\n");
+    s.push_str("void __VERIFIER_atomic_end(void) { }\n");
+
+    // Honour assumptions at runtime: assume(false) blocks the path WITHOUT a hit.
+    s.push_str("void __VERIFIER_assume(int c) { if (!c) _exit(0); }\n");
+
+    // Error sinks: dropping the sentinel is the sole evidence of a violation.
+    s.push_str(
+        "__attribute__((noreturn)) static void __saf_hit(void) { FILE* f = fopen(__SAF_SENTINEL, \"w\"); if (f) { fputc('1', f); fclose(f); } _exit(0); }\n",
+    );
+    // reach_error / __VERIFIER_error are WEAK: the canonical sv-benchmarks task
+    // DEFINES its own `reach_error(){ __assert_fail(...); }`, which must win the
+    // link (a strong symbol overrides our weak one); when the task only declares
+    // reach_error, our weak definition supplies it. __assert_fail is overridden
+    // (a safe libc override — libc is a shared object, so no multiple-definition)
+    // so the task-defined `reach_error -> __assert_fail` path still trips the
+    // sentinel. `abort` is deliberately NOT overridden: it is too generic to
+    // attribute to the property soundly, so reach_error variants calling it
+    // directly stay `unknown` (sound, at some recall cost).
+    s.push_str("__attribute__((weak)) void reach_error(void) { __saf_hit(); }\n");
+    s.push_str("__attribute__((weak)) void __VERIFIER_error(void) { __saf_hit(); }\n");
+    s.push_str(
+        "__attribute__((noreturn)) void __assert_fail(const char* a, const char* b, unsigned int c, const char* d) { (void)a; (void)b; (void)c; (void)d; __saf_hit(); }\n",
+    );
+
+    s
+}
+
+/// Confirm a FALSE candidate by concrete native execution.
+///
+/// Synthesizes the replay driver, compiles the ORIGINAL program natively
+/// together with it (`clang -O0`, no `-emit-llvm`), and runs it under a short
+/// timeout. The candidate is confirmed iff the run drops the sentinel — an
+/// irrefutable, real execution reaching `reach_error`. Any other outcome (normal
+/// exit, crash, timeout, compile/link failure) is inconclusive ⇒ `Ok(false)` ⇒
+/// the caller keeps `unknown`. Never emits to stdout (subprocess I/O is nulled).
+fn replay_confirms_false(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    stub: &Path,
+    dir: &Path,
+    clang: &str,
+    idx: usize,
+    candidate: &saf_svcomp::FalseCandidate,
+) -> anyhow::Result<bool> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+
+    let sentinel = dir.join(format!("saf_reach_{idx}.sentinel"));
+    let driver_src = dir.join(format!("saf_driver_{idx}.c"));
+    let harness = dir.join(format!("saf_harness_{idx}"));
+
+    std::fs::write(&driver_src, synthesize_driver(candidate, &sentinel))
+        .with_context(|| "writing replay driver")?;
+
+    let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
+    let status = Command::new(clang)
+        .args(["-O0", "-Wno-everything"])
+        .arg(data_model.clang_flag())
+        .arg("-include")
+        .arg(stub)
+        .arg("-I")
+        .arg(srcdir)
+        .arg(input)
+        .arg(&driver_src)
+        .arg("-o")
+        .arg(&harness)
+        .stdout(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to spawn {clang} for native replay"))?;
+    if !status.success() {
+        // Link/compile failure (e.g. the task inlines its own reach_error) —
+        // inconclusive, not a violation.
+        return Ok(false);
+    }
+
+    let mut child = Command::new(&harness)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| "spawning replay harness")?;
+
+    let timeout = replay_timeout();
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(false); // runaway program → inconclusive
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e).context("waiting on replay harness"),
+        }
+    }
+
+    // The sentinel is written only by our reach_error/__VERIFIER_error override,
+    // so its presence is an irrefutable witness that the real run reached the
+    // error call.
+    Ok(sentinel.exists())
 }
 
 pub fn run(args: &RunArgs) -> anyhow::Result<()> {

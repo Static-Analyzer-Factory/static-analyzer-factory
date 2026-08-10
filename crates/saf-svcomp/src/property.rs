@@ -1784,6 +1784,165 @@ fn must_reach_body(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Concrete-replay candidates for unreach-call (slice 1c).
+//
+// `must_reach_error` (above) yields sound FALSE only for *unconditional*
+// reaches. Guarded / nondet-driven violations need the over-approximate Z3
+// reachability engine to *propose* them, then a concrete native execution (in
+// saf-cli) to *confirm* them. `enumerate_false_candidates` produces those
+// proposals plus the Z3 model that seeds the replay; it is UNSOUND on its own
+// and must never feed a verdict without execution.
+// ---------------------------------------------------------------------------
+
+/// One `__VERIFIER_nondet_*` call resolved along a candidate's path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NondetCall {
+    /// The nondet function name, e.g. `__VERIFIER_nondet_int`.
+    pub func_name: String,
+    /// The value the replay harness returns for this call: the Z3 model value,
+    /// or `0` when the model does not constrain it.
+    pub value: i64,
+}
+
+/// An over-approximate FALSE *candidate* for the unreach-call property: a
+/// `reach_error` site the Z3 path engine could not prove unreachable, plus the
+/// satisfying model that seeds a concrete-replay attempt.
+///
+/// A candidate is **not** a verdict. Because Z3 path feasibility
+/// over-approximates (it models guard operands as unconstrained fresh
+/// variables, ignoring the arithmetic/casts/pointer-identity that define them),
+/// a candidate may not correspond to any real execution. Slice 1c confirms each
+/// candidate by pinning the nondet inputs to `nondet_sequence` and running the
+/// program natively — only a run that actually reaches `reach_error` yields
+/// `false(unreach-call)`; everything else stays `unknown`.
+#[derive(Debug, Clone)]
+pub struct FalseCandidate {
+    /// The `reach_error` / `__VERIFIER_error` call instruction.
+    pub reach_error_inst: InstId,
+    /// The block path (within the error site's function) Z3 reported feasible.
+    pub block_path: Vec<BlockId>,
+    /// Raw Z3 model: each symbolic operand `ValueId` → concrete value.
+    pub assignments: BTreeMap<ValueId, i64>,
+    /// The scalar-integer `__VERIFIER_nondet_*` calls executed along
+    /// `block_path`, in program order, each paired with the value to return
+    /// (model value, or `0` when unconstrained). The harness groups these per
+    /// function name into the pinned input arrays.
+    pub nondet_sequence: Vec<NondetCall>,
+}
+
+/// Scalar-*integer* `__VERIFIER_nondet_*` names whose result the replay harness
+/// can pin from an integer model. Pointer / float / double nondet are excluded:
+/// a program using them still runs (the driver returns `0`/`NULL`), but their
+/// values are not model-pinned, so an error gated on them simply does not
+/// reproduce → `unknown` (sound).
+fn is_scalar_integer_nondet(name: &str) -> bool {
+    matches!(
+        name,
+        "__VERIFIER_nondet_int"
+            | "__VERIFIER_nondet_uint"
+            | "__VERIFIER_nondet_long"
+            | "__VERIFIER_nondet_ulong"
+            | "__VERIFIER_nondet_longlong"
+            | "__VERIFIER_nondet_ulonglong"
+            | "__VERIFIER_nondet_short"
+            | "__VERIFIER_nondet_ushort"
+            | "__VERIFIER_nondet_char"
+            | "__VERIFIER_nondet_uchar"
+            | "__VERIFIER_nondet_bool"
+            | "__VERIFIER_nondet_size_t"
+    )
+}
+
+/// Enumerate over-approximate FALSE *candidates* for the unreach-call property.
+///
+/// For each `reach_error` / `__VERIFIER_error` call site, asks the Z3 path
+/// engine whether the call is reachable *within its own function*; on a
+/// feasible path it emits a [`FalseCandidate`] carrying the block path, the Z3
+/// model, and the scalar nondet-input sequence along that path. These
+/// candidates are the input to slice-1c concrete replay — see [`FalseCandidate`]
+/// for the soundness contract (they must be confirmed by native execution
+/// before any verdict).
+#[must_use]
+pub fn enumerate_false_candidates(
+    module: &AirModule,
+    config: &PropertyAnalysisConfig,
+) -> Vec<FalseCandidate> {
+    let mut error_calls = Vec::new();
+    for name in REACH_ERROR_NAMES {
+        error_calls.extend(find_calls_to(module, name));
+    }
+
+    let mut candidates = Vec::new();
+    for (func_id, block_id, inst_id) in error_calls {
+        let Some(entry) = get_entry_block(module, func_id) else {
+            continue;
+        };
+        let result = check_path_reachable(
+            entry,
+            block_id,
+            func_id,
+            module,
+            config.z3_timeout_ms,
+            config.max_guards,
+            config.max_paths,
+        );
+        if let PathReachability::Reachable(path) = result.result {
+            let nondet_sequence = resolve_nondet_sequence(module, func_id, &path, &result.model);
+            candidates.push(FalseCandidate {
+                reach_error_inst: inst_id,
+                block_path: path,
+                assignments: result.model,
+                nondet_sequence,
+            });
+        }
+    }
+
+    candidates
+}
+
+/// Collect the scalar-integer nondet calls executed along `block_path` (in
+/// program order) within `func_id`, pairing each with its model value or `0`
+/// when unconstrained. Keeping a slot for every nondet call — even unmodeled
+/// ones — is what keeps the harness's per-function counter aligned with the
+/// program's actual call sequence.
+fn resolve_nondet_sequence(
+    module: &AirModule,
+    func_id: FunctionId,
+    block_path: &[BlockId],
+    assignments: &BTreeMap<ValueId, i64>,
+) -> Vec<NondetCall> {
+    let Some(func) = module.function(func_id) else {
+        return Vec::new();
+    };
+    let mut seq = Vec::new();
+    for block_id in block_path {
+        let Some(block) = func.blocks.iter().find(|b| b.id == *block_id) else {
+            continue;
+        };
+        for inst in &block.instructions {
+            let Operation::CallDirect { callee } = &inst.op else {
+                continue;
+            };
+            let Some(name) = module.function(*callee).map(|f| f.name.as_str()) else {
+                continue;
+            };
+            if !is_scalar_integer_nondet(name) {
+                continue;
+            }
+            let value = inst
+                .dst
+                .and_then(|dst| assignments.get(&dst).copied())
+                .unwrap_or(0);
+            seq.push(NondetCall {
+                func_name: name.to_string(),
+                value,
+            });
+        }
+    }
+    seq
+}
+
 #[cfg(test)]
 mod must_reach_tests {
     use super::*;
@@ -2071,5 +2230,191 @@ mod tests {
             ..Default::default()
         };
         assert!(!config.conservative);
+    }
+}
+
+#[cfg(test)]
+mod enumerate_tests {
+    use super::*;
+    use saf_core::air::{AirBlock, AirFunction, BinaryOp, Constant, Instruction};
+    use saf_core::ids::ModuleId;
+
+    fn decl(id: FunctionId, name: &str) -> AirFunction {
+        AirFunction {
+            id,
+            name: name.into(),
+            params: vec![],
+            blocks: vec![],
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    fn func(id: FunctionId, name: &str, blocks: Vec<AirBlock>, entry: BlockId) -> AirFunction {
+        AirFunction {
+            id,
+            name: name.into(),
+            params: vec![],
+            blocks,
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    fn blk(id: BlockId, instructions: Vec<Instruction>) -> AirBlock {
+        AirBlock {
+            id,
+            label: None,
+            instructions,
+        }
+    }
+
+    fn nondet_call(iid: u128, callee: FunctionId, dst: ValueId) -> Instruction {
+        Instruction::new(InstId::new(iid), Operation::CallDirect { callee }).with_dst(dst)
+    }
+
+    fn icmp_sgt(iid: u128, lhs: ValueId, rhs: ValueId, dst: ValueId) -> Instruction {
+        Instruction::new(
+            InstId::new(iid),
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+        )
+        .with_operands(vec![lhs, rhs])
+        .with_dst(dst)
+    }
+
+    fn condbr(iid: u128, cond: ValueId, then_target: BlockId, else_target: BlockId) -> Instruction {
+        Instruction::new(
+            InstId::new(iid),
+            Operation::CondBr {
+                then_target,
+                else_target,
+            },
+        )
+        .with_operands(vec![cond])
+    }
+
+    fn call(iid: u128, callee: FunctionId) -> Instruction {
+        Instruction::new(InstId::new(iid), Operation::CallDirect { callee })
+    }
+
+    fn ret(iid: u128) -> Instruction {
+        Instruction::new(InstId::new(iid), Operation::Ret)
+    }
+
+    /// `int x = nondet_int(); if (x > 5) reach_error();` — the guarded error is
+    /// Z3-reachable, so `enumerate_false_candidates` must yield one candidate
+    /// carrying the reach_error `InstId`, the block path, a model constraining
+    /// `x` to satisfy `x > 5`, and a one-element nondet sequence pinning
+    /// `__VERIFIER_nondet_int` to that value.
+    #[test]
+    fn enumerate_finds_guarded_nondet_candidate() {
+        let (main_id, nondet_id, err_id) =
+            (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let (entry, err_blk, exit) = (BlockId::new(10), BlockId::new(11), BlockId::new(12));
+        let (x, five, cond) = (ValueId::new(100), ValueId::new(101), ValueId::new(102));
+
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.constants
+            .insert(five, Constant::Int { value: 5, bits: 32 });
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![
+                blk(
+                    entry,
+                    vec![
+                        nondet_call(1, nondet_id, x),
+                        icmp_sgt(2, x, five, cond),
+                        condbr(3, cond, err_blk, exit),
+                    ],
+                ),
+                blk(err_blk, vec![call(4, err_id), ret(5)]),
+                blk(exit, vec![ret(6)]),
+            ],
+            entry,
+        ));
+        m.functions.push(decl(nondet_id, "__VERIFIER_nondet_int"));
+        m.functions.push(decl(err_id, "reach_error"));
+
+        let candidates = enumerate_false_candidates(&m, &PropertyAnalysisConfig::default());
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "one guarded error site → one candidate"
+        );
+        let c = &candidates[0];
+        assert_eq!(c.reach_error_inst, InstId::new(4));
+        assert_eq!(c.block_path, vec![entry, err_blk]);
+
+        let v = c
+            .assignments
+            .get(&x)
+            .copied()
+            .expect("model must constrain the nondet operand x");
+        assert!(v > 5, "model value {v} must satisfy the guard x > 5");
+
+        assert_eq!(c.nondet_sequence.len(), 1);
+        assert_eq!(c.nondet_sequence[0].func_name, "__VERIFIER_nondet_int");
+        assert_eq!(
+            c.nondet_sequence[0].value, v,
+            "the pinned value must match the model"
+        );
+    }
+
+    /// Two nondet reads where only the second is constrained by the guard. The
+    /// sequence must keep BOTH slots in call order (the first defaults to `0`)
+    /// so the harness's per-function counter stays aligned with the program's
+    /// actual call sequence.
+    #[test]
+    fn nondet_sequence_zero_fills_unconstrained_in_call_order() {
+        let (main_id, nondet_id, err_id) =
+            (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let (entry, err_blk, exit) = (BlockId::new(10), BlockId::new(11), BlockId::new(12));
+        let (a, b, five, cond) = (
+            ValueId::new(100),
+            ValueId::new(101),
+            ValueId::new(102),
+            ValueId::new(103),
+        );
+
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.constants
+            .insert(five, Constant::Int { value: 5, bits: 32 });
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![
+                blk(
+                    entry,
+                    vec![
+                        nondet_call(1, nondet_id, a), // unconstrained read
+                        nondet_call(2, nondet_id, b), // guarded read
+                        icmp_sgt(3, b, five, cond),
+                        condbr(4, cond, err_blk, exit),
+                    ],
+                ),
+                blk(err_blk, vec![call(5, err_id), ret(6)]),
+                blk(exit, vec![ret(7)]),
+            ],
+            entry,
+        ));
+        m.functions.push(decl(nondet_id, "__VERIFIER_nondet_int"));
+        m.functions.push(decl(err_id, "reach_error"));
+
+        let candidates = enumerate_false_candidates(&m, &PropertyAnalysisConfig::default());
+        assert_eq!(candidates.len(), 1);
+        let seq = &candidates[0].nondet_sequence;
+        assert_eq!(seq.len(), 2, "both nondet reads keep a slot");
+        assert_eq!(seq[0].value, 0, "unconstrained first read defaults to 0");
+        assert!(seq[1].value > 5, "second read pinned to satisfy x > 5");
     }
 }

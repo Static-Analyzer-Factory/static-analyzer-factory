@@ -3,10 +3,10 @@
 //! Given two program points, checks if any feasible CFG path connects them
 //! by enumerating paths and checking Z3 guard feasibility.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use saf_core::air::AirModule;
-use saf_core::ids::{BlockId, FunctionId};
+use saf_core::ids::{BlockId, FunctionId, ValueId};
 
 use crate::cfg::Cfg;
 
@@ -37,6 +37,11 @@ pub struct PathReachabilityResult {
     pub paths_checked: usize,
     /// Z3 filtering diagnostics.
     pub diagnostics: Z3FilterDiagnostics,
+    /// Satisfying model for the reported `Reachable` path: each symbolic
+    /// operand `ValueId` (e.g. a `__VERIFIER_nondet_*` result) mapped to a
+    /// concrete value. Empty for `Unreachable`/`Unknown` and for guard-free
+    /// reaches that never invoke Z3. Seeds slice-1c concrete replay.
+    pub model: BTreeMap<ValueId, i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +73,7 @@ pub fn check_path_reachable(
                 result: PathReachability::Unknown,
                 paths_checked: 0,
                 diagnostics: Z3FilterDiagnostics::default(),
+                model: BTreeMap::new(),
             };
         }
     };
@@ -104,6 +110,8 @@ pub fn check_path_reachable(
                 result: PathReachability::Reachable(path.clone()),
                 paths_checked,
                 diagnostics,
+                // Guard-free reach: no solver ran, so any assignment is valid.
+                model: BTreeMap::new(),
             };
         }
 
@@ -114,13 +122,15 @@ pub fn check_path_reachable(
         }
 
         diagnostics.z3_calls += 1;
-        match checker.check_feasibility(&pc, &index) {
+        let (feasibility, model) = checker.check_feasibility_with_model(&pc, &index);
+        match feasibility {
             FeasibilityResult::Feasible => {
                 diagnostics.feasible_count += 1;
                 return PathReachabilityResult {
                     result: PathReachability::Reachable(path.clone()),
                     paths_checked,
                     diagnostics,
+                    model,
                 };
             }
             FeasibilityResult::Infeasible => {
@@ -146,6 +156,8 @@ pub fn check_path_reachable(
         result,
         paths_checked,
         diagnostics,
+        // No feasible path reported → no witness assignment.
+        model: BTreeMap::new(),
     }
 }
 
@@ -361,5 +373,25 @@ mod assume_tests {
             "assume(x == 0) must make the x != 0 error path Unreachable; got {:?}",
             result.result
         );
+    }
+
+    /// A reachable *guarded* error path (branch `x != 0`) must carry a Z3 model
+    /// assigning the nondet operand `x` a concrete value satisfying the guard —
+    /// the seed slice 1c pins the nondet input to for concrete replay.
+    #[test]
+    fn model_returned_for_reachable_error_path() {
+        let (main_id, _assume, entry, error, _exit) = ids();
+        let module = build_module(false);
+
+        let result = check_path_reachable(entry, error, main_id, &module, 5000, 50, 1000);
+        assert!(matches!(result.result, PathReachability::Reachable(_)));
+
+        let x = ValueId::new(100);
+        let v = result
+            .model
+            .get(&x)
+            .copied()
+            .expect("reachable guarded error path must carry a model value for x");
+        assert!(v != 0, "model value {v} must satisfy the guard x != 0");
     }
 }

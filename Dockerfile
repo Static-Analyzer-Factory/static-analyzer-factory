@@ -50,6 +50,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
         git \
         pkg-config \
+        gcc-multilib \
+        libc6-dev-i386 \
         "llvm-${LLVM_VERSION}-dev" \
         "libclang-${LLVM_VERSION}-dev" \
         "clang-${LLVM_VERSION}" \
