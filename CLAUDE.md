@@ -325,6 +325,50 @@ Tags are free-form — no registration needed.
 - **All IDs are u128** — BLAKE3-derived, serialized as `0x` + 32 hex chars (FR-AIR-002)
 - **SVFG checkers: instruction-level vs node-level mismatch** — Checker specs express instruction-level properties (call sites, resource types) but the SVFG solver operates on SSA value nodes. Three known failure modes: (1) `BTreeSet<SvfgNodeId>` deduplicates same-SSA call sites (e.g., `free(p); free(p);` → 1 node) — use call-site counting when multiplicity matters; (2) `ResourceRole` is a flat namespace — roles shared across resource categories (memory/file/lock) cause checker cross-contamination; (3) solver's `target != source` guard blocks zero-length flows where SSA collapses source and sink to the same node (e.g., alloca returned directly). When adding new checkers or modifying the solver, verify behavior at this boundary.
 
+## SV-COMP Competition Work (branch `svcomp`)
+
+SAF competes (target: **SV-COMP 2027**) as a **sound, FALSE-only bug-finder in the `C.FalseOverall`
+meta-category**. Authoritative, evidence-backed assessment + roadmap: **`plans/193-svcomp-capability-audit-and-roadmap.md`** (user-approved 2026-08-10). Strategy context: `plans/191`; P0 entry point (blind `saf verify`): `plans/192`. All builds/experiments run on the VM (`ubuntu@cd-vm-15-ai-vm`), never the laptop — see the `saf-svcomp-*` memories.
+
+**Measured reality (do not overstate SAF's capability):** run blind through BenchExec today SAF scores
+≈ 0 across the C track — `saf verify` wires ONLY `unreach-call` (all other properties hard-gate to
+`unknown` at `commands.rs:789`), blind `unreach-call` recall is ~1/20, and **no witness is ever written**
+(so even correct FALSEs score 0). Do NOT re-trust plan 191's "reconnect the sophisticated
+`analyze_property`" premise: that engine family (`analyze_property`/`analyze_memsafety`/`analyze_no_overflow`/`analyze_termination`/`analyze_no_data_race`) is **dead code on both the `verify` and bench surfaces** (zero live callers); the live self-grading path is the crude `bench_result_to_verdict` (`saf-bench/svcomp/mod.rs:333`). See plan 193 §3.
+
+**Approved roadmap (ROI order, R1 is the immediate next implementation target):** R1 YAML-2.0 *violation*
+witness (turns existing sound `unreach-call` FALSEs from 0 → +1 across the 24,139-task reservoir) → R2
+measure full-reservoir recall + −16 audit → R3 close the Stage-1 `must_reach` holes → R4 interprocedural
+FALSE-candidate composition → R5 `valid-memsafety` FALSE + ASan replay → R6 `no-overflow` loop-free FALSE
+→ R7 `termination` loop-free∧acyclic TRUE → R8 `no-data-race` no-threading TRUE → R9 native-ZIP packaging
+→ R10 `valid-memcleanup`. R5–R10 are approved but **deferred**; **design R1's witness emitter and the
+`verify` verdict dispatch to be property-GENERIC from the start** (not `unreach-call`-hardcoded) so the
+later properties plug in without a rewrite — extensibility is a hard requirement, not a nicety.
+
+**Soundness redlines (NON-NEGOTIABLE — a wrong verdict is −16/−32, ~16× the reward of a right one):**
+1. **`saf verify` must never emit `true`** with the current engines. Every TRUE-capable path is
+   finding-absence heuristic or rests on ungated PTA/absint truncation. The hard "never prints `true`"
+   gate is the primary soundness guarantee — preserve it until a convergence-gated fixpoint + sound
+   interprocedural PTA + a correctness-witness pipeline all exist.
+2. **Never emit `false` without (a) an unconditional must-reach proof OR (b) concrete replay/execution
+   confirmation.** The Z3 path enumerator is unsound alone (models guard operands as fresh unconstrained
+   ints); its candidates MUST stay replay-gated. No FALSE straight from a Z3 SAT.
+3. **Each NEW property's FALSE needs its OWN concrete confirmer.** `replay_confirms_false` is
+   `reach_error`-sentinel-specific; it cannot confirm a UAF/OOB/leak/overflow. Emitting on
+   over-approximate findings alone = −16 (the memory checkers measured 75% false-alarm on *safe*
+   programs).
+4. **Before scaling `unreach-call` FALSE, close the two Stage-1 `must_reach_error` holes** (Stage-1 has
+   no replay backstop): treat any `CallIndirect` and any non-allowlisted external as `Indeterminate`
+   (`property.rs:1715,1745`).
+5. **Never wire `bench_result_to_verdict` to a competition surface** — substring-match findings +
+   finding-absence-TRUE, no gate. It is a self-grading measurement tool only.
+6. **`termination` TRUE requires loop-free CFGs AND an acyclic call graph**; delete (don't merely gate)
+   the aggressive `!conservative ⇒ TRUE` branch.
+7. **Sequential `no-data-race` TRUE requires hardening `has_threading_primitives`** to treat
+   `CallIndirect` / unlisted spawn wrappers conservatively.
+8. **Any future sound TRUE must gate on absint fixpoint convergence AND base-Andersen PTA convergence**
+   (fail-closed to `unknown` on truncation) — currently doc-level conventions, not enforced returns.
+
 ## Development Skills
 
 SAF ships coding-agent skills under `skills/` for guided feature development.
