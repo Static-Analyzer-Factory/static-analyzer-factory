@@ -244,6 +244,25 @@ fn verify_false_interproc() {
     verify_unreach("unreach_false_interproc.c").stdout("false(unreach-call)\n");
 }
 
+/// R4 (plan 196): a steering nondet + guard in `main` gating a callee's
+/// `reach_error` → `false(unreach-call)`. Missed by both must-reach (guarded) and
+/// the intraprocedural enumeration (rooted at the callee); the interprocedural
+/// enumerator pins main's nondet to 42 so native replay reaches the error.
+#[test]
+#[ignore]
+fn verify_false_interproc_nondet() {
+    verify_unreach("unreach_false_interproc_nondet.c").stdout("false(unreach-call)\n");
+}
+
+/// R4 soundness negative: the interprocedural path exists but the steering-nondet
+/// guard is unsatisfiable (`x > 5 && x < 3`), so the callee error is genuinely
+/// unreachable → `unknown` (never a false alarm).
+#[test]
+#[ignore]
+fn verify_false_interproc_unsat_is_unknown() {
+    verify_unreach("unreach_false_interproc_unsat.c").stdout("unknown\n");
+}
+
 /// `reach_error()` present but provably unreachable → we never emit `true`, so
 /// the verdict is `unknown`.
 #[test]

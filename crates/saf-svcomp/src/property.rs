@@ -26,11 +26,15 @@ use saf_analysis::checkers::{
     SolverConfig, run_checkers_path_sensitive,
 };
 use saf_analysis::defuse::DefUseGraph;
+use saf_analysis::guard::{ValueLocationIndex, extract_assume_guards, extract_guards_from_blocks};
 use saf_analysis::icfg::Icfg;
 use saf_analysis::mssa::MemorySsa;
 use saf_analysis::mta::{AccessKind, MtaAnalysis, MtaConfig, MtaResult, ThreadId};
 use saf_analysis::svfg::{Svfg, SvfgBuilder, SvfgNodeId};
-use saf_analysis::z3_utils::reachability::{PathReachability, check_path_reachable};
+use saf_analysis::z3_utils::reachability::{
+    PathReachability, block_paths_between, check_path_reachable,
+};
+use saf_analysis::z3_utils::{FeasibilityResult, PathFeasibilityChecker};
 use saf_analysis::{AliasResult, PtaConfig, PtaContext, PtaResult};
 use saf_core::air::{AirModule, Operation};
 use saf_core::ids::{BlockId, FunctionId, InstId, ValueId};
@@ -107,6 +111,15 @@ pub struct PropertyAnalysisConfig {
     /// When false (aggressive mode), return verdicts with lower confidence
     /// for higher coverage but small risk of incorrect results.
     pub conservative: bool,
+
+    /// Maximum interprocedural call-chain length (`main → … → error function`)
+    /// explored by [`enumerate_false_candidates_interproc`] (R4). Bounds
+    /// worst-case CPU so the wall-clock watchdog is never the arbiter.
+    pub max_call_depth: usize,
+
+    /// Maximum interprocedural call chains explored per `reach_error` site
+    /// (R4). Bounds chain explosion for heavily-called error functions.
+    pub max_chains_per_site: usize,
 }
 
 impl Default for PropertyAnalysisConfig {
@@ -118,6 +131,8 @@ impl Default for PropertyAnalysisConfig {
             context_sensitive: true,
             k_cfa_depth: 2,
             conservative: true,
+            max_call_depth: 3,
+            max_chains_per_site: 4,
         }
     }
 }
@@ -1952,22 +1967,262 @@ pub fn enumerate_false_candidates(
     candidates
 }
 
-/// Collect the scalar-integer nondet calls executed along `block_path` (in
-/// program order) within `func_id`, pairing each with its model value or `0`
-/// when unconstrained. Keeping a slot for every nondet call — even unmodeled
-/// ones — is what keeps the harness's per-function counter aligned with the
-/// program's actual call sequence.
-fn resolve_nondet_sequence(
+// ---------------------------------------------------------------------------
+// Interprocedural FALSE candidates (R4 — plan 196).
+//
+// `enumerate_false_candidates` (above) roots reachability at each reach_error's
+// OWN function, so a steering nondet read in `main` (or an intermediate caller)
+// is invisible and the candidate's `nondet_sequence` cannot pin it. R4 roots the
+// search at `main`: for each reach_error site it enumerates bounded call chains
+// `main → … → F`, stitches a cross-frame block sequence, extracts each frame's
+// own guards (Shape 1 — NO caller-arg→callee-param binding yet), solves once for
+// a joint model over all frames' nondet operands, and collects the whole-program
+// nondet sequence in execution order. Like `enumerate_false_candidates`, the
+// result is UNSOUND on its own and MUST be confirmed by native concrete replay.
+// ---------------------------------------------------------------------------
+
+/// One hop in an interprocedural call chain: within `caller`, a call at
+/// `call_block` descends toward the error function (the next frame).
+#[derive(Debug, Clone)]
+struct CallHop {
+    caller: FunctionId,
+    call_block: BlockId,
+}
+
+/// Index every direct call site as `callee → {(caller, call_block)}`, in
+/// deterministic module-walk order (`BTreeMap`/`BTreeSet`).
+fn build_direct_call_sites(
     module: &AirModule,
-    func_id: FunctionId,
-    block_path: &[BlockId],
-    assignments: &BTreeMap<ValueId, i64>,
-) -> Vec<NondetCall> {
-    let Some(func) = module.function(func_id) else {
+) -> BTreeMap<FunctionId, BTreeSet<(FunctionId, BlockId)>> {
+    let mut sites: BTreeMap<FunctionId, BTreeSet<(FunctionId, BlockId)>> = BTreeMap::new();
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Operation::CallDirect { callee } = &inst.op {
+                    sites
+                        .entry(*callee)
+                        .or_default()
+                        .insert((func.id, block.id));
+                }
+            }
+        }
+    }
+    sites
+}
+
+/// Enumerate interprocedural call chains `main → … → error_func`, each a `Vec`
+/// of hops in call order, bounded by `max_depth` (chain length) and `max_chains`
+/// (total). Recursion cycles are broken by a `visiting` set (a function already
+/// on the current chain is not re-entered).
+fn error_call_chains(
+    call_sites: &BTreeMap<FunctionId, BTreeSet<(FunctionId, BlockId)>>,
+    error_func: FunctionId,
+    main_id: FunctionId,
+    max_depth: usize,
+    max_chains: usize,
+) -> Vec<Vec<CallHop>> {
+    let mut chains = Vec::new();
+    let mut visiting = BTreeSet::new();
+    visiting.insert(error_func);
+    collect_chains(
+        call_sites,
+        error_func,
+        main_id,
+        max_depth,
+        max_chains,
+        &mut visiting,
+        &mut chains,
+    );
+    chains
+}
+
+fn collect_chains(
+    call_sites: &BTreeMap<FunctionId, BTreeSet<(FunctionId, BlockId)>>,
+    target: FunctionId,
+    main_id: FunctionId,
+    depth_left: usize,
+    max_chains: usize,
+    visiting: &mut BTreeSet<FunctionId>,
+    out: &mut Vec<Vec<CallHop>>,
+) {
+    if out.len() >= max_chains || depth_left == 0 {
+        return;
+    }
+    let Some(callers) = call_sites.get(&target) else {
+        return;
+    };
+    for &(caller, call_block) in callers {
+        if out.len() >= max_chains {
+            break;
+        }
+        let hop = CallHop { caller, call_block };
+        if caller == main_id {
+            out.push(vec![hop]);
+        } else if !visiting.contains(&caller) {
+            visiting.insert(caller);
+            let mut prefixes = Vec::new();
+            collect_chains(
+                call_sites,
+                caller,
+                main_id,
+                depth_left - 1,
+                max_chains,
+                visiting,
+                &mut prefixes,
+            );
+            visiting.remove(&caller);
+            for mut prefix in prefixes {
+                if out.len() >= max_chains {
+                    break;
+                }
+                prefix.push(hop.clone());
+                out.push(prefix);
+            }
+        }
+    }
+}
+
+/// Assemble the cross-frame `(func, block)` sequence for one call chain plus the
+/// error function's own path to the `reach_error` block. Each caller frame
+/// contributes its entry→call-site block path; the final frame contributes
+/// `err_path`. Returns `None` if any caller frame's entry→call-site path is
+/// unavailable.
+fn assemble_interproc_path(
+    module: &AirModule,
+    chain: &[CallHop],
+    err_func: FunctionId,
+    err_path: &[BlockId],
+    max_paths: usize,
+) -> Option<Vec<(FunctionId, BlockId)>> {
+    let mut block_seq: Vec<(FunctionId, BlockId)> = Vec::new();
+    for hop in chain {
+        let caller_entry = get_entry_block(module, hop.caller)?;
+        let path = block_paths_between(caller_entry, hop.call_block, hop.caller, module, max_paths)
+            .into_iter()
+            .next()?;
+        block_seq.extend(path.into_iter().map(|b| (hop.caller, b)));
+    }
+    block_seq.extend(err_path.iter().map(|&b| (err_func, b)));
+    Some(block_seq)
+}
+
+/// Enumerate over-approximate interprocedural FALSE *candidates* rooted at
+/// `main` (R4 — plan 196). For each `reach_error` site in a function other than
+/// `main`, compose bounded call chains `main → … → F`, joint-solve each whole-
+/// program path's guards (Shape 1 — each frame's own guards, no caller-arg→
+/// callee-param binding), and emit a [`FalseCandidate`] whose `nondet_sequence`
+/// spans the whole program in execution order and whose `block_path` is the
+/// error function's local sub-path (for the witness target).
+///
+/// Like [`enumerate_false_candidates`], the result is UNSOUND on its own: it must
+/// be confirmed by native concrete replay before any verdict. A spurious joint
+/// SAT, a wrong nondet order, or an unbound argument simply fails to reproduce →
+/// `unknown` (never a wrong FALSE).
+#[must_use]
+pub fn enumerate_false_candidates_interproc(
+    module: &AirModule,
+    config: &PropertyAnalysisConfig,
+) -> Vec<FalseCandidate> {
+    let Some(main_fn) = module.function_by_name("main") else {
         return Vec::new();
     };
+    let main_id = main_fn.id;
+    let call_sites = build_direct_call_sites(module);
+    let index = ValueLocationIndex::build(module);
+    let checker = PathFeasibilityChecker::new(config.z3_timeout_ms);
+
+    let mut error_calls = Vec::new();
+    for name in REACH_ERROR_NAMES {
+        error_calls.extend(find_calls_to(module, name));
+    }
+
+    let mut candidates = Vec::new();
+    for (err_func, err_block, err_inst) in error_calls {
+        // reach_error in main IS the intraprocedural case (enumerate_false_candidates).
+        if err_func == main_id {
+            continue;
+        }
+        let Some(err_entry) = get_entry_block(module, err_func) else {
+            continue;
+        };
+        let Some(err_path) =
+            block_paths_between(err_entry, err_block, err_func, module, config.max_paths)
+                .into_iter()
+                .next()
+        else {
+            continue;
+        };
+
+        for chain in error_call_chains(
+            &call_sites,
+            err_func,
+            main_id,
+            config.max_call_depth,
+            config.max_chains_per_site,
+        ) {
+            let Some(block_seq) =
+                assemble_interproc_path(module, &chain, err_func, &err_path, config.max_paths)
+            else {
+                continue;
+            };
+
+            // Feasibility over the WHOLE-PROGRAM path. Each frame contributes its
+            // own guards (disjoint ValueIds across frames), so a single model
+            // spans all frames' nondet operands. No caller-arg→callee-param
+            // binding yet (Shape 2 — plan 196 Slice 2).
+            let mut pc = extract_guards_from_blocks(&block_seq, &index);
+            let branch_guards = pc.guards.len();
+            pc.guards
+                .extend(extract_assume_guards(&block_seq, module, &index));
+
+            let model = if pc.guards.is_empty() {
+                // Guard-free interprocedural reach (also caught by must-reach;
+                // harmless): feasible with an empty model.
+                BTreeMap::new()
+            } else if branch_guards > config.max_guards {
+                continue;
+            } else {
+                match checker.check_feasibility_with_model(&pc, &index) {
+                    (FeasibilityResult::Feasible, model) => model,
+                    _ => continue,
+                }
+            };
+
+            let nondet_sequence = resolve_nondet_sequence_interproc(module, &block_seq, &model);
+            candidates.push(FalseCandidate {
+                reach_error_inst: err_inst,
+                block_path: err_path.clone(),
+                assignments: model,
+                nondet_sequence,
+            });
+        }
+    }
+
+    candidates
+}
+
+/// Collect the scalar-integer nondet calls executed across an ordered list of
+/// `(func_id, block_id)` frames in true whole-program execution order, pairing
+/// each with its model value or `0` when unconstrained. A caller's pre-call reads
+/// precede the callee's reads because the frames are supplied in execution order.
+///
+/// Keeping a slot for every scalar-int nondet call — even unmodeled ones — is what
+/// keeps the replay driver's per-function-name FIFO counter aligned with the
+/// program's actual call sequence (the driver runs the whole program from `main`
+/// and draws each name's next value regardless of which function calls it).
+fn resolve_nondet_sequence_interproc(
+    module: &AirModule,
+    path: &[(FunctionId, BlockId)],
+    assignments: &BTreeMap<ValueId, i64>,
+) -> Vec<NondetCall> {
     let mut seq = Vec::new();
-    for block_id in block_path {
+    for (func_id, block_id) in path {
+        let Some(func) = module.function(*func_id) else {
+            continue;
+        };
         let Some(block) = func.blocks.iter().find(|b| b.id == *block_id) else {
             continue;
         };
@@ -1992,6 +2247,19 @@ fn resolve_nondet_sequence(
         }
     }
     seq
+}
+
+/// Collect the scalar-integer nondet calls executed along `block_path` (in
+/// program order) within a single `func_id` — the single-frame case of
+/// [`resolve_nondet_sequence_interproc`].
+fn resolve_nondet_sequence(
+    module: &AirModule,
+    func_id: FunctionId,
+    block_path: &[BlockId],
+    assignments: &BTreeMap<ValueId, i64>,
+) -> Vec<NondetCall> {
+    let frames: Vec<(FunctionId, BlockId)> = block_path.iter().map(|b| (func_id, *b)).collect();
+    resolve_nondet_sequence_interproc(module, &frames, assignments)
 }
 
 #[cfg(test)]
@@ -2428,6 +2696,17 @@ mod enumerate_tests {
         .with_dst(dst)
     }
 
+    fn icmp_eq(iid: u128, lhs: ValueId, rhs: ValueId, dst: ValueId) -> Instruction {
+        Instruction::new(
+            InstId::new(iid),
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpEq,
+            },
+        )
+        .with_operands(vec![lhs, rhs])
+        .with_dst(dst)
+    }
+
     fn condbr(iid: u128, cond: ValueId, then_target: BlockId, else_target: BlockId) -> Instruction {
         Instruction::new(
             InstId::new(iid),
@@ -2554,5 +2833,340 @@ mod enumerate_tests {
         assert_eq!(seq.len(), 2, "both nondet reads keep a slot");
         assert_eq!(seq[0].value, 0, "unconstrained first read defaults to 0");
         assert!(seq[1].value > 5, "second read pinned to satisfy x > 5");
+    }
+
+    // --- Slice 0: frame-aware whole-program nondet walk -------------------
+
+    /// `main: %a = nondet_int(); f();   f: %b = nondet_int();` — the
+    /// interprocedural walk must emit the nondet reads in true whole-program
+    /// execution order (caller's read before the call, then the callee's read),
+    /// each pinned to its model value. The driver's per-name FIFO relies on this
+    /// exact dynamic order.
+    #[test]
+    fn interproc_nondet_walk_preserves_execution_order() {
+        let (main_id, f_id, nondet_id) =
+            (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let (m_blk, f_blk) = (BlockId::new(10), BlockId::new(20));
+        let (a, b) = (ValueId::new(100), ValueId::new(101));
+
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(
+                m_blk,
+                vec![nondet_call(1, nondet_id, a), call(2, f_id), ret(3)],
+            )],
+            m_blk,
+        ));
+        m.functions.push(func(
+            f_id,
+            "f",
+            vec![blk(f_blk, vec![nondet_call(4, nondet_id, b), ret(5)])],
+            f_blk,
+        ));
+        m.functions.push(decl(nondet_id, "__VERIFIER_nondet_int"));
+
+        let assigns = BTreeMap::from([(a, 7_i64), (b, 9_i64)]);
+        let seq =
+            resolve_nondet_sequence_interproc(&m, &[(main_id, m_blk), (f_id, f_blk)], &assigns);
+        assert_eq!(
+            seq,
+            vec![
+                NondetCall {
+                    func_name: "__VERIFIER_nondet_int".into(),
+                    value: 7,
+                },
+                NondetCall {
+                    func_name: "__VERIFIER_nondet_int".into(),
+                    value: 9,
+                },
+            ]
+        );
+    }
+
+    /// Cross-frame walk keeps a slot for EVERY scalar-int nondet read (even an
+    /// unmodeled one → `0`) and tags each with its real callee name, in dynamic
+    /// order. Mirrors `nondet_sequence_zero_fills_unconstrained_in_call_order`
+    /// across a call boundary.
+    #[test]
+    fn interproc_nondet_walk_zero_fills_and_tags_by_name() {
+        let (main_id, f_id, int_id, uint_id) = (
+            FunctionId::new(1),
+            FunctionId::new(2),
+            FunctionId::new(3),
+            FunctionId::new(4),
+        );
+        let (m_blk, f_blk) = (BlockId::new(10), BlockId::new(20));
+        let (a, b, c) = (ValueId::new(100), ValueId::new(101), ValueId::new(102));
+
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(
+                m_blk,
+                vec![nondet_call(1, int_id, a), call(2, f_id), ret(3)],
+            )],
+            m_blk,
+        ));
+        m.functions.push(func(
+            f_id,
+            "f",
+            vec![blk(
+                f_blk,
+                vec![
+                    nondet_call(4, uint_id, c), // unmodeled → 0
+                    nondet_call(5, int_id, b),  // modeled
+                    ret(6),
+                ],
+            )],
+            f_blk,
+        ));
+        m.functions.push(decl(int_id, "__VERIFIER_nondet_int"));
+        m.functions.push(decl(uint_id, "__VERIFIER_nondet_uint"));
+
+        let assigns = BTreeMap::from([(a, 7_i64), (b, 9_i64)]); // c unmodeled
+        let seq =
+            resolve_nondet_sequence_interproc(&m, &[(main_id, m_blk), (f_id, f_blk)], &assigns);
+        assert_eq!(
+            seq,
+            vec![
+                NondetCall {
+                    func_name: "__VERIFIER_nondet_int".into(),
+                    value: 7,
+                },
+                NondetCall {
+                    func_name: "__VERIFIER_nondet_uint".into(),
+                    value: 0,
+                },
+                NondetCall {
+                    func_name: "__VERIFIER_nondet_int".into(),
+                    value: 9,
+                },
+            ]
+        );
+    }
+
+    /// The single-frame `resolve_nondet_sequence` must be exactly the
+    /// interprocedural walk over that one frame — proving the refactor is
+    /// behavior-preserving (recall-neutral).
+    #[test]
+    fn resolve_nondet_sequence_matches_interproc_on_single_frame() {
+        let (main_id, nondet_id, err_id) =
+            (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let (entry, err_blk, exit) = (BlockId::new(10), BlockId::new(11), BlockId::new(12));
+        let (a, b, five, cond) = (
+            ValueId::new(100),
+            ValueId::new(101),
+            ValueId::new(102),
+            ValueId::new(103),
+        );
+
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.constants
+            .insert(five, Constant::Int { value: 5, bits: 32 });
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![
+                blk(
+                    entry,
+                    vec![
+                        nondet_call(1, nondet_id, a),
+                        nondet_call(2, nondet_id, b),
+                        icmp_sgt(3, b, five, cond),
+                        condbr(4, cond, err_blk, exit),
+                    ],
+                ),
+                blk(err_blk, vec![call(5, err_id), ret(6)]),
+                blk(exit, vec![ret(7)]),
+            ],
+            entry,
+        ));
+        m.functions.push(decl(nondet_id, "__VERIFIER_nondet_int"));
+        m.functions.push(decl(err_id, "reach_error"));
+
+        let path = vec![entry, err_blk];
+        let assigns = BTreeMap::from([(a, 3_i64), (b, 9_i64)]);
+        let direct = resolve_nondet_sequence(&m, main_id, &path, &assigns);
+        let via_interproc = resolve_nondet_sequence_interproc(
+            &m,
+            &path
+                .iter()
+                .map(|blk_id| (main_id, *blk_id))
+                .collect::<Vec<_>>(),
+            &assigns,
+        );
+        assert_eq!(direct, via_interproc);
+    }
+
+    // --- Slice 1: interprocedural candidates rooted at `main` (Shape 1) ---
+
+    /// R4 Shape 1: `main` reads a nondet, guards on it (`x == 42`), and calls a
+    /// buggy callee whose `reach_error` is unconditional. The interprocedural
+    /// enumerator must root at `main`, compose the whole-program path, and pin
+    /// `main`'s steering nondet to the value satisfying the guard — the exact
+    /// case the intraprocedural `enumerate_false_candidates` (rooted at `buggy`)
+    /// misses.
+    #[test]
+    fn interproc_candidate_pins_main_nondet_for_callee_error() {
+        let (main_id, buggy_id, nondet_id, err_id) = (
+            FunctionId::new(1),
+            FunctionId::new(2),
+            FunctionId::new(3),
+            FunctionId::new(4),
+        );
+        let (m_entry, m_then, m_exit) = (BlockId::new(10), BlockId::new(11), BlockId::new(12));
+        let b_entry = BlockId::new(20);
+        let (x, k42, cond) = (ValueId::new(100), ValueId::new(101), ValueId::new(102));
+
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.constants.insert(
+            k42,
+            Constant::Int {
+                value: 42,
+                bits: 32,
+            },
+        );
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![
+                blk(
+                    m_entry,
+                    vec![
+                        nondet_call(1, nondet_id, x),
+                        icmp_eq(2, x, k42, cond),
+                        condbr(3, cond, m_then, m_exit),
+                    ],
+                ),
+                blk(m_then, vec![call(4, buggy_id), ret(5)]),
+                blk(m_exit, vec![ret(6)]),
+            ],
+            m_entry,
+        ));
+        m.functions.push(func(
+            buggy_id,
+            "buggy",
+            vec![blk(b_entry, vec![call(7, err_id), ret(8)])],
+            b_entry,
+        ));
+        m.functions.push(decl(nondet_id, "__VERIFIER_nondet_int"));
+        m.functions.push(decl(err_id, "reach_error"));
+
+        let cands = enumerate_false_candidates_interproc(
+            &m,
+            &PropertyAnalysisConfig {
+                conservative: false,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            cands.iter().any(|c| c.reach_error_inst == InstId::new(7)
+                && c.nondet_sequence
+                    .iter()
+                    .any(|n| n.func_name == "__VERIFIER_nondet_int" && n.value == 42)),
+            "interproc enumerator must root at main and pin the steering nondet to 42; got {cands:#?}",
+        );
+    }
+
+    /// Recursion must not hang or explode: a self-recursive caller on the path to
+    /// `reach_error` is broken by the `visiting` guard, and the chain count stays
+    /// within `max_chains_per_site`.
+    #[test]
+    fn interproc_recursion_is_bounded() {
+        let (main_id, a_id, err_id) = (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let (m_blk, a_entry) = (BlockId::new(10), BlockId::new(20));
+
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(m_blk, vec![call(1, a_id), ret(2)])],
+            m_blk,
+        ));
+        // `a` reaches the error AND calls itself — the self-call must be skipped.
+        m.functions.push(func(
+            a_id,
+            "a",
+            vec![blk(a_entry, vec![call(3, err_id), call(4, a_id), ret(5)])],
+            a_entry,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+
+        let config = PropertyAnalysisConfig {
+            conservative: false,
+            ..Default::default()
+        };
+        let cands = enumerate_false_candidates_interproc(&m, &config);
+        // Terminates (no hang) and is bounded: the only sound chain is main → a.
+        assert!(
+            cands.len() <= config.max_chains_per_site,
+            "chain count must stay bounded; got {}",
+            cands.len()
+        );
+        assert!(
+            cands.iter().any(|c| c.reach_error_inst == InstId::new(3)),
+            "main → a → reach_error must still be found; got {cands:#?}"
+        );
+    }
+
+    /// Two runs on the same module produce byte-identical candidates (Debug),
+    /// guarding the sorted-iteration determinism requirement.
+    #[test]
+    fn interproc_enumeration_is_deterministic() {
+        let (main_id, buggy_id, nondet_id, err_id) = (
+            FunctionId::new(1),
+            FunctionId::new(2),
+            FunctionId::new(3),
+            FunctionId::new(4),
+        );
+        let (m_entry, m_then, m_exit) = (BlockId::new(10), BlockId::new(11), BlockId::new(12));
+        let b_entry = BlockId::new(20);
+        let (x, k42, cond) = (ValueId::new(100), ValueId::new(101), ValueId::new(102));
+
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.constants.insert(
+            k42,
+            Constant::Int {
+                value: 42,
+                bits: 32,
+            },
+        );
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![
+                blk(
+                    m_entry,
+                    vec![
+                        nondet_call(1, nondet_id, x),
+                        icmp_eq(2, x, k42, cond),
+                        condbr(3, cond, m_then, m_exit),
+                    ],
+                ),
+                blk(m_then, vec![call(4, buggy_id), ret(5)]),
+                blk(m_exit, vec![ret(6)]),
+            ],
+            m_entry,
+        ));
+        m.functions.push(func(
+            buggy_id,
+            "buggy",
+            vec![blk(b_entry, vec![call(7, err_id), ret(8)])],
+            b_entry,
+        ));
+        m.functions.push(decl(nondet_id, "__VERIFIER_nondet_int"));
+        m.functions.push(decl(err_id, "reach_error"));
+
+        let config = PropertyAnalysisConfig {
+            conservative: false,
+            ..Default::default()
+        };
+        let a = enumerate_false_candidates_interproc(&m, &config);
+        let b = enumerate_false_candidates_interproc(&m, &config);
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
     }
 }

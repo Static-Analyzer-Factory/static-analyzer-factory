@@ -161,6 +161,31 @@ pub fn check_path_reachable(
     }
 }
 
+/// Enumerate up to `max_paths` simple block paths from `from` to `to` within a
+/// single function's CFG.
+///
+/// Public wrapper over the internal path enumerator so interprocedural callers
+/// (e.g. `saf-svcomp`'s R4 chain composer) can stitch per-frame paths into a
+/// cross-function `(FunctionId, BlockId)` sequence. Returns an empty vec for a
+/// missing/declared function. Deterministic (BFS order).
+#[must_use]
+pub fn block_paths_between(
+    from: BlockId,
+    to: BlockId,
+    func_id: FunctionId,
+    module: &AirModule,
+    max_paths: usize,
+) -> Vec<Vec<BlockId>> {
+    let Some(func) = module.function(func_id) else {
+        return Vec::new();
+    };
+    if func.is_declaration {
+        return Vec::new();
+    }
+    let cfg = Cfg::build(func);
+    enumerate_paths(from, to, &cfg, max_paths)
+}
+
 /// Enumerate simple paths from `from` to `to` in a CFG using BFS.
 ///
 /// Returns up to `max_paths` unique paths. Each path is a sequence of `BlockId`.

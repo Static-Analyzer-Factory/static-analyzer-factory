@@ -22,7 +22,8 @@ pub mod witness_yaml;
 
 pub use property::{
     AnalysisContext, FalseCandidate, NondetCall, PropertyAnalysisConfig, PropertyResult,
-    analyze_property, analyze_property_with_context, enumerate_false_candidates, must_reach_error,
+    analyze_property, analyze_property_with_context, enumerate_false_candidates,
+    enumerate_false_candidates_interproc, must_reach_error,
 };
 pub use property_kind::{DataModel, Language, Property};
 pub use witness_lower::{lower_candidate, lower_must_reach, span_to_location};

@@ -1129,16 +1129,68 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         }
     }
 
-    if candidates.is_empty() {
+    // Stage 4 (R4, plan 196): INTERPROCEDURAL candidates rooted at `main`. The
+    // intraprocedural enumeration above roots at each reach_error's OWN function,
+    // so a steering nondet read in `main` (or an intermediate caller) is invisible
+    // and never gets pinned. Compose bounded call chains `main -> ... -> F` and
+    // confirm through the SAME native-replay gate — the sole arbiter of FALSE, so
+    // a spurious composition can only ever yield `unknown`, never a wrong verdict.
+    // The replay index is offset past the intraprocedural batch so sentinel/driver
+    // temp files never collide.
+    let interproc = saf_svcomp::enumerate_false_candidates_interproc(ctx.module, &config);
+    if !interproc.is_empty() {
+        // R4 addressable-surface signal: reached only when must-reach + the
+        // intraprocedural candidates did NOT already confirm, so this counts the
+        // tasks where interprocedural composition is the *only* remaining lever.
+        eprintln!(
+            "saf verify: R4 enumerated {} interprocedural candidate(s) (main -> callee reach_error)",
+            interproc.len()
+        );
+    }
+    for (idx, candidate) in interproc.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
+        match replay_confirms_false(
+            ctx.input,
+            ctx.data_model,
+            ctx.stub,
+            ctx.tempdir,
+            ctx.clang,
+            MAX_REPLAY_CANDIDATES + idx,
+            candidate,
+        ) {
+            Ok(true) => {
+                let witness =
+                    build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, candidate));
+                if witness.is_none() {
+                    eprintln!(
+                        "saf verify: FALSE (interproc replay-confirmed) but witness unconstructible -> emitting false without a witness"
+                    );
+                }
+                return VerdictOutcome {
+                    verdict: format!("false({})", Property::UnreachCall.name()),
+                    witness,
+                };
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!(
+                    "saf verify: interproc replay of candidate {idx} errored: {e:#} -> continue"
+                );
+            }
+        }
+    }
+
+    let total = candidates.len() + interproc.len();
+    if total == 0 {
         eprintln!(
             "saf verify: no FALSE candidate proposed (reach_error not proven reachable) -> unknown"
         );
     } else {
-        // A candidate was over-approximated as FALSE but did not reproduce under
+        // Candidates were over-approximated as FALSE but did not reproduce under
         // concrete replay — the soundness filter that keeps false alarms out.
         eprintln!(
-            "saf verify: {} candidate(s) enumerated; none reproduced reach_error at runtime -> unknown",
-            candidates.len()
+            "saf verify: {total} candidate(s) enumerated ({} intraproc + {} interproc); none reproduced reach_error at runtime -> unknown",
+            candidates.len(),
+            interproc.len()
         );
     }
     unknown_outcome()
