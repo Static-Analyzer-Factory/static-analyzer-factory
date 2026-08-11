@@ -5,9 +5,14 @@
 #
 # Stage 1 — witnesslint (HARD syntactic gate): the witness must conform to the
 #           2.0 violation-witness schema. Non-conformance => exit 2.
-# Stage 2 — CPAchecker witness validation (semantic confirmation, BEST-EFFORT):
-#           prints CONFIRMED / NOT_CONFIRMED / CPACHECKER_ABSENT. Never fails the
-#           script (the score-predicting measurement lives in the eval harness).
+# Stage 2 — CPAchecker ANALYSIS-based validation (semantic, BEST-EFFORT).
+# Stage 3 — cpa-witness2test EXECUTION-based validation (BEST-EFFORT): tried when
+#           analysis does not confirm. Compiles+runs a test harness from the
+#           witness and confirms if it reaches the target — catches the
+#           recursion/loop/array violations analysis leaves UNKNOWN.
+#           Prints CONFIRMED (<validator>) / NOT_CONFIRMED (...) / CPACHECKER_ABSENT.
+#           Never fails the script (the score-predicting measurement lives in the
+#           eval harness). Set SAF_SKIP_WITNESS2TEST=1 to run analysis only.
 #
 # Runs inside the dev image, which bakes witnesslint at $SAF_SVWITNESSES and a
 # JRE. CPAchecker is provisioned lazily to $SAF_CPACHECKER (persistent) — see
@@ -54,7 +59,7 @@ import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as z:
     z.extractall(sys.argv[2])
 PY
-    chmod +x "$CPA_HOME/bin/cpachecker" 2>/dev/null || true
+    chmod +x "$CPA_HOME/bin/cpachecker" "$CPA_HOME/bin/cpa-witness2test" 2>/dev/null || true
     rm -f "$zip"
     [ -x "$CPA_HOME/bin/cpachecker" ]
 }
@@ -81,9 +86,39 @@ out="$("$CPA_HOME/bin/cpachecker" \
 rm -rf "$out_dir"
 
 verdict="$(printf '%s\n' "$out" | grep -oE 'Verification result: [A-Z]+' | head -1 | awk '{print $3}')"
-case "$verdict" in
-    FALSE) echo "CONFIRMED" ;;
-    TRUE | UNKNOWN) echo "NOT_CONFIRMED ($verdict)" ;;
-    *) echo "NOT_CONFIRMED (cpachecker gave no parseable verdict)" ;;
+if [ "$verdict" = "FALSE" ]; then
+    echo "CONFIRMED (cpachecker-analysis)"
+    exit 0
+fi
+
+# ---- Stage 3: cpa-witness2test (execution-based confirmation, best-effort) --
+# Analysis-based validation returns UNKNOWN on recursion/loops/arrays it cannot
+# unroll; an execution harness (compile + run the witnessed path) reproduces many
+# of those. Confirmed iff the generated test reaches the expected violation.
+if [ "${SAF_SKIP_WITNESS2TEST:-0}" = "1" ]; then
+    echo "NOT_CONFIRMED (analysis=${verdict:-none}; witness2test skipped)"
+    exit 0
+fi
+W2T="$CPA_HOME/bin/cpa-witness2test"
+chmod +x "$W2T" 2>/dev/null || true
+if [ ! -f "$W2T" ] || [ -z "$PROPERTY" ]; then
+    # cpa-witness2test requires an executable driver and a --spec property file.
+    echo "NOT_CONFIRMED (analysis=${verdict:-none}; witness2test unavailable)"
+    exit 0
+fi
+case "$DATA_MODEL" in
+    ILP32) w2t_bit=--32 ;;
+    *) w2t_bit=--64 ;;
 esac
+out_dir2="$(mktemp -d)"
+out2="$(timeout 120 "$W2T" "$w2t_bit" --spec "$PROPERTY" \
+        --witness "$WITNESS" \
+        --output-path "$out_dir2" \
+        "$PROGRAM" 2>&1)" || true
+rm -rf "$out_dir2"
+if printf '%s\n' "$out2" | grep -qE 'reached expected property violation|Verification result: FALSE'; then
+    echo "CONFIRMED (witness2test-execution)"
+else
+    echo "NOT_CONFIRMED (analysis=${verdict:-none}; witness2test did not reproduce)"
+fi
 exit 0
