@@ -483,3 +483,50 @@ fn verify_witness_passes_witnesslint() {
         "witnesslint rejected the emitted witness:\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
     );
 }
+
+/// A branch-guarded (nondet) violation's witness carries a `branching` waypoint
+/// located by LINE ONLY (plan 195 Tier A): the `column` key is present only on
+/// the `target` waypoint, never on the `branching` one (a column pointing into
+/// the condition is mis-parsed by `CPAchecker` as a ternary and rejects the whole
+/// witness). The enriched witness must still pass `witnesslint`.
+#[test]
+#[ignore]
+fn verify_nondet_witness_has_branching_no_column_and_lints() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().join("w.yml");
+    verify_unreach_witness("unreach_false_nondet.c", "LP64", &w).stdout("false(unreach-call)\n");
+    let yaml = std::fs::read_to_string(&w).expect("witness written for a false verdict");
+    assert!(
+        yaml.contains("type: branching"),
+        "branch-guarded violation must carry a branching waypoint:\n{yaml}"
+    );
+    assert!(yaml.contains("type: target"), "{yaml}");
+    // The branching block precedes the target block; the branching location must
+    // omit `column` (only the target keeps its column).
+    let branching_pos = yaml.find("type: branching").expect("branching waypoint");
+    let target_pos = yaml.find("type: target").expect("target waypoint");
+    assert!(
+        branching_pos < target_pos,
+        "branching precedes target:\n{yaml}"
+    );
+    assert!(
+        !yaml[branching_pos..target_pos].contains("column:"),
+        "branching waypoint must omit column (CPAchecker snaps to the if/while keyword):\n{yaml}"
+    );
+
+    // The enriched witness still passes witnesslint (CPAchecker skipped here; the
+    // reservoir sweep measures confirmation).
+    let fx = svcomp_fixture("unreach_false_nondet.c");
+    let out = std::process::Command::new("bash")
+        .arg(ws("scripts/validate_witness.sh"))
+        .arg(&w)
+        .arg(&fx)
+        .env("SAF_SKIP_CPACHECKER", "1")
+        .output()
+        .expect("run validate_witness.sh");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("LINT_OK"),
+        "witnesslint rejected the enriched (branching) witness:\n{stdout}"
+    );
+}
