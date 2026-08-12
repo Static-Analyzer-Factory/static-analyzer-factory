@@ -339,9 +339,12 @@ meta-category**. Authoritative, evidence-backed assessment + roadmap: **`plans/1
 **Approved roadmap (ROI order, R1 is the immediate next implementation target):** R1 YAML-2.0 *violation*
 witness (turns existing sound `unreach-call` FALSEs from 0 → +1 across the 24,139-task reservoir) → R2
 measure full-reservoir recall + −16 audit → R3 close the Stage-1 `must_reach` holes → R4 interprocedural
-FALSE-candidate composition → R5 `valid-memsafety` FALSE + ASan replay → R6 `no-overflow` loop-free FALSE
+FALSE-candidate composition → R5 `valid-memsafety` FALSE + ASan replay **(DONE — plan 197 Slices 0–2:
+sequential valid-deref/valid-free, committed `d163e30`+`782a78f`)** → **plan 198 concurrency-aware memsafety
+confirmation (THE NEXT TASK — the threaded reservoir is 94% of buggy valid-memsafety, ~17× R5's sequential
+scope; scoping in `plans/198`)** → R6 `no-overflow` loop-free FALSE
 → R7 `termination` loop-free∧acyclic TRUE → R8 `no-data-race` no-threading TRUE → R9 native-ZIP packaging
-→ R10 `valid-memcleanup`. R5–R10 are approved but **deferred**; **design R1's witness emitter and the
+→ R10 `valid-memcleanup`. R6–R10 are approved but **deferred**; **design R1's witness emitter and the
 `verify` verdict dispatch to be property-GENERIC from the start** (not `unreach-call`-hardcoded) so the
 later properties plug in without a rewrite — extensibility is a hard requirement, not a nicety.
 
