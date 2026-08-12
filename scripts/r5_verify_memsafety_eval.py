@@ -23,8 +23,8 @@ SVB = Path("tests/benchmarks/sv-benchmarks/c")
 SAF = os.environ.get("SAF_BIN", "target/release/saf")
 N = int(os.environ.get("N", "20"))            # per (class x data-model)
 TASK_TIMEOUT = int(os.environ.get("TASK_TIMEOUT", "60"))
-CONC_DIRS = ("/pthread", "/weaver/", "/goblint", "/ldv-races/", "/libvsync/",
-             "/locks/", "/ddv-machzwd/")
+CONC_DIRS = ("/pthread", "/weaver/", "/goblint", "/ldv-races/", "/ldv-linux-3.14-races/",
+             "/libvsync/", "/locks/", "/ddv-machzwd/")
 INPUT_RE = re.compile(r"input_files:\s*['\"]?([^'\"\n]+)")
 DM_RE = re.compile(r"data_model:\s*'?(ILP32|LP64)")
 VERDICT_RE = re.compile(r"^(true|false\((valid-[a-z]+)\)|unknown)$")
@@ -67,15 +67,23 @@ def collect():
         src = (yml.parent / mi.group(1).strip()).resolve()
         if not src.exists() or any(d in str(src) for d in CONC_DIRS):
             continue
-        # SEQ_ONLY: exclude genuinely-threaded tasks (a pthread_create/thrd_create
-        # CALL, not just the header prototype -> count > 1) to measure R5's actual
-        # sequential-scope recall (thread-spawners are soundly abstained by verify).
-        if os.environ.get("SEQ_ONLY") == "1":
+        # Thread-spawn classification (a pthread_create/thrd_create CALL, not just the
+        # header prototype -> token count > 1), matching r5_thread_reservoir.py.
+        #   SEQ_ONLY=1 : keep only sequential tasks (R5's committed scope).
+        #   THREADS=1  : keep only thread-spawners (the plan-198 de-risk target — the
+        #                reservoir `saf verify` currently abstains on).
+        # The dedicated concurrency-benchmark dirs (CONC_DIRS) are always excluded.
+        seq_only = os.environ.get("SEQ_ONLY") == "1"
+        threads_only = os.environ.get("THREADS") == "1"
+        if seq_only or threads_only:
             try:
                 body = src.read_text(errors="replace")
             except OSError:
                 continue
-            if body.count("pthread_create") > 1 or body.count("thrd_create") > 1:
+            spawns = body.count("pthread_create") > 1 or body.count("thrd_create") > 1
+            if seq_only and spawns:
+                continue
+            if threads_only and not spawns:
                 continue
         md = DM_RE.search(text)
         tasks.append({"src": str(src), "exp": exp, "sub": sub,
@@ -117,7 +125,9 @@ def main():
         for pool in (safe, buggy):
             for dm in ("ILP32", "LP64"):
                 sample += stride([t for t in pool if t["dm"] == dm], N)
-    print(f"sequential valid-memsafety tasks: {len(tasks)} (safe={len(safe)} "
+    mode = ("thread-spawning" if os.environ.get("THREADS") == "1"
+            else "sequential" if os.environ.get("SEQ_ONLY") == "1" else "all")
+    print(f"{mode} valid-memsafety tasks: {len(tasks)} (safe={len(safe)} "
           f"buggy={len(buggy)}); sampling {len(sample)} via `saf verify`\n")
 
     conf = Counter()

@@ -9,10 +9,13 @@
 //!
 //! Two Slice-0c-derived soundness rules (both "abstain, never guess" — a wrong
 //! sub-property or a mis-attributed fault is −16):
-//! - **R1 (I/O-frame rejection):** a report whose faulting frame is a libc
-//!   formatted-I/O function / interceptor (`printf`/`scanf` family) or a Juliet
-//!   `print*Line` output helper is an artifact of printing a non-terminated buffer
-//!   (SV-COMP `valid-memsafety` does not count libc `printf` string reads) → abstain.
+//! - **R1 (harness-frame rejection):** a report whose faulting frame is a libc
+//!   formatted-I/O function / interceptor (`printf`/`scanf` family), a Juliet
+//!   `print*Line` output helper (an artifact of printing a non-terminated buffer —
+//!   SV-COMP `valid-memsafety` does not count libc `printf` string reads), or an
+//!   sv-benchmarks LDV allocator MODEL (`ldv_reference_realloc` &c., whose native
+//!   execution over-reads by design of the abstraction) is a harness artifact, not a
+//!   memory-safety violation of the program under test → abstain.
 //! - **R2 (high-fidelity sub-property only):** map only the unambiguous ASan
 //!   classes to a sub-property (`*-buffer-overflow/underflow/overread/underread`,
 //!   `*use-after-free/scope/return`, `SEGV` → `valid-deref`; `double-free` →
@@ -75,11 +78,17 @@ pub fn parse_asan_report(stderr: &str) -> Option<AsanHit> {
     let start = stderr.find(MARKER)?;
     let class_line = stderr[start + MARKER.len()..].lines().next()?;
     let subproperty = asan_class_to_subproperty(class_line)?; // R2: abstain if unmapped
+    // A `SEGV` can be a wild DEREF (valid-deref) OR a crash inside a deallocator when
+    // the program frees a wild pointer (valid-free). The class alone cannot tell them
+    // apart, so a `SEGV` whose stack passes through a deallocator is treated as an
+    // ambiguous bad-free and abstained — never guess a sub-property (a wrong one is
+    // −16). Non-SEGV free violations (`double-free`) map via R2 and are unaffected.
+    let is_segv = class_line.starts_with("SEGV");
 
     // Walk the stack top-down. R1: reject if the faulting access is inside a libc
-    // formatted-I/O function/interceptor or a Juliet `print*Line` output helper
-    // (up to and including the first program-source frame). Otherwise the witness
-    // target is the first frame carrying a program-source location.
+    // formatted-I/O function/interceptor, a Juliet `print*Line` output helper, or an
+    // LDV allocator model (up to and including the first program-source frame).
+    // Otherwise the witness target is the first frame carrying a program location.
     for line in stderr.lines() {
         let t = line.trim_start();
         if !t.starts_with('#') {
@@ -89,8 +98,11 @@ pub fn parse_asan_report(stderr: &str) -> Option<AsanHit> {
             continue;
         };
         let func = frame_function(descr);
-        if is_format_io(func) || is_print_helper(func) {
+        if is_format_io(func) || is_print_helper(func) || is_harness_memory_model(func) {
             return None; // R1
+        }
+        if is_segv && is_deallocator(func) {
+            return None; // ambiguous bad-free SEGV -> abstain (never guess -16)
         }
         if let Some((path, line_no, col)) = parse_frame_location(descr) {
             return Some(AsanHit {
@@ -151,6 +163,29 @@ fn is_format_io(func: &str) -> bool {
 /// one is a print-time artifact, not the property under test (R1).
 fn is_print_helper(func: &str) -> bool {
     func.starts_with("print") && func.contains("Line")
+}
+
+/// An sv-benchmarks LDV allocator MODEL (`ldv_reference_realloc`, `ldv_realloc`,
+/// `ldv_malloc`, `ldv_calloc`, `ldv_zalloc`, `ldv_free`, …) — a verifier abstraction,
+/// NOT the program under test. Under native execution these can fault as a model
+/// artifact: e.g. `ldv_reference_realloc` does `res = malloc(NEW_size); memcpy(res,
+/// old, NEW_size)`, an OOB read of the smaller old buffer. A fault attributed to one
+/// is rejected like the libc I/O interceptors (R1) — a real program bug faults at the
+/// program's own access (the CWE sink), never inside these models.
+fn is_harness_memory_model(func: &str) -> bool {
+    func.starts_with("ldv_") && (func.contains("alloc") || func.contains("free"))
+}
+
+/// A deallocation function or its ASan interceptor (`free`, `cfree`, the allocator's
+/// `Deallocate`, `operator delete`). Used to disambiguate a `SEGV`: a crash reached
+/// THROUGH one of these is a bad-free (`valid-free`), not a wild deref, so the
+/// deref-class mapping is unsafe and the report abstains.
+fn is_deallocator(func: &str) -> bool {
+    func == "free"
+        || func == "cfree"
+        || func == "__libc_free"
+        || func.contains("Deallocate")
+        || func.contains("operator delete")
 }
 
 /// Parse a `path:line[:col]` source-location token out of a frame descriptor.
@@ -257,6 +292,23 @@ WRITE of size 10 at 0x502 thread T0
     }
 
     #[test]
+    fn ldv_realloc_model_over_read_is_rejected_r1() {
+        // Plan-198 FP (real report, CWE401_..._realloc_good): the sv-benchmarks LDV
+        // realloc MODEL does `res = malloc(NEW_size); memcpy(res, old, NEW_size)`, an
+        // OOB read of the smaller old buffer under native execution. The fault is in
+        // the harness memory model (`ldv_reference_realloc`), NOT the program under
+        // test, so it must abstain (never emit `false` on a safe task).
+        const LDV_REALLOC_MODEL_OOB: &str = "\
+==23==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x5140000001d0 at pc 0x555 bp 0x7ff sp 0x7ff
+READ of size 519600 at 0x5140000001d0 thread T0
+    #0 0x555 in __asan_memcpy (/tmp/h+0xc5105)
+    #1 0x555 in ldv_reference_realloc /workspace/x/CWE401_realloc_13_good.i:1581:5
+    #2 0x555 in ldv_realloc /workspace/x/CWE401_realloc_13_good.i:1326:9
+";
+        assert_eq!(parse_asan_report(LDV_REALLOC_MODEL_OOB), None);
+    }
+
+    #[test]
     fn double_free_is_valid_free() {
         let hit = parse_asan_report(DOUBLE_FREE).expect("a hit");
         assert_eq!(hit.subproperty, "valid-free");
@@ -270,6 +322,25 @@ WRITE of size 10 at 0x502 thread T0
         assert_eq!(hit.subproperty, "valid-deref");
         assert_eq!(hit.file, "nullderef.c");
         assert_eq!(hit.line, 1);
+    }
+
+    // A SEGV whose fault is inside a deallocator (`free`) is a bad-free of a wild
+    // pointer, not a wild DEREF — the class `SEGV` does not reliably map to the
+    // sub-property here (it is really valid-free, or a downstream effect of an
+    // earlier deref), so abstain rather than guess `valid-deref` (a wrong
+    // sub-property is −16). Real report: ldv-memsafety/memleaks_test3-1
+    // (expected_verdict false, subproperty valid-free).
+    const SEGV_IN_FREE_BADFREE: &str = "\
+==23==ERROR: AddressSanitizer: SEGV on unknown address 0xfffffffffffffff1 (pc 0x555 bp 0x000 sp 0x7ff T0)
+    #0 0x555 in __asan::Allocator::Deallocate(void*, unsigned long, unsigned long, __sanitizer::BufferedStackTrace*, __asan::AllocType) (/tmp/h+0x2d756)
+    #1 0x555 in free (/tmp/h+0xc5f6f)
+    #2 0x555 in entry_point /workspace/x/memleaks_test3-1.i:763:8
+";
+
+    #[test]
+    fn segv_inside_free_is_ambiguous_bad_free_abstains() {
+        // Must NOT emit valid-deref on a free-fault SEGV (the -16 sub-property case).
+        assert_eq!(parse_asan_report(SEGV_IN_FREE_BADFREE), None);
     }
 
     #[test]

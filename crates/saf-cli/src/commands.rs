@@ -1463,19 +1463,6 @@ fn memsafety_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     }
 }
 
-/// Does the program actually SPAWN threads? A deliberately tight check (only
-/// `pthread_create` / `thrd_create`) — unlike `has_threading_primitives`, which also
-/// flags `__VERIFIER_atomic_*`, mutex ops, and `fork`, and so false-abstains on
-/// sequential programs (the common case) and craters memsafety recall. A sequential
-/// program that uses atomic no-ops or holds a mutex is not concurrent. LLVM keeps
-/// only referenced symbols, so a `pthread_create` entry means it is actually called.
-fn program_spawns_threads(module: &saf_core::air::AirModule) -> bool {
-    module
-        .functions
-        .iter()
-        .any(|f| matches!(f.name.as_str(), "pthread_create" | "thrd_create"))
-}
-
 /// Build the `ASan`-replay driver: defines the SV-COMP nondet generators (all
 /// returning the default `0`/`NULL` — Slice 1 is an UNSTEERED probe) and honours
 /// `__VERIFIER_assume`. Unlike [`synthesize_driver`], it installs NO `reach_error`
@@ -1532,10 +1519,15 @@ fn asan_confirm(
     use std::process::{Command, Stdio};
 
     // Concurrency is out of scope (sequential valid-deref/valid-free); a threaded
-    // program's memory safety can be schedule-dependent, so abstain rather than
-    // risk a schedule-specific false alarm.
-    if program_spawns_threads(module) {
-        eprintln!("saf verify: program spawns threads (out of R5 scope) -> unknown");
+    // program's memory safety can be schedule-dependent, so abstain rather than risk
+    // a schedule-specific false alarm. The gate fires only on an ACTUALLY-reachable
+    // thread spawn (plan 198) — NOT the mere presence of a `pthread_create` symbol,
+    // which is dead scaffolding in the sv-benchmarks Juliet reservoir (the sink runs
+    // in `main`; `pthread_create` is unreachable). No reachable spawn ⇒ the execution
+    // is sequential ⇒ ASan's single run is schedule-independent ⇒ confirming is sound.
+    let callgraph = saf_analysis::callgraph::CallGraph::build(module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(module, &callgraph) {
+        eprintln!("saf verify: a thread spawn is reachable from main (out of scope) -> unknown");
         return Ok(None);
     }
 

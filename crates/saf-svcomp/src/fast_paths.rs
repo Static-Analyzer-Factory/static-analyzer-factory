@@ -585,6 +585,66 @@ pub fn reachable_has_heap_allocations(
     false
 }
 
+/// Thread-spawn primitive names — an actual thread *creation* (not mutex/atomic/
+/// join/`fork`). Any real POSIX/C11 thread spawn bottoms out in one of these, so
+/// call-graph reachability of one of these from `main` also captures spawns made
+/// through wrapper functions.
+const SPAWN_FUNCTIONS: &[&str] = &["pthread_create", "thrd_create"];
+
+/// Does a thread spawn MAY-happen on a path reachable from `main`? (Plan 198.)
+///
+/// A sound over-approximation used to gate the `valid-memsafety` ASan confirmer:
+/// returns `true` (⇒ the confirmer abstains) iff a [`SPAWN_FUNCTIONS`] primitive is
+/// reachable from `main` via a direct call, **or** a reachable function contains an
+/// indirect call while a spawn primitive is linked into the module (an unresolved
+/// indirect target could be a spawn, and the module-level call graph may
+/// under-approximate indirect edges — so this never *misses* a spawn). Returns
+/// `false` only when the execution is provably sequential, in which case ASan's
+/// single run is schedule-independent and a trap is a real violation on every
+/// schedule.
+///
+/// Unlike [`has_threading_primitives`] (symbol presence — also flags mutex/atomic/
+/// `fork`), this fires only on an actually-*reachable* spawn, so it does **not**
+/// abstain on the sv-benchmarks Juliet reservoir whose `pthread_create` is dead
+/// scaffolding (`stdThreadCreate` is never called; the sink runs directly in `main`).
+#[must_use]
+pub fn reachable_spawns_threads(module: &AirModule, callgraph: &CallGraph) -> bool {
+    // No spawn primitive linked at all ⇒ no thread can be created ⇒ sequential.
+    if !module
+        .functions
+        .iter()
+        .any(|f| SPAWN_FUNCTIONS.contains(&f.name.as_str()))
+    {
+        return false;
+    }
+
+    let reachable = reachable_functions(callgraph, module);
+    for func in &module.functions {
+        if func.is_declaration || !reachable.contains(&func.id) {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match &inst.op {
+                    // A reachable direct call to a spawn primitive.
+                    Operation::CallDirect { callee } => {
+                        if let Some(target) = module.function(*callee) {
+                            if SPAWN_FUNCTIONS.contains(&target.name.as_str()) {
+                                return true;
+                            }
+                        }
+                    }
+                    // A reachable indirect call could target the linked spawn
+                    // primitive — abstain conservatively (never miss a spawn).
+                    Operation::CallIndirect { .. } => return true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Check if all reachable functions are loop-free.
 ///
 /// Same as [`program_is_loop_free`] but only checks CFGs whose `FunctionId`
@@ -768,6 +828,36 @@ mod tests {
             block.instructions.push(inst);
         }
 
+        AirFunction {
+            id: fid,
+            name: name.to_string(),
+            params: Vec::new(),
+            blocks: vec![block],
+            entry_block: None,
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    /// Build a defined function whose body contains a single indirect call.
+    fn make_function_with_indirect_call(name: &str) -> AirFunction {
+        let fid = make_func_id(name);
+        let bid = make_block_id(&format!("{name}_entry"));
+        let mut block = AirBlock::new(bid);
+        block.instructions.push(Instruction {
+            id: make_inst_id(&format!("{name}_icall")),
+            op: Operation::CallIndirect {
+                expected_signature: None,
+            },
+            operands: Vec::new(),
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        });
         AirFunction {
             id: fid,
             name: name.to_string(),
@@ -1101,5 +1191,82 @@ mod tests {
         // Test with unknown function (not in cfgs)
         let unknown_id = make_func_id("unknown");
         assert!(function_is_loop_free(&cfgs2, unknown_id));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for reachable_spawns_threads (plan 198)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn spawns_threads_false_on_dead_pthread_scaffolding() {
+        // pthread_create is present and called, but ONLY by stdThreadCreate, which
+        // nothing reachable from main calls (the sv-benchmarks Juliet pattern:
+        // main runs the sink directly; the thread wrapper is dead scaffolding).
+        let pthread_create = make_declaration("pthread_create");
+        let std_thread = make_calling_function("stdThreadCreate", &[&pthread_create]);
+        let sink = make_defined_function("sink");
+        let main = make_calling_function("main", &[&sink]);
+        let module = make_module(vec![main, sink, std_thread, pthread_create]);
+        let cg = CallGraph::build(&module);
+        assert!(!reachable_spawns_threads(&module, &cg));
+    }
+
+    #[test]
+    fn spawns_threads_true_on_direct_reachable_pthread_create() {
+        let pthread_create = make_declaration("pthread_create");
+        let main = make_calling_function("main", &[&pthread_create]);
+        let module = make_module(vec![main, pthread_create]);
+        let cg = CallGraph::build(&module);
+        assert!(reachable_spawns_threads(&module, &cg));
+    }
+
+    #[test]
+    fn spawns_threads_true_via_reachable_helper_thrd_create() {
+        let thrd_create = make_declaration("thrd_create");
+        let spawn_it = make_calling_function("spawn_it", &[&thrd_create]);
+        let main = make_calling_function("main", &[&spawn_it]);
+        let module = make_module(vec![main, spawn_it, thrd_create]);
+        let cg = CallGraph::build(&module);
+        assert!(reachable_spawns_threads(&module, &cg));
+    }
+
+    #[test]
+    fn spawns_threads_true_on_reachable_indirect_call_with_spawn_linked() {
+        // A reachable indirect call could target the linked pthread_create and the
+        // callgraph may miss the indirect edge -> abstain conservatively.
+        let pthread_create = make_declaration("pthread_create");
+        let main = make_function_with_indirect_call("main");
+        let module = make_module(vec![main, pthread_create]);
+        let cg = CallGraph::build(&module);
+        assert!(reachable_spawns_threads(&module, &cg));
+    }
+
+    #[test]
+    fn spawns_threads_false_on_indirect_call_without_spawn_symbol() {
+        // No spawn primitive linked at all -> an indirect call cannot create a thread.
+        let main = make_function_with_indirect_call("main");
+        let module = make_module(vec![main]);
+        let cg = CallGraph::build(&module);
+        assert!(!reachable_spawns_threads(&module, &cg));
+    }
+
+    #[test]
+    fn spawns_threads_false_without_spawn_symbol() {
+        let sink = make_defined_function("sink");
+        let main = make_calling_function("main", &[&sink]);
+        let module = make_module(vec![main, sink]);
+        let cg = CallGraph::build(&module);
+        assert!(!reachable_spawns_threads(&module, &cg));
+    }
+
+    #[test]
+    fn spawns_threads_false_without_main() {
+        // No main -> empty reachable set; the program cannot run (link-fail ->
+        // unknown), so the gate returns false and the confirmer resolves to unknown.
+        let pthread_create = make_declaration("pthread_create");
+        let foo = make_calling_function("foo", &[&pthread_create]);
+        let module = make_module(vec![foo, pthread_create]);
+        let cg = CallGraph::build(&module);
+        assert!(!reachable_spawns_threads(&module, &cg));
     }
 }

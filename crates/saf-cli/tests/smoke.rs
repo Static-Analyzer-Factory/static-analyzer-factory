@@ -655,6 +655,25 @@ fn verify_memsafety_guarded_is_false_deref() {
     verify_memsafety("memsafety_false_guarded.c", "LP64").stdout("false(valid-deref)\n");
 }
 
+/// DEAD pthread scaffolding (the Juliet shape, plan 198): pthread_create is present
+/// but UNREACHABLE from main, so the reachability-refined thread gate proves the run
+/// sequential and the ASan confirmer reproduces the unconditional fault ->
+/// false(valid-deref). The old symbol-presence gate abstained here (-> unknown).
+#[test]
+#[ignore]
+fn verify_memsafety_dead_pthread_is_false_deref() {
+    verify_memsafety("memsafety_false_dead_pthread.c", "LP64").stdout("false(valid-deref)\n");
+}
+
+/// A GENUINE, reachable thread spawn on a SAFE program: the reachability gate sees
+/// pthread_create reachable from main and ABSTAINS -> unknown (never a
+/// schedule-dependent false alarm). Soundness guard for the residual.
+#[test]
+#[ignore]
+fn verify_memsafety_safe_threaded_worker_is_unknown() {
+    verify_memsafety("memsafety_safe_threaded_worker.c", "LP64").stdout("unknown\n");
+}
+
 /// A confirmed memsafety FALSE writes a YAML 2.0 violation witness whose target is
 /// the faulting operation's source file/line.
 #[test]

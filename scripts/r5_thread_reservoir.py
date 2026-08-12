@@ -14,8 +14,8 @@ from collections import Counter
 from pathlib import Path
 
 SVB = Path("tests/benchmarks/sv-benchmarks/c")
-CONC_DIRS = ("/pthread", "/weaver/", "/goblint", "/ldv-races/", "/libvsync/",
-             "/locks/", "/ddv-machzwd/")
+CONC_DIRS = ("/pthread", "/weaver/", "/goblint", "/ldv-races/", "/ldv-linux-3.14-races/",
+             "/libvsync/", "/locks/", "/ddv-machzwd/")
 INPUT_RE = re.compile(r"input_files:\s*['\"]?([^'\"\n]+)")
 
 
