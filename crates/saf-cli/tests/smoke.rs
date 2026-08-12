@@ -549,3 +549,139 @@ fn verify_nondet_witness_has_branching_no_column_and_lints() {
         "witnesslint rejected the enriched (branching) witness:\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// valid-memsafety FALSE via the ASan concrete-replay confirmer (plan 197, R5).
+// The strategy compiles the ORIGINAL program with -fsanitize=address, runs it
+// under a zeroed-nondet driver, and emits false(<sub-property>) iff ASan reports
+// a violation in the program's own code (R1) with a high-fidelity class (R2).
+// Never `true`; a safe program -> `unknown` with no witness.
+// ---------------------------------------------------------------------------
+
+fn memsafety_prp() -> String {
+    ws("tests/programs/c/svcomp/valid-memsafety.prp")
+}
+
+/// Run `saf verify <fixture>` against valid-memsafety at `data_model`, exit 0.
+fn verify_memsafety(fixture: &str, data_model: &str) -> assert_cmd::assert::Assert {
+    let prp = memsafety_prp();
+    let fx = svcomp_fixture(fixture);
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.as_str(),
+            "--data-model",
+            data_model,
+            fx.as_str(),
+        ])
+        .assert()
+        .success()
+}
+
+/// Run `saf verify <fixture> --witness <path>` against valid-memsafety.
+fn verify_memsafety_witness(
+    fixture: &str,
+    data_model: &str,
+    witness: &std::path::Path,
+) -> assert_cmd::assert::Assert {
+    let prp = memsafety_prp();
+    let fx = svcomp_fixture(fixture);
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.as_str(),
+            "--data-model",
+            data_model,
+            "--witness",
+            witness.to_str().unwrap(),
+            fx.as_str(),
+        ])
+        .assert()
+        .success()
+}
+
+/// Unconditional heap-buffer-overflow -> false(valid-deref) (LP64).
+#[test]
+#[ignore]
+fn verify_memsafety_heap_oob_is_false_deref() {
+    verify_memsafety("memsafety_false_heap_oob.c", "LP64").stdout("false(valid-deref)\n");
+}
+
+/// The same overflow at ILP32 -> false(valid-deref) (exercises 32-bit ASan).
+#[test]
+#[ignore]
+fn verify_memsafety_heap_oob_ilp32_is_false_deref() {
+    verify_memsafety("memsafety_false_heap_oob.c", "ILP32").stdout("false(valid-deref)\n");
+}
+
+/// Unconditional double-free -> false(valid-free).
+#[test]
+#[ignore]
+fn verify_memsafety_double_free_is_false_free() {
+    verify_memsafety("memsafety_false_double_free.c", "LP64").stdout("false(valid-free)\n");
+}
+
+/// Unconditional NULL dereference -> false(valid-deref).
+#[test]
+#[ignore]
+fn verify_memsafety_null_deref_is_false_deref() {
+    verify_memsafety("memsafety_false_null_deref.c", "LP64").stdout("false(valid-deref)\n");
+}
+
+/// A safe program: ASan never traps -> `unknown` (never `true`, never a false alarm).
+#[test]
+#[ignore]
+fn verify_memsafety_safe_is_unknown() {
+    verify_memsafety("memsafety_true_safe.c", "LP64").stdout("unknown\n");
+}
+
+/// A confirmed memsafety FALSE writes a YAML 2.0 violation witness whose target is
+/// the faulting operation's source file/line.
+#[test]
+#[ignore]
+fn verify_memsafety_false_writes_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().join("w.yml");
+    verify_memsafety_witness("memsafety_false_heap_oob.c", "LP64", &w)
+        .stdout("false(valid-deref)\n");
+    let yaml = std::fs::read_to_string(&w).expect("witness written for a false verdict");
+    assert!(yaml.contains("entry_type: violation_sequence"), "{yaml}");
+    assert!(yaml.contains("type: target"), "{yaml}");
+    assert!(
+        yaml.contains("file_name: memsafety_false_heap_oob.c"),
+        "witness target points at the faulting source file:\n{yaml}"
+    );
+}
+
+/// A safe program writes NO witness (the verdict is `unknown`).
+#[test]
+#[ignore]
+fn verify_memsafety_safe_writes_no_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().join("w.yml");
+    verify_memsafety_witness("memsafety_true_safe.c", "LP64", &w).stdout("unknown\n");
+    assert!(
+        !w.exists(),
+        "no witness may be written for an unknown verdict"
+    );
+}
+
+/// The memsafety witness is byte-identical across re-runs (NFR-DET determinism).
+#[test]
+#[ignore]
+fn verify_memsafety_witness_is_byte_stable() {
+    let dir = tempfile::tempdir().unwrap();
+    let w1 = dir.path().join("w1.yml");
+    let w2 = dir.path().join("w2.yml");
+    verify_memsafety_witness("memsafety_false_heap_oob.c", "LP64", &w1)
+        .stdout("false(valid-deref)\n");
+    verify_memsafety_witness("memsafety_false_heap_oob.c", "LP64", &w2)
+        .stdout("false(valid-deref)\n");
+    assert_eq!(
+        std::fs::read(&w1).expect("w1"),
+        std::fs::read(&w2).expect("w2"),
+        "memsafety witness bytes must be deterministic across runs"
+    );
+}

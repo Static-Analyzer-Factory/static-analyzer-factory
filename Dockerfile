@@ -114,6 +114,22 @@ RUN git clone --depth 1 https://gitlab.com/sosy-lab/benchmarking/sv-witnesses.gi
     && chmod -R a+rX /opt/sv-witnesses
 ENV SAF_SVWITNESSES=/opt/sv-witnesses
 
+# AddressSanitizer runtime for the SV-COMP valid-memsafety concrete-replay
+# confirmer (plan 197, R5). The apt `clang-${LLVM_VERSION}` package does NOT
+# bundle compiler-rt, so `-fsanitize=address` link-fails without this. The amd64
+# `libclang-rt-${LLVM_VERSION}-dev` ships BOTH the x86_64 AND i386 asan archives;
+# pair it with the i386 libc/gcc dev libs so `-m32` (ILP32) tasks link. Do NOT add
+# `libclang-rt-*:i386` — it depends on `libc6-amd64:i386`, which conflicts with
+# `libc6-dev:i386` (whole apt transaction aborts). Placed late in `base` to avoid
+# invalidating the rust/maturin layers above.
+RUN dpkg --add-architecture i386 \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        "libclang-rt-${LLVM_VERSION}-dev" \
+        libc6-dev:i386 \
+        libstdc++6:i386 \
+        libgcc-s1:i386 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /workspace
 
 # Pre-create volume mount points with permissive permissions so that

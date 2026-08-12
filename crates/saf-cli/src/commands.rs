@@ -990,6 +990,7 @@ type StrategyFn = fn(&VerifyCtx) -> VerdictOutcome;
 fn strategy_for(property: saf_svcomp::Property) -> Option<StrategyFn> {
     match property {
         saf_svcomp::Property::UnreachCall => Some(unreach_strategy),
+        saf_svcomp::Property::ValidMemsafety => Some(memsafety_strategy),
         _ => None,
     }
 }
@@ -1407,6 +1408,170 @@ fn replay_confirms_false(
     // so its presence is an irrefutable witness that the real run reached the
     // error call.
     Ok(sentinel.exists())
+}
+
+/// The `valid-memsafety` FALSE pipeline (plan 197, R5): confirmer-first.
+///
+/// Compiles the ORIGINAL program with `-fsanitize=address` and runs it under a
+/// zeroed-nondet driver; emits `false(<sub-property>)` iff `AddressSanitizer` reports
+/// a violation in the program's OWN code (R1) with a high-fidelity class (R2). `ASan`
+/// is the sole arbiter, the witness-target source, and the sub-property classifier
+/// — SAF's over-approximate memory checkers are not consulted. Never emits `true`;
+/// a program whose violation does not reproduce (or is out of scope) → `unknown`.
+fn memsafety_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
+    match asan_confirm(
+        ctx.input,
+        ctx.data_model,
+        ctx.module,
+        ctx.stub,
+        ctx.tempdir,
+        ctx.clang,
+    ) {
+        Ok(Some(hit)) => {
+            let witness = build_witness(ctx, Some(saf_svcomp::lower_memsafety_hit(&hit)));
+            if witness.is_none() {
+                eprintln!(
+                    "saf verify: FALSE (ASan {}) but witness unconstructible -> emitting false without a witness",
+                    hit.subproperty
+                );
+            }
+            VerdictOutcome {
+                verdict: saf_svcomp::memsafety_verdict(hit.subproperty),
+                witness,
+            }
+        }
+        Ok(None) => {
+            eprintln!("saf verify: ASan replay reproduced no memsafety violation -> unknown");
+            unknown_outcome()
+        }
+        Err(e) => {
+            eprintln!("saf verify: ASan replay errored: {e:#} -> unknown");
+            unknown_outcome()
+        }
+    }
+}
+
+/// Build the `ASan`-replay driver: defines the SV-COMP nondet generators (all
+/// returning the default `0`/`NULL` — Slice 1 is an UNSTEERED probe) and honours
+/// `__VERIFIER_assume`. Unlike [`synthesize_driver`], it installs NO `reach_error`
+/// sentinel and does NOT override `malloc`/`free`/`memcpy` (`ASan` intercepts those,
+/// and a memory-safety fault is intrinsic to the program).
+fn synthesize_asan_driver() -> String {
+    use std::fmt::Write as _;
+
+    let mut s = String::new();
+    let _ = writeln!(s, "/* R5 ASan-replay driver (generated) */");
+    s.push_str("#include <stddef.h>\n");
+    s.push_str("extern void _exit(int) __attribute__((noreturn));\n");
+    for (fname, cty) in SCALAR_NONDET {
+        let suffix = fname.trim_start_matches("__VERIFIER_nondet_");
+        let _ = writeln!(
+            s,
+            "{cty} __VERIFIER_nondet_{suffix}(void) {{ return ({cty})0; }}"
+        );
+    }
+    s.push_str("void* __VERIFIER_nondet_pointer(void) { return (void*)0; }\n");
+    s.push_str("float __VERIFIER_nondet_float(void) { return 0.0f; }\n");
+    s.push_str("double __VERIFIER_nondet_double(void) { return 0.0; }\n");
+    s.push_str("void __VERIFIER_atomic_begin(void) { }\n");
+    s.push_str("void __VERIFIER_atomic_end(void) { }\n");
+    s.push_str("void __VERIFIER_assume(int c) { if (!c) _exit(0); }\n");
+    s
+}
+
+/// Confirm a `valid-memsafety` FALSE by `AddressSanitizer`-instrumented native
+/// execution.
+///
+/// Compiles the ORIGINAL program with `-fsanitize=address -g` + the zeroed-nondet
+/// driver, runs it under a short timeout capturing stderr to a file, and parses the
+/// report ([`saf_svcomp::parse_asan_report`], which applies R1/R2). `Ok(Some(hit))`
+/// is a confirmed violation; `Ok(None)` is inconclusive (no report / abstained /
+/// compile-link failure / timeout) ⇒ the caller keeps `unknown`. Multithreaded
+/// programs are out of R5 scope (schedule-dependent memory safety) and abstain up
+/// front.
+fn asan_confirm(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    module: &saf_core::air::AirModule,
+    stub: &Path,
+    dir: &Path,
+    clang: &str,
+) -> anyhow::Result<Option<saf_svcomp::AsanHit>> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+
+    // Concurrency is out of scope (sequential valid-deref/valid-free); a threaded
+    // program's memory safety can be schedule-dependent, so abstain rather than
+    // risk a schedule-specific false alarm.
+    if saf_svcomp::fast_paths::has_threading_primitives(module) {
+        eprintln!("saf verify: program uses threading primitives (out of R5 scope) -> unknown");
+        return Ok(None);
+    }
+
+    let driver_src = dir.join("saf_asan_driver.c");
+    let harness = dir.join("saf_asan_harness");
+    let errpath = dir.join("saf_asan_stderr.txt");
+
+    std::fs::write(&driver_src, synthesize_asan_driver())
+        .with_context(|| "writing ASan replay driver")?;
+
+    let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
+    let status = Command::new(clang)
+        .args([
+            "-O0",
+            "-g",
+            "-fsanitize=address",
+            "-fno-sanitize-recover=address",
+            "-Wno-everything",
+        ])
+        .arg(data_model.clang_flag())
+        .arg("-include")
+        .arg(stub)
+        .arg("-I")
+        .arg(srcdir)
+        .arg(input)
+        .arg(&driver_src)
+        .arg("-o")
+        .arg(&harness)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to spawn {clang} for ASan replay"))?;
+    if !status.success() {
+        // Compile/link failure (e.g. a missing 32-bit ASan runtime) -> inconclusive.
+        return Ok(None);
+    }
+
+    // Redirect the child's stderr to a FILE (not a pipe) so a large ASan report
+    // cannot deadlock on a full pipe buffer while we poll for the timeout.
+    let errfile = std::fs::File::create(&errpath).with_context(|| "creating ASan stderr file")?;
+    let mut child = Command::new(&harness)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(errfile))
+        .env("ASAN_OPTIONS", "exitcode=1:abort_on_error=0:detect_leaks=0")
+        .spawn()
+        .with_context(|| "spawning ASan harness")?;
+
+    let timeout = replay_timeout();
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break; // runaway -> parse whatever stderr exists (likely no report)
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e).context("waiting on ASan harness"),
+        }
+    }
+
+    let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+    Ok(saf_svcomp::parse_asan_report(&report))
 }
 
 pub fn run(args: &RunArgs) -> anyhow::Result<()> {

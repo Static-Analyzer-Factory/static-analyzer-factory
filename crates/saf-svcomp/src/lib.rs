@@ -14,12 +14,16 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod fast_paths;
+pub mod memsafety;
 pub mod property;
 pub mod property_kind;
 pub mod summaries;
 pub mod witness_lower;
 pub mod witness_yaml;
 
+pub use memsafety::{
+    AsanHit, asan_class_to_subproperty, lower_memsafety_hit, memsafety_verdict, parse_asan_report,
+};
 pub use property::{
     AnalysisContext, FalseCandidate, NondetCall, PropertyAnalysisConfig, PropertyResult,
     analyze_property, analyze_property_with_context, enumerate_false_candidates,
