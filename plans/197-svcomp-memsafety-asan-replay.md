@@ -395,5 +395,40 @@ confirmed sub-property fidelity on the real `saf verify` path.
 **ACCEPTANCE MET:** blind `valid-deref`+`valid-free` recall ↑ from 0 with a **CPAchecker-confirmed** witness,
 holding **0 false alarms / 0 TRUE** across ILP32+LP64, byte-deterministic; memsafety added as a `strategy_for`
 arm + confirmer + lowering fn with **no seam rewrite** (the plan-194 spine generalized). Redlines §1 held.
-Work uncommitted (commit when the user asks). **Next levers (deferred):** Slice 2 input-steering for the
-real-world/CVE reservoir; a full CPAchecker-confirmation-% sweep; broaden past the small-fault subset.
+Committed `d163e30`.
+
+### Slice 2 — de-risk → the recall levers (2026-08-12, VM, TDD) — DONE
+
+Started as the planned Z3 input-steering slice; the de-risk (`scripts/r5_slice2_derisk.py` + `r5_asan_constdriver.c`) redirected it to three sound, higher-ROI fixes, and surfaced that the honest recall story is NOT what Slice 1f's 15% implied.
+
+- **Slice-2 de-risk (mini-fuzz):** compile each buggy task once with a const-driver, run under a spread of
+  constants ({0,1,2,42,255,256,1024,65535,2³¹−1,−1}). On the ALL-buggy sample: 0 steerable (the R4 pattern —
+  masked because caught@0 was dominated by threaded Juliet variants). On the **sequential-only** subset:
+  **8/60 trap under a nonzero constant but not 0** (`@42:stack-buffer-overflow`, `@2³¹−1:SEGV`, `@1:…`) — a
+  real scalar-guarded/scalar-sized reservoir. **So heavy Z3 steering is NOT needed; a multi-constant
+  mini-fuzz recovers it.** Scalar-nondet Z3 steering (the plan's original Slice 2) would only add the
+  specific-value guards (`==31337`) a fuzz misses — deferred as low marginal ROI.
+- **Fix A — threading guard was over-broad (bug).** `has_threading_primitives` flags `__VERIFIER_atomic_*`,
+  mutex ops, and `fork` — none of which spawn threads — so it false-abstained on huge numbers of sequential
+  tasks. Replaced with `program_spawns_threads` (only `pthread_create`/`thrd_create`; LLVM keeps only
+  referenced symbols so a name match = an actual call). Regression fixture `memsafety_false_atomic_nothread.c`.
+  (Genuinely-threaded Juliet flow variants — a `pthread_create` sink — are still soundly abstained: a
+  concurrency benchmark's safe-but-ASan-traps schedule is a −16 risk, per the Slice-0c race FPs.)
+- **Fix B — `check_printf=0`** added to the replay `ASAN_OPTIONS`: stops ASan aborting at a benign
+  `printf("%s")` artifact before a task's real fault (sound — SV-COMP doesn't count libc printf reads;
+  suppressing reports can't add a false alarm; R2 still abstains on any ambiguous secondary fault).
+- **Fix C — multi-constant mini-fuzz confirmer:** `synthesize_asan_driver` now returns `$SAF_NONDET_CONST`
+  for every scalar nondet; `asan_confirm` runs the one binary under `NONDET_CONSTS` (0 first) and confirms on
+  the FIRST trap. Sound: each constant is a valid concrete input; `__VERIFIER_assume` prunes infeasible ones.
+  Regression fixture `memsafety_false_guarded.c` (`if (nondet()==42) OOB`).
+- **Measured (blind `saf verify`, sequential subset, N=40):** recall **8/37 → 12/37 (22%→32%)** with the
+  mini-fuzz, holding **FP=0 / TRUE=0 / sub-property 12/12 / 12-12 witnesses** — the fuzz never traps a safe
+  program (soundness confirmed). Gates: 2250 nextest, **33/33 verify e2e**, clippy `-D warnings` + fmt clean.
+- **Honest recall correction:** Slice 1f's 15% (and the 2% representative number) were sampling/guard
+  artifacts. The real picture: on the **sequential** reservoir (R5's scope) the confirmer catches ~a third
+  of buggy tasks soundly; the misses are leaks (valid-memtrack, out of scope), real-world CVE needing crafted
+  non-scalar input, loops/arrays (big-engine), and native-compile failures — NOT a steering gap.
+
+**Deferred (future):** concurrency-aware confirmation to soundly recover deterministic-thread Juliet variants
+(distinguish a single-worker deterministic sink from a race — the largest remaining reservoir, but a subtle
+soundness design); a full CPAchecker confirmation-% sweep; per-nondet Z3 steering for specific-value guards.

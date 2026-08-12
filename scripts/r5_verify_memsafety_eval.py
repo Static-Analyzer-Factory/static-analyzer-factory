@@ -67,6 +67,16 @@ def collect():
         src = (yml.parent / mi.group(1).strip()).resolve()
         if not src.exists() or any(d in str(src) for d in CONC_DIRS):
             continue
+        # SEQ_ONLY: exclude genuinely-threaded tasks (a pthread_create/thrd_create
+        # CALL, not just the header prototype -> count > 1) to measure R5's actual
+        # sequential-scope recall (thread-spawners are soundly abstained by verify).
+        if os.environ.get("SEQ_ONLY") == "1":
+            try:
+                body = src.read_text(errors="replace")
+            except OSError:
+                continue
+            if body.count("pthread_create") > 1 or body.count("thrd_create") > 1:
+                continue
         md = DM_RE.search(text)
         tasks.append({"src": str(src), "exp": exp, "sub": sub,
                       "dm": md.group(1) if md else "LP64", "size": src.stat().st_size})
@@ -98,10 +108,15 @@ def main():
     tasks = collect()
     safe = [t for t in tasks if t["exp"]]
     buggy = [t for t in tasks if not t["exp"]]
-    sample = []
-    for pool in (safe, buggy):
-        for dm in ("ILP32", "LP64"):
-            sample += stride([t for t in pool if t["dm"] == dm], N)
+    if os.environ.get("DM_STRATIFY", "1") == "0":
+        # Size-representative sampling (no data-model split): reflects the reservoir
+        # composition (~90% Juliet) instead of over-weighting the ILP32 real-world stratum.
+        sample = stride(safe, N) + stride(buggy, N)
+    else:
+        sample = []
+        for pool in (safe, buggy):
+            for dm in ("ILP32", "LP64"):
+                sample += stride([t for t in pool if t["dm"] == dm], N)
     print(f"sequential valid-memsafety tasks: {len(tasks)} (safe={len(safe)} "
           f"buggy={len(buggy)}); sampling {len(sample)} via `saf verify`\n")
 

@@ -1197,6 +1197,18 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     unknown_outcome()
 }
 
+/// Constants the memsafety `ASan` mini-fuzz drives every scalar nondet to, in order
+/// (0 first — the common unconditional case). A scalar-guarded/scalar-sized fault
+/// the zeroed probe misses is reproduced by the matching constant. Sound: each is a
+/// valid concrete input, and `__VERIFIER_assume` prunes infeasible ones.
+const NONDET_CONSTS: &[i64] = &[0, 1, 2, 42, 255, 256, 1024, 65_535, 2_147_483_647, -1];
+
+/// `ASAN_OPTIONS` for the memsafety replay: deterministic exit (no `SIGABRT`/coredump),
+/// leaks off (valid-memtrack deferred), printf checks off (SV-COMP does not count
+/// libc `printf` string reads; keeps a benign printf artifact from aborting before a
+/// real fault — suppressing reports can never add a false alarm, so it stays sound).
+const ASAN_OPTS: &str = "exitcode=1:abort_on_error=0:detect_leaks=0:check_printf=0";
+
 /// Cap on how many candidates to replay per task — bounds worst-case native
 /// compile+run time; a real violation almost always surfaces in the first
 /// candidate. Dropped candidates are logged implicitly by not confirming.
@@ -1451,6 +1463,19 @@ fn memsafety_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     }
 }
 
+/// Does the program actually SPAWN threads? A deliberately tight check (only
+/// `pthread_create` / `thrd_create`) — unlike `has_threading_primitives`, which also
+/// flags `__VERIFIER_atomic_*`, mutex ops, and `fork`, and so false-abstains on
+/// sequential programs (the common case) and craters memsafety recall. A sequential
+/// program that uses atomic no-ops or holds a mutex is not concurrent. LLVM keeps
+/// only referenced symbols, so a `pthread_create` entry means it is actually called.
+fn program_spawns_threads(module: &saf_core::air::AirModule) -> bool {
+    module
+        .functions
+        .iter()
+        .any(|f| matches!(f.name.as_str(), "pthread_create" | "thrd_create"))
+}
+
 /// Build the `ASan`-replay driver: defines the SV-COMP nondet generators (all
 /// returning the default `0`/`NULL` — Slice 1 is an UNSTEERED probe) and honours
 /// `__VERIFIER_assume`. Unlike [`synthesize_driver`], it installs NO `reach_error`
@@ -1462,12 +1487,18 @@ fn synthesize_asan_driver() -> String {
     let mut s = String::new();
     let _ = writeln!(s, "/* R5 ASan-replay driver (generated) */");
     s.push_str("#include <stddef.h>\n");
+    s.push_str("#include <stdlib.h>\n");
     s.push_str("extern void _exit(int) __attribute__((noreturn));\n");
+    // Every scalar nondet returns the constant chosen at RUNTIME via $SAF_NONDET_CONST
+    // (the multi-constant mini-fuzz — one binary run under many constants), default 0.
+    s.push_str(
+        "static long __saf_c(void) { const char *e = getenv(\"SAF_NONDET_CONST\"); return e ? atol(e) : 0; }\n",
+    );
     for (fname, cty) in SCALAR_NONDET {
         let suffix = fname.trim_start_matches("__VERIFIER_nondet_");
         let _ = writeln!(
             s,
-            "{cty} __VERIFIER_nondet_{suffix}(void) {{ return ({cty})0; }}"
+            "{cty} __VERIFIER_nondet_{suffix}(void) {{ return ({cty})__saf_c(); }}"
         );
     }
     s.push_str("void* __VERIFIER_nondet_pointer(void) { return (void*)0; }\n");
@@ -1503,8 +1534,8 @@ fn asan_confirm(
     // Concurrency is out of scope (sequential valid-deref/valid-free); a threaded
     // program's memory safety can be schedule-dependent, so abstain rather than
     // risk a schedule-specific false alarm.
-    if saf_svcomp::fast_paths::has_threading_primitives(module) {
-        eprintln!("saf verify: program uses threading primitives (out of R5 scope) -> unknown");
+    if program_spawns_threads(module) {
+        eprintln!("saf verify: program spawns threads (out of R5 scope) -> unknown");
         return Ok(None);
     }
 
@@ -1542,36 +1573,57 @@ fn asan_confirm(
         return Ok(None);
     }
 
-    // Redirect the child's stderr to a FILE (not a pipe) so a large ASan report
-    // cannot deadlock on a full pipe buffer while we poll for the timeout.
-    let errfile = std::fs::File::create(&errpath).with_context(|| "creating ASan stderr file")?;
-    let mut child = Command::new(&harness)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(errfile))
-        .env("ASAN_OPTIONS", "exitcode=1:abort_on_error=0:detect_leaks=0")
-        .spawn()
-        .with_context(|| "spawning ASan harness")?;
-
+    // Multi-constant mini-fuzz (Slice 2): the nondet generators return
+    // $SAF_NONDET_CONST, so one binary is run under a spread of constants — a
+    // scalar-guarded/scalar-sized fault (e.g. `if (nondet()==42) OOB`, or a
+    // nondet-sized alloc/index) that the zeroed probe misses is reproduced by the
+    // matching constant. Sound: each constant is a valid concrete input the verifier
+    // may choose, and __VERIFIER_assume still prunes infeasible ones. 0 first (the
+    // common unconditional case); confirm on the FIRST trap.
+    //
+    // check_printf=0: SV-COMP valid-memsafety does not count a libc printf("%s")
+    // string read (ASan's printf_common interceptor from Juliet's printLine on a
+    // non-terminated buffer). Suppressing it — in addition to the R1 frame filter —
+    // stops ASan aborting at a benign printf artifact BEFORE the real fault; it can
+    // never add a false alarm (only suppresses reports), so it stays sound. R2 still
+    // abstains on any ambiguous secondary fault a suppressed intended-fault exposes.
     let timeout = replay_timeout();
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break; // runaway -> parse whatever stderr exists (likely no report)
+    for &k in NONDET_CONSTS {
+        // Redirect the child's stderr to a FILE (not a pipe) so a large ASan report
+        // cannot deadlock on a full pipe buffer while we poll for the timeout.
+        let errfile =
+            std::fs::File::create(&errpath).with_context(|| "creating ASan stderr file")?;
+        let mut child = Command::new(&harness)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(errfile))
+            .env("ASAN_OPTIONS", ASAN_OPTS)
+            .env("SAF_NONDET_CONST", k.to_string())
+            .spawn()
+            .with_context(|| "spawning ASan harness")?;
+
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break; // runaway -> parse whatever exists (likely no report)
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                Err(e) => return Err(e).context("waiting on ASan harness"),
             }
-            Err(e) => return Err(e).context("waiting on ASan harness"),
+        }
+
+        let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+        if let Some(hit) = saf_svcomp::parse_asan_report(&report) {
+            return Ok(Some(hit)); // first constant that reproduces a violation wins
         }
     }
-
-    let report = std::fs::read_to_string(&errpath).unwrap_or_default();
-    Ok(saf_svcomp::parse_asan_report(&report))
+    Ok(None)
 }
 
 pub fn run(args: &RunArgs) -> anyhow::Result<()> {

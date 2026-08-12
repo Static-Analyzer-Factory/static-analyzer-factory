@@ -637,6 +637,24 @@ fn verify_memsafety_safe_is_unknown() {
     verify_memsafety("memsafety_true_safe.c", "LP64").stdout("unknown\n");
 }
 
+/// A sequential program that calls __VERIFIER_atomic_* (NOT thread creation) around
+/// an unconditional OOB must still be caught -> false(valid-deref). Regression guard
+/// for the over-broad threading abstain (atomics/mutex/fork are not thread-spawn).
+#[test]
+#[ignore]
+fn verify_memsafety_atomic_nothread_is_false_deref() {
+    verify_memsafety("memsafety_false_atomic_nothread.c", "LP64").stdout("false(valid-deref)\n");
+}
+
+/// A scalar-nondet-GUARDED OOB (fires only when the nondet input is 42) is NOT
+/// reached by the zeroed-nondet probe, but the multi-constant mini-fuzz confirmer
+/// (Slice 2) tries 42 and reproduces it -> false(valid-deref).
+#[test]
+#[ignore]
+fn verify_memsafety_guarded_is_false_deref() {
+    verify_memsafety("memsafety_false_guarded.c", "LP64").stdout("false(valid-deref)\n");
+}
+
 /// A confirmed memsafety FALSE writes a YAML 2.0 violation witness whose target is
 /// the faulting operation's source file/line.
 #[test]
