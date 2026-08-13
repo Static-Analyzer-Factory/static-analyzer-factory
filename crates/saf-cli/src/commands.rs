@@ -1210,7 +1210,16 @@ const NONDET_CONSTS: &[i64] = &[0, 1, 2, 42, 255, 256, 1024, 65_535, 2_147_483_6
 /// leaks off (valid-memtrack deferred), printf checks off (SV-COMP does not count
 /// libc `printf` string reads; keeps a benign printf artifact from aborting before a
 /// real fault — suppressing reports can never add a false alarm, so it stays sound).
-const ASAN_OPTS: &str = "exitcode=1:abort_on_error=0:detect_leaks=0:check_printf=0";
+// `max_allocation_size_mb=1024`: the multi-constant mini-fuzz drives every nondet
+// (incl. `malloc(nondet)` sizes / VLA lengths) to the constants in `NONDET_CONSTS`,
+// which include `2_147_483_647` — so an ASan harness can attempt a ~2 GB allocation;
+// at high job counts these aggregate and OOM the host (which has no swap). Capping a
+// single ASan allocation at 1 GB makes ASan report a
+// "requested-allocation-size-exceeds-maximum" error and exit — an UNMAPPED class that
+// `parse_asan_report` abstains on (⇒ `unknown`, never a false alarm), while the other
+// mini-fuzz constants still probe the task. Bounds harness memory at the source, sound.
+const ASAN_OPTS: &str =
+    "exitcode=1:abort_on_error=0:detect_leaks=0:check_printf=0:max_allocation_size_mb=1024";
 
 /// `UBSAN_OPTIONS` for the `no-overflow` replay (plan 199, R6): a deterministic,
 /// non-coredumping exit (`halt_on_error=1:abort_on_error=0` — the default

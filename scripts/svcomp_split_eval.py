@@ -39,6 +39,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -69,11 +70,71 @@ def resolve_prp(svb: Path, prop: str) -> str:
     raise SystemExit(f"no {prop}.prp found under {svb}/c/properties or fallback")
 
 
+def _rss_kb(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+    return 0
+
+
+def _subtree_pids(root_pid: int) -> list[int]:
+    """root_pid and ALL descendants (via /proc PPID links), root-first."""
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return [root_pid]
+    children: dict[int, list[int]] = {}
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(pid)
+    out, stack, seen = [], [root_pid], set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(pid)
+        stack.extend(children.get(pid, []))
+    return out
+
+
+def _subtree_rss_mb(root_pid: int) -> int:
+    """Sum resident memory (MB) of root_pid and ALL descendants — catches SAF's own PTA
+    growth (unreach) AND a runaway ASan/replay harness child (memsafety/overflow)."""
+    return sum(_rss_kb(p) for p in _subtree_pids(root_pid)) // 1024
+
+
+def _kill_subtree(root_pid: int) -> None:
+    """SIGKILL the whole saf subtree. Enumerate FIRST (before anything dies), then kill
+    the process group AND every descendant pid explicitly — a forked grandchild that
+    changed its group (so `killpg` misses it) is still caught, leaving no orphan hog."""
+    pids = _subtree_pids(root_pid)
+    try:
+        os.killpg(os.getpgid(root_pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 def run_verify(task: dict, src: str, prp: str, timeout: int,
-               witness: str | None) -> tuple[str, float, str]:
+               witness: str | None, max_rss_mb: int = 0) -> tuple[str, float, str]:
     """Run `saf verify`; return (verdict_line, wallclock_seconds, stderr_tail).
     The stderr tail carries SAF's own diagnostics (why it abstained / a compile or
-    ingest failure) — the signal for improving recall on the misses."""
+    ingest failure) — the signal for improving recall on the misses. When max_rss_mb>0,
+    an RSS watchdog kills the whole process group if the saf+harness subtree exceeds the
+    cap (→ treated as `unknown`) so no single task can OOM a swap-less host."""
     dm = "ILP32" if task["data_model"].upper() == "ILP32" else "LP64"
     cmd = [SAF, "verify", "--property", prp, "--data-model", dm,
            "--timeout", str(timeout)]
@@ -81,15 +142,48 @@ def run_verify(task: dict, src: str, prp: str, timeout: int,
         cmd += ["--witness", witness]
     cmd.append(src)
     t0 = time.monotonic()
+    outf = tempfile.TemporaryFile(mode="w+", errors="replace")
+    errf = tempfile.TemporaryFile(mode="w+", errors="replace")
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                           timeout=timeout + 30)
-    except subprocess.TimeoutExpired:
-        return "timeout", time.monotonic() - t0, "(killed: subprocess timeout)"
+        # start_new_session so the saf process is its own group leader -> one killpg
+        # takes down saf AND its clang/harness children (no orphaned memory hog).
+        proc = subprocess.Popen(cmd, stdout=outf, stderr=errf, start_new_session=True)
+    except OSError as e:
+        outf.close()
+        errf.close()
+        return "error", time.monotonic() - t0, f"(spawn failed: {e})"
+
+    reason = None
+    hard = timeout + 30
+    while proc.poll() is None:
+        el = time.monotonic() - t0
+        if el > hard:
+            reason = "timeout"
+        elif max_rss_mb and _subtree_rss_mb(proc.pid) > max_rss_mb:
+            reason = "rss"
+        if reason:
+            _kill_subtree(proc.pid)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            break
+        time.sleep(0.5)
+
     dur = time.monotonic() - t0
-    out = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
-    line = out[-1] if out else "(no-output)"
-    err_tail = (r.stderr or "")[-600:].strip()
+    outf.seek(0)
+    out = outf.read()
+    outf.close()
+    errf.seek(0)
+    err = errf.read()
+    errf.close()
+    if reason == "timeout":
+        return "timeout", dur, "(killed: wall-clock timeout)"
+    if reason == "rss":
+        return "timeout", dur, f"(killed: subtree RSS > {max_rss_mb} MB)"
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    line = lines[-1] if lines else "(no-output)"
+    err_tail = (err or "")[-600:].strip()
     return line, dur, err_tail
 
 
@@ -175,7 +269,7 @@ def load_manifest(path: Path, only_prop: str | None, sample: int) -> list[dict]:
 
 
 def eval_one(task: dict, svb: Path, timeout: int, confirm: bool,
-             confirm_timeout: int) -> dict:
+             confirm_timeout: int, max_rss_mb: int = 0) -> dict:
     prp = resolve_prp(svb, task["property"])
     # Resolve a PORTABLE source path against --svb (relative → works both on the host
     # and inside the Docker container where the repo is at /workspace). Falls back to
@@ -183,7 +277,7 @@ def eval_one(task: dict, svb: Path, timeout: int, confirm: bool,
     src = str(svb / task["rel_src"]) if task.get("rel_src") else task["src"]
     with tempfile.TemporaryDirectory() as d:
         w = os.path.join(d, "w.yml") if confirm else None
-        line, dur, err_tail = run_verify(task, src, prp, timeout, w)
+        line, dur, err_tail = run_verify(task, src, prp, timeout, w, max_rss_mb)
         kind, sub = classify(line)
         wstatus = None
         if confirm and kind == "false":
@@ -257,6 +351,11 @@ def main() -> int:
     ap.add_argument("--per-task", default=None,
                     help="write a per-task diagnostic JSONL (verdict, outcome, "
                          "duration, stderr tail on misses) for later inspection")
+    ap.add_argument("--max-rss-mb", type=int, default=0,
+                    help="RSS watchdog: kill a saf task (+ its harness children) whose "
+                         "process-subtree resident memory exceeds this many MB, scoring "
+                         "it unknown. 0 = disabled. Prevents a runaway PTA/alloc task "
+                         "from OOM-ing a swap-less host.")
     args = ap.parse_args()
 
     svb = Path(args.svb)
@@ -266,7 +365,8 @@ def main() -> int:
           f"jobs={args.jobs}; timeout={args.timeout}s ==")
 
     def work(t):
-        return eval_one(t, svb, args.timeout, args.confirm_witness, args.confirm_timeout)
+        return eval_one(t, svb, args.timeout, args.confirm_witness,
+                        args.confirm_timeout, args.max_rss_mb)
 
     if args.jobs > 1:
         with ThreadPoolExecutor(max_workers=args.jobs) as ex:
