@@ -329,6 +329,19 @@ Legend: **Effort** S/M/L/XL. Reservoir in parens. All FALSE work targets `C.Fals
 | **R9** | **Native self-contained ZIP packaging** (release build, bundled/loader libLLVM, `share/saf/{stubs,specs}`, `smoketest.sh` exit 0, ≤2 MB stdout) + fm-tools YAML (`ai` label if any LLM) | **M** | **OCI/Docker is not an accepted submission.** Required before *any* real entry, but no code-scoring value until R1 lands — sequence after the FALSE engine scores. |
 | **R10** | **`valid-memcleanup`** narrow sound-FALSE abstainer | **S** | 93 tasks. Do last, if ever. |
 
+> **Roadmap status + RESEQUENCING (updated 2026-08-13).** Executed: R1–R3 (witness emitter + sound spines,
+> `plans/194`/`195`), R4 built-to-spine then **STOPPED** at low ROI (`plans/196` — prevalence scan: fires on 31%,
+> catches ~0; the reservoir's misses need loops/memory/concurrency, not scalar interproc), R5 memsafety FALSE +
+> the reachability-refined thread gate **committed** (`plans/197`/`198`), R6 `no-overflow` FALSE **committed**
+> (`plans/199`), R7 `termination` TRUE **done** (uncommitted, `plans/201`), R8 `no-data-race` TRUE **DE-RISKED →
+> DEFERRED** (`plans/202` — measured 0/791 = 0.0% recall; the reservoir is 100% reachably-threaded).
+> **Remaining sequencing (user decision 2026-08-13): the `svcomp` branch focuses on IMPROVING SV-COMP RESULTS;
+> R9 (native-ZIP packaging) + R10 (`valid-memcleanup`) are the LAST steps.** SAF's general perf/memory issue
+> (`plans/190` CruxBC parity) was **already addressed by PR #7** (`5c875b7`, merged 2026-08-05, in `svcomp` HEAD),
+> so there is no separate performance push pending (`plans/190`'s "in-progress" status is stale). The branch
+> improves SV-COMP results (recall / coverage / witness-confirmation across the wired properties) and packages
+> (ZIP) last. See PROGRESS.md Next Steps + [[saf-svcomp-branch-sequencing]].
+
 **Deliberately NOT on the near-term path (structurally out of reach for a *sound* 2027 entry):** sound
 TRUE for unreach-call/no-overflow at scale (needs k-induction/IC3 + invariant→witness + convergence-
 gated PTA/absint — greenfield); sound memory-safety/memcleanup TRUE (needs shape/separation); race

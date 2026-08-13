@@ -1,8 +1,19 @@
 # Plan 190 — CruxBC Performance & Memory Parity vs SVF
 
-**Status:** in-progress (investigation complete 2026-08-04; fixes 1.1, 2.2, 3.1,
-3.2a, 4.1a/b implemented and verified same day — see "Implementation results";
-fix 1.2 implemented but gated off pending 2.1; fix 2.1 designed, not implemented)
+**Status:** **LIKELY RESOLVED — the CruxBC speed/memory issues were addressed by PR #7
+(`5c875b7`, "fix speed and memory consumption issues on larger projects of cruxbc",
+merged 2026-08-05, in `svcomp` HEAD)**, which reworked the PTA solver (+408), FS-PTA
+solver (+244), constraint extraction, PTA location model, LLVM mapping, and the bench
+driver. The user considers the performance issue addressed (2026-08-13). The
+"in-progress" notes below (fixes 1.1/2.2/3.1/3.2a/4.1a-b landed 2026-08-04; 1.2 gated;
+2.1 designed-not-implemented) predate PR #7 and are **stale** — a Phase-1–4-vs-PR-#7
+reconciliation was NOT done. Retained as the original investigation record. **The
+`svcomp` branch's active focus is improving SV-COMP results, not further CruxBC perf**
+([[saf-svcomp-branch-sequencing]]).
+
+_Original status (2026-08-04, pre-PR-#7): in-progress (investigation complete; fixes
+1.1, 2.2, 3.1, 3.2a, 4.1a/b implemented and verified same day; fix 1.2 implemented but
+gated off pending 2.1; fix 2.1 designed, not implemented)._
 
 ## Implementation results (2026-08-04)
 
