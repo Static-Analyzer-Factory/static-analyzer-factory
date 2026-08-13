@@ -165,6 +165,7 @@ def parse_task_yaml(text: str):
 def collect_tasks(c_dir: Path, properties: set[str], group_depth: int) -> list[dict]:
     """Walk `c/**/*.yml` and build one task record per (yml, target-property)."""
     c_root = c_dir.resolve()
+    svb_root = c_root.parent
     tasks: list[dict] = []
     for yml in c_dir.rglob("*.yml"):
         try:
@@ -191,7 +192,8 @@ def collect_tasks(c_dir: Path, properties: set[str], group_depth: int) -> list[d
             tasks.append(
                 {
                     "yml": str(yml.resolve()),
-                    "src": str(src),
+                    "src": str(src),                              # abs (host convenience)
+                    "rel_src": os.path.relpath(str(src), svb_root),  # portable: relative
                     "rel_yml": rel_yml,          # relative to c/
                     "rel_svb": f"c/{rel_yml}",   # relative to sv-benchmarks root
                     "property": name,
@@ -225,7 +227,7 @@ def write_split(
     with (out_dir / f"{split}.jsonl").open("w") as f:
         for t in tasks:
             f.write(json.dumps({k: t[k] for k in (
-                "yml", "src", "rel_yml", "property", "expected",
+                "yml", "src", "rel_src", "rel_yml", "property", "expected",
                 "subproperty", "data_model", "group")}) + "\n")
 
     by_prop: dict[str, list[dict]] = defaultdict(list)

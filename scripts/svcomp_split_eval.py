@@ -68,13 +68,13 @@ def resolve_prp(svb: Path, prop: str) -> str:
     raise SystemExit(f"no {prop}.prp found under {svb}/c/properties or fallback")
 
 
-def run_verify(task: dict, prp: str, timeout: int, witness: str | None) -> str:
+def run_verify(task: dict, src: str, prp: str, timeout: int, witness: str | None) -> str:
     dm = "ILP32" if task["data_model"].upper() == "ILP32" else "LP64"
     cmd = [SAF, "verify", "--property", prp, "--data-model", dm,
            "--timeout", str(timeout)]
     if witness:
         cmd += ["--witness", witness]
-    cmd.append(task["src"])
+    cmd.append(src)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                            timeout=timeout + 30)
@@ -84,12 +84,13 @@ def run_verify(task: dict, prp: str, timeout: int, witness: str | None) -> str:
     return out[-1] if out else "(no-output)"
 
 
-def confirm_witness(task: dict, prp: str, witness: str | None, timeout: int) -> str:
+def confirm_witness(task: dict, src: str, prp: str, witness: str | None,
+                    timeout: int) -> str:
     """Validate an emitted violation witness. Returns CONFIRMED / NOT_CONFIRMED /
     LINT_FAIL / LINT_ONLY (validator unavailable) / TIMEOUT / NO_WITNESS / ERROR."""
     if not witness or not os.path.exists(witness):
         return "NO_WITNESS"
-    cmd = ["bash", VALIDATE_SH, witness, task["src"], prp, task["data_model"]]
+    cmd = ["bash", VALIDATE_SH, witness, src, prp, task["data_model"]]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -167,13 +168,17 @@ def load_manifest(path: Path, only_prop: str | None, sample: int) -> list[dict]:
 def eval_one(task: dict, svb: Path, timeout: int, confirm: bool,
              confirm_timeout: int) -> dict:
     prp = resolve_prp(svb, task["property"])
+    # Resolve a PORTABLE source path against --svb (relative → works both on the host
+    # and inside the Docker container where the repo is at /workspace). Falls back to
+    # the stored absolute path for older manifests without rel_src.
+    src = str(svb / task["rel_src"]) if task.get("rel_src") else task["src"]
     with tempfile.TemporaryDirectory() as d:
         w = os.path.join(d, "w.yml") if confirm else None
-        line = run_verify(task, prp, timeout, w)
+        line = run_verify(task, src, prp, timeout, w)
         kind, sub = classify(line)
         wstatus = None
         if confirm and kind == "false":
-            wstatus = confirm_witness(task, prp, w, confirm_timeout)
+            wstatus = confirm_witness(task, src, prp, w, confirm_timeout)
     outcome = raw_outcome(kind, task["expected"])
     return {
         "property": task["property"], "expected": task["expected"],
