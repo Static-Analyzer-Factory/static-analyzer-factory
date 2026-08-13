@@ -19,6 +19,7 @@ pub mod overflow;
 pub mod property;
 pub mod property_kind;
 pub mod summaries;
+pub mod termination;
 pub mod witness_lower;
 pub mod witness_yaml;
 
@@ -32,6 +33,9 @@ pub use property::{
     enumerate_false_candidates_interproc, must_reach_error,
 };
 pub use property_kind::{DataModel, Language, Property};
+pub use termination::{
+    is_known_returning_external, program_structurally_terminates, termination_verdict,
+};
 pub use witness_lower::{lower_candidate, lower_must_reach, span_to_location};
 pub use witness_yaml::{
     Action, Constraint, SourceWaypoint, ViolationWitness, WaypointKind, WitnessMeta,

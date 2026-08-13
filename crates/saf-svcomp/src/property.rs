@@ -43,8 +43,7 @@ use serde::{Deserialize, Serialize};
 
 use super::fast_paths::{
     build_value_function_map, find_allocation_sites, find_deallocation_sites,
-    find_nonterminating_loops, function_is_loop_free, has_heap_allocations,
-    has_threading_primitives, program_is_loop_free, reachable_functions,
+    function_is_loop_free, has_heap_allocations, has_threading_primitives, reachable_functions,
     reachable_has_heap_allocations, reachable_is_loop_free,
 };
 use super::summaries::{ErrorSummary, compute_error_summaries};
@@ -1432,54 +1431,20 @@ struct MemoryAccessInfo {
 
 /// Analyze the termination property.
 ///
-/// A program satisfies the termination property if it always terminates
-/// (no infinite loops). This is undecidable in general, but we can detect
-/// specific patterns.
-///
-/// For TRUE verdicts: We only need to prove termination, not check other properties.
-/// For FALSE verdicts: We need to prove non-termination (very hard without ranking functions).
-fn analyze_termination(ctx: &AnalysisContext<'_>) -> PropertyResult {
-    let module = ctx.module;
-    let config = ctx.config;
-
-    // Build CFGs for all functions
-    let mut cfgs = std::collections::BTreeMap::new();
-    for func in &module.functions {
-        if func.is_declaration {
-            continue;
-        }
-        cfgs.insert(func.id, saf_analysis::cfg::Cfg::build(func));
-    }
-
-    // If program is loop-free, it definitely terminates
-    if program_is_loop_free(&cfgs) {
-        return PropertyResult::True;
-    }
-
-    // Check for loops that depend on nondeterministic input
-    let nondet_loops = find_nonterminating_loops(module, &cfgs);
-
-    if nondet_loops.is_empty() {
-        // Program has loops but none depend on nondeterministic input
-        // In aggressive mode, assume bounded loops terminate
-        // This is a heuristic: most loops in real programs have finite bounds
-        if !config.conservative {
-            return PropertyResult::True;
-        }
-
-        return PropertyResult::Unknown {
-            reason: "Program has loops; termination analysis requires ranking functions".into(),
-        };
-    }
-
-    // Has nondeterministic loops - these may or may not terminate
-    // Cannot safely return FALSE (loops may terminate via break/return/exit)
-    // Cannot safely return TRUE (loops may run forever)
+/// **Neutralized dead engine (CLAUDE.md redline #6).** `analyze_property` /
+/// `analyze_termination` has zero live callers; the sound `verify` termination
+/// path is the static structural proof
+/// `termination::program_structurally_terminates` (`termination_strategy`, plan
+/// 201). Both TRUE-capable branches this function once had are **deleted**:
+/// loop-free⇒TRUE was unsound (a loop-free *recursive* program may not halt) and
+/// `!conservative`⇒TRUE was unsound (it called `while(1)` terminating). A sound
+/// termination TRUE requires loop-free CFGs **and** an acyclic call graph **and**
+/// terminating externals — not a bare loop scan. Retained only to keep the
+/// `analyze_property` dispatch total; it always abstains.
+fn analyze_termination(_ctx: &AnalysisContext<'_>) -> PropertyResult {
     PropertyResult::Unknown {
-        reason: format!(
-            "{} loop(s) with nondeterministic condition; termination undecidable",
-            nondet_loops.len()
-        ),
+        reason: "termination: sound TRUE is termination_strategy (plan 201); no FALSE engine"
+            .into(),
     }
 }
 

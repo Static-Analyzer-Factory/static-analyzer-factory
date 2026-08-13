@@ -743,17 +743,18 @@ pub fn index(args: &IndexArgs) -> anyhow::Result<()> {
 
 /// Run `saf verify` — the blind SV-COMP verifier entry point (plan 192, slice 1).
 ///
-/// Prints exactly one verdict line to stdout — `false(<prop>)` or `unknown`
-/// (never `true`; a proof of safety maps to `unknown`, so `-32` exposure is
-/// zero) — and nothing else (all diagnostics go to stderr). It never reads an
-/// expected verdict, and always exits 0 once a verdict is printed.
+/// Prints exactly one verdict line to stdout — `false(<prop>)`, `true`, or
+/// `unknown` — and nothing else (all diagnostics go to stderr). `true` is emitted
+/// ONLY for `termination` on a proven loop-free ∧ acyclic-callgraph structural
+/// proof (plan 201, R7 — witness-not-required); every other property never emits
+/// `true` (a proof of safety maps to `unknown`, so `-32` exposure stays zero). It
+/// never reads an expected verdict, and always exits 0 once a verdict is printed.
 ///
 /// Pipeline: pin determinism-affecting env toggles, parse the `.prp` (real
-/// `CHECK/LTL` form), then — for unreach-call — compile the C in-tool with
-/// clang+`opt -passes=mem2reg`, ingest the IR, and run the reconnected
-/// `analyze_property`, all under a wall-clock watchdog that degrades to
-/// `unknown` on timeout. Non-unreach-call properties map to `unknown` in this
-/// slice.
+/// `CHECK/LTL` form), compile the C in-tool with clang+`opt -passes=mem2reg`,
+/// ingest the IR, and dispatch to the property's `strategy_for` arm, all under a
+/// wall-clock watchdog that degrades to `unknown` on timeout. Properties with no
+/// wired strategy map to `unknown`.
 // The handler is infallible by contract (it always prints a verdict and exits
 // 0), but the `Result` return is required by the `Commands` dispatch signature.
 #[allow(clippy::unnecessary_wraps)]
@@ -992,6 +993,7 @@ fn strategy_for(property: saf_svcomp::Property) -> Option<StrategyFn> {
         saf_svcomp::Property::UnreachCall => Some(unreach_strategy),
         saf_svcomp::Property::ValidMemsafety => Some(memsafety_strategy),
         saf_svcomp::Property::NoOverflow => Some(overflow_strategy),
+        saf_svcomp::Property::Termination => Some(termination_strategy),
         _ => None,
     }
 }
@@ -1679,6 +1681,25 @@ fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             eprintln!("saf verify: UBSan replay errored: {e:#} -> unknown");
             unknown_outcome()
         }
+    }
+}
+
+/// The `termination` TRUE strategy (plan 201, R7 — SAF's first sound-TRUE arm).
+///
+/// A purely-static structural proof over the already-ingested AIR — no
+/// compile-of-original, no execution, no witness (termination TRUE is
+/// witness-not-required in SV-COMP 2026). Emits a bare `true` iff
+/// [`saf_svcomp::program_structurally_terminates`] holds (loop-free reachable CFGs
+/// ∧ acyclic reachable call graph ∧ no reachable indirect call ∧ allowlisted
+/// externals); otherwise `unknown`. Never emits `false`.
+fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
+    if saf_svcomp::program_structurally_terminates(ctx.module) {
+        VerdictOutcome {
+            verdict: saf_svcomp::termination_verdict().to_string(),
+            witness: None,
+        }
+    } else {
+        unknown_outcome()
     }
 }
 

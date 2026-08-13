@@ -861,3 +861,157 @@ fn verify_overflow_witness_is_byte_stable() {
         "overflow witness bytes must be deterministic across runs"
     );
 }
+
+// ---------------------------------------------------------------------------
+// termination TRUE via the static structural proof (plan 201, R7 — SAF's first
+// sound `true`). Emits a bare `true` iff every function reachable from `main` is
+// loop-free AND the reachable call graph is acyclic AND there is no reachable
+// indirect call AND every reachable external is known-terminating; otherwise
+// `unknown`. Never `false`; a `true` writes NO witness (termination TRUE is
+// witness-not-required in SV-COMP 2026).
+// ---------------------------------------------------------------------------
+
+fn termination_prp() -> String {
+    ws("tests/programs/c/svcomp/termination.prp")
+}
+/// Run `saf verify <fixture>` against termination at `data_model`, exit 0.
+fn verify_termination(fixture: &str, data_model: &str) -> assert_cmd::assert::Assert {
+    let prp = termination_prp();
+    let fx = svcomp_fixture(fixture);
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.as_str(),
+            "--data-model",
+            data_model,
+            fx.as_str(),
+        ])
+        .assert()
+        .success()
+}
+
+/// A loop-free, call-free `main` => provably terminates => `true` (LP64).
+#[test]
+#[ignore]
+fn verify_termination_straightline_is_true() {
+    verify_termination("termination_true_straightline.c", "LP64").stdout("true\n");
+}
+
+/// The same, at ILP32 — the structural proof is data-model-independent.
+#[test]
+#[ignore]
+fn verify_termination_straightline_ilp32_is_true() {
+    verify_termination("termination_true_straightline.c", "ILP32").stdout("true\n");
+}
+
+/// A loop-free `main` calling only known-terminating externals
+/// (`__VERIFIER_nondet_int`, `printf`) => `true`.
+#[test]
+#[ignore]
+fn verify_termination_allowlisted_externs_is_true() {
+    verify_termination("termination_true_extern.c", "LP64").stdout("true\n");
+}
+
+/// A loop lives only in a function UNREACHABLE from `main` — the reachability
+/// refinement ignores it => `true`.
+#[test]
+#[ignore]
+fn verify_termination_loop_in_unreachable_is_true() {
+    verify_termination("termination_true_loop_in_dead.c", "LP64").stdout("true\n");
+}
+
+/// A reachable loop needs a ranking function (out of scope) => abstain =>
+/// `unknown` (never `true`).
+#[test]
+#[ignore]
+fn verify_termination_loop_is_unknown() {
+    verify_termination("termination_unknown_loop.c", "LP64").stdout("unknown\n");
+}
+
+/// Recursion (a loop-free but self-recursive `fact`) => the acyclic-callgraph
+/// gate abstains => `unknown`.
+#[test]
+#[ignore]
+fn verify_termination_recursion_is_unknown() {
+    verify_termination("termination_unknown_recursion.c", "LP64").stdout("unknown\n");
+}
+
+/// A reachable indirect call (through a nondet-chosen function pointer) could
+/// hide recursion => abstain => `unknown` (redline #8).
+#[test]
+#[ignore]
+fn verify_termination_indirect_call_is_unknown() {
+    verify_termination("termination_unknown_indirect.c", "LP64").stdout("unknown\n");
+}
+
+/// A reachable non-allowlisted external (`read`, which may block) => abstain =>
+/// `unknown`.
+#[test]
+#[ignore]
+fn verify_termination_bad_external_is_unknown() {
+    verify_termination("termination_unknown_bad_extern.c", "LP64").stdout("unknown\n");
+}
+
+/// A `true` verdict writes NO witness (the write-gate keys on a `false`-prefix;
+/// termination TRUE is witness-not-required).
+#[test]
+#[ignore]
+fn verify_termination_true_writes_no_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().join("w.yml");
+    let prp = termination_prp();
+    let fx = svcomp_fixture("termination_true_straightline.c");
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.as_str(),
+            "--data-model",
+            "LP64",
+            "--witness",
+            w.to_str().unwrap(),
+            fx.as_str(),
+        ])
+        .assert()
+        .success()
+        .stdout("true\n");
+    assert!(
+        !w.exists(),
+        "no witness may be written for a `true` verdict"
+    );
+}
+
+/// The `true` verdict is byte-stable across re-runs (a constant, no timestamps).
+#[test]
+#[ignore]
+fn verify_termination_true_is_byte_stable() {
+    verify_termination("termination_true_straightline.c", "LP64").stdout("true\n");
+    verify_termination("termination_true_straightline.c", "LP64").stdout("true\n");
+}
+
+// −32 regression guards (found by the pre-commit adversarial review): each is a
+// NON-terminating program R7 must NOT call `true`.
+
+/// A global constructor loops forever before main (outside main's call graph) ⇒
+/// `unknown` (the module has `llvm.global_ctors`).
+#[test]
+#[ignore]
+fn verify_termination_ctor_loop_is_unknown() {
+    verify_termination("termination_unknown_ctor_loop.c", "LP64").stdout("unknown\n");
+}
+
+/// A global destructor loops forever after main returns ⇒ `unknown`.
+#[test]
+#[ignore]
+fn verify_termination_dtor_loop_is_unknown() {
+    verify_termination("termination_unknown_dtor_loop.c", "LP64").stdout("unknown\n");
+}
+
+/// A computed-goto infinite loop (`indirectbr`, dropped by the frontend) leaves a
+/// block with no terminator ⇒ the CFG-completeness gate abstains ⇒ `unknown`.
+#[test]
+#[ignore]
+fn verify_termination_computed_goto_is_unknown() {
+    verify_termination("termination_unknown_computed_goto.c", "LP64").stdout("unknown\n");
+}

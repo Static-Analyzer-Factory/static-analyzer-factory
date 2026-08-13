@@ -10,11 +10,15 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let saf_layer = saf_core::logging::subscriber::init();
+    // Diagnostics (incl. frontend "unsupported instruction" warnings) go to
+    // STDERR so that stdout stays clean — `saf verify` requires verdict-only
+    // stdout for BenchExec, and other commands write their real output to stdout.
     if cli.json_errors {
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
                     .json()
+                    .with_writer(std::io::stderr)
                     .with_filter(tracing_subscriber::EnvFilter::new("info")),
             )
             .with(saf_layer)
@@ -23,6 +27,7 @@ fn main() -> anyhow::Result<()> {
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
                     .with_filter(tracing_subscriber::EnvFilter::new("info")),
             )
             .with(saf_layer)
