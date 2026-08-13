@@ -991,6 +991,7 @@ fn strategy_for(property: saf_svcomp::Property) -> Option<StrategyFn> {
     match property {
         saf_svcomp::Property::UnreachCall => Some(unreach_strategy),
         saf_svcomp::Property::ValidMemsafety => Some(memsafety_strategy),
+        saf_svcomp::Property::NoOverflow => Some(overflow_strategy),
         _ => None,
     }
 }
@@ -1208,6 +1209,34 @@ const NONDET_CONSTS: &[i64] = &[0, 1, 2, 42, 255, 256, 1024, 65_535, 2_147_483_6
 /// libc `printf` string reads; keeps a benign printf artifact from aborting before a
 /// real fault — suppressing reports can never add a false alarm, so it stays sound).
 const ASAN_OPTS: &str = "exitcode=1:abort_on_error=0:detect_leaks=0:check_printf=0";
+
+/// `UBSAN_OPTIONS` for the `no-overflow` replay (plan 199, R6): a deterministic,
+/// non-coredumping exit (`halt_on_error=1:abort_on_error=0` — the default
+/// `abort_on_error` is platform-dependent, so pin it) plus a symbolized frame #0
+/// (`print_stacktrace=1`) for the R1 verifier-abstraction rejection. Do NOT set
+/// `external_symbolizer_path` — a bad value breaks symbolization; the runtime
+/// auto-finds `llvm-symbolizer`/`addr2line`. The witness location comes from the
+/// address-free `runtime error:` line, so stack-frame addresses never leak in.
+const UBSAN_OPTS: &str = "halt_on_error=1:abort_on_error=0:print_stacktrace=1";
+
+/// Mini-fuzz constants for the overflow confirmer: the [`NONDET_CONSTS`] spread plus
+/// `INT_MIN` and `2^31` — load-bearing for `-INT_MIN`, `INT_MIN - 1`, and `INT_MIN / -1`
+/// overflow (Slice-0 caught `id_b3_o2-1.c` only at `INT_MIN`). Kept SEPARATE from
+/// `NONDET_CONSTS` so the committed R5 memsafety byte-for-byte behavior is unperturbed.
+const OVERFLOW_CONSTS: &[i64] = &[
+    0,
+    1,
+    2,
+    42,
+    255,
+    256,
+    1024,
+    65_535,
+    2_147_483_647,
+    -1,
+    -2_147_483_648,
+    2_147_483_648,
+];
 
 /// Cap on how many candidates to replay per task — bounds worst-case native
 /// compile+run time; a real violation almost always surfaces in the first
@@ -1613,6 +1642,146 @@ fn asan_confirm(
         let report = std::fs::read_to_string(&errpath).unwrap_or_default();
         if let Some(hit) = saf_svcomp::parse_asan_report(&report) {
             return Ok(Some(hit)); // first constant that reproduces a violation wins
+        }
+    }
+    Ok(None)
+}
+
+/// The `no-overflow` FALSE pipeline (plan 199, R6): confirmer-first, propose-free.
+/// Mirrors [`memsafety_strategy`], swapping the arbiter ASan→UBSan. No sub-property,
+/// so the verdict is always `false(no-overflow)` (no classifier).
+fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
+    match ubsan_confirm(
+        ctx.input,
+        ctx.data_model,
+        ctx.module,
+        ctx.stub,
+        ctx.tempdir,
+        ctx.clang,
+    ) {
+        Ok(Some(hit)) => {
+            let witness = build_witness(ctx, Some(saf_svcomp::lower_overflow_hit(&hit)));
+            if witness.is_none() {
+                eprintln!(
+                    "saf verify: FALSE (UBSan signed-overflow) but witness unconstructible -> emitting false without a witness"
+                );
+            }
+            VerdictOutcome {
+                verdict: saf_svcomp::overflow_verdict(),
+                witness,
+            }
+        }
+        Ok(None) => {
+            eprintln!("saf verify: UBSan replay reproduced no signed-integer overflow -> unknown");
+            unknown_outcome()
+        }
+        Err(e) => {
+            eprintln!("saf verify: UBSan replay errored: {e:#} -> unknown");
+            unknown_outcome()
+        }
+    }
+}
+
+/// Confirm a `no-overflow` FALSE by UBSan-instrumented native execution (plan 199, R6).
+///
+/// Compiles the ORIGINAL program with `-fsanitize=signed-integer-overflow -g` + the
+/// nondet driver, runs it under the [`OVERFLOW_CONSTS`] mini-fuzz capturing stderr to a
+/// file, and parses the report ([`saf_svcomp::parse_ubsan_overflow`], which applies R1).
+/// `Ok(Some(hit))` is a confirmed signed overflow; `Ok(None)` is inconclusive (no report
+/// / abstained / compile-link failure / timeout) ⇒ the caller keeps `unknown`. Reuses
+/// [`synthesize_asan_driver`] (sanitizer-agnostic) unchanged.
+///
+/// Threaded programs abstain up front (conservative default, plan 199 D5): an overflow
+/// is schedule-independent so confirming a threaded task is sound, but the concurrency
+/// reservoir is small and low-recall, so the R5 reachability gate is kept until a gated
+/// slice measures it worth dropping.
+fn ubsan_confirm(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    module: &saf_core::air::AirModule,
+    stub: &Path,
+    dir: &Path,
+    clang: &str,
+) -> anyhow::Result<Option<saf_svcomp::OverflowHit>> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+
+    let callgraph = saf_analysis::callgraph::CallGraph::build(module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(module, &callgraph) {
+        eprintln!("saf verify: a thread spawn is reachable from main (out of R6 scope) -> unknown");
+        return Ok(None);
+    }
+
+    let driver_src = dir.join("saf_ubsan_driver.c");
+    let harness = dir.join("saf_ubsan_harness");
+    let errpath = dir.join("saf_ubsan_stderr.txt");
+
+    std::fs::write(&driver_src, synthesize_asan_driver())
+        .with_context(|| "writing UBSan replay driver")?;
+
+    let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
+    let status = Command::new(clang)
+        .args([
+            "-O0",
+            "-g",
+            "-fsanitize=signed-integer-overflow",
+            "-fno-sanitize-recover=signed-integer-overflow",
+            "-Wno-everything",
+        ])
+        .arg(data_model.clang_flag())
+        .arg("-include")
+        .arg(stub)
+        .arg("-I")
+        .arg(srcdir)
+        .arg(input)
+        .arg(&driver_src)
+        .arg("-o")
+        .arg(&harness)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to spawn {clang} for UBSan replay"))?;
+    if !status.success() {
+        // Compile/link failure (e.g. a task defining its own nondet) -> inconclusive.
+        return Ok(None);
+    }
+
+    // Multi-constant mini-fuzz: one binary run under OVERFLOW_CONSTS (0 first). A
+    // scalar-guarded/scalar-sized overflow the zeroed probe misses is reproduced by the
+    // matching constant. Sound: each constant is a valid concrete input, and
+    // __VERIFIER_assume still prunes infeasible ones. Confirm on the FIRST trap.
+    let timeout = replay_timeout();
+    for &k in OVERFLOW_CONSTS {
+        let errfile =
+            std::fs::File::create(&errpath).with_context(|| "creating UBSan stderr file")?;
+        let mut child = Command::new(&harness)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(errfile))
+            .env("UBSAN_OPTIONS", UBSAN_OPTS)
+            .env("SAF_NONDET_CONST", k.to_string())
+            .spawn()
+            .with_context(|| "spawning UBSan harness")?;
+
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break; // runaway -> parse whatever exists (likely no report)
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => return Err(e).context("waiting on UBSan harness"),
+            }
+        }
+
+        let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+        if let Some(hit) = saf_svcomp::parse_ubsan_overflow(&report) {
+            return Ok(Some(hit)); // first constant that reproduces an overflow wins
         }
     }
     Ok(None)

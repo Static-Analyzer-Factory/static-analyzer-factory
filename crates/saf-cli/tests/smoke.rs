@@ -722,3 +722,142 @@ fn verify_memsafety_witness_is_byte_stable() {
         "memsafety witness bytes must be deterministic across runs"
     );
 }
+
+// ---------------------------------------------------------------------------
+// no-overflow FALSE via the UBSan signed-integer-overflow confirmer (plan 199, R6).
+// The strategy compiles the ORIGINAL program with -fsanitize=signed-integer-overflow,
+// runs it under the nondet driver + OVERFLOW_CONSTS mini-fuzz, and emits
+// false(no-overflow) iff UBSan reports a signed overflow in the program's own code
+// (R1). No sub-property. Never `true`; a safe program -> `unknown` with no witness.
+// ---------------------------------------------------------------------------
+
+fn overflow_prp() -> String {
+    ws("tests/programs/c/svcomp/no-overflow.prp")
+}
+/// Run `saf verify <fixture>` against no-overflow at `data_model`, exit 0.
+fn verify_overflow(fixture: &str, data_model: &str) -> assert_cmd::assert::Assert {
+    let prp = overflow_prp();
+    let fx = svcomp_fixture(fixture);
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.as_str(),
+            "--data-model",
+            data_model,
+            fx.as_str(),
+        ])
+        .assert()
+        .success()
+}
+/// Run `saf verify <fixture> --witness <path>` against no-overflow.
+fn verify_overflow_witness(
+    fixture: &str,
+    data_model: &str,
+    witness: &std::path::Path,
+) -> assert_cmd::assert::Assert {
+    let prp = overflow_prp();
+    let fx = svcomp_fixture(fixture);
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.as_str(),
+            "--data-model",
+            data_model,
+            "--witness",
+            witness.to_str().unwrap(),
+            fx.as_str(),
+        ])
+        .assert()
+        .success()
+}
+
+/// Unconditional signed addition overflow (INT_MAX + 1) -> false(no-overflow) (LP64).
+#[test]
+#[ignore]
+fn verify_overflow_add_is_false() {
+    verify_overflow("overflow_false_add.c", "LP64").stdout("false(no-overflow)\n");
+}
+
+/// The same overflow at ILP32 -> false(no-overflow) (exercises the 32-bit UBSan runtime).
+#[test]
+#[ignore]
+fn verify_overflow_add_ilp32_is_false() {
+    verify_overflow("overflow_false_add.c", "ILP32").stdout("false(no-overflow)\n");
+}
+
+/// Negation of INT_MIN -> false(no-overflow) (the "negation of ..." report form).
+#[test]
+#[ignore]
+fn verify_overflow_negation_is_false() {
+    verify_overflow("overflow_false_negation.c", "LP64").stdout("false(no-overflow)\n");
+}
+
+/// INT_MIN / -1 -> false(no-overflow) (the "division of ... by -1" report form).
+#[test]
+#[ignore]
+fn verify_overflow_division_is_false() {
+    verify_overflow("overflow_false_division.c", "LP64").stdout("false(no-overflow)\n");
+}
+
+/// A scalar-nondet-guarded overflow (fires only when the input is INT_MAX) is missed by
+/// the zeroed probe but reproduced by the OVERFLOW_CONSTS mini-fuzz -> false(no-overflow).
+#[test]
+#[ignore]
+fn verify_overflow_guarded_is_false() {
+    verify_overflow("overflow_false_guarded.c", "LP64").stdout("false(no-overflow)\n");
+}
+
+/// A safe program: UBSan never traps -> `unknown` (never `true`, never a false alarm).
+#[test]
+#[ignore]
+fn verify_overflow_safe_is_unknown() {
+    verify_overflow("overflow_true_safe.c", "LP64").stdout("unknown\n");
+}
+
+/// A confirmed overflow FALSE writes a YAML 2.0 violation witness whose target is the
+/// overflowing operation's source file/line.
+#[test]
+#[ignore]
+fn verify_overflow_false_writes_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().join("w.yml");
+    verify_overflow_witness("overflow_false_add.c", "LP64", &w).stdout("false(no-overflow)\n");
+    let yaml = std::fs::read_to_string(&w).expect("witness written for a false verdict");
+    assert!(yaml.contains("entry_type: violation_sequence"), "{yaml}");
+    assert!(yaml.contains("type: target"), "{yaml}");
+    assert!(
+        yaml.contains("file_name: overflow_false_add.c"),
+        "witness target points at the overflowing source file:\n{yaml}"
+    );
+}
+
+/// A safe program writes NO witness (the verdict is `unknown`).
+#[test]
+#[ignore]
+fn verify_overflow_safe_writes_no_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().join("w.yml");
+    verify_overflow_witness("overflow_true_safe.c", "LP64", &w).stdout("unknown\n");
+    assert!(
+        !w.exists(),
+        "no witness may be written for an unknown verdict"
+    );
+}
+
+/// The overflow witness is byte-identical across re-runs (NFR-DET determinism).
+#[test]
+#[ignore]
+fn verify_overflow_witness_is_byte_stable() {
+    let dir = tempfile::tempdir().unwrap();
+    let w1 = dir.path().join("w1.yml");
+    let w2 = dir.path().join("w2.yml");
+    verify_overflow_witness("overflow_false_add.c", "LP64", &w1).stdout("false(no-overflow)\n");
+    verify_overflow_witness("overflow_false_add.c", "LP64", &w2).stdout("false(no-overflow)\n");
+    assert_eq!(
+        std::fs::read(&w1).expect("w1"),
+        std::fs::read(&w2).expect("w2"),
+        "overflow witness bytes must be deterministic across runs"
+    );
+}
