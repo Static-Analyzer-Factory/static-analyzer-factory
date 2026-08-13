@@ -42,6 +42,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -68,20 +69,28 @@ def resolve_prp(svb: Path, prop: str) -> str:
     raise SystemExit(f"no {prop}.prp found under {svb}/c/properties or fallback")
 
 
-def run_verify(task: dict, src: str, prp: str, timeout: int, witness: str | None) -> str:
+def run_verify(task: dict, src: str, prp: str, timeout: int,
+               witness: str | None) -> tuple[str, float, str]:
+    """Run `saf verify`; return (verdict_line, wallclock_seconds, stderr_tail).
+    The stderr tail carries SAF's own diagnostics (why it abstained / a compile or
+    ingest failure) — the signal for improving recall on the misses."""
     dm = "ILP32" if task["data_model"].upper() == "ILP32" else "LP64"
     cmd = [SAF, "verify", "--property", prp, "--data-model", dm,
            "--timeout", str(timeout)]
     if witness:
         cmd += ["--witness", witness]
     cmd.append(src)
+    t0 = time.monotonic()
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                            timeout=timeout + 30)
     except subprocess.TimeoutExpired:
-        return "timeout"
+        return "timeout", time.monotonic() - t0, "(killed: subprocess timeout)"
+    dur = time.monotonic() - t0
     out = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
-    return out[-1] if out else "(no-output)"
+    line = out[-1] if out else "(no-output)"
+    err_tail = (r.stderr or "")[-600:].strip()
+    return line, dur, err_tail
 
 
 def confirm_witness(task: dict, src: str, prp: str, witness: str | None,
@@ -174,18 +183,23 @@ def eval_one(task: dict, svb: Path, timeout: int, confirm: bool,
     src = str(svb / task["rel_src"]) if task.get("rel_src") else task["src"]
     with tempfile.TemporaryDirectory() as d:
         w = os.path.join(d, "w.yml") if confirm else None
-        line = run_verify(task, src, prp, timeout, w)
+        line, dur, err_tail = run_verify(task, src, prp, timeout, w)
         kind, sub = classify(line)
         wstatus = None
         if confirm and kind == "false":
             wstatus = confirm_witness(task, src, prp, w, confirm_timeout)
     outcome = raw_outcome(kind, task["expected"])
+    # Keep SAF's stderr tail only where it's diagnostically useful (an abstain, a
+    # miss, a crash) — not on clean scoring verdicts — to bound the dump size.
+    keep_err = kind in ("unknown", "timeout", "error") or outcome == "FalseIncorrect"
     return {
         "property": task["property"], "expected": task["expected"],
         "kind": kind, "sub": sub, "rel_yml": task["rel_yml"],
+        "data_model": task["data_model"], "group": task.get("group", ""),
         "outcome": outcome, "raw": SCORE[outcome],
         "confirmed": confirmed_score(outcome, task["property"], wstatus),
-        "witness": wstatus,
+        "witness": wstatus, "duration_s": round(dur, 2),
+        "stderr_tail": err_tail if keep_err else "",
     }
 
 
@@ -240,6 +254,9 @@ def main() -> int:
     ap.add_argument("--confirm-timeout", type=int, default=150)
     ap.add_argument("--jobs", type=int, default=1, help="parallel verify workers")
     ap.add_argument("-o", "--out", default=None, help="write JSON summary to file")
+    ap.add_argument("--per-task", default=None,
+                    help="write a per-task diagnostic JSONL (verdict, outcome, "
+                         "duration, stderr tail on misses) for later inspection")
     args = ap.parse_args()
 
     svb = Path(args.svb)
@@ -256,6 +273,15 @@ def main() -> int:
             results = list(ex.map(work, rows))
     else:
         results = [work(t) for t in rows]
+
+    if args.per_task:
+        with open(args.per_task, "w") as f:
+            for r in sorted(results, key=lambda r: (r["property"], r["rel_yml"])):
+                f.write(json.dumps(r) + "\n")
+        misses = sum(1 for r in results
+                     if not r["expected"] and r["kind"] in ("unknown", "timeout", "error"))
+        print(f"  per-task dump: {args.per_task} ({len(results)} tasks, "
+              f"{misses} missed FALSEs with stderr tails)")
 
     per = summarize(results)
     tot = {"raw": 0, "confirmed": 0, "max": 0, "FP": 0, "wrong_true": 0,
