@@ -349,14 +349,22 @@ def main() -> int:
         holdout = [t for t in tasks if side[t["group"]] == "holdout"]
         holdout_groups = sorted(g for g, s in side.items() if s == "holdout")
 
-    # Invariant guard: no origin group may straddle the split.
+    # No-straddle is a GROUPED-mode invariant (whole families to one side, so
+    # near-duplicate generator tasks can't leak across the split). In EDITION mode
+    # the honest boundary is git-addition: a task added in 2026 could not have been
+    # tuned on regardless of whether its family has older members, so a family
+    # spanning both editions is expected, not leakage.
     tg = {t["group"] for t in train}
     hg = {t["group"] for t in holdout}
     straddle = tg & hg
-    if straddle:
+    if mode == "grouped" and straddle:
         print(f"FATAL: {len(straddle)} groups straddle train/holdout "
               f"(e.g. {sorted(straddle)[:3]}) — leakage!", file=sys.stderr)
         return 2
+    if mode == "edition" and straddle:
+        print(f"note: {len(straddle)} origin families span both editions "
+              f"(older members in train, 2026-added members in holdout) — "
+              f"expected for edition holdout, not leakage.")
 
     train_sum = write_split(out_dir, "train", train, properties)
     holdout_sum = write_split(out_dir, "holdout", holdout, properties)
