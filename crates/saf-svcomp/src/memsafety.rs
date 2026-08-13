@@ -165,15 +165,27 @@ fn is_print_helper(func: &str) -> bool {
     func.starts_with("print") && func.contains("Line")
 }
 
-/// An sv-benchmarks LDV allocator MODEL (`ldv_reference_realloc`, `ldv_realloc`,
-/// `ldv_malloc`, `ldv_calloc`, `ldv_zalloc`, `ldv_free`, …) — a verifier abstraction,
-/// NOT the program under test. Under native execution these can fault as a model
-/// artifact: e.g. `ldv_reference_realloc` does `res = malloc(NEW_size); memcpy(res,
-/// old, NEW_size)`, an OOB read of the smaller old buffer. A fault attributed to one
-/// is rejected like the libc I/O interceptors (R1) — a real program bug faults at the
-/// program's own access (the CWE sink), never inside these models.
+/// An sv-benchmarks LDV MEMORY/STRING MODEL (`ldv_reference_realloc`, `ldv_malloc`,
+/// `ldv_free`, `ldv_strcpy`, `ldv_strlen`, `ldv_strdup`, `ldv_memcpy`, `ldv_memset`, …)
+/// — a verifier abstraction, NOT the program under test. These models are faithful only
+/// under ABSTRACT verification; under SAF's concrete ASan replay they can fault as a
+/// model artifact on a SAFE program:
+/// - `ldv_reference_realloc` does `res = malloc(NEW); memcpy(res, old, NEW)` — an OOB
+///   read of the smaller old buffer.
+/// - `ldv_strcpy(dst, src)` / `ldv_strdup(src)` allocate/copy `ldv_strlen(src)` bytes but
+///   do NOT write the terminating NUL (sv-benchmarks CWE761 `char_fixed_string` good),
+///   so a subsequent `ldv_strlen(dst)` walks off the heap buffer → a spurious
+///   heap-buffer-overflow READ *inside `ldv_strlen`* (38 full-pool false alarms).
+/// A fault attributed to one of these models is rejected like the libc I/O interceptors
+/// (R1) — a real program bug faults at the program's OWN access (the CWE sink), never
+/// inside these models. (`str`/`mem` are matched in addition to `alloc`/`free`; non-model
+/// `ldv_` helpers like `ldv_undef_int`/`ldv_exit` carry none of these and are unaffected.)
 fn is_harness_memory_model(func: &str) -> bool {
-    func.starts_with("ldv_") && (func.contains("alloc") || func.contains("free"))
+    func.starts_with("ldv_")
+        && (func.contains("alloc")
+            || func.contains("free")
+            || func.contains("str")
+            || func.contains("mem"))
 }
 
 /// A deallocation function or its ASan interceptor (`free`, `cfree`, the allocator's
@@ -306,6 +318,25 @@ READ of size 519600 at 0x5140000001d0 thread T0
     #2 0x555 in ldv_realloc /workspace/x/CWE401_realloc_13_good.i:1326:9
 ";
         assert_eq!(parse_asan_report(LDV_REALLOC_MODEL_OOB), None);
+    }
+
+    #[test]
+    fn ldv_strcpy_model_overread_inside_ldv_strlen_is_rejected_r1() {
+        // Real report (VM, 2026-08-14): CWE761_..._char_fixed_string_01_good
+        // (expected_verdict TRUE). goodB2G does malloc(100); ldv_strcpy(data,"Fixed
+        // String"); ldv_strlen(data). The sv-benchmarks `ldv_strcpy` MODEL copies
+        // ldv_strlen(src) bytes WITHOUT the terminating NUL, so the subsequent
+        // ldv_strlen walks off the 100-byte buffer → heap-buffer-overflow READ INSIDE
+        // the `ldv_strlen` model. A model artifact on a SAFE program, not a program bug
+        // → must abstain (this was 38 valid-deref false alarms at full-pool scale).
+        const LDV_STRLEN_OVERREAD: &str = "\
+==22==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x50b0000000a4 at pc 0x555 bp 0x7ff sp 0x7ff
+READ of size 1 at 0x50b0000000a4 thread T0
+    #0 0x555 in ldv_strlen /workspace/x/CWE761_char_fixed_string_01_good.i:1098:12
+    #1 0x555 in ldv_strlen_3 /workspace/x/CWE761_char_fixed_string_01_good.i:964:9
+    #2 0x555 in goodB2G /workspace/x/CWE761_char_fixed_string_01_good.i:888:13
+";
+        assert_eq!(parse_asan_report(LDV_STRLEN_OVERREAD), None);
     }
 
     #[test]
