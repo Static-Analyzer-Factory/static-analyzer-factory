@@ -168,7 +168,10 @@ def run_verify(task: dict, src: str, prp: str, timeout: int,
             except subprocess.TimeoutExpired:
                 pass
             break
-        time.sleep(0.5)
+        # 0.2s poll: the ASan/UBSan harness bombs are bounded at the source by ASan's own
+        # hard_rss_limit_mb; this watchdog is the backstop for SAF's own PTA growth
+        # (unreach, not sanitized) and UBSan, where growth is gradual enough for 0.2s.
+        time.sleep(0.2)
 
     dur = time.monotonic() - t0
     outf.seek(0)

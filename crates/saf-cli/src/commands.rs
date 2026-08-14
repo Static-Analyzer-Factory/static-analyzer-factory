@@ -1226,16 +1226,20 @@ const NONDET_CONSTS: &[i64] = &[0, 1, 2, 42, 255, 256, 1024, 65_535, 2_147_483_6
 /// leaks off (valid-memtrack deferred), printf checks off (SV-COMP does not count
 /// libc `printf` string reads; keeps a benign printf artifact from aborting before a
 /// real fault — suppressing reports can never add a false alarm, so it stays sound).
-// `max_allocation_size_mb=1024`: the multi-constant mini-fuzz drives every nondet
-// (incl. `malloc(nondet)` sizes / VLA lengths) to the constants in `NONDET_CONSTS`,
-// which include `2_147_483_647` — so an ASan harness can attempt a ~2 GB allocation;
-// at high job counts these aggregate and OOM the host (which has no swap). Capping a
-// single ASan allocation at 1 GB makes ASan report a
-// "requested-allocation-size-exceeds-maximum" error and exit — an UNMAPPED class that
-// `parse_asan_report` abstains on (⇒ `unknown`, never a false alarm), while the other
-// mini-fuzz constants still probe the task. Bounds harness memory at the source, sound.
-const ASAN_OPTS: &str =
-    "exitcode=1:abort_on_error=0:detect_leaks=0:check_printf=0:max_allocation_size_mb=1024";
+// Memory safety for the replay harness (the swap-less host OOM'd when a harness ballooned
+// to tens of GB under the mini-fuzz's huge constants). Two ASan-native bounds:
+// - `max_allocation_size_mb=1024`: a SINGLE allocation over 1 GB (e.g. the
+//   `2_147_483_647` mini-fuzz constant as a `malloc`/VLA size) becomes a
+//   "requested-allocation-size-exceeds-maximum" error and exit.
+// - `hard_rss_limit_mb=3072`: ASan's own background RSS monitor kills the harness the
+//   moment its RESIDENT memory crosses 3 GB — this catches the growth that
+//   `max_allocation_size_mb` misses (a VLA / `calloc` / many-small-allocs / `memset`
+//   loop that reached 34–49 GB in one run), far more reliably than an external poll.
+// Both exit with an UNMAPPED error class that `parse_asan_report` abstains on (⇒
+// `unknown`, never a false alarm), while the other mini-fuzz constants still probe the
+// task. Keep per-task jobs so jobs × 3 GB stays well under host RAM (≤16 on the 62 GB VM).
+const ASAN_OPTS: &str = "exitcode=1:abort_on_error=0:detect_leaks=0:check_printf=0:\
+max_allocation_size_mb=1024:hard_rss_limit_mb=3072";
 
 /// `UBSAN_OPTIONS` for the `no-overflow` replay (plan 199, R6): a deterministic,
 /// non-coredumping exit (`halt_on_error=1:abort_on_error=0` — the default
