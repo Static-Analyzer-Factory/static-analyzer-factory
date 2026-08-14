@@ -1096,6 +1096,22 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         };
     }
 
+    // Concurrency gate: a multithreaded program's reachability is schedule-dependent,
+    // so a single native replay of ONE interleaving is not a sound basis for FALSE — a
+    // race-free/safe program can be driven to `reach_error` under an arbitrary native
+    // schedule (the goblint `race_reach_*_racefree` tasks: `main` spawns 10^4 threads and
+    // the assert lives in the thread body). Stage 1 (`must_reach`, sequential
+    // unconditional) is already sound above; the replay-confirmed stages below are not.
+    // Abstain when a thread spawn is reachable from `main`, matching the R5/R6 ASan/UBSan
+    // confirmers' gate (plan 198). Sound over-approximation: never miss a spawn.
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        eprintln!(
+            "saf verify: a thread spawn is reachable from main (unreach replay is schedule-unsound) -> unknown"
+        );
+        return unknown_outcome();
+    }
+
     // Stage 2 + 3: enumerate over-approximate candidates, CONFIRM by concrete
     // native replay. Only a run that actually reaches reach_error is a violation,
     // so the over-approximation's false alarms are filtered out (they do not
