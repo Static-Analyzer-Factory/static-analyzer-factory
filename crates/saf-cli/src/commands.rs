@@ -1254,6 +1254,17 @@ const UBSAN_OPTS: &str = "halt_on_error=1:abort_on_error=0:print_stacktrace=1";
 /// `INT_MIN` and `2^31` — load-bearing for `-INT_MIN`, `INT_MIN - 1`, and `INT_MIN / -1`
 /// overflow (Slice-0 caught `id_b3_o2-1.c` only at `INT_MIN`). Kept SEPARATE from
 /// `NONDET_CONSTS` so the committed R5 memsafety byte-for-byte behavior is unperturbed.
+///
+/// The large POSITIVE probe is `2^30`, NOT `INT_MAX`. When a nondet drives a loop trip
+/// count, `for (i=0; i<=x; i++)` (Parts) or `while (z>0) { x=x+1; z=z-1; }` (ESOP2008),
+/// the counter/accumulator reaches ~`x`; at `x == INT_MAX` the next `+1` is a spurious
+/// `INT_MAX + 1` overflow that SV-COMP's no-overflow benchmarks label TRUE (the
+/// termination-* families — 2 full-pool false alarms, indistinguishable in the UBSan
+/// report from a genuine `x+1`-at-INT_MAX). At `2^30` a loop counter/accumulator stays
+/// under `INT_MAX` (no false alarm), while genuine large-value overflows still trap
+/// (`2^30 + 2^30`, `2^30 * 2`, `2^30 + 2^30` all exceed `INT_MAX`). The only loss is a
+/// direct `x+1`-EXACTLY-at-INT_MAX overflow, which cannot be caught without re-admitting
+/// the loop false alarms — soundness (FP=0) is worth more than that ambiguous case.
 const OVERFLOW_CONSTS: &[i64] = &[
     0,
     1,
@@ -1263,7 +1274,7 @@ const OVERFLOW_CONSTS: &[i64] = &[
     256,
     1024,
     65_535,
-    2_147_483_647,
+    1_073_741_824,
     -1,
     -2_147_483_648,
     2_147_483_648,
