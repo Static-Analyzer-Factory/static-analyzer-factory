@@ -138,3 +138,253 @@ sub-agent) · `progress-journal.md` (durable shift-handoff) · `report.sh` (huma
 Never push; never merge to `svcomp` without the human; never edit the scorer/audit/labels/holdout;
 never emit `true` outside the gated paths; FP=0 & wrong-TRUE=0 every kept arm; byte-determinism;
 all builds/evals in Docker on the VM.
+
+---
+
+# Addendum A (2026-08-14) — capability track, ConcurrencySafety-FALSE, research/learn arms, verified headless mechanics
+
+Research-backed and adversarially verified (workflow `wf_35fcca7f`, primary sources: SV-COMP
+2025/2026 rules+benchmarks pages, TACAS reports, Lazy-CSeq/CSeq + Symbiotic + Claude Code headless
+docs). Full brief + per-claim verdicts: **`plans/204-research-brief.md`**. This addendum SUPERSEDES
+the base plan wherever they differ. Two verified corrections to the base plan and two refuted
+"obvious" levers are flagged inline — do not re-introduce them.
+
+## A0. Motivation (user, 2026-08-14)
+The loop must do more than tune recall of already-wired properties: it must be able to **build NEW
+enabling capabilities** — flagship example **ConcurrencySafety-FALSE** (SAF abstains on all concurrent
+programs today) — and it must **learn mechanisms from the best SV-COMP tools via WebSearch** (learn
+the *mechanism*, never copy code; REQ-IP-001). The base plan's per-arm gate structurally forbids
+both; §A2 fixes that without weakening any soundness gate.
+
+## A1. Scoring truth (verified) — ConcurrencySafety-FALSE is a real C.FalseOverall lever
+- **A correct, confirmed FALSE on a ConcurrencySafety task counts in `C.FalseOverall`** (+1; wrong
+  FALSE −16). `C.FalseOverall` = **all C categories with the TRUE results dropped** (not "all
+  non-Termination" — SV-COMP **2026 renamed FalsificationOverall→C.FalseOverall and now INCLUDES
+  Termination**; base plan wording is stale but the GO signal is unchanged).
+- ConcurrencySafety is **4 sub-categories over one `Concurrency.set`**: Main (`unreach-call`),
+  MemSafety, NoOverflows, NoDataRace-Main. **Three of the four test properties SAF ALREADY confirms
+  concretely** (reach_error / ASan / UBSan) — the value is NOT limited to the hard data-race property.
+- `no-data-race` **TRUE** scores only in `C.TrueOverall` (worthless to SAF, per [[saf-svcomp-202-r8-nodatarace-defer]]); `no-data-race` **FALSE** (a real reachable race) DOES count in
+  `C.FalseOverall` but needs its own race confirmer (late slice §A7 lever 9). **Verdict: GO.**
+
+## A2. The capability-track gate fix (THE core plan-204 change)
+**Verified problem:** base gate ⑤(d) requires `CONFIRMED train-delta > 0` for **every** kept arm, and
+arms are atomic keep-or-revert with no cross-arm accumulation → any multi-slice capability whose
+Slice-0 spine scores 0 is reverted before the payoff. The loop is structurally confined to greedy
+tuning. **Fix: split gate (d) into two orthogonal predicates.**
+
+- **SOUNDNESS predicate — ABSOLUTE, byte-identical for BOTH modes, always the non-LLM supervisor:**
+  (a) immutable-file sha256 intact · (b) holdout-not-read audit · (c) re-run the immutable scorer with
+  **FP=0 AND wrong-TRUE=0** · nextest/clippy/fmt green. **Gate (c) runs on the FULL immutable SAFE
+  reservoir for the arm's family — NEVER a subsample** (plan-203 lesson: sample FP=0 at N=40–60 was
+  38 real FPs at scale, each "confirmed" by the ASan pipeline — *"confirmed by the pipeline" ≠ "correct
+  verdict"*). A new FALSE-emitting confirmer is the **higher-risk** class; scan it against the entire
+  SAFE pool for latent FP classes before keep.
+- **PROGRESS predicate — mode-dependent:**
+  - **tuning arm** (targets an already-wired scoring property) → unchanged: `CONFIRMED train-delta > 0`.
+  - **capability arm** (a not-yet-wired property / new engine, declared milestone ladder) → a
+    **milestone contract** instead of a train-delta.
+
+**Supervisor decision rule (deterministic, logged every arm, never an LLM judgment):** the supervisor
+picks the mode at **lever-selection time** from the **human-curated lever taxonomy (§A7)**. Each arm
+writes an `arm.json` declaring `mode∈{tuning,capability}`, target family, and (capability) the
+milestone predicate. Consistency check removes any incentive to mislabel: a capability-flagged arm
+that *does* move score folds in as success; a tuning-flagged arm that fails to move score reverts as
+today. The **only** asymmetry a capability flag buys: a **zero-delta arm may survive IFF
+capability-flagged AND it meets its milestone AND it touches only a `cap-*` branch.**
+
+**Milestone acceptance for a capability arm** (replaces "score rose this arm"):
+1. **FP=0 on the family's held-out SAFE set** via gate (c) on the **FULL** reservoir (never a subsample).
+2. **Either** a declared structural milestone advanced (a unit test the arm adds, itself run under the
+   FP audit), **or** (terminal arm) **≥1 newly-confirmed FALSE** on the target family that baseline
+   missed, validated by the **same immutable witness/confirmation pipeline** the aggregate score uses.
+3. Capability arms accumulate on a **`cap-<capability>/<n>` branch lineage** (never reverted between
+   scaffolding arms, never auto-merged to `svcomp`), tagged `not-yet-scoring` in the journal, so arm
+   N+1 builds on arm N.
+
+**Anti-gaming (absorb both REFUTED premises — do not re-introduce):**
+- **DO NOT** justify the relaxation with *"no reward-hacking exploit attacks the score-delta."* FALSE:
+  memorization/benchmark-keyed overfitting raises the measured score without touching the scorer and is
+  **the dominant** coding-agent exploit (SpecBench/EvilGenie). The relaxation is safe **because** (i)
+  soundness is enforced by (a)–(c) independently of (d), and (ii) the real anti-overfit control is the
+  **frozen svcomp26 HELD-OUT gate + origin-family (not per-task) split** — which must be a **HARD
+  reject** for any arm whose train gain does not reproduce on held-out.
+- **DO NOT** claim a capability milestone is a *"stronger soundness bar."* FALSE: both modes clear the
+  same gate (c); a capability arm is only weaker on *progress*. Soundness comes from full-reservoir
+  gate (c) + the held-out gate, never from any "capability > tuning" ordering.
+- **`arm_prompt.md` redline:** confirmers must be property-general — **no benchmark-path / function-name
+  / task-id keying** (closes the memorization exploit). WebSearch/WebFetch scoped to the ACT step,
+  deny-by-default egress (model + search endpoint only), no arbitrary curl, no `git push`; every fetched
+  URL logged into the same transcript audit that checks holdout-not-read.
+
+**De-prioritization (non-converging track): milestone-budgeted circuit breaker with a PARKED state, not
+a hard kill.** Each capability track gets a budget (~6–8 arms / bounded tokens per milestone). Advance
+within budget → refill. Budget consumed with no advance → **PARK** the `cap-*` branch for human review,
+deprioritize the lever, rotate. **Graduation:** once a capability's confirmed FALSEs raise the
+**aggregate svcomp26 HELD-OUT score** (step 6, the real signal), its confirmer joins the baseline and
+future arms on it are scored as **tuning**. (This matches SAF history: R4/R8 correctly abandoned, but
+their scaffolding taught the next slice.)
+
+## A3. ConcurrencySafety-FALSE — recommended sound mechanism (ranked)
+1. **Bounded round-robin lazy sequentialization (AIR→AIR transform) as the FINDER.** Reimplement the
+   Lal-Reps / La-Torre-Madhusudan-Parlato / Lazy-CSeq schema from scratch (REQ-IP-001): pc-labeled
+   re-enterable thread functions, per-thread **static local cells** (locals keep real concrete values
+   across yields), round-robin driver with nondeterministic yield, bounds *K* rounds × *N* threads.
+   **Soundness for FALSE is proven:** it is an **under-approximation of the schedule space with NO
+   data/state over-approximation** — every violation it finds is a genuine concurrent violation;
+   tightening *K*/*L* costs only recall, never a spurious FALSE.
+2. **Deterministic-replay scheduler shim as the CONFIRMER** (the composability lever). A violating path
+   yields an explicit **(round, thread, steps-before-yield) schedule vector**; a small pthread
+   interposer (intercept create/join/mutex/cond + yield points, gate each op on a shared turn-counter)
+   forces that exact interleaving on the **real, un-transformed binary** under ASan/UBSan. Confirmation
+   on the real binary ⇒ a mis-modeling transform can only cost recall (replay fails → abstain), **never
+   a wrong FALSE** — identical to SAF's sequential "prove-reach OR concretely-reproduce" doctrine.
+3. **CHESS-style preemption-bounded concrete testing** — the cheapest first-pass finder AND the replay
+   substrate (it *is* the shim). Most SV-COMP concurrency bugs manifest within few context switches.
+
+**FIRST de-risk milestone (throwaway VM branch, plan-198/202 style): build the replay shim ALONE**, run
+it as a CHESS-style c≤1→c≤2 **blind sweep** over the ConcurrencySafety-FALSE reservoir with ASan/UBSan
+on. **Metric: FALSE recall at FA=0.** This de-risks the confirmer independently of the transform and
+reuses SAF's oracle verbatim; if a shallow sweep already catches a non-trivial fraction at 0 false
+alarms, ship it before building the sequentialization. Milestone 2 = the AIR→AIR pass, every proposed
+FALSE re-confirmed by the shim on the original binary before emission.
+
+**SC is sufficient (verified):** ConcurrencySafety-C is sequentially consistent (interleaving
+semantics). **Do NOT build weak-memory (TSO/PSO/C11-relaxed) machinery for the first capability.**
+
+**Fail-closed guardrails (arm invariants):** (a) native x86 replay is TSO → **ABSTAIN on
+pthread-wmm / C11-relaxed**; (b) reachability-gate dead `pthread_create` scaffolding (reuse plan-198
+`reachable_spawns_threads`); (c) dropped `#pragma omp`/OpenMP → **abstain** (plan-202 lesson);
+(d) model `__VERIFIER_atomic_begin/end` uninterruptible, any un-modeled sync primitive → abstain
+(encoding fidelity, not the round bound, is the real spurious-FALSE risk); (e) abstain on any divergence
+between shim replay and the recorded schedule.
+
+**Witness — a REAL correction to the base plan.** SAF's YAML-2.0 witness pipeline and its
+`cpa-witness2test` execution validator **DO NOT WORK for concurrency violations** (Witness Format 2.0:
+*"Violation witnesses have not yet been defined for concurrency safety."*). Concurrency FALSE must be
+witnessed in **GraphML format 1.0** carrying thread-schedule keys (`threadId` per transition,
+`createThread` edges, `startline`), confirmed by **CPAchecker-ThreadingCPA / Dartagnan /
+ConcurrentWitness2Test** (execution-based — SAF's replay identity is NOT disqualified). **Build an
+independent GraphML-1.0 emitter** that serializes the exact interleaving SAF replayed; without it every
+concurrency FALSE lands **+0 (raw), not +1**. Confirm the year-2027 active concurrency validators
+before relying on it (2024 had <3).
+
+## A4. Recall + witness-confirmation levers (mechanisms — two refuted "obvious" bets flagged)
+- **REFUTED — "the 2026-new unreach miss is BMC/KLEE nondet-solving territory."** Inverted: the marquee
+  new-2026 content is the **Intel TDX Module firmware set (~418 tasks, HarnessForge)** and its hardness
+  is **STRUCTURAL** — frontend fragility on anonymous unions/nested types (causes *quiet wrong answers*
+  in top tools), complex-object havocking (motivated the new `__VERIFIER_nondet_memory()` primitive),
+  harness construction + preconditions; ~30% of cover points are unreachable/expected-TRUE (out of scope
+  for a FALSE-finder). **Directive:** treat bounded path-solving as ONE lever, not the dominant bet;
+  prioritize **harness/entry-point synthesis + complex-object havocking** and **frontend robustness on
+  unions/nested types**; **split the 2026-new batch by shape and attribute recall per shape before
+  betting heavily.**
+- **REFUTED — "emit the replay's nondet values as assumption/value waypoints to lift confirmation-%."**
+  Refuted on every link: SAF's `witness_lower.rs` emits only `branching`+`target` (the internal
+  `FalseCandidate.nondet_sequence` is never lowered); an assumption `x==6` needs the C-level name SAF's
+  frontend drops after mem2reg; and plan-195 **already measured** Tier-A branching = zero change and
+  declared Tier-B assumption-values NO-GO. **The REAL confirmation lever (measured 3/7→6/7): wire an
+  execution-based validator (cpa-witness2test-style) into SAF's OWN confirmation gate** — accept CONFIRM
+  if analysis OR execution replay agrees (validator-side, SAF already does concrete replay internally,
+  so it can self-confirm). Before any witness-content work, **dump a few unconfirmed-but-correct SAF
+  witnesses and diff against what the validator needs** to locate the true bottleneck.
+- **Sound recall mechanisms (all keep SAF's replay as the SOLE arbiter → soundness-neutral):**
+  backward **AIR program slicing** from the sink (Symbiotic mechanism; scalability multiplier, shrinks
+  witnesses); **bounded symbolic path-solving as an input oracle** (collect path condition → solve with
+  SAF's SMT for a concrete nondet model → feed the **existing native replay**; wrong model → replay
+  fails → abstain → no −16/−32 risk; incremental bound raising k=1,2,4…). **Redline:** replay must
+  exercise the **unmodified** program under SV-COMP-faithful semantics (correct 32/64 bit-width,
+  in-source violation attribution, full nondet determinization, abstain-on-UB/divergence).
+
+## A5. Research/learn arm directive (reusable `arm_prompt.md` block)
+> **During the ACT step you MAY use WebSearch/WebFetch** to learn how top SV-COMP tools *work*
+> (Lazy-CSeq/CSeq sequentialization, Symbiotic slicing+KLEE, CBMC/ESBMC BMC, GenMC/Nidhugg DPOR,
+> Witch3/cpa-witness2test). **Prefer PRIMARY sources** (sv-comp.sosy-lab.org, TACAS proceedings, tool
+> papers/repos). **Extract the MECHANISM** (the algorithmic idea, well enough to reimplement from
+> scratch) — **never code; no vendoring, no copy** (REQ-IP-001). Write a **fresh independent
+> implementation** that passes SAF's own tests. **Log every fetched URL** into the per-arm transcript
+> audit. Deny-by-default egress: model provider + search endpoint only; no arbitrary curl, no `git
+> push`. Web access does not weaken gates (a)–(c) (immutables are local/hash-gated; the holdout is a
+> local manifest you must not READ). *(Enforcement is a review property — the adversarial-review Claude
+> flags any diff that looks copied — plus the frozen scorer + FP audit, which validate the result
+> regardless of source.)* Overfit note: a sound concrete-replay confirmer is a low-complexity,
+> mechanism-level object that cannot overfit the way a tuned threshold can, so capability arms importing
+> a mechanism are **lower** overfit risk than tuning arms.
+
+## A6. Verified Claude Code headless / rate-limit mechanics (corrects §"Verified operational facts")
+- **Classify transient-vs-hard from the structured `system`/`api_retry` stream event, NOT prose.**
+  Requires `--output-format stream-json --verbose`. Event carries `attempt`, `max_retries`,
+  `retry_delay_ms`, `error_status` (HTTP code or **null** for connection errors), and
+  `error∈{authentication_failed, oauth_org_not_allowed, billing_error, rate_limit, overloaded,
+  invalid_request, model_not_found, server_error, max_output_tokens, unknown}`. Switch on `.error`:
+  transient `{overloaded, server_error, rate_limit-throttle, null-status}` → jittered exp backoff +
+  resume-by-id; hard/abort `{authentication_failed, billing_error, oauth_org_not_allowed,
+  invalid_request, model_not_found, max_output_tokens}`; `unknown` → conservative bounded retry.
+- **Gate per-arm success on the terminal result `subtype=="success"`, NOT `is_error`, NOT exit code.**
+  `is_error` stays `false` on `error_max_turns` (silent-truncation footgun); the `result` text is
+  present only on `success`. Subtypes: `success | error_max_turns | error_max_budget_usd |
+  error_during_execution | error_max_structured_output_retries`. On `error_max_turns`, **resume from
+  `session_id`** (all subtypes carry it). Treat exit 143 as supervisor-initiated kill; do not assert
+  other non-zero codes — branch on subtype.
+- **Launch:** `claude -p --output-format stream-json --verbose --allowedTools <explicit> --max-turns N`
+  (`--max-budget-usd B` if available); capture `session_id`; drive all retries/resumes by it; **never
+  `--continue`** in a multi-arm loop (races on "most recent in dir"). `--bare` isolates from
+  hook/skill/plugin/MCP/CLAUDE.md auto-discovery but **requires `ANTHROPIC_API_KEY`** — the VM uses
+  PROXY auth (`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`), so **verify `--bare` compatibility on the
+  VM before relying on it**; otherwise use an explicit `--allowedTools` allowlist + a PreToolUse
+  denylist hook as the isolation control.
+- **Reset time is a Unix epoch in headless, not "3:45pm" prose** — parse the pipe-delimited epoch (may
+  arrive on a non-JSON line; guard `JSON.parse`), or poll the status-line JSON
+  `rate_limits.five_hour.resets_at` / `.seven_day.resets_at` (Pro/Max only). Sleep-to-reset conclusion
+  stands; the parsing guidance inverts the base plan.
+- **stream-json stdout can stall mid-session** → the supervisor needs a **wall-clock watchdog
+  independent of stream events**. **Proxy gotcha:** a non-first-party `ANTHROPIC_BASE_URL` may strip the
+  unified quota headers → **don't trust the CLI's auto-classification behind the proxy**; classify from
+  the `api_retry` event + a conservative fixed-sleep fallback.
+- **Env:** `CLAUDE_CODE_MAX_RETRIES` low (3–5) so the supervisor sees hard blocks fast and owns the
+  sleep policy; `API_TIMEOUT_MS≈1200000` for the proxy; **unset** telemetry vars (any non-empty value
+  incl. `"0"` turns them ON).
+- **Isolation = BOTH** a preventive PreToolUse-hook/denylist on the holdout path AND a post-hoc audit
+  scanning `~/.claude/projects/<sanitized-cwd>/<session-id>.jsonl` for `tool_use` Reads of that path.
+  **Pin the CLI version** (the JSONL per-line schema is internal/version-coupled).
+- **systemd:** the **plain-process supervisor** (not a claude worker) is the long-lived unit —
+  `Restart=always`, `RestartSec` backoff, `EnvironmentFile` (chmod 600), generous timeouts. **Persist
+  per-arm `session_id` to a state file so reboot resumes arms by id**, not restart.
+
+## A7. Lever taxonomy / punch list (the supervisor's ROI-ordered menu; tag decides tuning vs capability)
+1. **[tuning]** Wire an execution-based validator into SAF's confirmation gate — CONFIRM if analysis OR
+   execution replay agrees (measured 3/7→6/7; no witness-content change). *(Replaces the refuted
+   "emit nondet values" lever.)*
+2. **[capability]** ConcurrencySafety-FALSE **Milestone 1** — deterministic-replay scheduler shim as a
+   CHESS c≤1→c≤2 blind sweep w/ ASan/UBSan; metric FALSE-recall at FA=0.
+3. **[capability]** Backward AIR program slicing from the sink (control+data closure via existing
+   points-to) — scalability multiplier for symbolic solving + smaller witnesses.
+4. **[capability]** Harness/entry-point synthesis + complex-object havocking (`__VERIFIER_nondet_memory`
+   -style) — the binding constraint on the 2026-new TDX firmware batch. *(Replaces the refuted
+   "path-solving is dominant" lever.)*
+5. **[capability]** Bounded symbolic path-solving as an input oracle → existing native replay (replay
+   decides; wrong model → abstain; incremental bound raising; bit-width/UB/semantics-faithful).
+6. **[capability]** ConcurrencySafety-FALSE **Milestone 2** — lazy round-robin sequentialization AIR→AIR
+   pass; every proposed FALSE re-confirmed by the Milestone-1 shim on the original binary.
+7. **[capability]** GraphML-1.0 concurrency-witness emitter (threadId/createThread/startline from the
+   replayed schedule) → CPAchecker-ThreadingCPA / Dartagnan / ConcurrentWitness2Test; without it every
+   concurrency FALSE is +0.
+8. **[tuning]** Frontend robustness on anonymous unions / nested types — prevents quiet wrong answers,
+   unlocks TDX-family reachability.
+9. **[capability, later]** Dedicated concrete race confirmer (TSan-style happens-before replay) for the
+   ~235 racy NoDataRace-FALSE tasks.
+10. **[deferred]** Weak-memory encodings & full DPOR engine — unnecessary for SC-only ConcurrencySafety-C.
+
+**Cross-cutting invariants for EVERY arm:** gate (c) on the FULL immutable SAFE reservoir (never a
+subsample); scan each new FALSE-emitter against the whole SAFE pool for latent FP classes before keep;
+replay the **unmodified** program under SV-COMP-faithful semantics; abstain on any divergence /
+un-modeled primitive / weak-memory / dropped pragma; **held-out svcomp26 is a HARD reject** for train
+gains that don't reproduce; **no benchmark-path/function-name/task-id keying**.
+
+## A8. VM baseline prerequisite (discovered 2026-08-14)
+The VM (`cd-vm-15-ai-vm`) `svcomp` checkout is at a **stale HEAD (plan-191 era) with a large uncommitted
+working tree** (R1–R8 arrived via `rsync` of `crates/`+`scripts/`, never committed there). The loop does
+`git checkout -b arm/<n>`, commits kept arms, and **reconstructs state from `git log`** — it needs a
+**clean, current baseline**. **Setup step before Stage 1:** bring the VM to a clean `svcomp` baseline
+matching the laptop HEAD via a **`git bundle`** transfer (no push to origin), working tree clean, then
+regenerate the splits deterministically. Only then freeze immutables and run the dry-run.

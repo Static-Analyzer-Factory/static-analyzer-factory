@@ -1,0 +1,16 @@
+{
+  "_comment": "Settings passed to each claude worker via --settings. Installs the PreToolUse holdout denylist hook as the preventive isolation layer (Addendum A6). The supervisor's transcript audit is the second layer.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Bash|Grep|Glob|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/scripts/loop/hooks/deny-holdout.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

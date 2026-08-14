@@ -1,6 +1,14 @@
 # Rust
 /target/
 
+# SAF autonomous loop (plan 204): generated state + splits + research provenance (never committed by arms)
+/.loop-state/
+/tests/benchmarks/svcomp-splits/
+/plans/.204-research-raw.json
+/eval-*.json
+/final*-*.json
+/pertask*.jsonl
+
 # Python
 __pycache__/
 *.pyc

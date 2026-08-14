@@ -1,0 +1,34 @@
+# systemd (user) unit for the SAF autonomous loop. Enable AFTER a watched dry-run passes.
+# Install (on the VM):
+#   cp scripts/loop/saf-loop.service ~/.config/systemd/user/
+#   export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user daemon-reload
+#   systemctl --user enable --now saf-loop        # linger is already on -> survives logout + reboot
+# The long-lived unit is the PLAIN supervisor (never a claude worker); it resumes arms from
+# .loop-state on restart. It NEVER pushes and NEVER merges to svcomp.
+[Unit]
+Description=SAF SV-COMP autonomous improvement loop (plan 204)
+Wants=network-online.target
+After=network-online.target
+# Never stop restarting on crashes (default start-limit would kill the service after a few fast
+# restarts — fatal for an unattended run).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/static-analyzer-factory
+EnvironmentFile=%h/.claude-code.env
+Environment=SAF_LOOP_STATE=%h/static-analyzer-factory/.loop-state
+# Minimal systemd user env needs an explicit PATH so claude/docker/git/python3 resolve.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:%h/.local/bin
+ExecStart=/usr/bin/env bash %h/static-analyzer-factory/scripts/loop/supervisor.sh --loop
+# on-failure (NOT always): a crash/OOM -> restart + resume from .loop-state; a CLEAN completion
+# (all levers parked, or MAX_ARMS reached) -> exit 0 -> graceful stop, no tight restart loop.
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=300
+KillMode=control-group
+# Resource hygiene on the swap-less VM; the eval also self-caps via --max-rss-mb + ASan caps.
+Nice=5
+
+[Install]
+WantedBy=default.target
