@@ -115,3 +115,33 @@ achieved holdout fraction near target per property. Eval: RAW and CONFIRMED scor
 recall reported separately for train and holdout with a clean −16/−32 audit (FP=0,
 wrong-TRUE=0). BenchExec: `saf.xml` validates and runs at competition limits producing
 a `table-generator` score table.
+
+## Outcome (2026-08-14) — full-pool runs found & fixed 7 issues; final sound + deterministic
+
+The harness ran full-pool on svcomp25 (train) + svcomp26 (holdout). Each run surfaced a
+real bug that the earlier stratified samples missed; all fixed and committed on `svcomp`:
+
+1. `a40076e` split manifest stored abs host paths → invisible in Docker (`/workspace`).
+2. `881ef8b` no-straddle guard scoped to grouped mode (edition holdout legitimately spans).
+3. `3ad7c48` `--per-task` diagnostic JSONL (verdict/outcome/duration/stderr on misses).
+4. `54349c3` narrowed CWE761 memsafety R1 to length-walk `ldv_strlen` (FP 38→0, keeps
+   ~1000 real CWE12x buffer bugs that fault in `ldv_memcpy`).
+5. `88ab2c8` stub `rand()/srand()` via `-Wl,--wrap` (Juliet `*_rand_*` were non-deterministic).
+6. `992eac3` gate unreach FALSE replay on `reachable_spawns_threads` (2 goblint racefree FPs).
+7. `604256b`/`7b0fff6` memory caps: `hard_rss_limit_mb=3072` (ASan RSS monitor) + eval
+   RSS-subtree watchdog — a harness that OOM'd the 62 GB swap-less host six times is now bounded.
+8. `bf71cda` overflow mini-fuzz uses `2^30` not `INT_MAX` (kills `INT_MAX+1` loop-counter/
+   accumulator FPs: Parts, ESOP2008).
+
+**Final measured svcomp25 (all fixes, capped, unreach sampled→extrapolated):** memsafety
+5361 TP / **FP 0**, no-overflow 1201 TP / **FP 1**, unreach ~224 (6.6% of 3392) / FP 0,
+termination 396 (198 TRUE), ndr 0 → **RAW ≈ 7166**; **confirmed C.FalseOverall ≈ 3960 +
+~396 termination.** svcomp26-new (holdout) adds +33 raw. Versus the first run: **40 false
+alarms → 1**, and **memsafety recall 4368 (rand-noisy) → 5361 (stable)**; deterministic;
+**no OOM** (`rss_kills=0`, ran the previously-fatal memsafety at jobs=16 with 60 GB free).
+
+**The 1 residual FP** = `termination-numeric/twisted` (`return i+j` where loop counters
+`i,j` reach nondet bounds `k=l=2^30` → `2^30+2^30` overflow) — indistinguishable in the
+UBSan report from a genuine `x+x` overflow (the exact pattern the confirmer relies on), so
+unfixable without losing all addition-overflow recall → accepted as inherent label noise
+(1/9060). Result JSONs on the VM: `final3-{train,holdout}-*.json` + `pertask4-*.jsonl`.
