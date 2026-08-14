@@ -1534,6 +1534,14 @@ fn synthesize_asan_driver() -> String {
     s.push_str("void __VERIFIER_atomic_begin(void) { }\n");
     s.push_str("void __VERIFIER_atomic_end(void) { }\n");
     s.push_str("void __VERIFIER_assume(int c) { if (!c) _exit(0); }\n");
+    // Determinism (reproducibility is an SV-COMP requirement): Juliet's `*_rand_*`
+    // variants call `srand(time(NULL))` and derive buffer indices/sizes from `rand()`,
+    // so a native replay's verdict flips run-to-run. Intercept both via the linker's
+    // `--wrap` (see the `-Wl,--wrap=rand/srand` compile flags): `rand()` is tied to the
+    // mini-fuzz constant (`SAF_NONDET_CONST`), so the constant sweep deterministically
+    // probes rand-driven indices instead of a time seed; `srand()` becomes a no-op.
+    s.push_str("int __wrap_rand(void) { return (int)__saf_c(); }\n");
+    s.push_str("void __wrap_srand(unsigned s) { (void)s; }\n");
     s
 }
 
@@ -1586,6 +1594,9 @@ fn asan_confirm(
             "-fsanitize=address",
             "-fno-sanitize-recover=address",
             "-Wno-everything",
+            // Determinism: redirect rand()/srand() to the driver's __wrap_* stubs.
+            "-Wl,--wrap=rand",
+            "-Wl,--wrap=srand",
         ])
         .arg(data_model.clang_flag())
         .arg("-include")
@@ -1757,6 +1768,9 @@ fn ubsan_confirm(
             "-fsanitize=signed-integer-overflow",
             "-fno-sanitize-recover=signed-integer-overflow",
             "-Wno-everything",
+            // Determinism: redirect rand()/srand() to the driver's __wrap_* stubs.
+            "-Wl,--wrap=rand",
+            "-Wl,--wrap=srand",
         ])
         .arg(data_model.clang_flag())
         .arg("-include")
