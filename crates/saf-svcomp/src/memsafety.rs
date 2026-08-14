@@ -165,27 +165,30 @@ fn is_print_helper(func: &str) -> bool {
     func.starts_with("print") && func.contains("Line")
 }
 
-/// An sv-benchmarks LDV MEMORY/STRING MODEL (`ldv_reference_realloc`, `ldv_malloc`,
-/// `ldv_free`, `ldv_strcpy`, `ldv_strlen`, `ldv_strdup`, `ldv_memcpy`, `ldv_memset`, …)
-/// — a verifier abstraction, NOT the program under test. These models are faithful only
-/// under ABSTRACT verification; under SAF's concrete ASan replay they can fault as a
-/// model artifact on a SAFE program:
-/// - `ldv_reference_realloc` does `res = malloc(NEW); memcpy(res, old, NEW)` — an OOB
-///   read of the smaller old buffer.
-/// - `ldv_strcpy(dst, src)` / `ldv_strdup(src)` allocate/copy `ldv_strlen(src)` bytes but
-///   do NOT write the terminating NUL (sv-benchmarks CWE761 `char_fixed_string` good),
-///   so a subsequent `ldv_strlen(dst)` walks off the heap buffer → a spurious
-///   heap-buffer-overflow READ *inside `ldv_strlen`* (38 full-pool false alarms).
-/// A fault attributed to one of these models is rejected like the libc I/O interceptors
-/// (R1) — a real program bug faults at the program's OWN access (the CWE sink), never
-/// inside these models. (`str`/`mem` are matched in addition to `alloc`/`free`; non-model
-/// `ldv_` helpers like `ldv_undef_int`/`ldv_exit` carry none of these and are unaffected.)
+/// An sv-benchmarks LDV MODEL whose fault under concrete ASan replay is an ARTIFACT of
+/// the abstraction, not a bug in the program under test. Two families qualify:
+///
+/// 1. **Allocator models** (`ldv_reference_realloc`, `ldv_malloc`, `ldv_free`, …): e.g.
+///    `ldv_reference_realloc` does `res = malloc(NEW); memcpy(res, old, NEW)` — an OOB
+///    read of the smaller old buffer.
+/// 2. **String-LENGTH models** (`ldv_strlen` / `ldv_strnlen` / `ldv_wcslen`, incl. the
+///    numbered wrappers `ldv_strlen_3`): these walk to a NUL, and overread a heap buffer
+///    ONLY because the companion `ldv_strcpy`/`ldv_strdup` models copy `ldv_strlen(src)`
+///    bytes WITHOUT the terminating NUL (the CWE761 `char_fixed_string` good artifact).
+///
+/// CRITICALLY, this must NOT match the COPY/INDEX models (`ldv_memcpy`, `ldv_memmove`,
+/// `ldv_strcpy`, `ldv_memset`): a REAL CWE121/122/124/126/127 buffer overflow/underread
+/// faults *inside those* with a bad size the PROGRAM supplied, so it is a genuine
+/// violation — rejecting them abstained on ~1000 real bugs (measured). Only the
+/// length-walk artifact and the allocator models are rejected here.
 fn is_harness_memory_model(func: &str) -> bool {
-    func.starts_with("ldv_")
-        && (func.contains("alloc")
-            || func.contains("free")
-            || func.contains("str")
-            || func.contains("mem"))
+    if !func.starts_with("ldv_") {
+        return false;
+    }
+    func.contains("alloc")
+        || func.contains("free")
+        || func.contains("strlen")
+        || func.contains("wcslen")
 }
 
 /// A deallocation function or its ASan interceptor (`free`, `cfree`, the allocator's
@@ -337,6 +340,27 @@ READ of size 1 at 0x50b0000000a4 thread T0
     #2 0x555 in goodB2G /workspace/x/CWE761_char_fixed_string_01_good.i:888:13
 ";
         assert_eq!(parse_asan_report(LDV_STRLEN_OVERREAD), None);
+    }
+
+    #[test]
+    fn buffer_overflow_faulting_in_ldv_memcpy_is_a_real_bug_and_is_caught() {
+        // A real CWE121/122/124/126/127 buffer overflow/underread copies with a bad size
+        // the PROGRAM supplied, faulting INSIDE the faithful `ldv_memcpy` model. This is a
+        // genuine violation and must be CAUGHT — the earlier broad `ldv_*mem*` rejection
+        // abstained on ~1000 of these (measured full-pool). The narrowed rule rejects only
+        // the length-walk artifact (`ldv_strlen`), never the copy/index models. #0 is
+        // ASan's memcpy interceptor (a `+offset` object token, skipped); the located frame
+        // is `ldv_memcpy`.
+        const LDV_MEMCPY_OOB: &str = "\
+==7==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502 at pc 0x555 bp 0x7ff sp 0x7ff
+WRITE of size 40 at 0x502 thread T0
+    #0 0x555 in __asan_memcpy (/tmp/h+0xc5105)
+    #1 0x555 in ldv_memcpy /workspace/x/CWE122_heap_bad.i:1162:3
+    #2 0x555 in badSink /workspace/x/CWE122_heap_bad.i:900:5
+";
+        let hit = parse_asan_report(LDV_MEMCPY_OOB).expect("a real ldv_memcpy OOB is a bug");
+        assert_eq!(hit.subproperty, "valid-deref");
+        assert_eq!(hit.line, 1162);
     }
 
     #[test]
