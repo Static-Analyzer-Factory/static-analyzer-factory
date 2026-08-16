@@ -2223,6 +2223,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "tracing",
+ "z3",
 ]
 
 [[package]]

@@ -6,8 +6,10 @@
 //! [`program_structurally_terminates`] holds iff **T∧L∧A∧I∧E**:
 //!
 //! - **(T)** the program has a *defined* `main`;
-//! - **(L)** every function reachable-from-`main` that is *defined* has a
-//!   **loop-free** (DAG) CFG (no back-edge);
+//! - **(L)** every function reachable-from-`main` that is *defined* either has a
+//!   **loop-free** (DAG) CFG (no back-edge) *or* every one of its natural loops
+//!   admits a **linear ranking function** ([`crate::ranking::loops_are_ranked`],
+//!   R7 follow-on) — a complete, sound termination proof for that loop;
 //! - **(A)** the reachable **call graph is acyclic** (no recursion);
 //! - **(I)** there is **no reachable unresolved indirect call** — any reachable
 //!   `CallIndirect` / `IndirectPlaceholder` forces abstain (it could hide a
@@ -200,9 +202,17 @@ pub fn program_structurally_terminates(module: &AirModule) -> bool {
         return false;
     }
 
-    // (L) every reachable defined function has a loop-free CFG.
-    !module.functions.iter().any(|f| {
-        reachable_fids.contains(&f.id) && !f.is_declaration && cfg_has_loops(&Cfg::build(f))
+    // (L) every reachable defined function is either loop-free OR has all of its
+    // natural loops proven terminating by linear ranking-function synthesis
+    // (`ranking::loops_are_ranked`, R7 follow-on). A ranking function is a
+    // complete, sound termination proof, so this preserves the −32 guarantee while
+    // extending recall past the plan-201 loop-free-only slice.
+    module.functions.iter().all(|f| {
+        if !reachable_fids.contains(&f.id) || f.is_declaration {
+            return true;
+        }
+        let cfg = Cfg::build(f);
+        !cfg_has_loops(&cfg) || crate::ranking::loops_are_ranked(f, module, &cfg)
     })
 }
 

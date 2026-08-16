@@ -1079,6 +1079,10 @@ fn build_witness(
 /// (Stage 2/3). Never emits `true`. The witness is a *side output* of an
 /// already-sound verdict — a `false` is still returned when the witness cannot be
 /// constructed (e.g. a missing span), it just scores 0 like `unknown`.
+// NOTE: staged unreach-call strategy (Stage 1 must-reach → Stage 2/3 replay) kept
+// as one cohesive unit; splitting the stages across helpers would obscure the
+// fail-closed control flow.
+#[allow(clippy::too_many_lines)]
 fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     use saf_svcomp::Property;
 
@@ -1259,7 +1263,7 @@ const UBSAN_OPTS: &str = "halt_on_error=1:abort_on_error=0:print_stacktrace=1";
 /// count, `for (i=0; i<=x; i++)` (Parts) or `while (z>0) { x=x+1; z=z-1; }` (ESOP2008),
 /// the counter/accumulator reaches ~`x`; at `x == INT_MAX` the next `+1` is a spurious
 /// `INT_MAX + 1` overflow that SV-COMP's no-overflow benchmarks label TRUE (the
-/// termination-* families — 2 full-pool false alarms, indistinguishable in the UBSan
+/// termination-* families — 2 full-pool false alarms, indistinguishable in the `UBSan`
 /// report from a genuine `x+1`-at-INT_MAX). At `2^30` a loop counter/accumulator stays
 /// under `INT_MAX` (no false alarm), while genuine large-value overflows still trap
 /// (`2^30 + 2^30`, `2^30 * 2`, `2^30 + 2^30` all exceed `INT_MAX`). The only loss is a

@@ -13,6 +13,10 @@ path = "src/lib.rs"
 [dependencies]
 saf-core = { workspace = true }
 saf-analysis = { workspace = true, features = ["z3-solver", "analysis-mta"] }
+# Direct Z3 access for linear ranking-function synthesis (Farkas → QF_LIA). The
+# `bundled` build is shared with `saf-analysis`'s identical `z3` dependency, so it
+# adds no extra native build.
+z3 = { version = "0.19", features = ["bundled"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }

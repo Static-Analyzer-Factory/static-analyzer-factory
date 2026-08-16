@@ -18,6 +18,7 @@ pub mod memsafety;
 pub mod overflow;
 pub mod property;
 pub mod property_kind;
+pub mod ranking;
 pub mod summaries;
 pub mod termination;
 pub mod witness_lower;
