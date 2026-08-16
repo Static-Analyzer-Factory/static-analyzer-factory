@@ -23,10 +23,18 @@ saf_eval() {
     crosscut_regression:after.json)  confirmed=320; per="{\"valid-memsafety\":{\"confirmed\":190},\"unreach-call\":{\"confirmed\":130}}" ;;
     *:after.json)                confirmed=100 ;;
   esac
-  [ -z "$per" ] && per="{\"valid-memsafety\":{\"confirmed\":$confirmed}}"
+  [ -z "$per" ] && per="{\"valid-memsafety\":{\"confirmed\":$confirmed,\"confirmed_false\":$confirmed,\"false_total\":200}}"
   printf "{\"confirmed_score\":%s,\"false_alarms\":%s,\"wrong_true\":%s,\"raw_score\":%s,\"max_score\":1000,\"per_property\":%s}\n" \
     "$confirmed" "$fp" "$wt" "$confirmed" "$per" > "$out"
-  [ -n "$pt" ] && : > "$pt"
+  # per-task dump for the observability task-flip diff: before=unknown, after=confirmed (a gain), so
+  # record.py exercises the flips path end to end (plan 205 §5a). Keyed on the output filename.
+  if [ -n "$pt" ]; then
+    case "$(basename "$pt")" in
+      before.pertask.jsonl) printf "%s\n" "{\"rel_yml\":\"t/x.yml\",\"property\":\"valid-memsafety\",\"outcome\":\"unknown\",\"witness\":null}" > "$pt" ;;
+      after.pertask.jsonl)  printf "%s\n" "{\"rel_yml\":\"t/x.yml\",\"property\":\"valid-memsafety\",\"outcome\":\"FalseCorrect\",\"witness\":\"CONFIRMED\"}" > "$pt" ;;
+      *) : > "$pt" ;;
+    esac
+  fi
   return 0
 }
 saf_tests() { return 0; }
@@ -45,6 +53,7 @@ saf_worker() {
     printf "%s\n" "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"file_path\":\"tests/benchmarks/svcomp-splits/train.jsonl\"}}]}}" > "$transcript"
   fi
   printf "%s\n" "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}" >> "$transcript"
+  [ "$SMOKE_SCENARIO" = worker_fail ] && return 1   # simulate a worker that edited then aborted
   return 0
 }
 '
@@ -77,10 +86,17 @@ scenario() {  # name  scenario  lever  expected-outcome-word
   # no leftover worker files) — the multi-arm-safety property the dry-run surfaced.
   local dirty br; dirty="$(git -C "$tmp" status --porcelain --ignore-submodules=all 2>/dev/null | wc -l | tr -d ' ')"
   br="$(git -C "$tmp" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-  if [ "$got" = "$expect" ] && [ "$dirty" = "0" ] && [[ "$br" == auto/loop-* ]]; then
-    printf '  ok   %-16s scenario=%-14s -> %-13s [clean, on %s]\n' "$name" "$sc" "$got" "$br"; pass=$((pass+1))
+  # OBSERVABILITY (plan 205 §1b): every arm — KEEP or REVERT or REJECT — must append exactly one
+  # arms.jsonl spine row for arm 1 whose recorded decision matches the journal decision.
+  local rec; rec="$(python3 -c 'import json,os,sys
+p=sys.argv[1]
+rows=[json.loads(l) for l in open(p)] if os.path.exists(p) else []
+r=next((r for r in rows if r.get("arm")==1), None)
+print(r.get("decision") if r else "MISSING")' "$tmp/state/arms.jsonl" 2>/dev/null || echo ERR)"
+  if [ "$got" = "$expect" ] && [ "$dirty" = "0" ] && [[ "$br" == auto/loop-* ]] && [ "$rec" = "$expect" ]; then
+    printf '  ok   %-16s scenario=%-14s -> %-13s [clean, on %s, rec=%s]\n' "$name" "$sc" "$got" "$br" "$rec"; pass=$((pass+1))
   else
-    printf '  FAIL %-16s scenario=%-14s expected=%s got=%s dirty=%s branch=%s\n' "$name" "$sc" "$expect" "${got:-<none>}" "$dirty" "$br"; fail=$((fail+1))
+    printf '  FAIL %-16s scenario=%-14s expected=%s got=%s dirty=%s branch=%s rec=%s\n' "$name" "$sc" "$expect" "${got:-<none>}" "$dirty" "$br" "$rec"; fail=$((fail+1))
     printf '       --- supervisor output ---\n%s\n' "$log" | sed 's/^/       /' | tail -20
   fi
   rm -rf "$tmp" 2>/dev/null || true
@@ -159,6 +175,7 @@ scenario cross_reg     crosscut_regression cross-smoke REVERT      # crosscut ar
 scenario tamper        tamper           tune-smoke  REJECT_TAMPER  # tamper an immutable -> reject
 scenario gate_sabotage gate_sabotage    tune-smoke  REJECT_TAMPER  # worker rewrites gates.py -> caught via pristine copy
 scenario holdout       holdout          tune-smoke  REJECT_HOLDOUT # read the holdout -> reject
+scenario worker_fail   worker_fail      tune-smoke  WORKER_FAIL    # worker aborted after editing -> wasted-work record still emitted (§1c)
 multi_arm_budget                                                  # lever repeats, parks after budget, loop breaks
 family_rotation                                                   # lever selection round-robins across families
 

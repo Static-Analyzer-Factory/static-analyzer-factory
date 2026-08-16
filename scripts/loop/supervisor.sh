@@ -294,11 +294,12 @@ run_arm() {
   git_here checkout -q "$base"
   if [ "$LOOP_GEN_MODE" = on ]; then
     # gen gate: score the reasoning VAL set (the metric) + the deduped TRAIN pool (the guard), both weighted.
+    # --per-task on the pool eval feeds the observability task-flip diff (plan 205 §5a); free (same run).
     saf_eval "$VAL_MANIFEST"   "$wk/val_before.json"  $prop_arg --group-weight
-    saf_eval "$TRAIN_MANIFEST" "$wk/pool_before.json" $prop_arg --group-weight
+    saf_eval "$TRAIN_MANIFEST" "$wk/pool_before.json" $prop_arg --group-weight --per-task "$wk/before.pertask.jsonl"
     py -c "import json;v=json.load(open('$wk/val_before.json'));p=json.load(open('$wk/pool_before.json'));print('base: val_w=%s pool_w=%s FP=%s'%(v.get('confirmed_score_weighted'),p.get('confirmed_score_weighted'),p.get('false_alarms')))" >&2 || true
   else
-    saf_eval "$TRAIN_MANIFEST" "$wk/before.json" $prop_arg
+    saf_eval "$TRAIN_MANIFEST" "$wk/before.json" $prop_arg --per-task "$wk/before.pertask.jsonl"
     py -c "import json;d=json.load(open('$wk/before.json'));print('base: confirmed=%s FP=%s wrongTRUE=%s'%(d.get('confirmed_score'),d.get('false_alarms'),d.get('wrong_true')))" >&2 || true
   fi
 
@@ -308,6 +309,11 @@ run_arm() {
   render_arm_prompt "$id" "$mode" "$family" "$desc" > "$prompt"
   if ! saf_worker "$prompt" "$wk/transcript.jsonl" "$wk/session_id"; then
     log "worker did not complete cleanly; reverting arm $n"
+    # Record the wasted-work signal BEFORE reverting (worker edits are still on the arm branch): a
+    # worker that burned turns/cost then aborted is the single most expensive waste event. before.json
+    # exists from ORIENT; there is no after (record.py tolerates it → no-after). Guarded observability.
+    local wfb; [ "$LOOP_GEN_MODE" = on ] && wfb="$wk/pool_before.json" || wfb="$wk/before.json"
+    emit_arm_record "$n" "$id" "$mode" "$family" "$scope" "WORKER_FAIL" 0 0 "$base" "$wfb" "$wk/after.json" "$wk" || true
     revert_arm "$branch"; journal "$n" "$id" "$mode" "WORKER_FAIL" ""; record_lever_outcome "$id" REVERT; return 1
   fi
 
@@ -320,11 +326,11 @@ run_arm() {
   if ! git_here diff --quiet "$base" -- crates Cargo.toml Cargo.lock 2>/dev/null; then
     saf_captest >"$wk/captest.log" 2>&1 && progressed=1
   fi
-  local decision delta="n/a" gen_delta="n/a" pool_delta="n/a" checkpoint_after jdelta
+  local decision delta="n/a" gen_delta="n/a" pool_delta="n/a" checkpoint_before checkpoint_after jdelta
   local fwd; fwd="$(for f in $FORBIDDEN_READS; do printf ' --forbidden %s' "$f"; done)"
   if [ "$LOOP_GEN_MODE" = on ]; then
     saf_eval "$VAL_MANIFEST"   "$wk/val_after.json"  $prop_arg --group-weight
-    saf_eval "$TRAIN_MANIFEST" "$wk/pool_after.json" $prop_arg --group-weight
+    saf_eval "$TRAIN_MANIFEST" "$wk/pool_after.json" $prop_arg --group-weight --per-task "$wk/after.pertask.jsonl"
     gen_delta="$(py -c "import json,os;b=json.load(open('$wk/val_before.json'));a=json.load(open('$wk/val_after.json')) if os.path.exists('$wk/val_after.json') else {};c=a.get('confirmed_score_weighted');print((c-b.get('confirmed_score_weighted',0)) if c is not None else -999999999)")"
     pool_delta="$(py -c "import json,os;b=json.load(open('$wk/pool_before.json'));a=json.load(open('$wk/pool_after.json')) if os.path.exists('$wk/pool_after.json') else {};c=a.get('confirmed_score_weighted');print((c-b.get('confirmed_score_weighted',0)) if c is not None else -999999999)")"
     local novel=0; [ "$mode" = capability ] && novel=1
@@ -334,30 +340,42 @@ run_arm() {
         --immutable-manifest "$IMMUTABLE_MANIFEST" --repo-root "$REPO_ROOT" \
         --transcript "$wk/transcript.jsonl" $fwd \
         --progressed "$progressed" --novel-solved "$novel" $ccflag --verdict-out "$wk/verdict.json")" || true
-    checkpoint_after="$wk/pool_after.json"; jdelta="$gen_delta"
+    checkpoint_before="$wk/pool_before.json"; checkpoint_after="$wk/pool_after.json"; jdelta="$gen_delta"
     log "decision: $decision (gen_delta=$gen_delta pool_delta=$pool_delta progressed=$progressed scope=$scope)"
   else
-    saf_eval "$TRAIN_MANIFEST" "$wk/after.json" $prop_arg
+    saf_eval "$TRAIN_MANIFEST" "$wk/after.json" $prop_arg --per-task "$wk/after.pertask.jsonl"
     delta="$(py -c "import json,os;b=json.load(open('$wk/before.json'));a=json.load(open('$wk/after.json')) if os.path.exists('$wk/after.json') else {};c=a.get('confirmed_score');print((c-b.get('confirmed_score',0)) if c is not None else -999999999)")"
     decision="$(py "$LIB/verify_arm.py" \
         --before "$wk/before.json" --after "$wk/after.json" \
         --immutable-manifest "$IMMUTABLE_MANIFEST" --repo-root "$REPO_ROOT" \
         --transcript "$wk/transcript.jsonl" $fwd \
         --progressed "$progressed" $ccflag --verdict-out "$wk/verdict.json")" || true
-    checkpoint_after="$wk/after.json"; jdelta="$delta"
+    checkpoint_before="$wk/before.json"; checkpoint_after="$wk/after.json"; jdelta="$delta"
     log "decision: $decision (delta=$delta progressed=$progressed scope=$scope)"
   fi
+
+  # OBSERVABILITY (plan 205 §1b/§3/§5a): assemble the per-arm record from artifacts already on disk
+  # and append the arms.jsonl spine — AFTER the decision, BEFORE the checkpoint mutates branches, so a
+  # REVERT still records the discarded worker diff (the wasted-work signal). Purely additive + guarded.
+  emit_arm_record "$n" "$id" "$mode" "$family" "$scope" "$decision" "$jdelta" "$progressed" \
+                  "$base" "$checkpoint_before" "$checkpoint_after" "$wk" || true
+  local costline; costline="$(py -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print("cost=$%.2f turns=%s retries=%s subtype=%s"%(d.get("total_cost_usd",0) or 0,d.get("num_turns"),d.get("api_retries"),d.get("subtype")))' "$wk/result.json" 2>/dev/null || true)"
+  [ -n "$costline" ] && log "arm $n worker $costline" || true
 
   # CHECKPOINT
   case "$decision" in
     KEEP|KEEP_POOL)     # both bank real (deduped) points and advance the integration branch
       keep_arm "$branch" "$n" "$id" "$decision (Δ=$jdelta)"
       journal "$n" "$id" "$mode" "$decision" "$jdelta"
+      journal_perproperty "$checkpoint_before" "$checkpoint_after"
       maybe_heldout_check "$n"
       maybe_overall_checkpoint "$n" "$scope" "$checkpoint_after" ;;
     ACCUMULATE|ACCUMULATE_PLUS)   # score-neutral useful work preserved for future arms (PLUS = capability progress)
       keep_arm "$branch" "$n" "$id" "$decision (useful; reusable by future arms)"
-      journal "$n" "$id" "$mode" "$decision" "0" ;;
+      journal "$n" "$id" "$mode" "$decision" "0"
+      journal_perproperty "$checkpoint_before" "$checkpoint_after" ;;
     REJECT_TAMPER|REJECT_HOLDOUT)
       log "SECURITY: $decision on arm $n — reverting + alerting"
       revert_arm "$branch"; journal "$n" "$id" "$mode" "$decision" "" ; touch "$STATE_DIR/ALERT_$decision" ;;
@@ -418,6 +436,22 @@ maybe_heldout_check() {
     saf_eval "$HOLDOUT_MANIFEST" "$STATE_DIR/heldout-$n.json" || true
     # NOTE: a train gain that does not reproduce on held-out is a HARD reject (Addendum A2);
     # the operator/next iteration deprioritizes that lever. Recorded for review.
+    # Journal the holdout confirmed + per-property recall + the paired TRAIN score so the
+    # train↔holdout GAP is visible inline (plan 205 §2b/§2d). A flat holdout under a rising
+    # train is the memorization diagnosis, spelled out in the log. Observability only, guarded.
+    py - "$STATE_DIR/heldout-$n.json" "$STATE_DIR/overall_checkpoint.json" <<'PY' >> "$JOURNAL" 2>/dev/null || true
+import json,os,sys
+try: h=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+hp={k:(v or {}).get("confirmed_false",0) for k,v in (h.get("per_property") or {}).items()}
+line=" ".join(f"{k}={v}" for k,v in sorted(hp.items()) if v)
+train=""
+if os.path.exists(sys.argv[2]):
+    try: train=" train=%s"%json.load(open(sys.argv[2])).get("confirmed_score")
+    except Exception: pass
+print(f"  - HOLDOUT confirmed={h.get('confirmed_score')} FP={h.get('false_alarms')} "
+      f"wrongTRUE={h.get('wrong_true')} [{line}]{train}  (svcomp26 novel tasks — the generalization signal)")
+PY
   fi
 }
 journal() {  # n id mode outcome delta
@@ -426,6 +460,51 @@ journal() {  # n id mode outcome delta
 }
 journal_note() {  # free-form trajectory line (no **OUTCOME** token, so it never shadows an arm decision)
   printf -- '  - %s | %s\n' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$JOURNAL"
+}
+# emit_arm_record — assemble ONE per-arm observability record (lib/record.py) from artifacts already
+# on disk and append the arms.jsonl spine. Observability ONLY: every step is `|| true`-guarded and
+# writes solely under $STATE_DIR, so it can NEVER change the loop's keep/revert control flow. Called
+# after the decision, before the checkpoint (so a REVERT still records the discarded worker diff).
+emit_arm_record() {  # n id mode family scope decision jdelta progressed base cbefore cafter wk
+  local n="$1" id="$2" mode="$3" family="$4" scope="$5" dec="$6" jdelta="$7" prog="$8"
+  local base="$9" cb="${10}" ca="${11}" wk="${12}"
+  # worker telemetry (turns/cost/retries/summary) from the transcript — reuse the parser
+  py "$LIB/worker_status.py" --result "$wk/transcript.jsonl" > "$wk/result.json" 2>/dev/null || echo '{}' > "$wk/result.json"
+  # diff stat vs the arm's base (worker edits are still uncommitted on the arm branch at this point)
+  local diffstat; diffstat="$(git_here diff --numstat "$base" -- crates Cargo.toml Cargo.lock benchmark-defs 2>/dev/null \
+    | py -c 'import sys,json
+rows=[l.rstrip("\n").split("\t") for l in sys.stdin if l.strip()]
+ins=sum(int(r[0]) for r in rows if r and r[0].isdigit())
+dele=sum(int(r[1]) for r in rows if len(r)>1 and r[1].isdigit())
+print(json.dumps({"files":len(rows),"insertions":ins,"deletions":dele,"paths":[r[2] for r in rows if len(r)>2][:40]}))' 2>/dev/null || true)"
+  [ -n "$diffstat" ] || diffstat='{}'
+  local scalars; scalars="$(py -c 'import json,sys
+def i(x):
+    try: return int(float(x))
+    except Exception: return 0
+print(json.dumps(dict(n=i(sys.argv[1]),lever=sys.argv[2],mode=sys.argv[3],family=sys.argv[4],scope=sys.argv[5],decision=sys.argv[6],delta=i(sys.argv[7]),progressed=i(sys.argv[8]),ts=sys.argv[9])))' \
+    "$n" "$id" "$mode" "$family" "$scope" "$dec" "$jdelta" "$prog" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null || true)"
+  [ -n "$scalars" ] || return 0
+  py "$LIB/record.py" "$scalars" "$cb" "$ca" "$wk/verdict.json" "$wk/result.json" "$diffstat" \
+     "$wk/transcript.jsonl" "$wk/before.pertask.jsonl" "$wk/after.pertask.jsonl" > "$wk/record.json" 2>/dev/null || true
+  # append the flat spine line (one deterministic JSON object per arm) that every view reads
+  [ -s "$wk/record.json" ] && py -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])),sort_keys=True))' "$wk/record.json" \
+    >> "$STATE_DIR/arms.jsonl" 2>/dev/null || true
+}
+# journal_perproperty — a continuation line under a KEEP/ACCUMULATE decision showing which property
+# each arm moved (a crosscut arm that traded one family for another is visible even if the total rose).
+journal_perproperty() {  # before_json after_json
+  py - "$1" "$2" <<'PY' >> "$JOURNAL" 2>/dev/null || true
+import json,sys
+def pp(p):
+    try: d=json.load(open(p)).get("per_property") or {}
+    except Exception: d={}
+    return {k:(v or {}).get("confirmed",0) for k,v in d.items()}
+b,a=pp(sys.argv[1]),pp(sys.argv[2])
+moved={k:a.get(k,0)-b.get(k,0) for k in sorted(set(b)|set(a)) if a.get(k,0)-b.get(k,0)!=0}
+if moved:
+    print("  - Δ/property: " + " ".join(f"{k}{'+' if v>=0 else ''}{v}" for k,v in moved.items()))
+PY
 }
 
 # init_overall_checkpoint — establish the pre-loop all-property C.FalseOverall reference the periodic
@@ -470,6 +549,8 @@ sys.exit(2 if (ptot is not None and tot < ptot) else 0)
 PY
 )"; rc=$?
   journal_note "$summary"; log "$summary"
+  # cumulative per-lever ROI ledger (plan 205 §2c): a durable one-line trace, recomputed from arms.jsonl
+  journal_note "$(py -c 'import sys,os; sys.path.insert(0,sys.argv[2]); import report_view as rv; print(rv.roi_oneline(rv.load_arms(os.path.join(sys.argv[1],"arms.jsonl")),3))' "$STATE_DIR" "$LIB" 2>/dev/null || echo 'lever ROI: n/a')"
   if [ "$rc" -eq 2 ]; then
     log "ALERT: OVERALL C.FalseOverall REGRESSED — rolling $WORK_BRANCH back to last-good checkpoint (overall-good)"
     touch "$STATE_DIR/ALERT_OVERALL_REGRESSION"; journal_note "**ALERT_OVERALL_REGRESSION** rolled back to overall-good"

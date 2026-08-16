@@ -36,6 +36,28 @@ def _load(p: str | None) -> dict:
         return {}
 
 
+def revert_reason(*, decision: str, after_present: bool, family_regressed: bool,
+                  delta: int) -> str | None:
+    """Name the PROXIMATE cause a non-kept arm was discarded (plan 205 §5d) — observability only,
+    never a gate. Returns one of tamper | holdout | build_broken | family_trade | regression |
+    no_gain, or None for any keep-family decision. Lets the dashboard separate "lever produces bad
+    changes" (regression/family_trade) from "lever produces no-ops" (no_gain) — different fixes.
+    `delta` is the driving score delta (confirmed in legacy mode; min(gen,pool) in gen mode)."""
+    if decision == "REJECT_TAMPER":
+        return "tamper"
+    if decision == "REJECT_HOLDOUT":
+        return "holdout"
+    if decision not in ("REVERT", "WORKER_FAIL"):
+        return None  # KEEP / KEEP_POOL / ACCUMULATE / ACCUMULATE_PLUS
+    if not after_present:
+        return "build_broken"
+    if family_regressed:
+        return "family_trade"
+    if delta < 0:
+        return "regression"
+    return "no_gain"
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--before", required=True, help="baseline scorer JSON (svcomp_split_eval -o)")
@@ -94,6 +116,10 @@ def main(argv: list[str] | None = None) -> int:
         verdict.update({"decision": decision, "gen_mode": True, "gen_delta_w": gen_delta_w,
                         "pool_delta_w": pool_delta_w, "novel_solved": args.novel_solved == "1",
                         "regressed_families": regressed_families})
+        after_present = gates.weighted_confirmed(after) is not None and gates.weighted_confirmed(pool_after) is not None
+        verdict["revert_reason"] = revert_reason(
+            decision=decision, after_present=after_present,
+            family_regressed=bool(regressed_families), delta=min(gen_delta_w, pool_delta_w))
     else:
         regressed_families = gates.family_regression(before, after) if args.check_all_families else []
         decision = gates.decide(
@@ -102,6 +128,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         verdict.update({"decision": decision, "gen_mode": False, "confirmed_delta": delta,
                         "check_all_families": args.check_all_families, "regressed_families": regressed_families})
+        verdict["revert_reason"] = revert_reason(
+            decision=decision, after_present=after.get("confirmed_score") is not None,
+            family_regressed=bool(regressed_families), delta=delta)
 
     if args.verdict_out:
         Path(args.verdict_out).write_text(json.dumps(verdict, indent=2))

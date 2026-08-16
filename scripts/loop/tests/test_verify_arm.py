@@ -144,6 +144,72 @@ def test_verify_arm_end_to_end_decisions():
         assert _run(root, b, a_trade, good, clean_t, F, check_all_families=False) == "KEEP"
 
 
+def _run_verdict(root: Path, before, after, manifest, transcript_lines, forbidden, progressed=0,
+                 check_all_families=False):
+    """Like _run but also returns the parsed verdict.json (for the revert_reason tag, §5d)."""
+    d = root
+    (d / "before.json").write_text(json.dumps(before))
+    if after is not None:
+        (d / "after.json").write_text(json.dumps(after))
+    else:
+        (d / "after.json").unlink(missing_ok=True)
+    (d / "manifest.json").write_text(json.dumps(manifest))
+    (d / "t.jsonl").write_text("\n".join(transcript_lines))
+    argv = [sys.executable, str(CLI),
+            "--before", str(d / "before.json"), "--after", str(d / "after.json"),
+            "--immutable-manifest", str(d / "manifest.json"), "--repo-root", str(d),
+            "--transcript", str(d / "t.jsonl"), "--progressed", str(progressed),
+            "--verdict-out", str(d / "verdict.json")]
+    if check_all_families:
+        argv += ["--check-all-families"]
+    for f in forbidden:
+        argv += ["--forbidden", f]
+    subprocess.run(argv, capture_output=True, text=True)
+    return json.loads((d / "verdict.json").read_text())
+
+
+def test_revert_reason_pure_function():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("verify_arm", CLI)
+    va = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(va)
+    # a keep-family decision has no revert reason
+    assert va.revert_reason(decision="KEEP", after_present=True, family_regressed=False, delta=3) is None
+    assert va.revert_reason(decision="ACCUMULATE", after_present=True, family_regressed=False, delta=0) is None
+    # anti-cheat rejects
+    assert va.revert_reason(decision="REJECT_TAMPER", after_present=True, family_regressed=False, delta=0) == "tamper"
+    assert va.revert_reason(decision="REJECT_HOLDOUT", after_present=True, family_regressed=False, delta=0) == "holdout"
+    # REVERT causes, most-proximate first
+    assert va.revert_reason(decision="REVERT", after_present=False, family_regressed=False, delta=-10**9) == "build_broken"
+    assert va.revert_reason(decision="REVERT", after_present=True, family_regressed=True, delta=5) == "family_trade"
+    assert va.revert_reason(decision="REVERT", after_present=True, family_regressed=False, delta=-3) == "regression"
+    assert va.revert_reason(decision="REVERT", after_present=True, family_regressed=False, delta=0) == "no_gain"
+
+
+def test_revert_reason_written_into_verdict():
+    with tempfile.TemporaryDirectory() as dd:
+        root = Path(dd)
+        imm = root / "scorer.py"; imm.write_text("SCORER\n")
+        good = {"scorer.py": hashlib.sha256(imm.read_bytes()).hexdigest()}
+        clean = [json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "splits/train.jsonl"}}]}})]
+        F = ["splits/holdout"]
+        # score-neutral no-op -> REVERT tagged no_gain
+        v = _run_verdict(root, _score(100), _score(100), good, clean, F, progressed=0)
+        assert v["decision"] == "REVERT" and v["revert_reason"] == "no_gain", v
+        # broken build (no after.json) -> build_broken
+        v2 = _run_verdict(root, _score(100), None, good, clean, F, progressed=1)
+        assert v2["revert_reason"] == "build_broken", v2
+        # a KEEP has revert_reason null
+        v3 = _run_verdict(root, _score(100), _score(101), good, clean, F)
+        assert v3["decision"] == "KEEP" and v3["revert_reason"] is None, v3
+        # crosscut family trade -> family_trade
+        b = _scorep(**{"valid-memsafety": 200, "unreach-call": 100})
+        a = _scorep(**{"valid-memsafety": 190, "unreach-call": 130})
+        v4 = _run_verdict(root, b, a, good, clean, F, check_all_families=True)
+        assert v4["decision"] == "REVERT" and v4["revert_reason"] == "family_trade", v4
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
