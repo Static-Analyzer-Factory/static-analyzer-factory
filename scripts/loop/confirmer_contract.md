@@ -1,0 +1,146 @@
+# SAF confirmer contract — the fail-closed rules every FALSE-emitting lever MUST obey
+
+**Status:** normative (plan 205 Movement 1d). Derived from `plans/205-loop-generalization/svcomp-compliance.md`
+(evidence-backed, primary-sourced). Any loop lever that can emit `false(<property>)` — a fuzzer, a
+symbolic/BMC input oracle, a memory/overflow/race confirmer, a harness synthesizer — is bound by this
+contract. Breaking a rule turns a 0 (abstain) into a −16 (wrong FALSE) or −32 (wrong TRUE); the whole point
+of SAF is that **abstaining always beats guessing**.
+
+This file is part of the immutable loop harness (a worker may READ it but never edit it).
+
+---
+
+## 0. Fuzzing and native execution ARE allowed — this is not the risk
+
+SV-COMP is method-agnostic. Nothing in the rules forbids any technique; they define only the input (a C
+program + a specification) and the required output (a verdict + a validator-confirmed witness). **Greybox /
+coverage-guided fuzzing and native execution are directly precedented and competitive** — VeriAbs/VeriFuzz
+run AFL greybox fuzzing inside ReachSafety and took 1st/2nd. SAF's exact model — compile → harness the
+`__VERIFIER_nondet_*` inputs → run natively under a sanitizer → confirm on the property's real violation
+event → serialize the reproducing run into a validator-confirmed witness — is *architecturally identical* to
+SV-COMP's own execution-based validators (`cpa-witness2test`). So **build fuzzers and native-replay oracles
+freely.**
+
+The compliance risk is NOT the technique. It is the **accountability contract**: confirm on the *right*
+event, under the *right* machine model, with the *right* witness format. The seven rules below are that
+contract. Each is fail-closed — when it triggers, it costs only recall (an abstain), never a wrong verdict.
+
+The one behavioral prohibition: **no fingerprinting.** Never key a confirmer on the program name, path, hash,
+task id, function name, or benchmark category. (Already a redline; it also scores 0 under the loop's
+cluster-dedup and is caught by the holdout.)
+
+---
+
+## R1 — Match the runtime event to the property (the dominant risk). The benchmarks are NOT UB-free.
+
+The sv-benchmarks set contains undefined behavior that is *not* the property under test: signed overflow
+inside an `unreach-call` task whose expected verdict is TRUE (issue #307), division-by-zero (#504). A naive
+"any sanitizer trap → FALSE" pipeline confirms off the **wrong** event → wrong FALSE (−16).
+
+**Rule:** Confirm a FALSE ONLY on the property's exact violation event:
+
+| property | the ONLY event that confirms a FALSE |
+|---|---|
+| `unreach-call` | reaching the `reach_error()` / `__assert_fail` call site (`CHECK LTL(G ! call(reach_error()))`) |
+| `no-overflow` | an **in-scope signed-integer *operation*** overflow (see R2) |
+| `valid-memsafety` (`valid-deref`/`valid-free`/`valid-memtrack`) | the matching ASan memory error |
+| `no-data-race` | a TSan data race, under a forced schedule (see R7) |
+| `termination` | non-termination evidence per the current (still-maturing) format — re-verify validator support first |
+
+On ANY trap that is not the property under test → **abstain (UNKNOWN = 0)**. Never run a catch-all
+`sanitizer → FALSE`.
+
+## R2 — Narrow the overflow oracle to signed-integer operations (exclude conversions)
+
+The `no-overflow` property is defined strictly on signed-integer *operations* whose result is out of range and
+**explicitly excludes conversions** ("conversions to signed-integer types do not violate this property"). But
+`-fsanitize=undefined` also traps on conversion truncation, shift-out-of-bounds, pointer overflow, etc. — a
+trap on any of those in a TRUE task is a wrong FALSE (−16).
+
+**Rule:** Arm UBSan narrowly — `-fsanitize=signed-integer-overflow` ONLY — and confirm ONLY on a
+signed-integer-*operation* overflow. Ignore conversion / shift / pointer traps for this property.
+
+## R3 — Compile and run under the task's DECLARED data model (ILP32 vs LP64)
+
+Each category mandates ILP32 (32-bit) or LP64 (64-bit); analysis must use *that* model. SAF's native replay on
+x86-64 defaults to LP64. Running an **ILP32** task under LP64 uses the wrong integer/pointer widths → a
+computation fails to overflow/wrap as 32-bit semantics require, or reaches `reach_error()` on a path 32-bit
+semantics forbid → an out-of-model FALSE the validator refuses (0) or, on a genuinely-correct program, a false
+alarm (−16). This is the same "64-bit gap" SAF already recorded for R6 overflow witnesses.
+
+**Rule:** Read the category's data model from the benchmark definition (do not hardcode); compile/run with
+`-m32` for ILP32 tasks. If the required model cannot be produced (missing multilib) → **abstain**.
+
+## R4 — Honor `__VERIFIER_assume` as a hard path filter
+
+`__VERIFIER_assume(cond)` blocks paths (`if (!cond) { LOOP: goto LOOP; }`); it does not return a value.
+Reaching the error on a path an `assume` would have killed is a spurious FALSE.
+
+**Rule:** Treat every `__VERIFIER_assume` as a hard path filter. Discard any concrete input assignment it would
+block *before* confirming a FALSE. (A symbolic/BMC oracle must add the assume as a path constraint; a fuzzer
+must reject inputs the assume kills.)
+
+## R5 — Keep nondet inputs in-model (right type / width / signedness)
+
+`__VERIFIER_nondet_X()` returns an arbitrary value of the indicated type, no side effects. Inputs MUST be
+within the declared C type range for that type/width/signedness. Undocumented nondet functions exist in the
+set (`__VERIFIER_nondet_longlong`/`_charp`/`_u8`/`_u16`, issue #1304).
+
+**Rule:** Emit only in-range values for the declared C type; get width/signedness right for every nondet
+function. If a function's width/signedness is ambiguous → **abstain**, do not guess.
+
+## R6 — Reproduce deterministically before emitting
+
+Relying on the literal uninitialized-read nondet template at runtime yields garbage that differs across runs;
+such a witness will not re-confirm (→ 0).
+
+**Rule:** Provide real nondet implementations that inject the witness's exact concrete values, and require the
+*same* inputs to re-trigger the violation deterministically *before* emitting the FALSE. Determinism is also a
+SAF-wide invariant (BTreeMap/BTreeSet, stubbed `rand`). Never emit a FALSE from a solver model alone — always
+end in a native replay on the **original, unsliced** program that confirms the actual event (a slice may drop
+a constraint the real program enforces; slice to search, confirm on the original).
+
+## R7 — Concurrency needs a forced schedule AND a GraphML 1.0 witness
+
+A dynamic race/assertion detector fires only if the conflicting accesses actually run concurrently; under the
+default OS schedule short programs serialize → 0 recall and no reproducing schedule to witness. And a
+concurrency violation witness in **YAML 2.0 scores 0** — concurrency/`no-data-race`/termination FALSE witnesses
+are **GraphML 1.0 ONLY**.
+
+**Rule:** A concurrency FALSE must carry an explicit, deterministic interleaving that drives the replay into
+the violation, serialized as a **GraphML 1.0** witness (threadId sequence + createThread edges), targeted at
+CPAchecker-4.0 / Dartagnan / ConcurrentWitness2Test. Additionally **abstain on relaxed-memory** (pthread-wmm /
+C11-relaxed / any dropped `#pragma omp`) — native x86 replay is TSO/SC-only, and a fail-open OpenMP probe
+produces a wrong verdict (plan-202 lesson: SAF's frontend drops `#pragma omp`, so a race gate must be
+fail-closed on OpenMP).
+
+---
+
+## Witness format targeting (per property)
+
+- **Sequential reachability FALSE** (`unreach-call`, `no-overflow`, `valid-memsafety`): **YAML 2.0** violation
+  witness → validated by **CPAchecker** and **Witch3**. Do NOT target UAutomizer for the 2.0-violation path
+  (it validates 1.0-violation and 2.0-correctness only).
+- **Concurrency / `no-data-race` / termination FALSE**: **GraphML 1.0** only (R7).
+- Every witness is syntax-checked by **WitnessLint** first — a syntactically invalid witness is never
+  confirmed. Keep witnesses small and concrete: violation-witness validation has a **90 s CPU budget**.
+
+## Packaging (submission-time, for the operator)
+
+No compiler is guaranteed on the competition machine — **bundle SAF's own gcc/clang toolchain and 32-bit
+multilib** (for R3) in the submission archive.
+
+---
+
+## Pre-emit checklist (a lever author ticks every box before returning `false(<prop>)`)
+
+1. The confirming event is the property's exact violation event (R1) — not an incidental UBSan/ASan/div-by-zero trap.
+2. For `no-overflow`: UBSan armed as `signed-integer-overflow` only; the trap is on a signed-integer operation, not a conversion/shift/pointer (R2).
+3. Task compiled/run under its declared ILP32/LP64 model, or abstained if unavailable (R3).
+4. Every `__VERIFIER_assume` on the path is satisfied by the concrete inputs (R4).
+5. All nondet inputs are in-range for their declared type/width/signedness; abstained on any ambiguous width (R5).
+6. The violation re-triggers deterministically from the witness's exact injected values on the original program (R6).
+7. Concurrency: an explicit forced schedule reproduces the violation and the witness is GraphML 1.0; abstained on relaxed-memory/OpenMP (R7).
+8. No fingerprinting: the confirmer keys on nothing task-specific (name/path/hash/id/function/category).
+
+If any box cannot be ticked → **return UNKNOWN (0)**. A wrong FALSE is −16; a wrong TRUE is −32; an abstain is 0.

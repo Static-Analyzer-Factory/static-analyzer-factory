@@ -167,6 +167,109 @@ def test_decide_v2_rewards_generalization_not_memorization():
     assert gates.decide_v2(**D, gen_delta_w=9, pool_delta_w=9, family_regressed=True) == "REVERT"
 
 
+def test_holdout_updates_boosts_reproducing_levers():
+    # holdout weighted rose -> every lever that banked val lift this window reproduced -> boost + clear stall.
+    upd = gates.holdout_lever_updates(holdout_increased=True,
+                                      per_lever_lift={"la": 3, "lb": 0, "lc": 5},
+                                      holdout_stall={"la": 1, "lc": 0}, min_lift=2)
+    assert upd["boost"] == ["la", "lc"]  # lb had no lift -> not boosted
+    assert upd["park"] == []
+    assert upd["new_stall"] == {"la": 0}  # la's stall cleared; lc already 0 -> unchanged/omitted
+
+
+def test_holdout_updates_stalls_but_needs_two_checks_to_park():
+    # holdout flat, a lever banked >= min_lift that didn't reproduce -> stall++ (but not parked at 1).
+    upd = gates.holdout_lever_updates(holdout_increased=False,
+                                      per_lever_lift={"la": 4}, holdout_stall={"la": 0}, min_lift=2)
+    assert upd["park"] == [] and upd["new_stall"] == {"la": 1}
+    # second consecutive non-reproducing checkpoint -> park as overfit.
+    upd2 = gates.holdout_lever_updates(holdout_increased=False,
+                                       per_lever_lift={"la": 4}, holdout_stall={"la": 1}, min_lift=2)
+    assert upd2["park"] == ["la"] and upd2["new_stall"] == {"la": 2}
+
+
+def test_holdout_updates_ignores_sub_threshold_and_zero_lift():
+    # a tiny lift below min_lift is NOT strong evidence of overfitting -> no stall; zero-lift untouched.
+    upd = gates.holdout_lever_updates(holdout_increased=False,
+                                      per_lever_lift={"la": 1, "lb": 0}, holdout_stall={}, min_lift=2)
+    assert upd["park"] == [] and upd["boost"] == [] and upd["new_stall"] == {}
+
+
+def _ls(decision, state, *, gen_mode=True, lever_budget=6, accumulate_budget=3, max_lever_arms=12):
+    return gates.lever_state_after(decision, state, gen_mode=gen_mode, lever_budget=lever_budget,
+                                   accumulate_budget=accumulate_budget, max_lever_arms=max_lever_arms)
+
+
+def test_lever_state_after_revert_streak_parks_at_lever_budget():
+    # unchanged behavior the multi_arm_budget smoke asserts: N consecutive reverts -> park 'revert'.
+    st, reason = {"attempts": 0, "revert_stall": 0, "accum_stall": 0}, None
+    for _ in range(3):
+        st, reason = _ls("REVERT", st, lever_budget=3)
+    assert st["revert_stall"] == 3 and reason == "revert"
+
+
+def test_lever_state_after_keep_resets_both_stalls():
+    st, reason = _ls("KEEP", {"attempts": 5, "revert_stall": 2, "accum_stall": 2})
+    assert st["revert_stall"] == 0 and st["accum_stall"] == 0 and reason is None
+
+
+def test_lever_state_after_accumulate_forever_parks_gen_mode():
+    # BUG-4: an ACCUMULATE-only lever (race-confirmer) parks on its own budget, not at max_lever_arms.
+    st, reason = {"attempts": 0, "revert_stall": 0, "accum_stall": 0}, None
+    for _ in range(3):
+        st, reason = _ls("ACCUMULATE", st, gen_mode=True, accumulate_budget=3)
+    assert st["accum_stall"] == 3 and reason == "accumulate"
+
+
+def test_lever_state_after_accumulate_forever_parks_legacy_mode():
+    # BUG-4 (the real gap): in LEGACY mode a plain ACCUMULATE reset the revert-stall so the lever
+    # never parked; the dedicated accumulate budget parks it regardless of mode.
+    st, reason = {"attempts": 0, "revert_stall": 0, "accum_stall": 0}, None
+    for _ in range(3):
+        st, reason = _ls("ACCUMULATE", st, gen_mode=False, accumulate_budget=3)
+    assert reason == "accumulate"
+    assert st["revert_stall"] == 0  # legacy still resets the revert-stall each ACCUMULATE (unchanged)
+
+
+def test_lever_state_after_keep_pool_banks_points_but_still_parks_on_revert_side():
+    # KEEP_POOL banks honest pool points -> resets accum_stall (not an unscoreable polish), but does
+    # NOT reset the revert-stall (a pure-memorization lever still parks on the revert side, gen mode).
+    st, reason = _ls("KEEP_POOL", {"attempts": 0, "revert_stall": 0, "accum_stall": 2}, gen_mode=True)
+    assert st["accum_stall"] == 0 and st["revert_stall"] == 1 and reason is None
+
+
+def test_lever_state_after_accumulate_plus_resets_both():
+    st, reason = _ls("ACCUMULATE_PLUS", {"attempts": 0, "revert_stall": 2, "accum_stall": 2})
+    assert st["revert_stall"] == 0 and st["accum_stall"] == 0 and reason is None
+
+
+def test_lever_state_after_cap_takes_precedence():
+    # even a KEEP that resets the stalls parks if it hits the hard total-arms cap.
+    st, reason = _ls("KEEP", {"attempts": 11, "revert_stall": 0, "accum_stall": 0}, max_lever_arms=12)
+    assert reason == "cap"
+
+
+def test_lever_state_after_keep_interrupts_accumulate_streak():
+    # plateaued-KEEP lever (exec-validator-gate's tail): an early KEEP resets accum_stall; later plain
+    # ACCUMULATEs count from there and eventually park.
+    st = {"attempts": 0, "revert_stall": 0, "accum_stall": 0}
+    st, _ = _ls("ACCUMULATE", st)
+    st, _ = _ls("ACCUMULATE", st)
+    st, _ = _ls("KEEP", st)
+    assert st["accum_stall"] == 0
+    reason = None
+    for _ in range(3):
+        st, reason = _ls("ACCUMULATE", st, accumulate_budget=3)
+    assert reason == "accumulate"
+
+
+def test_lever_state_after_zero_budget_disables_accumulate_park():
+    st, reason = {"attempts": 0, "revert_stall": 0, "accum_stall": 0}, None
+    for _ in range(9):
+        st, reason = _ls("ACCUMULATE", st, gen_mode=True, accumulate_budget=0, lever_budget=0)
+    assert reason is None and st["accum_stall"] == 9
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

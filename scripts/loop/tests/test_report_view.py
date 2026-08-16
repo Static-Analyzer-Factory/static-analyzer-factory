@@ -82,6 +82,19 @@ def test_holdout_trend_reads_sorted_by_arm_number():
         assert [p[1] for p in tr] == [7, 8, 9], tr
 
 
+def test_lift_since_sums_keep_bucket_deltas_after_checkpoint():
+    # per-lever val lift banked AFTER a given checkpoint arm — the holdout brake's attribution input.
+    lift = rv.lift_since(ROWS, since_arm=0)
+    assert lift["overflow-recall"] == 5, lift          # arms 1(+3)+2(+2), both KEEP
+    assert lift["mem-recall"] == 0, lift               # arm 7 KEEP_POOL, delta 0 -> KEEP bucket, +0
+    assert "air-slicing" not in lift, lift             # only REVERT/ACCUMULATE_PLUS -> not a KEEP bucket
+    # a later checkpoint excludes earlier arms
+    lift2 = rv.lift_since(ROWS, since_arm=1)
+    assert lift2.get("overflow-recall") == 2, lift2    # only arm 2 counts now
+    # nothing after the last arm
+    assert rv.lift_since(ROWS, since_arm=7) == {}, "no arms after the last checkpoint"
+
+
 def test_recent_returns_last_n():
     r = rv.recent(ROWS, 2)
     assert [x["arm"] for x in r] == [6, 7], r

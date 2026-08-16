@@ -21,11 +21,19 @@ saf_eval() {
     # family_regressed -> REVERT (never trade one property for another).
     crosscut_regression:before.json) confirmed=300; per="{\"valid-memsafety\":{\"confirmed\":200},\"unreach-call\":{\"confirmed\":100}}" ;;
     crosscut_regression:after.json)  confirmed=320; per="{\"valid-memsafety\":{\"confirmed\":190},\"unreach-call\":{\"confirmed\":130}}" ;;
+    # GEN MODE (LOOP_GEN_MODE=on): a val gain (43>40) with a flat deduped pool (200) -> KEEP each arm;
+    # the svcomp26 holdout stays FLAT at 7 -> the actionable brake parks the lever after two misses.
+    gen_keep:val_before.json)    confirmed=40 ;;
+    gen_keep:val_after.json)     confirmed=43 ;;
+    gen_keep:pool_before.json)   confirmed=200 ;;
+    gen_keep:pool_after.json)    confirmed=200 ;;
+    gen_keep:heldout-*)          confirmed=7 ;;          # FLAT across checkpoints -> does not reproduce
     *:after.json)                confirmed=100 ;;
   esac
   [ -z "$per" ] && per="{\"valid-memsafety\":{\"confirmed\":$confirmed,\"confirmed_false\":$confirmed,\"false_total\":200}}"
-  printf "{\"confirmed_score\":%s,\"false_alarms\":%s,\"wrong_true\":%s,\"raw_score\":%s,\"max_score\":1000,\"per_property\":%s}\n" \
-    "$confirmed" "$fp" "$wt" "$confirmed" "$per" > "$out"
+  # confirmed_score_weighted mirrors confirmed so gen-mode decide_v2 / the holdout brake have a deduped number.
+  printf "{\"confirmed_score\":%s,\"confirmed_score_weighted\":%s,\"false_alarms\":%s,\"wrong_true\":%s,\"raw_score\":%s,\"max_score\":1000,\"per_property\":%s}\n" \
+    "$confirmed" "$confirmed" "$fp" "$wt" "$confirmed" "$per" > "$out"
   # per-task dump for the observability task-flip diff: before=unknown, after=confirmed (a gain), so
   # record.py exercises the flips path end to end (plan 205 §5a). Keyed on the output filename.
   if [ -n "$pt" ]; then
@@ -56,6 +64,7 @@ saf_worker() {
   [ "$SMOKE_SCENARIO" = worker_fail ] && return 1   # simulate a worker that edited then aborted
   return 0
 }
+reap_orphan_containers() { echo reaped >> "$STATE_DIR/reaped.log"; }  # BUG-3: prove the sweep is invoked (no docker in smoke)
 '
 
 scenario() {  # name  scenario  lever  expected-outcome-word
@@ -166,6 +175,175 @@ family_rotation() {  # lever selection must ROUND-ROBIN across families, not rep
   rm -rf "$tmp" 2>/dev/null || true
 }
 
+accumulate_park() {  # BUG-4: a lever that only ever ACCUMULATEs (0 KEEPs) must park on ACCUMULATE_BUDGET,
+                     # not run to MAX_LEVER_ARMS. Single capability lever, useful-but-score-neutral every arm.
+  local tmp; tmp="$(mktemp -d)"
+  mkdir -p "$tmp/scripts/loop/lib" "$tmp/tests/benchmarks/svcomp-splits" "$tmp/crates/saf-svcomp/src"
+  echo "SCORER" > "$tmp/scripts/svcomp_split_eval.py"
+  cp "$LOOP_DIR"/lib/*.py "$tmp/scripts/loop/lib/"
+  echo '{"t":1}' > "$tmp/tests/benchmarks/svcomp-splits/train.jsonl"
+  echo '{"t":2}' > "$tmp/tests/benchmarks/svcomp-splits/holdout.jsonl"
+  echo 'pub fn foo(){}' > "$tmp/crates/saf-svcomp/src/lib.rs"
+  printf 'state/\n.loop-state/\nlevers.tsv\nstubs.sh\ngate/\n' > "$tmp/.gitignore"
+  git -C "$tmp" init -q
+  git -C "$tmp" -c user.email=a@b -c user.name=t add -A >/dev/null
+  git -C "$tmp" -c user.email=a@b -c user.name=t commit -qm init
+  echo "$STUBS_BODY" > "$tmp/stubs.sh"
+  printf 'accjunk\tcapability\tvalid-memsafety\tlocal\tan unscoreable capability that only accumulates\n' > "$tmp/levers.tsv"
+  SAF_REPO_ROOT="$tmp" SAF_LOOP_STATE="$tmp/state" SAF_GATE_LIB="$tmp/gate" SAF_LOOP_STUBS="$tmp/stubs.sh" \
+    LEVERS_FILE="$tmp/levers.tsv" ARM_PROMPT_FILE="$LOOP_DIR/arm_prompt.md" JOURNAL="$tmp/state/journal.md" \
+    LOOP_ENV=/dev/null SMOKE_SCENARIO=accumulate MAX_ARMS=8 LEVER_BUDGET=9 ACCUMULATE_BUDGET=3 \
+    GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=a@b GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=a@b \
+    bash "$SUP" --loop >"$tmp.log" 2>&1
+  local accs parked broke reason
+  accs="$(grep -c 'ACCUMULATE' "$tmp/state/journal.md" 2>/dev/null || echo 0)"
+  [ -e "$tmp/state/lever.accjunk.parked" ] && parked=yes || parked=no
+  grep -q 'no active levers remain' "$tmp.log" && broke=yes || broke=no
+  reason="$(grep -oE 'PARKED \(accumulate' "$tmp.log" | head -1)"
+  if [ "$accs" = 3 ] && [ "$parked" = yes ] && [ "$broke" = yes ] && [ -n "$reason" ]; then
+    printf '  ok   %-16s accumulates=%s parked=%s(accumulate) broke-early=%s (budget 3 < cap 8)\n' accumulate_park "$accs" "$parked" "$broke"; pass=$((pass+1))
+  else
+    printf '  FAIL %-16s accumulates=%s(want 3) parked=%s broke-early=%s reason=%s\n' accumulate_park "$accs" "$parked" "$broke" "${reason:-<none>}"; fail=$((fail+1))
+    tail -20 "$tmp.log" | sed 's/^/       /'
+  fi
+  rm -rf "$tmp" 2>/dev/null || true
+}
+
+cap_wip_reprime() {  # BUG-2: a reverted capability arm's crates diff is preserved to lever.<id>.wip.patch
+                     # and the NEXT same-lever arm's rendered prompt is primed with it (no re-derivation).
+  local tmp; tmp="$(mktemp -d)"
+  mkdir -p "$tmp/scripts/loop/lib" "$tmp/tests/benchmarks/svcomp-splits" "$tmp/crates/saf-svcomp/src"
+  echo "SCORER" > "$tmp/scripts/svcomp_split_eval.py"
+  cp "$LOOP_DIR"/lib/*.py "$tmp/scripts/loop/lib/"
+  echo '{"t":1}' > "$tmp/tests/benchmarks/svcomp-splits/train.jsonl"
+  echo '{"t":2}' > "$tmp/tests/benchmarks/svcomp-splits/holdout.jsonl"
+  echo 'pub fn foo(){}' > "$tmp/crates/saf-svcomp/src/lib.rs"
+  printf 'state/\n.loop-state/\nlevers.tsv\nstubs.sh\ngate/\n' > "$tmp/.gitignore"
+  git -C "$tmp" init -q
+  git -C "$tmp" -c user.email=a@b -c user.name=t add -A >/dev/null
+  git -C "$tmp" -c user.email=a@b -c user.name=t commit -qm init
+  echo "$STUBS_BODY" > "$tmp/stubs.sh"
+  printf 'capwip\tcapability\tvalid-memsafety\tlocal\tmulti-arm capability that reverts then continues\n' > "$tmp/levers.tsv"
+  SAF_REPO_ROOT="$tmp" SAF_LOOP_STATE="$tmp/state" SAF_GATE_LIB="$tmp/gate" SAF_LOOP_STUBS="$tmp/stubs.sh" \
+    LEVERS_FILE="$tmp/levers.tsv" ARM_PROMPT_FILE="$LOOP_DIR/arm_prompt.md" JOURNAL="$tmp/state/journal.md" \
+    LOOP_ENV=/dev/null SMOKE_SCENARIO=tuning_nogain MAX_ARMS=2 LEVER_BUDGET=9 \
+    GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=a@b GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=a@b \
+    bash "$SUP" --loop >"$tmp.log" 2>&1
+  local saved primed
+  [ -s "$tmp/state/lever.capwip.wip.patch" ] && saved=yes || saved=no
+  grep -q 'lever.capwip.wip.patch' "$tmp/state/arm-2/arm_prompt.rendered.md" 2>/dev/null && primed=yes || primed=no
+  if [ "$saved" = yes ] && [ "$primed" = yes ]; then
+    printf '  ok   %-16s wip-saved=%s arm2-primed=%s (capability continues, not re-derives)\n' cap_wip_reprime "$saved" "$primed"; pass=$((pass+1))
+  else
+    printf '  FAIL %-16s wip-saved=%s arm2-primed=%s\n' cap_wip_reprime "$saved" "$primed"; fail=$((fail+1))
+    tail -20 "$tmp.log" | sed 's/^/       /'
+  fi
+  rm -rf "$tmp" 2>/dev/null || true
+}
+
+reap_swept() {  # BUG-3: reap_orphan_containers must be invoked on BOTH the keep and the revert checkpoint path
+  local ok=yes sc
+  for sc in tuning_gain tuning_nogain; do
+    local tmp; tmp="$(mktemp -d)"
+    mkdir -p "$tmp/scripts/loop/lib" "$tmp/tests/benchmarks/svcomp-splits" "$tmp/crates/saf-svcomp/src"
+    echo SCORER > "$tmp/scripts/svcomp_split_eval.py"
+    cp "$LOOP_DIR"/lib/*.py "$tmp/scripts/loop/lib/"
+    echo '{"t":1}' > "$tmp/tests/benchmarks/svcomp-splits/train.jsonl"
+    echo '{"t":2}' > "$tmp/tests/benchmarks/svcomp-splits/holdout.jsonl"
+    echo 'pub fn foo(){}' > "$tmp/crates/saf-svcomp/src/lib.rs"
+    printf 'state/\n.loop-state/\nlevers.tsv\nstubs.sh\ngate/\n' > "$tmp/.gitignore"
+    git -C "$tmp" init -q
+    git -C "$tmp" -c user.email=a@b -c user.name=t add -A >/dev/null
+    git -C "$tmp" -c user.email=a@b -c user.name=t commit -qm init
+    echo "$STUBS_BODY" > "$tmp/stubs.sh"
+    printf 'l\ttuning\tvalid-memsafety\tlocal\treap probe\n' > "$tmp/levers.tsv"
+    SAF_REPO_ROOT="$tmp" SAF_LOOP_STATE="$tmp/state" SAF_GATE_LIB="$tmp/gate" SAF_LOOP_STUBS="$tmp/stubs.sh" \
+      LEVERS_FILE="$tmp/levers.tsv" ARM_PROMPT_FILE="$LOOP_DIR/arm_prompt.md" JOURNAL="$tmp/state/journal.md" \
+      LOOP_ENV=/dev/null SMOKE_SCENARIO="$sc" \
+      GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=a@b GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=a@b \
+      bash "$SUP" --once l >/dev/null 2>&1
+    [ -s "$tmp/state/reaped.log" ] || ok=no
+    rm -rf "$tmp" 2>/dev/null || true
+  done
+  if [ "$ok" = yes ]; then
+    printf '  ok   %-16s reap invoked on keep + revert checkpoints\n' reap_swept; pass=$((pass+1))
+  else
+    printf '  FAIL %-16s reap NOT invoked on some checkpoint path\n' reap_swept; fail=$((fail+1))
+  fi
+}
+
+gen_credit_priority() {  # §2.5: within a family, pick_lever prefers the highest earned gen_credit (holdout
+                         # boosts) over file order; ties fall back to file order.
+  local tmp; tmp="$(mktemp -d)"
+  mkdir -p "$tmp/scripts/loop/lib" "$tmp/tests/benchmarks/svcomp-splits" "$tmp/crates/saf-svcomp/src" "$tmp/state"
+  echo SCORER > "$tmp/scripts/svcomp_split_eval.py"
+  cp "$LOOP_DIR"/lib/*.py "$tmp/scripts/loop/lib/"
+  echo '{"t":1}' > "$tmp/tests/benchmarks/svcomp-splits/train.jsonl"
+  echo '{"t":2}' > "$tmp/tests/benchmarks/svcomp-splits/holdout.jsonl"
+  echo 'pub fn foo(){}' > "$tmp/crates/saf-svcomp/src/lib.rs"
+  printf 'state/\n.loop-state/\nlevers.tsv\nstubs.sh\ngate/\n' > "$tmp/.gitignore"
+  git -C "$tmp" init -q
+  git -C "$tmp" -c user.email=a@b -c user.name=t add -A >/dev/null
+  git -C "$tmp" -c user.email=a@b -c user.name=t commit -qm init
+  echo "$STUBS_BODY" > "$tmp/stubs.sh"
+  # la is file-first; lb has earned a holdout boost -> lb must be picked despite coming second.
+  printf 'la\ttuning\tvalid-memsafety\tlocal\tfile-first lever\n'  > "$tmp/levers.tsv"
+  printf 'lb\ttuning\tvalid-memsafety\tlocal\thigher gen_credit lever\n' >> "$tmp/levers.tsv"
+  echo 5 > "$tmp/state/lever.lb.gen_credit"
+  SAF_REPO_ROOT="$tmp" SAF_LOOP_STATE="$tmp/state" SAF_GATE_LIB="$tmp/gate" SAF_LOOP_STUBS="$tmp/stubs.sh" \
+    LEVERS_FILE="$tmp/levers.tsv" ARM_PROMPT_FILE="$LOOP_DIR/arm_prompt.md" JOURNAL="$tmp/state/journal.md" \
+    LOOP_ENV=/dev/null SMOKE_SCENARIO=tuning_nogain \
+    GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=a@b GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=a@b \
+    bash "$SUP" --once >"$tmp.log" 2>&1
+  local picked; picked="$(awk -F' \\| ' '/^- arm/ {print $2}' "$tmp/state/journal.md" 2>/dev/null | tr -d ' ')"
+  if [ "$picked" = lb ]; then
+    printf '  ok   %-16s picked=%s (higher gen_credit beats file order)\n' gen_credit_priority "$picked"; pass=$((pass+1))
+  else
+    printf '  FAIL %-16s picked=%s want=lb\n' gen_credit_priority "$picked"; fail=$((fail+1))
+    tail -20 "$tmp.log" | sed 's/^/       /'
+  fi
+  rm -rf "$tmp" 2>/dev/null || true
+}
+
+heldout_brake_park() {  # §1a/§2.4 END-TO-END (gen mode): a lever KEEPs on val each arm but the svcomp26
+                        # holdout stays flat -> the actionable brake PARKS it as overfit after two misses.
+  local tmp; tmp="$(mktemp -d)"
+  mkdir -p "$tmp/scripts/loop/lib" "$tmp/tests/benchmarks/svcomp-splits" "$tmp/crates/saf-svcomp/src"
+  echo SCORER > "$tmp/scripts/svcomp_split_eval.py"
+  cp "$LOOP_DIR"/lib/*.py "$tmp/scripts/loop/lib/"
+  echo '{"t":1}' > "$tmp/tests/benchmarks/svcomp-splits/train.jsonl"
+  echo '{"t":2}' > "$tmp/tests/benchmarks/svcomp-splits/holdout.jsonl"
+  echo '{"t":3}' > "$tmp/tests/benchmarks/svcomp-splits/val.jsonl"
+  echo 'pub fn foo(){}' > "$tmp/crates/saf-svcomp/src/lib.rs"
+  printf 'state/\n.loop-state/\nlevers.tsv\nstubs.sh\ngate/\n' > "$tmp/.gitignore"
+  git -C "$tmp" init -q
+  git -C "$tmp" -c user.email=a@b -c user.name=t add -A >/dev/null
+  git -C "$tmp" -c user.email=a@b -c user.name=t commit -qm init
+  echo "$STUBS_BODY" > "$tmp/stubs.sh"
+  printf 'gk\ttuning\tvalid-memsafety\tlocal\tgen-mode lever: val gains that do not reproduce on holdout\n' > "$tmp/levers.tsv"
+  SAF_REPO_ROOT="$tmp" SAF_LOOP_STATE="$tmp/state" SAF_GATE_LIB="$tmp/gate" SAF_LOOP_STUBS="$tmp/stubs.sh" \
+    LEVERS_FILE="$tmp/levers.tsv" ARM_PROMPT_FILE="$LOOP_DIR/arm_prompt.md" JOURNAL="$tmp/state/journal.md" \
+    LOOP_ENV=/dev/null SMOKE_SCENARIO=gen_keep LOOP_GEN_MODE=on MAX_ARMS=6 \
+    HELDOUT_EVERY_K=1 HELDOUT_MIN_LIFT=2 HELDOUT_STALL_TO_PARK=2 LEVER_BUDGET=9 ACCUMULATE_BUDGET=9 \
+    GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=a@b GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=a@b \
+    bash "$SUP" --loop >"$tmp.log" 2>&1
+  local keeps parked alerted broke overfit
+  keeps="$(grep -c '\*\*KEEP\*\*' "$tmp/state/journal.md" 2>/dev/null || echo 0)"
+  [ -e "$tmp/state/lever.gk.parked" ] && parked=yes || parked=no
+  [ -e "$tmp/state/ALERT_OVERFIT_gk" ] && alerted=yes || alerted=no
+  grep -q 'no active levers remain' "$tmp.log" && broke=yes || broke=no
+  grep -q 'PARK-OVERFIT gk' "$tmp/state/journal.md" && overfit=yes || overfit=no
+  if [ "$keeps" = 3 ] && [ "$parked" = yes ] && [ "$alerted" = yes ] && [ "$broke" = yes ] && [ "$overfit" = yes ]; then
+    printf '  ok   %-16s keeps=%s parked=%s alert=%s overfit-note=%s broke=%s (holdout brake works)\n' \
+      heldout_brake_park "$keeps" "$parked" "$alerted" "$overfit" "$broke"; pass=$((pass+1))
+  else
+    printf '  FAIL %-16s keeps=%s(want 3) parked=%s alert=%s overfit=%s broke=%s\n' \
+      heldout_brake_park "$keeps" "$parked" "$alerted" "$overfit" "$broke"; fail=$((fail+1))
+    tail -30 "$tmp.log" | sed 's/^/       /'
+  fi
+  rm -rf "$tmp" 2>/dev/null || true
+}
+
 echo "== supervisor smoke (score-gate + accumulate + crosscut + rotation + anti-cheat + lever-budget) =="
 scenario score_gain    tuning_gain      tune-smoke  KEEP           # score improved -> kept (win)
 scenario accumulate    accumulate       tune-smoke  ACCUMULATE     # score-neutral + useful (tests pass) -> preserved for future arms
@@ -178,6 +356,11 @@ scenario holdout       holdout          tune-smoke  REJECT_HOLDOUT # read the ho
 scenario worker_fail   worker_fail      tune-smoke  WORKER_FAIL    # worker aborted after editing -> wasted-work record still emitted (§1c)
 multi_arm_budget                                                  # lever repeats, parks after budget, loop breaks
 family_rotation                                                   # lever selection round-robins across families
+accumulate_park                                                   # BUG-4: an ACCUMULATE-only lever parks on its own budget
+cap_wip_reprime                                                   # BUG-2: reverted capability WIP preserved + next arm primed
+reap_swept                                                        # BUG-3: orphan-container sweep invoked on keep + revert
+gen_credit_priority                                               # §2.5: holdout-boosted lever wins within its family
+heldout_brake_park                                                # §1a/§2.4: gen-mode holdout brake parks a non-reproducing lever
 
 echo
 echo "$pass passed, $fail failed"

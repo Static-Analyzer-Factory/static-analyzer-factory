@@ -191,6 +191,97 @@ def decide_v2(*, immutable_violations: list[str], forbidden_reads: list[str],
     return "REVERT"
 
 
+def holdout_lever_updates(*, holdout_increased: bool, per_lever_lift: dict[str, int],
+                          holdout_stall: dict[str, int], min_lift: int,
+                          stall_to_park: int = 2) -> dict:
+    """Decide per-lever park/boost from ONE global svcomp26-holdout checkpoint (plan 205 §1a/§2.4).
+
+    The holdout eval is GLOBAL (it scores the whole integration branch, not a single lever) and
+    READ-FORBIDDEN to the worker, so it is used supervisor-side ONLY, AFTER the per-arm KEEP is already
+    decided — it can only *lower* a lever's standing (park) or *raise* it (boost), never keep a bad
+    change. Movement is attributed to the levers that banked reasoning-set (`val`) lift since the previous
+    checkpoint (`per_lever_lift`, from arms.jsonl KEEP-bucket deltas), since the holdout number is not
+    itself per-lever.
+
+      * `holdout_increased` (weighted score rose vs the previous checkpoint):
+          BOOST every lever that contributed lift (>0) this window — its gains reproduced on
+          genuinely-new tasks → reset its holdout-stall and grant a priority (gen_credit) boost.
+      * NOT increased (flat or down):
+          every lever that banked `>= min_lift` this window is one whose train gains did NOT reproduce →
+          `holdout_stall += 1`; PARK it once it reaches `stall_to_park` CONSECUTIVE non-reproducing
+          checkpoints (two, to ride out holdout-eval noise — redesign §2.4).
+      * a lever with no lift this window is untouched (neither boosted nor stalled).
+
+    Returns `{'park': sorted[str], 'boost': sorted[str], 'new_stall': {lever: int}}` where `new_stall`
+    carries ONLY the levers whose stall changed (the caller merges it into the persisted counters). Pure
+    and deterministic: same inputs → identical output."""
+    park: list[str] = []
+    boost: list[str] = []
+    new_stall: dict[str, int] = {}
+    for lever, lift in per_lever_lift.items():
+        if lift <= 0:
+            continue
+        if holdout_increased:
+            boost.append(lever)
+            if holdout_stall.get(lever, 0) != 0:
+                new_stall[lever] = 0  # reproduced → clear the overfit stall
+        elif lift >= min_lift:
+            n = holdout_stall.get(lever, 0) + 1
+            new_stall[lever] = n
+            if n >= stall_to_park:
+                park.append(lever)
+    return {"park": sorted(park), "boost": sorted(boost), "new_stall": new_stall}
+
+
+def lever_state_after(decision: str, state: dict, *, gen_mode: bool,
+                      lever_budget: int, accumulate_budget: int,
+                      max_lever_arms: int) -> tuple[dict, str | None]:
+    """Pure transition of a lever's park bookkeeping after one arm's `decision` (plan 205 §1c BUG-4).
+
+    `state` carries the three persisted counters `{"attempts", "revert_stall", "accum_stall"}`
+    (missing keys default to 0). Returns `(new_state, park_reason)` where `park_reason` is one of
+    `None | "cap" | "revert" | "accumulate"`.
+
+    Semantics — a superset of the pre-BUG-4 `record_lever_outcome`, adding the ACCUMULATE budget:
+      * `attempts` always increments; hitting `max_lever_arms` parks (`"cap"`) — a hard spend ceiling.
+      * REVERT-stall (unchanged): a `KEEP` or `ACCUMULATE_PLUS` is progress and resets it; in LEGACY
+        mode a plain `ACCUMULATE` also resets it; everything else (`REVERT`/`WORKER_FAIL`/`REJECT_*`,
+        `KEEP_POOL`, and — in gen mode — a plain `ACCUMULATE`) increments it. `lever_budget`
+        consecutive non-progress arms parks (`"revert"`).
+      * ACCUMULATE-stall (NEW, BUG-4): plain `ACCUMULATE`s since the last point-banking / novel-solve
+        arm. `KEEP`, `KEEP_POOL` and `ACCUMULATE_PLUS` reset it (they moved the score or solved a
+        novel task); a plain `ACCUMULATE` increments it; `REVERT`/`REJECT` leave it unchanged
+        (reverts are the revert-stall's job). Reaching `accumulate_budget` parks (`"accumulate"`) —
+        so a lever that only ever polishes an unscoreable capability (race-confirmer) stops burning
+        slots instead of running to `max_lever_arms`. Fixes both modes: in LEGACY the revert-stall
+        was reset by every ACCUMULATE, so such a lever never parked at all.
+    Precedence when several thresholds trip on one arm: `cap` > `revert` > `accumulate`. A budget of
+    0 disables that park path.
+    """
+    attempts = int(state.get("attempts", 0)) + 1
+    revert_stall = int(state.get("revert_stall", 0))
+    accum_stall = int(state.get("accum_stall", 0))
+
+    resets_revert = decision in ("KEEP", "ACCUMULATE_PLUS") or (decision == "ACCUMULATE" and not gen_mode)
+    revert_stall = 0 if resets_revert else revert_stall + 1
+
+    if decision in ("KEEP", "KEEP_POOL", "ACCUMULATE_PLUS"):
+        accum_stall = 0
+    elif decision == "ACCUMULATE":
+        accum_stall += 1
+    # REVERT / WORKER_FAIL / REJECT_* leave accum_stall unchanged (the revert-stall handles them).
+
+    new_state = {"attempts": attempts, "revert_stall": revert_stall, "accum_stall": accum_stall}
+    reason: str | None = None
+    if attempts >= max_lever_arms:
+        reason = "cap"
+    elif lever_budget > 0 and revert_stall >= lever_budget:
+        reason = "revert"
+    elif accumulate_budget > 0 and accum_stall >= accumulate_budget:
+        reason = "accumulate"
+    return new_state, reason
+
+
 def sha256_file(p: Path) -> str:
     return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 

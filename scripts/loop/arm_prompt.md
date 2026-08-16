@@ -11,6 +11,8 @@ supervisor-measured, sound, held-out-checked gain (or, for a capability arm, a m
 - Family:  {{FAMILY}}        (the SV-COMP property your change targets)
 - Task:    {{DESC}}
 
+{{PRIOR_WIP}}
+
 ## What SAF is (do not break this)
 SAF is a SOUND, FALSE-only bug-finder in C.FalseOverall. It emits `false(<prop>)` ONLY when it can (a)
 prove must-reach unconditionally, or (b) concretely reproduce the violation (native replay / ASan for
@@ -35,6 +37,23 @@ memsafety / UBSan for overflow), which doubles as the witness. A wrong FALSE = �
 6. **Determinism:** byte-identical outputs for identical inputs (BTreeMap/BTreeSet, stub `rand`, etc.).
 7. Abstain (return `unknown`) whenever unsure — abstaining scores 0; a wrong verdict scores −16/−32.
 
+## SV-COMP compliance — REQUIRED if your change can emit a FALSE (read `scripts/loop/confirmer_contract.md`)
+Fuzzing and native execution ARE allowed and competitive (VeriAbs/VeriFuzz run AFL greybox fuzzing in
+ReachSafety and placed 1st/2nd) — SAF's compile→harness-nondet→run-natively→confirm-on-the-real-event→emit-
+witness model is the blessed pattern. **So build fuzzers / symbolic input oracles / native-replay confirmers
+freely.** The risk is never the technique; it is the accountability contract. Before ANY `false(<prop>)`, obey
+the fail-closed rules in `confirmer_contract.md` (each costs only recall when it triggers — abstain, never guess):
+- **R1** confirm ONLY on the property's exact violation event (`reach_error`/`__assert_fail` for unreach-call;
+  a signed-int *operation* overflow for no-overflow; ASan mem-error for memsafety; TSan race for no-data-race).
+  The benchmarks are NOT UB-free — abstain on any other trap. **No catch-all sanitizer→FALSE.**
+- **R2** no-overflow oracle = `-fsanitize=signed-integer-overflow` ONLY; ignore conversion/shift/pointer traps.
+- **R3** compile/run under the task's declared ILP32/LP64 model (`-m32` for ILP32); abstain if unavailable.
+- **R4** honor `__VERIFIER_assume` as a hard path filter. **R5** nondet inputs in-range for the declared
+  type/width/signedness (abstain on ambiguous/undocumented widths). **R6** re-trigger deterministically from
+  the exact injected values on the ORIGINAL (unsliced) program before emitting.
+- **R7** concurrency FALSE needs an explicit forced schedule + a **GraphML 1.0** witness (YAML 2.0 scores 0 for
+  concurrency); abstain on relaxed-memory / OpenMP. Sequential FALSE witnesses stay YAML 2.0 (CPAchecker/Witch3).
+
 ## Where to work
 Confirmers and property logic live in `crates/saf-svcomp/src/` (`memsafety.rs`, `overflow.rs`,
 `termination.rs`, `fast_paths.rs`, `property.rs`, `witness_lower.rs`, `witness_yaml.rs`) and the CLI
@@ -44,6 +63,12 @@ Add or extend unit tests for any new confirmer/logic (TDD). Keep the change SCOP
 **Put any scratch/probe/temp files in `/tmp`, NEVER in the repo.** The supervisor only commits `crates/` +
 manifest changes; stray files in the repo (probe outputs, temp dirs, large binaries) bloat the branch and
 are ignored — keep the working tree clean except for your real source change.
+**Container hygiene (do not leak containers):** any ad-hoc `docker compose run` probe MUST use `--rm` and an
+OUTER hard `timeout` on the `docker` invocation itself (not just the inner binary), and kill the process
+group on timeout — e.g. `timeout -k 5 60 docker compose run --rm -T dev sh -c '... timeout 8 ./probe ...'`.
+A sanitizer/pthread binary that outlives its inner `timeout` leaves a defunct child that wedges the
+container (it never exits, holding a slot for hours). The supervisor also sweeps leaked oneoff containers
+after each arm, but clean probes are your responsibility.
 
 ## Build / tests / clippy are YOUR job (the supervisor does NOT gate on them)
 The supervisor only checks anti-cheat + whether the CONFIRMED score improved. But your change MUST still
@@ -64,6 +89,16 @@ Your arm is a WIN (KEPT) iff you did NOT tamper with the scorer/labels/harness, 
 held-out set, AND the CONFIRMED score on the family went UP — even by +1 confirmed FALSE. Soundness is
 IN the score (a false alarm is -16, a wrong TRUE -32), so aim for sound gains — a big real gain
 outweighs a minor cost, but false alarms hurt.
+
+**Your target is TRANSFERABLE SOLVING POWER, not pool memorization.** The gate scores you on a held-IN
+validation set of reasoning-heavy, NON-generator tasks (loops, arrays, floats, recursion, drivers,
+firmware harnesses — NOT Juliet CWE clusters) with per-cluster DEDUP weighting: confirming more
+near-duplicate members of one generator family moves your score by ~0. So build a MECHANISM that solves a
+*class* of tasks (a sounder must-reach, a fuzzer/symbolic input oracle feeding native replay, backward
+slicing, harness/havoc synthesis) — never a pattern that keys on one cluster's shape (that scores 0 under
+dedup AND is caught by the read-forbidden holdout brake). You MAY read `tests/benchmarks/svcomp-splits/val.jsonl`
+and its per-task diagnostics (stderr tails) to see which reasoning tasks you miss and why — it's TRAIN,
+freely readable; only `holdout.jsonl` is off-limits.
 
 **Use your FULL turn budget to actually move the score.** Building a helper, a shim, or a scaffold is a
 MEANS, not the end: after you build it, WIRE IT INTO the verdict path and keep iterating — run the

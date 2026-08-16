@@ -71,6 +71,21 @@ def lever_roi(rows: list[dict]) -> dict[str, dict]:
     return dict(sorted(g.items(), key=lambda kv: (-kv[1]["netDelta"], kv[1]["cost"])))
 
 
+def lift_since(rows: list[dict], since_arm: int) -> dict[str, int]:
+    """Per-lever sum of KEEP-bucket `confirmed_delta` for arms numbered strictly > `since_arm` — the
+    reasoning-set (`val`) lift a lever banked since the last holdout checkpoint (plan 205 §2.4). Only
+    KEEP/KEEP_POOL arms contribute (they advanced the integration branch); REVERT/ACCUMULATE/REJECT
+    contribute 0. In gen mode `confirmed_delta` IS the val weighted delta, so this is exactly the
+    per-lever generalization lift the holdout brake attributes movement to. Deterministic."""
+    out: dict[str, int] = defaultdict(int)
+    for r in rows:
+        if _int(r.get("arm")) <= since_arm:
+            continue
+        if _BUCKET.get(r.get("decision", ""), "") == "KEEP":
+            out[r.get("lever", "?")] += _int(r.get("confirmed_delta"))
+    return dict(out)
+
+
 def waste(rows: list[dict]) -> dict:
     """Signals of wasted/re-derived work: reverting levers with net<=0, arms that hit max_turns,
     large reverts (>=8 files discarded), and near-identical diffs (same touched paths on >1 arm of
