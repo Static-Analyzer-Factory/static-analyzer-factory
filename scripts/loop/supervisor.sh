@@ -36,8 +36,10 @@ STATE_DIR="${SAF_LOOP_STATE:-$REPO_ROOT/.loop-state}"
 : "${EVAL_MAX_RSS_MB:=3072}"
 : "${EVAL_TIMEOUT:=60}"
 : "${HELDOUT_EVERY_K:=3}"          # run the svcomp26 held-out eval every K kept arms (the real signal)
-: "${OVERALL_CHECKPOINT_EVERY_KEEP:=1}"  # after every N KEPT arms run a FULL all-property eval: track the
-                                   # true C.FalseOverall trajectory + revert any cross-family regression
+: "${OVERALL_CHECKPOINT_EVERY_KEEP:=3}"  # after every N KEPT arms run a FULL all-property eval: track the
+                                   # true C.FalseOverall trajectory + revert any cross-family regression.
+                                   # 3 balances safety vs eval cost (the crosscut gate already prevents the
+                                   # main regressors per-arm at no extra cost; this backstops local leakage).
 : "${MAX_ARMS:=1}"                  # --loop cap; --once forces 1
 : "${SCRATCH_PREFIX:=auto/loop}"    # kept tuning arms land here (never pushed, never merged)
 : "${CAP_PREFIX:=cap}"              # capability scaffolding lineage: cap-<capability>/<n>
