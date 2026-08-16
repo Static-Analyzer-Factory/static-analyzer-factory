@@ -51,6 +51,58 @@ def _scorep(**fams):
             "max_score": 1000, "per_property": per}
 
 
+def _scorew(cw):
+    """A weighted (deduped) scorer JSON — the shape --group-weight produces."""
+    return {"confirmed_score": cw, "confirmed_score_weighted": cw,
+            "false_alarms": 0, "wrong_true": 0, "max_score": 1000}
+
+
+def _run_gen(root, val_before, val_after, pool_before, pool_after, manifest, transcript_lines,
+             forbidden, novel=0):
+    d = root
+    (d / "vb.json").write_text(json.dumps(val_before))
+    (d / "va.json").write_text(json.dumps(val_after) if val_after is not None else "")
+    if val_after is None:
+        (d / "va.json").unlink(missing_ok=True)
+    (d / "pb.json").write_text(json.dumps(pool_before))
+    (d / "pa.json").write_text(json.dumps(pool_after))
+    (d / "manifest.json").write_text(json.dumps(manifest))
+    (d / "t.jsonl").write_text("\n".join(transcript_lines))
+    argv = [sys.executable, str(CLI), "--gen-mode",
+            "--before", str(d / "vb.json"), "--after", str(d / "va.json"),
+            "--pool-before", str(d / "pb.json"), "--pool-after", str(d / "pa.json"),
+            "--immutable-manifest", str(d / "manifest.json"), "--repo-root", str(d),
+            "--transcript", str(d / "t.jsonl"), "--novel-solved", str(novel)]
+    for f in forbidden:
+        argv += ["--forbidden", f]
+    r = subprocess.run(argv, capture_output=True, text=True)
+    return r.stdout.strip().splitlines()[-1] if r.stdout.strip() else f"(no-output rc={r.returncode} err={r.stderr[-200:]})"
+
+
+def test_verify_arm_gen_mode():
+    with tempfile.TemporaryDirectory() as dd:
+        root = Path(dd)
+        imm = root / "scorer.py"; imm.write_text("SCORER\n")
+        good = {"scorer.py": hashlib.sha256(imm.read_bytes()).hexdigest()}
+        clean = [json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "splits/val.jsonl"}}]}})]
+        F = ["splits/holdout"]
+        # reasoning-set gain, pool flat -> KEEP
+        assert _run_gen(root, _scorew(40), _scorew(43), _scorew(200), _scorew(200), good, clean, F) == "KEEP"
+        # val flat, pool up (memorized Juliet points) -> KEEP_POOL
+        assert _run_gen(root, _scorew(40), _scorew(40), _scorew(200), _scorew(205), good, clean, F) == "KEEP_POOL"
+        # val up but the deduped pool REGRESSED -> REVERT (never trade pool away)
+        assert _run_gen(root, _scorew(40), _scorew(45), _scorew(200), _scorew(198), good, clean, F) == "REVERT"
+        # capability novel-solving progress, net-neutral -> ACCUMULATE_PLUS
+        assert _run_gen(root, _scorew(40), _scorew(40), _scorew(200), _scorew(200), good, clean, F, novel=1) == "ACCUMULATE_PLUS"
+        # broken val eval (no after) -> big-negative gen delta -> REVERT
+        assert _run_gen(root, _scorew(40), None, _scorew(200), _scorew(200), good, clean, F) == "REVERT"
+        # holdout read still rejected in gen mode
+        holdout_t = [json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "splits/holdout.jsonl"}}]}})]
+        assert _run_gen(root, _scorew(40), _scorew(43), _scorew(200), _scorew(200), good, holdout_t, F) == "REJECT_HOLDOUT"
+
+
 def test_verify_arm_end_to_end_decisions():
     with tempfile.TemporaryDirectory() as dd:
         root = Path(dd)

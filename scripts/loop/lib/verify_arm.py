@@ -51,6 +51,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--check-all-families", action="store_true",
                     help="CROSS-CUTTING arm: before/after are ALL-property evals; REVERT if any family's "
                          "confirmed score dropped (never trade one property's recall for another).")
+    # --- generalization mode (LOOP_GEN_MODE=on): --before/--after are the VAL (reasoning) evals with
+    # --group-weight; --pool-before/--pool-after are the deduped TRAIN-pool guard evals. decide_v2 replaces
+    # decide: a KEEP needs a val gain with no pool regression; a pool-only gain is KEEP_POOL. ---
+    ap.add_argument("--gen-mode", action="store_true", help="use the generalization gate (decide_v2)")
+    ap.add_argument("--pool-before", default=None, help="gen-mode: deduped TRAIN-pool scorer JSON (before)")
+    ap.add_argument("--pool-after", default=None, help="gen-mode: deduped TRAIN-pool scorer JSON (after)")
+    ap.add_argument("--novel-solved", choices=["0", "1"], default="0",
+                    help="gen-mode: 1 iff a capability arm made genuine novel-solving progress (-> ACCUMULATE_PLUS)")
     ap.add_argument("--verdict-out", default=None, help="optional: write a JSON verdict record here")
     args = ap.parse_args(argv)
 
@@ -60,31 +68,46 @@ def main(argv: list[str] | None = None) -> int:
 
     immutable_violations = gates.verify_immutables(manifest, Path(args.repo_root))
     forbidden_reads = gates.audit_forbidden_reads(transcript_lines, args.forbidden)
-    delta = gates.confirmed_delta(before, after)
     progressed = args.progressed == "1"
-    regressed_families = gates.family_regression(before, after) if args.check_all_families else []
+    delta = gates.confirmed_delta(before, after)
 
-    decision = gates.decide(
-        immutable_violations=immutable_violations,
-        forbidden_reads=forbidden_reads,
-        delta=delta,
-        progressed=progressed,
-        family_regressed=bool(regressed_families),
-    )
+    verdict = {
+        "immutable_violations": immutable_violations, "forbidden_reads": forbidden_reads,
+        "progressed": progressed,
+        "sound": gates.soundness_ok(after),  # informational only
+        "false_alarms": after.get("false_alarms"), "wrong_true": after.get("wrong_true"),
+    }
+
+    if args.gen_mode:
+        # --before/--after are the VAL (reasoning) evals; --pool-* are the deduped-pool guard.
+        pool_before, pool_after = _load(args.pool_before), _load(args.pool_after)
+        gen_delta_w = gates.generalization_delta(before, after)
+        pool_delta_w = gates.pool_guard_delta_w(pool_before, pool_after)
+        # a cross-cutting arm must not regress any family's DEDUPED pool score
+        regressed_families = gates.family_regression(pool_before, pool_after) if args.check_all_families else []
+        decision = gates.decide_v2(
+            immutable_violations=immutable_violations, forbidden_reads=forbidden_reads,
+            gen_delta_w=gen_delta_w, pool_delta_w=pool_delta_w,
+            novel_solved=args.novel_solved == "1", progressed=progressed,
+            family_regressed=bool(regressed_families),
+        )
+        verdict.update({"decision": decision, "gen_mode": True, "gen_delta_w": gen_delta_w,
+                        "pool_delta_w": pool_delta_w, "novel_solved": args.novel_solved == "1",
+                        "regressed_families": regressed_families})
+    else:
+        regressed_families = gates.family_regression(before, after) if args.check_all_families else []
+        decision = gates.decide(
+            immutable_violations=immutable_violations, forbidden_reads=forbidden_reads,
+            delta=delta, progressed=progressed, family_regressed=bool(regressed_families),
+        )
+        verdict.update({"decision": decision, "gen_mode": False, "confirmed_delta": delta,
+                        "check_all_families": args.check_all_families, "regressed_families": regressed_families})
 
     if args.verdict_out:
-        Path(args.verdict_out).write_text(json.dumps({
-            "decision": decision,
-            "immutable_violations": immutable_violations, "forbidden_reads": forbidden_reads,
-            "confirmed_delta": delta, "progressed": progressed,
-            "check_all_families": args.check_all_families, "regressed_families": regressed_families,
-            # informational (NOT gating): the soundness of the post-arm state, for human review
-            "sound": gates.soundness_ok(after),
-            "false_alarms": after.get("false_alarms"), "wrong_true": after.get("wrong_true"),
-        }, indent=2))
+        Path(args.verdict_out).write_text(json.dumps(verdict, indent=2))
 
     print(decision)
-    return 0 if decision in ("KEEP", "ACCUMULATE") else 1
+    return 0 if decision in ("KEEP", "KEEP_POOL", "ACCUMULATE", "ACCUMULATE_PLUS") else 1
 
 
 if __name__ == "__main__":

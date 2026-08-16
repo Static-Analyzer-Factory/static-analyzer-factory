@@ -46,13 +46,18 @@ STATE_DIR="${SAF_LOOP_STATE:-$REPO_ROOT/.loop-state}"
 : "${ALLOWED_TOOLS:=Read,Grep,Glob,Edit,Write,Bash,WebSearch,WebFetch}"
 # Immutable set — the scorer/splitter/validator/labels/holdout AND the loop's own harness
 # (`scripts/loop`, hashed recursively) so a worker can't edit its own gate. The agent may never alter these.
-: "${IMMUTABLE_GLOBS:=scripts/svcomp_split_eval.py scripts/svcomp_split.py scripts/validate_witness.sh tests/benchmarks/svcomp-splits/holdout.jsonl tests/benchmarks/svcomp-splits/train.jsonl scripts/loop}"
+: "${IMMUTABLE_GLOBS:=scripts/svcomp_split_eval.py scripts/svcomp_split.py scripts/validate_witness.sh tests/benchmarks/svcomp-splits/holdout.jsonl tests/benchmarks/svcomp-splits/train.jsonl tests/benchmarks/svcomp-splits/val.jsonl scripts/loop}"
 # Forbidden reads audited in the worker transcript (the held-out manifest — the agent may not READ it).
 : "${FORBIDDEN_READS:=svcomp-splits/holdout}"
 : "${LEVER_BUDGET:=6}"              # park a lever after this many CONSECUTIVE REVERTs (progress resets it)
 : "${MAX_LEVER_ARMS:=12}"           # hard cap on total arms per lever (bounds accumulation spend)
 TRAIN_MANIFEST="$REPO_ROOT/tests/benchmarks/svcomp-splits/train.jsonl"
 HOLDOUT_MANIFEST="$REPO_ROOT/tests/benchmarks/svcomp-splits/holdout.jsonl"
+VAL_MANIFEST="$REPO_ROOT/tests/benchmarks/svcomp-splits/val.jsonl"
+# LOOP_GEN_MODE=on: the generalization gate (decide_v2) — arms are scored on the reasoning `val` set with
+# per-cluster dedup weighting + a deduped-pool no-regression guard, so the loop rewards novel solving, not
+# Juliet memorization. off (default): legacy `decide` on the raw train sample. Flip on for a fresh campaign.
+: "${LOOP_GEN_MODE:=off}"
 # Gate self-protection: run the gate PYTHON and store the immutable manifest in a PRISTINE dir OUTSIDE
 # the repo, snapshotted from the clean baseline, so a worker editing scripts/loop/lib on its arm branch
 # cannot neuter its own judge — the check itself always runs untampered.
@@ -241,15 +246,23 @@ record_lever_outcome() {  # id decision : PROGRESS (KEEP/ACCUMULATE) resets the 
     touch "$STATE_DIR/lever.$id.parked"
     log "lever $id PARKED after $at total arms (cap $MAX_LEVER_ARMS)"; return
   fi
+  # PROGRESS resets the park-stall. In gen mode only a real generalization gain (KEEP) or preserved
+  # capability progress (ACCUMULATE_PLUS) counts — a KEEP_POOL (Juliet-only points) or plain ACCUMULATE does
+  # NOT, so pure-memorization / neutral levers still park. In legacy mode KEEP|ACCUMULATE reset (as before).
+  local reset=0
   case "$dec" in
-    KEEP|ACCUMULATE) echo 0 > "$sf" ;;   # real progress toward a score -> reset the consecutive-revert stall
-    *)
-      local s; s=$(( $(cat "$sf" 2>/dev/null || echo 0) + 1 )); echo "$s" > "$sf"
-      if [ "$s" -ge "$LEVER_BUDGET" ]; then
-        touch "$STATE_DIR/lever.$id.parked"
-        log "lever $id PARKED after $s consecutive REVERTs (budget $LEVER_BUDGET); any accumulated work stays on the branch"
-      fi ;;
+    KEEP|ACCUMULATE_PLUS) reset=1 ;;
+    ACCUMULATE) [ "$LOOP_GEN_MODE" = on ] || reset=1 ;;
   esac
+  if [ "$reset" = 1 ]; then
+    echo 0 > "$sf"
+  else
+    local s; s=$(( $(cat "$sf" 2>/dev/null || echo 0) + 1 )); echo "$s" > "$sf"
+    if [ "$s" -ge "$LEVER_BUDGET" ]; then
+      touch "$STATE_DIR/lever.$id.parked"
+      log "lever $id PARKED after $s arms with no progress (budget $LEVER_BUDGET); accumulated work stays on the branch"
+    fi
+  fi
 }
 
 # ----------------------------------------------------------------------------- one arm
@@ -279,8 +292,15 @@ run_arm() {
   # ORIENT + BASELINE on the work branch. Soundness is SOFT (baked into the score), so a base carrying
   # some false alarms is noted, not fatal — we do NOT die.
   git_here checkout -q "$base"
-  saf_eval "$TRAIN_MANIFEST" "$wk/before.json" $prop_arg
-  py -c "import json;d=json.load(open('$wk/before.json'));print('base: confirmed=%s FP=%s wrongTRUE=%s'%(d.get('confirmed_score'),d.get('false_alarms'),d.get('wrong_true')))" >&2 || true
+  if [ "$LOOP_GEN_MODE" = on ]; then
+    # gen gate: score the reasoning VAL set (the metric) + the deduped TRAIN pool (the guard), both weighted.
+    saf_eval "$VAL_MANIFEST"   "$wk/val_before.json"  $prop_arg --group-weight
+    saf_eval "$TRAIN_MANIFEST" "$wk/pool_before.json" $prop_arg --group-weight
+    py -c "import json;v=json.load(open('$wk/val_before.json'));p=json.load(open('$wk/pool_before.json'));print('base: val_w=%s pool_w=%s FP=%s'%(v.get('confirmed_score_weighted'),p.get('confirmed_score_weighted'),p.get('false_alarms')))" >&2 || true
+  else
+    saf_eval "$TRAIN_MANIFEST" "$wk/before.json" $prop_arg
+    py -c "import json;d=json.load(open('$wk/before.json'));print('base: confirmed=%s FP=%s wrongTRUE=%s'%(d.get('confirmed_score'),d.get('false_alarms'),d.get('wrong_true')))" >&2 || true
+  fi
 
   # ACT on a throwaway arm branch cut from the work branch
   git_here checkout -q -b "$branch"
@@ -295,32 +315,49 @@ run_arm() {
   # the work is USEFUL (compiles + saf-svcomp tests pass + non-empty diff) -> ACCUMULATE: preserve it on
   # the integration branch so FUTURE arms build ON it instead of re-deriving it (user ask). Otherwise
   # (regression / broken build / no-op) -> REVERT. The agent's self-report is never trusted.
-  saf_eval "$TRAIN_MANIFEST" "$wk/after.json" $prop_arg
-  local delta; delta="$(py -c "import json,os;b=json.load(open('$wk/before.json'));a=json.load(open('$wk/after.json')) if os.path.exists('$wk/after.json') else {};c=a.get('confirmed_score');print((c-b.get('confirmed_score',0)) if c is not None else -999999999)")"
+  # useful-work probe (ACCUMULATE signal): a real crates/manifest change that compiles + passes saf-svcomp tests.
   local progressed=0
-  # "useful" is a real SOURCE change (crates/ + manifests) — NOT worker scratch (probe files, temp dirs).
-  if [ "$delta" = "0" ] && ! git_here diff --quiet "$base" -- crates Cargo.toml Cargo.lock 2>/dev/null; then
-    saf_captest >"$wk/captest.log" 2>&1 && progressed=1   # score-neutral source change: is it tested?
+  if ! git_here diff --quiet "$base" -- crates Cargo.toml Cargo.lock 2>/dev/null; then
+    saf_captest >"$wk/captest.log" 2>&1 && progressed=1
   fi
-  local decision
-  decision="$(py "$LIB/verify_arm.py" \
-      --before "$wk/before.json" --after "$wk/after.json" \
-      --immutable-manifest "$IMMUTABLE_MANIFEST" --repo-root "$REPO_ROOT" \
-      --transcript "$wk/transcript.jsonl" \
-      $(for f in $FORBIDDEN_READS; do printf ' --forbidden %s' "$f"; done) \
-      --progressed "$progressed" $ccflag --verdict-out "$wk/verdict.json")" || true
-  log "decision: $decision (delta=$delta progressed=$progressed scope=$scope)"
+  local decision delta="n/a" gen_delta="n/a" pool_delta="n/a" checkpoint_after jdelta
+  local fwd; fwd="$(for f in $FORBIDDEN_READS; do printf ' --forbidden %s' "$f"; done)"
+  if [ "$LOOP_GEN_MODE" = on ]; then
+    saf_eval "$VAL_MANIFEST"   "$wk/val_after.json"  $prop_arg --group-weight
+    saf_eval "$TRAIN_MANIFEST" "$wk/pool_after.json" $prop_arg --group-weight
+    gen_delta="$(py -c "import json,os;b=json.load(open('$wk/val_before.json'));a=json.load(open('$wk/val_after.json')) if os.path.exists('$wk/val_after.json') else {};c=a.get('confirmed_score_weighted');print((c-b.get('confirmed_score_weighted',0)) if c is not None else -999999999)")"
+    pool_delta="$(py -c "import json,os;b=json.load(open('$wk/pool_before.json'));a=json.load(open('$wk/pool_after.json')) if os.path.exists('$wk/pool_after.json') else {};c=a.get('confirmed_score_weighted');print((c-b.get('confirmed_score_weighted',0)) if c is not None else -999999999)")"
+    local novel=0; [ "$mode" = capability ] && novel=1
+    decision="$(py "$LIB/verify_arm.py" --gen-mode \
+        --before "$wk/val_before.json" --after "$wk/val_after.json" \
+        --pool-before "$wk/pool_before.json" --pool-after "$wk/pool_after.json" \
+        --immutable-manifest "$IMMUTABLE_MANIFEST" --repo-root "$REPO_ROOT" \
+        --transcript "$wk/transcript.jsonl" $fwd \
+        --progressed "$progressed" --novel-solved "$novel" $ccflag --verdict-out "$wk/verdict.json")" || true
+    checkpoint_after="$wk/pool_after.json"; jdelta="$gen_delta"
+    log "decision: $decision (gen_delta=$gen_delta pool_delta=$pool_delta progressed=$progressed scope=$scope)"
+  else
+    saf_eval "$TRAIN_MANIFEST" "$wk/after.json" $prop_arg
+    delta="$(py -c "import json,os;b=json.load(open('$wk/before.json'));a=json.load(open('$wk/after.json')) if os.path.exists('$wk/after.json') else {};c=a.get('confirmed_score');print((c-b.get('confirmed_score',0)) if c is not None else -999999999)")"
+    decision="$(py "$LIB/verify_arm.py" \
+        --before "$wk/before.json" --after "$wk/after.json" \
+        --immutable-manifest "$IMMUTABLE_MANIFEST" --repo-root "$REPO_ROOT" \
+        --transcript "$wk/transcript.jsonl" $fwd \
+        --progressed "$progressed" $ccflag --verdict-out "$wk/verdict.json")" || true
+    checkpoint_after="$wk/after.json"; jdelta="$delta"
+    log "decision: $decision (delta=$delta progressed=$progressed scope=$scope)"
+  fi
 
   # CHECKPOINT
   case "$decision" in
-    KEEP)
-      keep_arm "$branch" "$n" "$id" "KEPT (score +$delta)"
-      journal "$n" "$id" "$mode" "KEEP" "$delta"
+    KEEP|KEEP_POOL)     # both bank real (deduped) points and advance the integration branch
+      keep_arm "$branch" "$n" "$id" "$decision (Δ=$jdelta)"
+      journal "$n" "$id" "$mode" "$decision" "$jdelta"
       maybe_heldout_check "$n"
-      maybe_overall_checkpoint "$n" "$scope" "$wk/after.json" ;;
-    ACCUMULATE)
-      keep_arm "$branch" "$n" "$id" "ACCUMULATED (useful, score-neutral; reusable by future arms)"
-      journal "$n" "$id" "$mode" "ACCUMULATE" "0" ;;
+      maybe_overall_checkpoint "$n" "$scope" "$checkpoint_after" ;;
+    ACCUMULATE|ACCUMULATE_PLUS)   # score-neutral useful work preserved for future arms (PLUS = capability progress)
+      keep_arm "$branch" "$n" "$id" "$decision (useful; reusable by future arms)"
+      journal "$n" "$id" "$mode" "$decision" "0" ;;
     REJECT_TAMPER|REJECT_HOLDOUT)
       log "SECURITY: $decision on arm $n — reverting + alerting"
       revert_arm "$branch"; journal "$n" "$id" "$mode" "$decision" "" ; touch "$STATE_DIR/ALERT_$decision" ;;
