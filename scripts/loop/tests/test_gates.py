@@ -85,6 +85,28 @@ def test_confirmed_delta_tolerates_missing_after():
     assert gates.confirmed_delta(_score(confirmed=100), _score(confirmed=101)) == 1
 
 
+def _scorep(**fams):
+    """A scorer JSON with a per_property breakdown: _scorep(**{'unreach-call': 100, ...})."""
+    per = {f: {"confirmed": c} for f, c in fams.items()}
+    return {"confirmed_score": sum(fams.values()), "false_alarms": 0, "wrong_true": 0,
+            "max_score": 1000, "per_property": per}
+
+
+def test_family_regression_flags_any_dropped_property():
+    before = _scorep(**{"valid-memsafety": 200, "unreach-call": 100, "no-overflow": 50})
+    # a pure Pareto improvement -> no regression
+    after_up = _scorep(**{"valid-memsafety": 210, "unreach-call": 100, "no-overflow": 50})
+    assert gates.family_regression(before, after_up) == []
+    # +unreach but -memsafety (a cross-family trade) -> memsafety flagged, even though total rose
+    after_trade = _scorep(**{"valid-memsafety": 190, "unreach-call": 130, "no-overflow": 50})
+    assert gates.family_regression(before, after_trade) == ["valid-memsafety"]
+    # two families drop -> both, sorted
+    after_two = _scorep(**{"valid-memsafety": 190, "unreach-call": 90, "no-overflow": 50})
+    assert gates.family_regression(before, after_two) == ["unreach-call", "valid-memsafety"]
+    # no per_property (a family-scoped eval) -> nothing detectable (checkpoint is the backstop)
+    assert gates.family_regression(_score(confirmed=100), _score(confirmed=90)) == []
+
+
 def test_decide_score_anticheat_and_accumulate():
     D = dict(immutable_violations=[], forbidden_reads=[])
     # Anti-cheat FIRST (precedence) — these ALERT, not merely revert.
@@ -100,6 +122,10 @@ def test_decide_score_anticheat_and_accumulate():
     assert gates.decide(**D, delta=0, progressed=False) == "REVERT"
     # a regression -> REVERT even if it compiles (never lower the score)
     assert gates.decide(**D, delta=-3, progressed=True) == "REVERT"
+    # CROSS-CUTTING arm that regressed another family -> REVERT, even with a positive overall delta
+    assert gates.decide(**D, delta=5, progressed=False, family_regressed=True) == "REVERT"
+    # family_regressed=False leaves the normal ladder intact
+    assert gates.decide(**D, delta=5, progressed=False, family_regressed=False) == "KEEP"
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

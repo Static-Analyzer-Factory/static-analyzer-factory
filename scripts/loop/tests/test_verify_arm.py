@@ -20,7 +20,8 @@ def _score(confirmed=0, fp=0, wt=0):
     return {"confirmed_score": confirmed, "false_alarms": fp, "wrong_true": wt, "max_score": 100}
 
 
-def _run(root: Path, before, after, manifest, transcript_lines, forbidden, progressed=0):
+def _run(root: Path, before, after, manifest, transcript_lines, forbidden, progressed=0,
+         check_all_families=False):
     d = root
     (d / "before.json").write_text(json.dumps(before))
     if after is not None:
@@ -36,10 +37,18 @@ def _run(root: Path, before, after, manifest, transcript_lines, forbidden, progr
             "--repo-root", str(d),
             "--transcript", str(d / "t.jsonl"),
             "--progressed", str(progressed)]
+    if check_all_families:
+        argv += ["--check-all-families"]
     for f in forbidden:
         argv += ["--forbidden", f]
     r = subprocess.run(argv, capture_output=True, text=True)
     return r.stdout.strip().splitlines()[-1] if r.stdout.strip() else f"(no-output rc={r.returncode} err={r.stderr[-200:]})"
+
+
+def _scorep(**fams):
+    per = {f: {"confirmed": c} for f, c in fams.items()}
+    return {"confirmed_score": sum(fams.values()), "false_alarms": 0, "wrong_true": 0,
+            "max_score": 1000, "per_property": per}
 
 
 def test_verify_arm_end_to_end_decisions():
@@ -71,6 +80,16 @@ def test_verify_arm_end_to_end_decisions():
         assert _run(root, _score(3960), _score(3961), tamper, clean_t, F) == "REJECT_TAMPER"
         # arm read the holdout -> REJECT_HOLDOUT
         assert _run(root, _score(3960), _score(3961), good, holdout_t, F) == "REJECT_HOLDOUT"
+
+        # CROSS-CUTTING arm, all-property eval: overall +20 but memsafety dropped -> REVERT (no trades)
+        b = _scorep(**{"valid-memsafety": 200, "unreach-call": 100})
+        a_trade = _scorep(**{"valid-memsafety": 190, "unreach-call": 130})   # total +20, memsafety -10
+        assert _run(root, b, a_trade, good, clean_t, F, check_all_families=True) == "REVERT"
+        # a Pareto improvement under the same all-property gate -> KEEP
+        a_pareto = _scorep(**{"valid-memsafety": 205, "unreach-call": 130})
+        assert _run(root, b, a_pareto, good, clean_t, F, check_all_families=True) == "KEEP"
+        # WITHOUT the flag (a local arm), the per-family drop is invisible; total +20 -> KEEP
+        assert _run(root, b, a_trade, good, clean_t, F, check_all_families=False) == "KEEP"
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

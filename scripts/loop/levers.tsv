@@ -1,12 +1,24 @@
-# SAF loop lever taxonomy (Addendum A7). TAB-separated: id <TAB> mode <TAB> family <TAB> description
-# ROI order top-to-bottom. mode ∈ {tuning, capability}. family = scorer --property for the SAFE-set gate.
-# The supervisor picks the first non-tried, non-parked lever. Prefix a line with # to PARK it.
-exec-validator-gate	tuning	valid-memsafety	Wire an execution-based validator (cpa-witness2test-style) into SAF's confirmation gate: accept CONFIRM if analysis OR execution replay agrees. Validator-side, no witness-content change (measured 3/7->6/7).
-conc-shim-m1	capability	unreach-call	ConcurrencySafety-FALSE Milestone 1: a deterministic-replay scheduler shim run as a CHESS-style c<=1->c<=2 blind sweep with ASan/UBSan; metric = FALSE recall at FA=0. De-risks the confirmer, reuses SAF's oracle verbatim.
-air-slicing	capability	unreach-call	Backward AIR program slicing from the sink (control+data dependence closure via existing points-to). Scalability multiplier that lets symbolic solving finish in budget and shrinks witnesses.
-harness-havoc	capability	unreach-call	Harness/entry-point synthesis + complex-object havocking (__VERIFIER_nondet_memory-style) — the binding constraint on the 2026-new Intel-TDX firmware batch (STRUCTURAL, not nondet-solving).
-symbolic-oracle	capability	unreach-call	Bounded symbolic path-solving as an INPUT ORACLE feeding the existing native replay (replay decides; wrong model -> replay fails -> abstain; incremental bound raising k=1,2,4). Bit-width/UB/semantics-faithful.
-conc-seq-m2	capability	unreach-call	ConcurrencySafety-FALSE Milestone 2: lazy round-robin sequentialization AIR->AIR pass (pc-labeled re-enterable thread fns + per-thread static local cells + round-robin driver); every FALSE re-confirmed by the M1 shim on the original binary.
-graphml-witness	capability	unreach-call	GraphML-1.0 concurrency-witness emitter (threadId sequence + createThread edges + startline from the replayed schedule) targeting CPAchecker-ThreadingCPA / Dartagnan / ConcurrentWitness2Test. Without it every concurrency FALSE is +0 not +1.
-frontend-unions	tuning	unreach-call	Frontend robustness on anonymous unions / nested types — prevents quiet wrong answers and unlocks TDX-family reachability.
-race-confirmer	capability	no-data-race	Dedicated concrete race confirmer (TSan-style happens-before replay) for the ~235 racy NoDataRace-FALSE tasks. Smaller pool; do after the reuse arms.
+# SAF loop lever taxonomy (Addendum A7). TAB-separated: id <TAB> mode <TAB> family <TAB> scope <TAB> description
+# ROI order top-to-bottom, and — since 2026-08-16 — lever SELECTION round-robins across FAMILIES so every
+# property type gets coverage (not just the first productive lever). Within a family the first non-parked
+# lever (ROI order) is picked. mode ∈ {tuning, capability}. family = scorer --property gate.
+#   scope ∈ {local, crosscut}:
+#     local    — the change is confined to ONE property's confirmer/verdict path; the arm is eval'd on that
+#                family only (cheap) and cannot affect other properties. The periodic all-property
+#                checkpoint backstops any leakage.
+#     crosscut — the change touches SHARED infrastructure (frontend / PTA / AIR / generic slicing) that runs
+#                for EVERY property; the arm is eval'd on ALL properties and REVERTED if any family regressed
+#                (never trade one property's recall for another).
+# Prefix a line with # to PARK it. The supervisor skips parked/commented levers.
+exec-validator-gate	tuning	valid-memsafety	local	Wire an execution-based validator (cpa-witness2test-style) into SAF's confirmation gate: accept CONFIRM if analysis OR execution replay agrees. Validator-side, no witness-content change (measured 3/7->6/7).
+overflow-recall	tuning	no-overflow	local	Raise no-overflow FALSE recall via the UBSan signed-overflow confirmer (R6, plan 199): widen the loop-free / interval reachability that feeds the confirmer and close the 64-bit gap; every FALSE concretely UBSan-replayed (no FALSE without a confirmed trap). Big pool — 9060 train tasks, currently 0 levers.
+conc-shim-m1	capability	unreach-call	local	ConcurrencySafety-FALSE Milestone 1: a deterministic-replay scheduler shim run as a CHESS-style c<=1->c<=2 blind sweep with ASan/UBSan; metric = FALSE recall at FA=0. De-risks the confirmer, reuses SAF's oracle verbatim.
+air-slicing	capability	unreach-call	crosscut	Backward AIR program slicing from the sink (control+data dependence closure via existing points-to). Scalability multiplier that lets symbolic solving finish in budget and shrinks witnesses. Touches shared AIR/analysis -> all-property gated.
+harness-havoc	capability	unreach-call	crosscut	Harness/entry-point synthesis + complex-object havocking (__VERIFIER_nondet_memory-style) — the binding constraint on the 2026-new Intel-TDX firmware batch (STRUCTURAL, not nondet-solving). Touches shared frontend/harness -> all-property gated.
+symbolic-oracle	capability	unreach-call	local	Bounded symbolic path-solving as an INPUT ORACLE feeding the existing native replay (replay decides; wrong model -> replay fails -> abstain; incremental bound raising k=1,2,4). Bit-width/UB/semantics-faithful. Additive oracle, unreach-scoped.
+conc-seq-m2	capability	unreach-call	crosscut	ConcurrencySafety-FALSE Milestone 2: lazy round-robin sequentialization AIR->AIR pass (pc-labeled re-enterable thread fns + per-thread static local cells + round-robin driver); every FALSE re-confirmed by the M1 shim on the original binary. AIR->AIR pass -> all-property gated.
+graphml-witness	capability	unreach-call	local	GraphML-1.0 concurrency-witness emitter (threadId sequence + createThread edges + startline from the replayed schedule) targeting CPAchecker-ThreadingCPA / Dartagnan / ConcurrentWitness2Test. Without it every concurrency FALSE is +0 not +1.
+frontend-unions	tuning	unreach-call	crosscut	Frontend robustness on anonymous unions / nested types — prevents quiet wrong answers and unlocks TDX-family reachability. Frontend change -> all-property gated.
+race-confirmer	capability	no-data-race	local	Dedicated concrete race confirmer (TSan-style happens-before replay) for the ~235 racy NoDataRace-FALSE tasks. Smaller pool; do after the reuse arms.
+termination-recall	tuning	termination	local	Raise termination-TRUE recall: widen the structural proof T∧L∧A∧I∧E (plan 201) to accept more loop-free / bounded-loop / acyclic-callgraph programs instead of abstaining. Verdict-only (no witness; scored on the verdict). PRESERVE the plan-201 hardening (abstain on llvm.global_ctors/dtors + any reachable block with no terminator).
+# memcleanup-r10	tuning	valid-memcleanup	local	DEFERRED (R10, LAST per branch-sequencing): valid-memcleanup FALSE via a leak-at-exit confirmer. Parked — the split pool currently has ~0 memcleanup tasks; revisit only after memsafety/overflow/unreach/termination levers are exhausted.

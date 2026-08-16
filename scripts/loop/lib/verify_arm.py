@@ -48,6 +48,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--progressed", choices=["0", "1"], default="0",
                     help="1 iff (score-neutral) work is USEFUL: compiles + tests pass + non-empty diff "
                          "(supervisor-computed; only consulted when delta == 0 -> ACCUMULATE vs REVERT)")
+    ap.add_argument("--check-all-families", action="store_true",
+                    help="CROSS-CUTTING arm: before/after are ALL-property evals; REVERT if any family's "
+                         "confirmed score dropped (never trade one property's recall for another).")
     ap.add_argument("--verdict-out", default=None, help="optional: write a JSON verdict record here")
     args = ap.parse_args(argv)
 
@@ -59,12 +62,14 @@ def main(argv: list[str] | None = None) -> int:
     forbidden_reads = gates.audit_forbidden_reads(transcript_lines, args.forbidden)
     delta = gates.confirmed_delta(before, after)
     progressed = args.progressed == "1"
+    regressed_families = gates.family_regression(before, after) if args.check_all_families else []
 
     decision = gates.decide(
         immutable_violations=immutable_violations,
         forbidden_reads=forbidden_reads,
         delta=delta,
         progressed=progressed,
+        family_regressed=bool(regressed_families),
     )
 
     if args.verdict_out:
@@ -72,6 +77,7 @@ def main(argv: list[str] | None = None) -> int:
             "decision": decision,
             "immutable_violations": immutable_violations, "forbidden_reads": forbidden_reads,
             "confirmed_delta": delta, "progressed": progressed,
+            "check_all_families": args.check_all_families, "regressed_families": regressed_families,
             # informational (NOT gating): the soundness of the post-arm state, for human review
             "sound": gates.soundness_ok(after),
             "false_alarms": after.get("false_alarms"), "wrong_true": after.get("wrong_true"),

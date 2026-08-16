@@ -36,6 +36,8 @@ STATE_DIR="${SAF_LOOP_STATE:-$REPO_ROOT/.loop-state}"
 : "${EVAL_MAX_RSS_MB:=3072}"
 : "${EVAL_TIMEOUT:=60}"
 : "${HELDOUT_EVERY_K:=3}"          # run the svcomp26 held-out eval every K kept arms (the real signal)
+: "${OVERALL_CHECKPOINT_EVERY_KEEP:=1}"  # after every N KEPT arms run a FULL all-property eval: track the
+                                   # true C.FalseOverall trajectory + revert any cross-family regression
 : "${MAX_ARMS:=1}"                  # --loop cap; --once forces 1
 : "${SCRATCH_PREFIX:=auto/loop}"    # kept tuning arms land here (never pushed, never merged)
 : "${CAP_PREFIX:=cap}"              # capability scaffolding lineage: cap-<capability>/<n>
@@ -201,18 +203,33 @@ PY
 }
 
 # ----------------------------------------------------------------------------- lever selection
-pick_lever() {  # prints "id<TAB>mode<TAB>family<TAB>description"
+pick_lever() {  # prints "id<TAB>mode<TAB>family<TAB>scope<TAB>description"
   local forced="${1:-}"
   if [ -n "$forced" ]; then
-    awk -F'\t' -v id="$forced" 'NF>=4 && $1==id {print; exit}' "$LEVERS_FILE"; return
+    awk -F'\t' -v id="$forced" 'NF>=5 && $1==id {print; exit}' "$LEVERS_FILE"; return
   fi
-  # ROI order = file order. REPEATS ARE ALLOWED (a capability accumulates over many arms; a tuning
-  # lever can keep yielding gains) — only PARKED levers (stalled past budget) are skipped.
-  awk -F'\t' 'NF>=4 && $1 !~ /^#/' "$LEVERS_FILE" | while IFS= read -r line; do
-    local id; id="$(printf '%s' "$line" | cut -f1)"
-    [ -e "$STATE_DIR/lever.$id.parked" ] && continue
-    printf '%s\n' "$line"; return 0
-  done | head -1
+  # ROUND-ROBIN ACROSS FAMILIES (user 2026-08-16): every property type gets coverage instead of the first
+  # productive lever hogging the budget. Families are taken in first-appearance (ROI) order; a persisted
+  # cursor makes each pick start AFTER the family worked last. WITHIN a family, the first non-parked lever
+  # (ROI order) is picked — so a productive lever still repeats, but only on its family's turn. Repeats are
+  # allowed; only PARKED levers (stalled past budget) are skipped.
+  local fams; fams="$(awk -F'\t' 'NF>=5 && $1 !~ /^#/ {print $3}' "$LEVERS_FILE" | awk '!seen[$0]++')"
+  local last; last="$(cat "$STATE_DIR/family_cursor" 2>/dev/null || echo '')"
+  local ordered; ordered="$(printf '%s\n' "$fams" | awk -v last="$last" '
+    { all[NR]=$0; if ($0==last) at=NR }
+    END { if (at) { for(i=at+1;i<=NR;i++) print all[i]; for(i=1;i<=at;i++) print all[i] }
+          else    { for(i=1;i<=NR;i++)   print all[i] } }')"
+  local fam id line
+  while IFS= read -r fam; do
+    [ -z "$fam" ] && continue
+    while IFS= read -r line; do
+      id="$(printf '%s' "$line" | cut -f1)"
+      [ -e "$STATE_DIR/lever.$id.parked" ] && continue
+      printf '%s' "$fam" > "$STATE_DIR/family_cursor"
+      printf '%s\n' "$line"; return 0
+    done < <(awk -F'\t' -v f="$fam" 'NF>=5 && $1 !~ /^#/ && $3==f {print}' "$LEVERS_FILE")
+  done <<< "$ordered"
+  return 0
 }
 record_lever_outcome() {  # id decision : PROGRESS (KEEP/ACCUMULATE) resets the stall; park on a stuck
                           # run (LEVER_BUDGET consecutive REVERTs) OR a hard total-arms cap.
@@ -237,23 +254,30 @@ record_lever_outcome() {  # id decision : PROGRESS (KEEP/ACCUMULATE) resets the 
 run_arm() {
   local lever_line; lever_line="$(pick_lever "${1:-}")"
   [ -z "$lever_line" ] && { log "no available lever (all tried/parked)"; return 10; }
-  local id mode family desc
+  local id mode family scope desc
   id="$(printf '%s' "$lever_line" | cut -f1)"
   mode="$(printf '%s' "$lever_line" | cut -f2)"
   family="$(printf '%s' "$lever_line" | cut -f3)"
-  desc="$(printf '%s' "$lever_line" | cut -f4-)"
+  scope="$(printf '%s' "$lever_line" | cut -f4)"; [ "$scope" = crosscut ] || scope=local
+  desc="$(printf '%s' "$lever_line" | cut -f5-)"
   local n; n="$(( $(cat "$STATE_DIR/arm_counter" 2>/dev/null || echo 0) + 1 ))"; echo "$n" > "$STATE_DIR/arm_counter"
   local base="$WORK_BRANCH" branch="arm/${n}"   # uniform: every arm builds on + folds into the work branch
 
-  log "=== ARM $n | lever=$id ($mode) | family=$family ==="
+  # A LOCAL lever (change confined to one confirmer/verdict path) is eval'd on its FAMILY only — cheap,
+  # and it cannot move another property. A CROSSCUT lever (frontend/PTA/AIR/slicing — shared code that
+  # runs for every property) is eval'd on ALL properties and REVERTED if any family regressed, so shared
+  # infra can never trade one property's recall away for another's.
+  local prop_arg="--property $family" ccflag=""
+  [ "$scope" = crosscut ] && { prop_arg=""; ccflag="--check-all-families"; }
+
+  log "=== ARM $n | lever=$id ($mode) | family=$family | scope=$scope ==="
   log "    $desc"
   local wk="$STATE_DIR/arm-$n"; mkdir -p "$wk"
 
-  # ORIENT + BASELINE on the work branch, scoped to the arm's family (a scoped change can't affect other
-  # properties). Soundness is SOFT (baked into the score), so a base carrying some false alarms is noted,
-  # not fatal — we do NOT die.
+  # ORIENT + BASELINE on the work branch. Soundness is SOFT (baked into the score), so a base carrying
+  # some false alarms is noted, not fatal — we do NOT die.
   git_here checkout -q "$base"
-  saf_eval "$TRAIN_MANIFEST" "$wk/before.json" --property "$family"
+  saf_eval "$TRAIN_MANIFEST" "$wk/before.json" $prop_arg
   py -c "import json;d=json.load(open('$wk/before.json'));print('base: confirmed=%s FP=%s wrongTRUE=%s'%(d.get('confirmed_score'),d.get('false_alarms'),d.get('wrong_true')))" >&2 || true
 
   # ACT on a throwaway arm branch cut from the work branch
@@ -269,7 +293,7 @@ run_arm() {
   # the work is USEFUL (compiles + saf-svcomp tests pass + non-empty diff) -> ACCUMULATE: preserve it on
   # the integration branch so FUTURE arms build ON it instead of re-deriving it (user ask). Otherwise
   # (regression / broken build / no-op) -> REVERT. The agent's self-report is never trusted.
-  saf_eval "$TRAIN_MANIFEST" "$wk/after.json" --property "$family"
+  saf_eval "$TRAIN_MANIFEST" "$wk/after.json" $prop_arg
   local delta; delta="$(py -c "import json,os;b=json.load(open('$wk/before.json'));a=json.load(open('$wk/after.json')) if os.path.exists('$wk/after.json') else {};c=a.get('confirmed_score');print((c-b.get('confirmed_score',0)) if c is not None else -999999999)")"
   local progressed=0
   # "useful" is a real SOURCE change (crates/ + manifests) — NOT worker scratch (probe files, temp dirs).
@@ -282,15 +306,16 @@ run_arm() {
       --immutable-manifest "$IMMUTABLE_MANIFEST" --repo-root "$REPO_ROOT" \
       --transcript "$wk/transcript.jsonl" \
       $(for f in $FORBIDDEN_READS; do printf ' --forbidden %s' "$f"; done) \
-      --progressed "$progressed" --verdict-out "$wk/verdict.json")" || true
-  log "decision: $decision (delta=$delta progressed=$progressed)"
+      --progressed "$progressed" $ccflag --verdict-out "$wk/verdict.json")" || true
+  log "decision: $decision (delta=$delta progressed=$progressed scope=$scope)"
 
   # CHECKPOINT
   case "$decision" in
     KEEP)
       keep_arm "$branch" "$n" "$id" "KEPT (score +$delta)"
       journal "$n" "$id" "$mode" "KEEP" "$delta"
-      maybe_heldout_check "$n" ;;
+      maybe_heldout_check "$n"
+      maybe_overall_checkpoint "$n" "$scope" "$wk/after.json" ;;
     ACCUMULATE)
       keep_arm "$branch" "$n" "$id" "ACCUMULATED (useful, score-neutral; reusable by future arms)"
       journal "$n" "$id" "$mode" "ACCUMULATE" "0" ;;
@@ -360,6 +385,63 @@ journal() {  # n id mode outcome delta
   printf -- '- arm %s | %s | %s | **%s** | Δconfirmed=%s | %s\n' \
     "$1" "$2" "$3" "$4" "${5:-n/a}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$JOURNAL"
 }
+journal_note() {  # free-form trajectory line (no **OUTCOME** token, so it never shadows an arm decision)
+  printf -- '  - %s | %s\n' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$JOURNAL"
+}
+
+# init_overall_checkpoint — establish the pre-loop all-property C.FalseOverall reference the periodic
+# checkpoint compares against (so even the FIRST KEEP is guarded). Tags the starting HEAD `overall-good`;
+# runs one full all-property eval only if we don't already have a checkpoint (resume keeps the prior one).
+init_overall_checkpoint() {
+  git_here tag -f overall-good "$WORK_BRANCH" >/dev/null 2>&1 || true
+  [ -s "$STATE_DIR/overall_checkpoint.json" ] && return 0
+  log "establishing initial overall (all-property) checkpoint baseline"
+  saf_eval "$TRAIN_MANIFEST" "$STATE_DIR/overall_checkpoint.json" || true
+}
+
+# maybe_overall_checkpoint <n> <scope> <after_json> — after every OVERALL_CHECKPOINT_EVERY_KEEP kept arms,
+# measure the TRUE all-property C.FalseOverall (reusing a crosscut arm's already-all-property after.json),
+# journal the per-property trajectory, and if the total REGRESSED vs the last good checkpoint, ALERT and
+# roll the work branch back to the `overall-good` tag (backstop for a "local" change that wasn't). This is
+# the safety net behind the per-arm crosscut gate: local arms are only eval'd on their own family, so a
+# genuine cross-family leak is caught here.
+maybe_overall_checkpoint() {
+  local n="$1" scope="$2" after_json="$3"
+  local kc; kc="$(( $(cat "$STATE_DIR/ckpt_keep_counter" 2>/dev/null || echo 0) + 1 ))"; echo "$kc" > "$STATE_DIR/ckpt_keep_counter"
+  [ $(( kc % OVERALL_CHECKPOINT_EVERY_KEEP )) -eq 0 ] || return 0
+  log "overall checkpoint (every $OVERALL_CHECKPOINT_EVERY_KEEP kept): full all-property C.FalseOverall"
+  local ov="$STATE_DIR/overall-$n.json"
+  if [ "$scope" = crosscut ] && [ -s "$after_json" ]; then
+    cp -f "$after_json" "$ov"                              # crosscut arm already eval'd ALL properties
+  else
+    saf_eval "$TRAIN_MANIFEST" "$ov" || { log "checkpoint eval failed; skipping"; return 0; }
+  fi
+  local summary rc
+  summary="$(py - "$ov" "$STATE_DIR/overall_checkpoint.json" <<'PY'
+import json, os, sys
+ov = json.load(open(sys.argv[1])); tot = ov.get("confirmed_score", 0)
+per = ov.get("per_property", {}) or {}
+line = " ".join("%s=%s" % (k, (v or {}).get("confirmed", 0)) for k, v in sorted(per.items()))
+prev = sys.argv[2]; ptot = None
+if os.path.exists(prev):
+    try: ptot = json.load(open(prev)).get("confirmed_score")
+    except Exception: ptot = None
+print("overall CONFIRMED=%d [%s]%s" % (tot, line, "" if ptot is None else " (prev %d)" % ptot))
+sys.exit(2 if (ptot is not None and tot < ptot) else 0)
+PY
+)"; rc=$?
+  journal_note "$summary"; log "$summary"
+  if [ "$rc" -eq 2 ]; then
+    log "ALERT: OVERALL C.FalseOverall REGRESSED — rolling $WORK_BRANCH back to last-good checkpoint (overall-good)"
+    touch "$STATE_DIR/ALERT_OVERALL_REGRESSION"; journal_note "**ALERT_OVERALL_REGRESSION** rolled back to overall-good"
+    git_here checkout -q "$WORK_BRANCH" 2>/dev/null || true
+    git_here reset -q --hard overall-good 2>/dev/null || true
+    git_here rev-parse HEAD > "$STATE_DIR/baseline_ref"
+  else
+    cp -f "$ov" "$STATE_DIR/overall_checkpoint.json"       # advance the reference
+    git_here tag -f overall-good "$WORK_BRANCH" >/dev/null 2>&1 || true
+  fi
+}
 
 render_arm_prompt() {  # id mode family desc -> stdout (fixed prompt + this arm's lever)
   local id="$1" mode="$2" family="$3" desc="$4"
@@ -383,7 +465,7 @@ main() {
       log "DRY-RUN: one arm, foreground, watched, then STOP"
       run_arm "${1:-}" ;;
     --loop)
-      setup_work_branch; freeze_immutables
+      setup_work_branch; freeze_immutables; init_overall_checkpoint
       local i=0 rc=0
       while [ "$i" -lt "$MAX_ARMS" ]; do
         [ -e "$STATE_DIR/STOP" ] && { log "STOP file present — halting"; break; }

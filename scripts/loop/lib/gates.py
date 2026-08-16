@@ -76,12 +76,38 @@ def confirmed_delta(before: dict, after: dict) -> int:
     return a - before.get("confirmed_score", 0)
 
 
+def family_regression(before: dict, after: dict) -> list[str]:
+    """Return the sorted property families whose CONFIRMED score DROPPED from `before` to `after`,
+    read from the scorer's per-property breakdown (svcomp_split_eval.py's `per_property` map).
+
+    Used ONLY for CROSS-CUTTING arms — changes to shared infrastructure (frontend / PTA / AIR /
+    program slicing) that can move EVERY property, not just the lever's nominal family. Such an arm is
+    eval'd on ALL properties and reverted if ANY family regressed, even when the OVERALL score rose:
+    SAF must never trade one property's recall away for another's when touching shared code. Local
+    (single-confirmer) arms don't use this — they are eval'd on their own family only, and the periodic
+    all-property checkpoint backstops any leakage. Missing/empty `per_property` -> [] (no detectable
+    regression; the total `confirmed_delta` still gates and the checkpoint is the real backstop).
+    """
+    pb = before.get("per_property") or {}
+    pa = after.get("per_property") or {}
+    regressed: list[str] = []
+    for fam, b in pb.items():
+        before_conf = (b or {}).get("confirmed", 0)
+        after_conf = (pa.get(fam) or {}).get("confirmed", 0)
+        if after_conf < before_conf:
+            regressed.append(fam)
+    return sorted(regressed)
+
+
 def decide(*, immutable_violations: list[str], forbidden_reads: list[str],
-           delta: int, progressed: bool) -> str:
+           delta: int, progressed: bool, family_regressed: bool = False) -> str:
     """The supervisor's decision for one arm. Returns exactly one of
     REJECT_TAMPER / REJECT_HOLDOUT / KEEP / ACCUMULATE / REVERT.
 
     Anti-reward-hacking violations come FIRST (they ALERT, not merely revert). Then:
+      * `family_regressed` -> REVERT  (a CROSS-CUTTING arm dropped some OTHER property's confirmed
+                        score — never trade one property's recall for another when touching shared
+                        frontend/PTA/AIR code; checked only for crosscut levers, see `family_regression`)
       * `delta > 0`  -> KEEP        (a real score gain — a win; the integration branch advances)
       * `delta == 0 and progressed` -> ACCUMULATE  (useful, score-NEUTRAL work — it compiles, its
                         tests pass, and it changed something; we PRESERVE it on the integration branch
@@ -94,6 +120,8 @@ def decide(*, immutable_violations: list[str], forbidden_reads: list[str],
         return "REJECT_TAMPER"
     if forbidden_reads:
         return "REJECT_HOLDOUT"
+    if family_regressed:
+        return "REVERT"
     if delta > 0:
         return "KEEP"
     if delta == 0 and progressed:
