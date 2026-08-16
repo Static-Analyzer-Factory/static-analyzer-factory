@@ -81,6 +81,34 @@ def origin_group(rel_dir: str, depth: int) -> str:
     return "/".join(parts[:depth])
 
 
+# Category roots that are known GENERATORS (near-duplicate machine-generated tasks). Excluded from the
+# reasoning VALIDATION set so the loop's gate rewards distinct solving power, not pool memorization. The
+# cluster-size backstop below auto-catches unlabeled generators, so this list only needs the obvious ones.
+GENERATOR_ROOTS = frozenset({"Juliet_Test", "weaver"})
+VAL_CLUSTER_MAX = 200  # a (group, property) cluster bigger than this is treated as a generator (self-maintaining backstop)
+
+
+def category_root(group: str) -> str:
+    """First path component of an origin group — its top-level benchmark family
+    (e.g. category_root("Juliet_Test/CWE190_x") -> "Juliet_Test", category_root("loops") -> "loops")."""
+    parts = [p for p in group.split("/") if p]
+    return parts[0] if parts else group
+
+
+def is_reasoning_task(task: dict, cluster_prop_size: dict, denylist=GENERATOR_ROOTS,
+                      cluster_max: int = VAL_CLUSTER_MAX) -> bool:
+    """A task belongs in the held-IN reasoning VALIDATION set (`val.jsonl` ⊂ train) iff its category root is
+    NOT a known generator AND its origin cluster (group × property) is not oversized. Defined STRUCTURALLY —
+    never a curated per-task allow-list (which would itself be a memorization surface and would rot). The
+    cluster-size backstop auto-catches unlabeled generators; the classifier fail-SAFE EXCLUDES when unsure,
+    so `val` only ever gets cleaner. `cluster_prop_size` maps (group, property) -> task count."""
+    if category_root(task["group"]) in denylist:
+        return False
+    if cluster_prop_size.get((task["group"], task["property"]), 0) > cluster_max:
+        return False
+    return True
+
+
 def stable_key(name: str, seed: int) -> str:
     """Deterministic per-group ordering key — SHA-256 of "<seed>:<name>". Stable
     across processes and machines (Python's built-in hash() is salted per run)."""
@@ -226,9 +254,9 @@ def write_split(
 
     with (out_dir / f"{split}.jsonl").open("w") as f:
         for t in tasks:
-            f.write(json.dumps({k: t[k] for k in (
+            f.write(json.dumps({k: t.get(k) for k in (
                 "yml", "src", "rel_src", "rel_yml", "property", "expected",
-                "subproperty", "data_model", "group")}) + "\n")
+                "subproperty", "data_model", "group", "cluster", "generator")}) + "\n")
 
     by_prop: dict[str, list[dict]] = defaultdict(list)
     for t in tasks:
@@ -317,6 +345,10 @@ def main() -> int:
     ap.add_argument("--holdout-frac", type=float, default=0.2,
                     help="grouped mode: target holdout fraction per property")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--val-cluster-max", type=int, default=VAL_CLUSTER_MAX,
+                    help="reasoning val set: a (group,property) cluster bigger than this is a generator")
+    ap.add_argument("--generator-roots", default=",".join(sorted(GENERATOR_ROOTS)),
+                    help="comma-separated category roots excluded from the reasoning val set")
     ap.add_argument("--timelimit", default="900 s", help="BenchExec per-task CPU limit")
     ap.add_argument("--memlimit", default="15 GB")
     ap.add_argument("--cpu-cores", default="4")
@@ -368,11 +400,27 @@ def main() -> int:
               f"(older members in train, 2026-added members in holdout) — "
               f"expected for edition holdout, not leakage.")
 
+    # Tag every task with its cluster + generator flag, then carve the held-IN reasoning VALIDATION set
+    # (`val` ⊂ train, generator/Juliet clusters excluded). The loop's generalization gate scores arms on
+    # `val` so it rewards distinct solving power, not near-duplicate pool recall. `val` is worker-READABLE
+    # (unlike the holdout); the svcomp26 holdout stays read-forbidden.
+    denylist = frozenset(r.strip() for r in args.generator_roots.split(",") if r.strip())
+    cluster_prop_size: dict = defaultdict(int)
+    for t in tasks:
+        cluster_prop_size[(t["group"], t["property"])] += 1
+    for t in tasks:
+        t["cluster"] = t["group"]
+        t["generator"] = not is_reasoning_task(t, cluster_prop_size, denylist, args.val_cluster_max)
+    val = [t for t in train if not t["generator"]]
+
     train_sum = write_split(out_dir, "train", train, properties)
     holdout_sum = write_split(out_dir, "holdout", holdout, properties)
+    val_sum = write_split(out_dir, "val", val, properties)
     write_bench_xml(out_dir, "train", train_sum["properties_present"], c_dir,
                     args.timelimit, args.memlimit, args.cpu_cores)
     write_bench_xml(out_dir, "holdout", holdout_sum["properties_present"], c_dir,
+                    args.timelimit, args.memlimit, args.cpu_cores)
+    write_bench_xml(out_dir, "val", val_sum["properties_present"], c_dir,
                     args.timelimit, args.memlimit, args.cpu_cores)
 
     achieved = {}
@@ -390,6 +438,9 @@ def main() -> int:
         "properties": properties,
         "train": train_sum,
         "holdout": holdout_sum,
+        "validation": val_sum,
+        "val_cluster_max": args.val_cluster_max,
+        "generator_roots": sorted(denylist),
         "achieved_holdout_fraction": achieved,
         "n_holdout_groups": len(holdout_groups),
         "holdout_groups": holdout_groups,
@@ -404,6 +455,8 @@ def main() -> int:
               f"{holdout_sum['per_property'][p]:>8} {achieved[p]*100:>8.1f}% "
               f"{holdout_sum['per_property_false'][p]:>13}")
     print(f"  holdout origin groups: {len(holdout_groups)}")
+    _val_props = ", ".join(f"{p}={val_sum['per_property'][p]}" for p in properties)
+    print(f"  reasoning VAL set (train minus generators): {val_sum['total']} tasks ({_val_props})")
     print(f"\nnext: score each split with confirmed witnesses, e.g.\n"
           f"  python3 scripts/svcomp_split_eval.py --manifest {out_dir}/holdout.jsonl "
           f"--confirm-witness")

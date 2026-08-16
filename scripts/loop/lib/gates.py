@@ -129,6 +129,68 @@ def decide(*, immutable_violations: list[str], forbidden_reads: list[str],
     return "REVERT"
 
 
+def weighted_confirmed(scorer: dict) -> int | None:
+    """The per-cluster-DEDUPED confirmed score (svcomp_split_eval.py --group-weight → `confirmed_score_weighted`).
+    Capping each generator cluster at 1 point means confirming 300 near-duplicate Juliet tasks moves this by at
+    most 1 — so it measures DISTINCT solving power, not pool volume. Returns None if the (weighted) eval is
+    missing (broken build / no --group-weight), so callers treat it as a regression."""
+    return scorer.get("confirmed_score_weighted")
+
+
+def generalization_delta(val_before: dict, val_after: dict) -> int:
+    """Change in the DEDUPED confirmed score on the reasoning VALIDATION set (`val.jsonl` ⊂ train, Juliet/
+    generator clusters excluded). This is the quantity the loop now maximizes: a gain here is real solving power
+    on novel-shaped tasks, not memorization of a repeated cluster. Missing after-eval → large negative (regression)."""
+    a = weighted_confirmed(val_after)
+    if a is None:
+        return -(10 ** 9)
+    return a - (weighted_confirmed(val_before) or 0)
+
+
+def pool_guard_delta_w(pool_before: dict, pool_after: dict) -> int:
+    """Change in the DEDUPED confirmed score on the (Juliet-inclusive) TRAIN pool — the no-regression GUARD.
+    A KEEP must not lower it (never trade pool recall away); a pool-only gain with val flat is a KEEP_POOL.
+    Deduping means 'confirm 3 of 300 near-dups' ≈ 0 movement, so memorization can't even tie-break. Missing
+    after-eval → large negative."""
+    a = weighted_confirmed(pool_after)
+    if a is None:
+        return -(10 ** 9)
+    return a - (weighted_confirmed(pool_before) or 0)
+
+
+def decide_v2(*, immutable_violations: list[str], forbidden_reads: list[str],
+              gen_delta_w: int, pool_delta_w: int, novel_solved: bool = False,
+              progressed: bool = False, family_regressed: bool = False) -> str:
+    """Generalization-aware decision (LOOP_GEN_MODE=on). Returns one of
+    REJECT_TAMPER / REJECT_HOLDOUT / KEEP / KEEP_POOL / ACCUMULATE_PLUS / ACCUMULATE / REVERT.
+
+    The loop now maximizes DEDUPED reasoning-set recall, not confirmed FALSEs on a Juliet-dominated sample:
+      * `gen_delta_w > 0 AND pool_delta_w >= 0` -> KEEP         (real generalization gain; pool not regressed)
+      * `pool_delta_w > 0 AND gen_delta_w >= 0` -> KEEP_POOL    (honest Juliet points, val flat — BANKED, but the
+                          supervisor does NOT reset the lever's revert-stall, so pure-memorization levers still park)
+      * `novel_solved AND both deltas >= 0`     -> ACCUMULATE_PLUS  (a capability arm confirmed its FIRST novel task
+                          — preserve its source AND give it priority/budget instead of the park countdown)
+      * `gen==0 AND pool==0 AND progressed`     -> ACCUMULATE   (useful score-neutral work — compiles+tests+diff)
+      * otherwise (either set regressed, or a no-op)            -> REVERT
+    Anti-cheat rejects come first; a crosscut arm that regressed another family is a hard REVERT. Neither KEEP
+    variant may lower the deduped pool (`pool_delta_w >= 0` is required), so the pool score is monotone."""
+    if immutable_violations:
+        return "REJECT_TAMPER"
+    if forbidden_reads:
+        return "REJECT_HOLDOUT"
+    if family_regressed:
+        return "REVERT"
+    if gen_delta_w > 0 and pool_delta_w >= 0:
+        return "KEEP"
+    if pool_delta_w > 0 and gen_delta_w >= 0:
+        return "KEEP_POOL"
+    if novel_solved and gen_delta_w >= 0 and pool_delta_w >= 0:
+        return "ACCUMULATE_PLUS"
+    if gen_delta_w == 0 and pool_delta_w == 0 and progressed:
+        return "ACCUMULATE"
+    return "REVERT"
+
+
 def sha256_file(p: Path) -> str:
     return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 

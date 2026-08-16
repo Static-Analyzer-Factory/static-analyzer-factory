@@ -128,6 +128,45 @@ def test_decide_score_anticheat_and_accumulate():
     assert gates.decide(**D, delta=5, progressed=False, family_regressed=False) == "KEEP"
 
 
+def _scorew(confirmed_weighted=0, **kw):
+    """A scorer JSON carrying the deduped weighted score (svcomp_split_eval --group-weight)."""
+    d = {"confirmed_score": confirmed_weighted, "confirmed_score_weighted": confirmed_weighted,
+         "false_alarms": 0, "wrong_true": 0, "max_score": 1000}
+    d.update(kw)
+    return d
+
+
+def test_generalization_and_pool_deltas():
+    assert gates.generalization_delta(_scorew(40), _scorew(43)) == 3
+    assert gates.pool_guard_delta_w(_scorew(200), _scorew(200)) == 0
+    assert gates.pool_guard_delta_w(_scorew(200), _scorew(195)) == -5
+    # a broken-build after (no weighted score) -> big negative -> regression, not a crash
+    assert gates.generalization_delta(_scorew(40), {}) < 0
+
+
+def test_decide_v2_rewards_generalization_not_memorization():
+    D = dict(immutable_violations=[], forbidden_reads=[])
+    # reasoning-set gain, pool not regressed -> KEEP (the real win)
+    assert gates.decide_v2(**D, gen_delta_w=3, pool_delta_w=0) == "KEEP"
+    assert gates.decide_v2(**D, gen_delta_w=3, pool_delta_w=5) == "KEEP"
+    # pool-only Juliet gain, val flat -> KEEP_POOL (banked, but supervisor won't reset the stall)
+    assert gates.decide_v2(**D, gen_delta_w=0, pool_delta_w=7) == "KEEP_POOL"
+    # a KEEP must never lower the deduped pool, even with a val gain -> REVERT
+    assert gates.decide_v2(**D, gen_delta_w=3, pool_delta_w=-1) == "REVERT"
+    # memorization that also regresses the reasoning set -> REVERT (can't tie-break on Juliet)
+    assert gates.decide_v2(**D, gen_delta_w=-1, pool_delta_w=9) == "REVERT"
+    # a capability arm's FIRST novel solve, net-neutral weighted -> ACCUMULATE_PLUS (preserve + priority)
+    assert gates.decide_v2(**D, gen_delta_w=0, pool_delta_w=0, novel_solved=True) == "ACCUMULATE_PLUS"
+    # score-neutral but useful -> ACCUMULATE
+    assert gates.decide_v2(**D, gen_delta_w=0, pool_delta_w=0, progressed=True) == "ACCUMULATE"
+    # no-op -> REVERT
+    assert gates.decide_v2(**D, gen_delta_w=0, pool_delta_w=0) == "REVERT"
+    # anti-cheat precedence + crosscut family regression
+    assert gates.decide_v2(immutable_violations=["s"], forbidden_reads=[], gen_delta_w=9, pool_delta_w=9) == "REJECT_TAMPER"
+    assert gates.decide_v2(immutable_violations=[], forbidden_reads=["h"], gen_delta_w=9, pool_delta_w=9) == "REJECT_HOLDOUT"
+    assert gates.decide_v2(**D, gen_delta_w=9, pool_delta_w=9, family_regressed=True) == "REVERT"
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

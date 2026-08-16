@@ -300,6 +300,38 @@ def eval_one(task: dict, svb: Path, timeout: int, confirm: bool,
     }
 
 
+def weighted_confirmed_summary(results: list[dict], cap: int = 1) -> dict:
+    """Per-CLUSTER-deduped confirmed score. Each origin cluster (the task's `group`, e.g. a single Juliet
+    CWE family) contributes at most `cap` POSITIVE points — so confirming 300 near-duplicate tasks moves the
+    number by at most `cap` — while penalties (−16/−32) pass through in FULL (a cluster can never hide a
+    false alarm). This is the quantity the loop's generalization gate maximizes on the reasoning `val` set:
+    distinct solving power, not pool volume. Returns `confirmed_score_weighted` + per-property
+    `{confirmed_weighted, confirmed_clusters}` + `confirmed_by_cluster`."""
+    by_cluster: dict[str, int] = defaultdict(int)
+    cluster_prop: dict[str, str] = {}
+    for r in results:
+        g = r.get("group") or r["rel_yml"]
+        by_cluster[g] += r["confirmed"]
+        cluster_prop[g] = r["property"]
+
+    def capped(c: int) -> int:
+        return min(c, cap) if c > 0 else c   # cap positives per cluster; keep penalties whole
+
+    per: dict[str, dict] = defaultdict(lambda: {"confirmed_weighted": 0, "confirmed_clusters": 0})
+    total = 0
+    for g, c in by_cluster.items():
+        w = capped(c)
+        total += w
+        per[cluster_prop[g]]["confirmed_weighted"] += w
+        if c > 0:
+            per[cluster_prop[g]]["confirmed_clusters"] += 1
+    return {
+        "confirmed_score_weighted": total,
+        "per_property_weighted": {p: dict(v) for p, v in per.items()},
+        "confirmed_by_cluster": dict(by_cluster),
+    }
+
+
 def summarize(results: list[dict]) -> dict:
     per: dict[str, dict] = defaultdict(lambda: {
         "n": 0, "TP": 0, "FP": 0, "TN": 0, "FN": 0, "true_emitted": 0,
@@ -351,6 +383,11 @@ def main() -> int:
     ap.add_argument("--confirm-timeout", type=int, default=150)
     ap.add_argument("--jobs", type=int, default=1, help="parallel verify workers")
     ap.add_argument("-o", "--out", default=None, help="write JSON summary to file")
+    ap.add_argument("--group-weight", action="store_true",
+                    help="also emit confirmed_score_weighted (per-cluster-deduped): each origin cluster "
+                         "contributes at most --weight-cap POSITIVE points (penalties pass through whole). "
+                         "The generalization gate's metric — rewards distinct solving, not pool volume.")
+    ap.add_argument("--weight-cap", type=int, default=1)
     ap.add_argument("--per-task", default=None,
                     help="write a per-task diagnostic JSONL (verdict, outcome, "
                          "duration, stderr tail on misses) for later inspection")
@@ -422,13 +459,16 @@ def main() -> int:
 
     ok = tot["FP"] == 0 and tot["wrong_true"] == 0
     if args.out:
-        Path(args.out).write_text(json.dumps({
+        out_obj = {
             "manifest": args.manifest, "n": tot["n"],
             "raw_score": tot["raw"], "confirmed_score": tot["confirmed"],
             "max_score": tot["max"], "false_alarms": tot["FP"],
             "wrong_true": tot["wrong_true"], "lint_only": lint_only,
             "per_property": per,
-        }, indent=2, default=int))
+        }
+        if args.group_weight:
+            out_obj.update(weighted_confirmed_summary(results, args.weight_cap))
+        Path(args.out).write_text(json.dumps(out_obj, indent=2, default=int))
         print(f"\n  wrote {args.out}")
     print("\nRESULT:", "PASS (sound)" if ok else "FAIL (soundness violation)")
     return 0 if ok else 1

@@ -11,7 +11,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from svcomp_split import assign_groups, origin_group, stable_key  # noqa: E402
+from svcomp_split import (  # noqa: E402
+    assign_groups, origin_group, stable_key, category_root, is_reasoning_task)
+from svcomp_split_eval import weighted_confirmed_summary  # noqa: E402
 
 
 def _synthetic_tasks():
@@ -107,6 +109,40 @@ def test_frac_zero_and_one_extremes():
     allout = assign_groups(tasks, 1.0, seed=0)
     # frac=1.0 targets every task; with whole-group assignment all groups move over.
     assert all(s == "holdout" for s in allout.values())
+
+
+def test_category_root():
+    assert category_root("Juliet_Test/CWE190_x") == "Juliet_Test"
+    assert category_root("loops") == "loops"
+    assert category_root("array-examples/sanfoundry") == "array-examples"
+
+
+def test_is_reasoning_task_excludes_generators_and_oversized_clusters():
+    # a small non-generator cluster -> reasoning (in val)
+    sizes = {("loops", "unreach-call"): 40, ("Juliet_Test/CWE190_x", "no-overflow"): 500,
+             ("array-examples", "valid-memsafety"): 900}
+    assert is_reasoning_task({"group": "loops", "property": "unreach-call"}, sizes) is True
+    # denylisted category root -> excluded even if the cluster is small
+    assert is_reasoning_task({"group": "Juliet_Test/CWE190_x", "property": "no-overflow"}, sizes) is False
+    # oversized cluster (backstop) -> excluded even though its root isn't denylisted
+    assert is_reasoning_task({"group": "array-examples", "property": "valid-memsafety"}, sizes) is False
+    # honor a custom denylist + threshold
+    assert is_reasoning_task({"group": "weaver/x", "property": "no-data-race"}, {}, cluster_max=10) is False
+
+
+def test_weighted_confirmed_caps_positives_per_cluster_keeps_penalties():
+    # cluster A = a Juliet family with 4 confirmed FALSEs (+1 each) -> capped to 1 (dedup)
+    res = [{"group": "Juliet/A", "property": "no-overflow", "confirmed": 1, "rel_yml": f"A/{i}"} for i in range(4)]
+    # cluster B = one confirmed reasoning task (+1)
+    res.append({"group": "loops/B", "property": "unreach-call", "confirmed": 1, "rel_yml": "B/0"})
+    # cluster C = a false alarm (-16) that must pass through WHOLE (never hidden by dedup)
+    res.append({"group": "arr/C", "property": "valid-memsafety", "confirmed": -16, "rel_yml": "C/0"})
+    w = weighted_confirmed_summary(res, cap=1)
+    assert w["confirmed_score_weighted"] == 1 + 1 - 16   # A capped to 1, B 1, C -16 whole
+    assert w["per_property_weighted"]["no-overflow"] == {"confirmed_weighted": 1, "confirmed_clusters": 1}
+    assert w["per_property_weighted"]["unreach-call"]["confirmed_clusters"] == 1
+    # raising the cap lets a big cluster count more (up to cap)
+    assert weighted_confirmed_summary(res, cap=3)["confirmed_score_weighted"] == 3 + 1 - 16
 
 
 def _run_all():
