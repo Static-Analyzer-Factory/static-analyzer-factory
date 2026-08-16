@@ -1217,7 +1217,246 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             interproc.len()
         );
     }
-    unknown_outcome()
+
+    // Stage 5 (blind byte-stream fuzz): the Z3 stages only reach errors whose
+    // guards its linear-arithmetic model can solve; a guard defined by
+    // nonlinear/opaque arithmetic (`if (x*x==...)`, bit tricks, hashed indices)
+    // leaves reach_error un-proposed. An AFL-style blind mutation loop over a
+    // deterministic byte-stream nondet shim (dictionary = the program's own IR
+    // constants) searches for an input that drives the ORIGINAL program into
+    // reach_error natively. A run that drops the sentinel yields a concrete input
+    // sequence, which is RE-CONFIRMED through the same deterministic replay gate
+    // (R6) before any verdict — so the fuzzer can only ever propose, never
+    // manufacture a wrong FALSE. Runs only when the program has scalar nondet
+    // input to fuzz and a reach_error to reach.
+    match fuzz_confirm_false(ctx) {
+        Some(candidate) => {
+            let witness = build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, &candidate));
+            if witness.is_none() {
+                eprintln!(
+                    "saf verify: FALSE (fuzz replay-confirmed) but witness unconstructible -> emitting false without a witness"
+                );
+            }
+            VerdictOutcome {
+                verdict: format!("false({})", Property::UnreachCall.name()),
+                witness,
+            }
+        }
+        None => unknown_outcome(),
+    }
+}
+
+/// Internal cap on blind-fuzz iterations (mutation trials), overridable via
+/// `$SAF_FUZZ_ITERS`. Bounds worst-case native run time; a dictionary-steered
+/// guard is usually hit in the seed corpus or the first handful of trials.
+fn fuzz_iters() -> usize {
+    std::env::var("SAF_FUZZ_ITERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(600)
+}
+
+/// Wall-clock safety cap on the whole blind-fuzz stage (seconds), overridable via
+/// `$SAF_FUZZ_TIME`. The iteration cap is the primary (deterministic) bound; this
+/// only stops a pathological slow-harness run from eating the task budget.
+fn fuzz_time_budget() -> std::time::Duration {
+    let secs = std::env::var("SAF_FUZZ_TIME")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(25);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Blind byte-stream fuzz confirmer for `unreach-call` (Stage 5).
+///
+/// Compiles the ORIGINAL program with the byte-stream nondet shim ONCE, runs an
+/// AFL-style deterministic mutation loop (dictionary = harvested IR constants),
+/// and, on the first input that drops the sentinel, reconstructs the concrete
+/// nondet sequence and RE-CONFIRMS it via the existing deterministic
+/// sequence-replay gate ([`replay_confirms_false`]) on the original program.
+/// Returns the confirmed [`saf_svcomp::FalseCandidate`], or `None` (abstain) on any
+/// gate miss / compile failure / no reproduction.
+// NOTE: the compile-once / seed / mutate / confirm loop is one cohesive unit;
+// splitting it across helpers would obscure the fail-closed control flow.
+#[allow(clippy::too_many_lines)]
+fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
+    use saf_svcomp::fuzz;
+    use std::process::{Command, Stdio};
+
+    // Gate: nothing to fuzz without scalar nondet input, nothing to reach without
+    // a reach_error site.
+    let error_sites = saf_svcomp::reach_error_call_sites(ctx.module);
+    let &reach_error_inst = error_sites.first()?;
+    if !fuzz::references_scalar_nondet(ctx.module) {
+        return None;
+    }
+
+    let dir = ctx.tempdir;
+    let sentinel = dir.join("saf_fuzz.sentinel");
+    let driver_src = dir.join("saf_fuzz_driver.c");
+    let harness = dir.join("saf_fuzz_harness");
+    let input_path = dir.join("saf_fuzz.input");
+    let log_path = dir.join("saf_fuzz.log");
+
+    if std::fs::write(
+        &driver_src,
+        fuzz::synthesize_bytestream_driver(&escape_c_string(&sentinel)),
+    )
+    .is_err()
+    {
+        return None;
+    }
+
+    // Compile the shim + original program ONCE (native, no sanitizer).
+    let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
+    let compiled = Command::new(ctx.clang)
+        .args(["-O0", "-Wno-everything"])
+        .arg(ctx.data_model.clang_flag())
+        .arg("-include")
+        .arg(ctx.stub)
+        .arg("-I")
+        .arg(srcdir)
+        .arg(ctx.input)
+        .arg(&driver_src)
+        .arg("-o")
+        .arg(&harness)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match compiled {
+        Ok(s) if s.success() => {}
+        _ => return None, // link/compile failure -> inconclusive
+    }
+
+    let dict = fuzz::harvest_dictionary(ctx.module);
+    let mut corpus = fuzz::seed_corpus(&dict);
+    // Fixed seed -> the whole search (and therefore the verdict) is reproducible.
+    let mut rng = fuzz::XorShift64::new(0x5AF3_C0DE);
+    let per_run = replay_timeout();
+    let iters = fuzz_iters();
+    let deadline = std::time::Instant::now() + fuzz_time_budget();
+    let mut max_depth = 0usize;
+
+    // Trial 0..N: the seed corpus first (its entries are tried verbatim before any
+    // mutation), then mutations of corpus entries. A run that consumes MORE nondet
+    // bytes than any seen (deeper execution) is kept in the corpus — a lightweight,
+    // instrumentation-free greybox signal that progressively deepens the search.
+    let total = iters + corpus.len();
+    for i in 0..total {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let input: Vec<u8> = if i < corpus.len() {
+            corpus[i].clone()
+        } else {
+            let base = &corpus[rng.below(corpus.len())];
+            fuzz::mutate(&mut rng, base, &dict)
+        };
+
+        if std::fs::write(&input_path, &input).is_err() {
+            continue;
+        }
+        let _ = std::fs::remove_file(&sentinel);
+        let _ = std::fs::remove_file(&log_path);
+
+        if run_fuzz_harness(&harness, &input_path, &log_path, per_run).is_err() {
+            continue;
+        }
+
+        if sentinel.exists() {
+            // Hit: reconstruct the concrete sequence and re-confirm deterministically
+            // on the ORIGINAL program through the existing replay gate (R6).
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let nondet_sequence = fuzz::parse_fuzz_log(&log);
+            let candidate = saf_svcomp::FalseCandidate {
+                reach_error_inst,
+                block_path: Vec::new(),
+                assignments: std::collections::BTreeMap::new(),
+                nondet_sequence,
+            };
+            match replay_confirms_false(
+                ctx.input,
+                ctx.data_model,
+                ctx.stub,
+                ctx.tempdir,
+                ctx.clang,
+                // Offset the replay index well past the Z3 batches so temp files
+                // never collide.
+                2 * MAX_REPLAY_CANDIDATES + i,
+                &candidate,
+            ) {
+                Ok(true) => {
+                    eprintln!(
+                        "saf verify: blind fuzz reached reach_error (trial {i}); re-confirmed -> false(unreach-call)"
+                    );
+                    return Some(candidate);
+                }
+                // A sentinel drop that does NOT re-confirm deterministically means
+                // the harness state was not faithfully captured; abstain (sound).
+                Ok(false) => {
+                    eprintln!(
+                        "saf verify: fuzz hit at trial {i} did not re-confirm deterministically -> continue"
+                    );
+                }
+                Err(e) => eprintln!("saf verify: fuzz re-confirm errored: {e:#} -> continue"),
+            }
+        } else if i >= corpus.len() {
+            // Greybox corpus feedback: keep inputs that reached deeper.
+            let depth = std::fs::read_to_string(&log_path)
+                .map(|l| l.lines().count())
+                .unwrap_or(0);
+            if depth > max_depth && corpus.len() < MAX_FUZZ_CORPUS {
+                max_depth = depth;
+                corpus.push(input);
+            }
+        }
+    }
+
+    eprintln!("saf verify: blind fuzz exhausted (no confirmed reach_error) -> unknown");
+    None
+}
+
+/// Corpus size cap for the greybox feedback loop — bounds memory and keeps the
+/// mutation base-selection distribution stable.
+const MAX_FUZZ_CORPUS: usize = 256;
+
+/// Run the byte-stream fuzz harness on one input under a short timeout, feeding
+/// `$SAF_FUZZ_INPUT` / `$SAF_FUZZ_LOG`. Success/normal-exit/timeout all return
+/// `Ok(())`; the caller inspects the sentinel/log. A runaway harness is killed.
+fn run_fuzz_harness(
+    harness: &Path,
+    input_path: &Path,
+    log_path: &Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(harness)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("SAF_FUZZ_INPUT", input_path)
+        .env("SAF_FUZZ_LOG", log_path)
+        .spawn()
+        .with_context(|| "spawning fuzz harness")?;
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) => return Err(e).context("waiting on fuzz harness"),
+        }
+    }
+    Ok(())
 }
 
 /// Constants the memsafety `ASan` mini-fuzz drives every scalar nondet to, in order

@@ -450,6 +450,21 @@ fn find_calls_to(module: &AirModule, func_name: &str) -> Vec<(FunctionId, BlockI
     results
 }
 
+/// The `reach_error` / `__VERIFIER_error` call instructions in the module, in
+/// deterministic order. Used by the blind-fuzz `unreach-call` stage to pick a
+/// witness target for a replay-confirmed FALSE (any reach_error site is a valid
+/// target, since the confirmed run reached the error).
+#[must_use]
+pub fn reach_error_call_sites(module: &AirModule) -> Vec<InstId> {
+    let mut sites = Vec::new();
+    for name in REACH_ERROR_NAMES {
+        for (_, _, inst) in find_calls_to(module, name) {
+            sites.push(inst);
+        }
+    }
+    sites
+}
+
 /// Get the entry block of a function.
 fn get_entry_block(module: &AirModule, func_id: FunctionId) -> Option<BlockId> {
     module
