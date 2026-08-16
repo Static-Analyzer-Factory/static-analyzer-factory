@@ -40,11 +40,32 @@
 //!
 //! # Scope (deliberately conservative — abstain, never guess)
 //!
-//! We handle a function's loop only when it is a **single natural loop** (exactly
-//! one back-edge). Nested/multiple loops, unresolved indirect control flow, and
-//! any non-affine update all force an abstain (the caller then falls back to
-//! `unknown`, scoring 0 — never a wrong verdict). Follow-ons (lexicographic /
-//! multiphase ranking, SCC decomposition) can widen this later.
+//! We handle a function's loops when the CFG is **reducible** (every cycle is a
+//! natural loop identified by a dominance back-edge) and **each natural loop has
+//! its own distinct header with a single latch**. This covers the common
+//! sequential-loops (`for … ; for …`) and nested-loops (`for { for } `) shapes:
+//! each natural loop is ranked *independently* by its own linear ranking function.
+//! We abstain (⇒ `unknown`, score 0, never a wrong verdict) on:
+//!
+//! - **irreducible** CFGs — a cycle with no dominance back-edge would be missed
+//!   by natural-loop enumeration, so we reject unless removing all back-edges
+//!   leaves an acyclic graph;
+//! - **multi-latch** loops — a single header with two back-edges can oscillate
+//!   (each latch transition individually ranked ⇏ the loop terminates), so we
+//!   require one latch per header;
+//! - unresolved indirect control flow and any non-affine update.
+//!
+//! ## Why per-loop ranking on a reducible CFG is sound
+//!
+//! In a reducible CFG every cycle passes through exactly one natural-loop header,
+//! and natural loops are either disjoint or properly nested. If every natural loop
+//! admits a ranking function then no infinite execution exists: an infinite run
+//! would traverse some loop's back-edge infinitely often, contradicting that
+//! loop's strictly-decreasing, bounded-below rank. When ranking an *outer* loop we
+//! model an inner loop's effect on state as a free (universally-quantified) havoc,
+//! so the outer proof holds for every inner outcome; the inner loop's own ranking
+//! function separately guarantees it runs finitely. Follow-ons (lexicographic /
+//! multiphase ranking, multi-latch joint ranking) can widen this later.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -66,22 +87,24 @@ const Z3_SEED: u32 = 42;
 /// Public entry point: does every natural loop in `func` admit a linear ranking
 /// function (⇒ the function's loops all terminate)?
 ///
-/// Returns `true` **only** when a ranking function is synthesized for the
-/// function's single natural loop. Abstains (`false`) on anything outside the
-/// supported shape or when synthesis fails — the caller maps abstain to `unknown`,
-/// so a `false` here is never a verdict, only "not proven".
+/// Returns `true` **only** when the CFG is reducible, every natural loop has a
+/// distinct single-latch header, and a ranking function is synthesized for *each*
+/// natural loop. Abstains (`false`) on anything outside the supported shape or
+/// when synthesis fails for any loop — the caller maps abstain to `unknown`, so a
+/// `false` here is never a verdict, only "not proven".
 ///
 /// Precondition: `func` is a defined function whose CFG *has* a loop (the caller
 /// checks `cfg_has_loops` first); a loop-free function is handled upstream.
 #[must_use]
 pub fn loops_are_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg) -> bool {
-    let Some(loop_info) = extract_single_natural_loop(func, cfg) else {
+    let Some(loops) = extract_natural_loops(func, cfg) else {
         return false;
     };
-    let Some(model) = build_loop_model(func, module, &loop_info) else {
-        return false;
-    };
-    synthesize_ranking_function(&model)
+    // Every natural loop must build an affine model *and* be ranked; any failure
+    // (unmodelable loop, or Z3 `Unsat`/`Unknown`) abstains the whole function.
+    loops.iter().all(|li| {
+        build_loop_model(func, module, li).is_some_and(|model| synthesize_ranking_function(&model))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -99,9 +122,16 @@ struct LoopInfo {
     idom: BTreeMap<BlockId, BlockId>,
 }
 
-/// Identify the function's single natural loop, or `None` if the CFG does not
-/// have exactly one back-edge (nested/multiple loops, or an irreducible shape).
-fn extract_single_natural_loop(func: &AirFunction, cfg: &Cfg) -> Option<LoopInfo> {
+/// Identify *every* natural loop of the function (one per dominance back-edge), or
+/// `None` if the CFG is not in the supported shape:
+///
+/// - **irreducible** — removing the dominance back-edges does not leave an acyclic
+///   graph, so some cycle has no natural-loop header and would be silently missed;
+/// - **multi-latch** — a single header has more than one back-edge, which can
+///   oscillate (per-latch ranking is unsound), so we require one latch per header;
+/// - no back-edge at all (caller guarantees `cfg_has_loops`, so this means an
+///   irreducible cycle — already covered by the reducibility check).
+fn extract_natural_loops(func: &AirFunction, cfg: &Cfg) -> Option<Vec<LoopInfo>> {
     let idom = compute_dominators(cfg);
 
     // A back-edge `u → v` is a CFG edge whose head `v` dominates its tail `u`.
@@ -113,40 +143,110 @@ fn extract_single_natural_loop(func: &AirFunction, cfg: &Cfg) -> Option<LoopInfo
             }
         }
     }
-    // Exactly one back-edge ⇒ a single, reducible natural loop with one latch.
-    if back_edges.len() != 1 {
+    if back_edges.is_empty() {
         return None;
     }
-    let (latch, header) = back_edges[0];
 
-    // Natural-loop body: {header} ∪ {nodes that can reach `latch` without going
-    // through `header`}. Reverse BFS from `latch`, never expanding past `header`.
-    let mut body: BTreeSet<BlockId> = BTreeSet::new();
-    body.insert(header);
-    let mut queue: VecDeque<BlockId> = VecDeque::new();
-    if latch != header {
-        body.insert(latch);
-        queue.push_back(latch);
+    // Reducibility: with all dominance back-edges removed, a reducible CFG is
+    // acyclic. If a cycle survives, some cycle has no natural-loop header (an
+    // irreducible retreating edge) and enumerating natural loops would miss it —
+    // ranking the rest and returning `true` would be unsound. Abstain.
+    let back_set: BTreeSet<(BlockId, BlockId)> = back_edges.iter().copied().collect();
+    if forward_graph_has_cycle(cfg, &back_set) {
+        return None;
     }
-    while let Some(b) = queue.pop_front() {
-        if let Some(preds) = cfg.predecessors.get(&b) {
-            for &p in preds {
-                if body.insert(p) {
-                    queue.push_back(p);
+
+    // Multi-latch guard: two back-edges into the same header form one loop with two
+    // latch transitions; ranking each independently does not prove the loop
+    // terminates (it may alternate latches forever). Require one latch per header.
+    let mut headers: BTreeSet<BlockId> = BTreeSet::new();
+    for &(_, header) in &back_edges {
+        if !headers.insert(header) {
+            return None;
+        }
+    }
+
+    let mut loops = Vec::with_capacity(back_edges.len());
+    for (latch, header) in back_edges {
+        // Sanity: the header block must actually exist in the function.
+        func.blocks.iter().find(|b| b.id == header)?;
+
+        // Natural-loop body: {header} ∪ {nodes that can reach `latch` without going
+        // through `header`}. Reverse BFS from `latch`, never expanding past
+        // `header`. For a nested loop this yields the *whole* outer body (inner
+        // blocks included); the inner loop's effect is over-approximated as havoc
+        // during outer-loop synthesis, and the inner loop is ranked on its own.
+        let mut body: BTreeSet<BlockId> = BTreeSet::new();
+        body.insert(header);
+        let mut queue: VecDeque<BlockId> = VecDeque::new();
+        if latch != header {
+            body.insert(latch);
+            queue.push_back(latch);
+        }
+        while let Some(b) = queue.pop_front() {
+            if let Some(preds) = cfg.predecessors.get(&b) {
+                for &p in preds {
+                    if p != header && body.insert(p) {
+                        queue.push_back(p);
+                    }
+                }
+            }
+        }
+
+        loops.push(LoopInfo {
+            header,
+            latch,
+            body,
+            idom: idom.clone(),
+        });
+    }
+    Some(loops)
+}
+
+/// Does the CFG contain a cycle once the dominance back-edges are removed? A
+/// reducible CFG becomes a DAG; a surviving cycle proves irreducibility (an
+/// unhandled retreating edge), on which we must abstain.
+fn forward_graph_has_cycle(cfg: &Cfg, back_set: &BTreeSet<(BlockId, BlockId)>) -> bool {
+    // Iterative three-colour DFS over the back-edge-free graph. `on_stack` marks
+    // the current DFS path; re-entering an on-stack node is a forward cycle.
+    let mut visited: BTreeSet<BlockId> = BTreeSet::new();
+    let mut on_stack: BTreeSet<BlockId> = BTreeSet::new();
+    // Stack frames: (node, whether we've begun expanding it).
+    let mut stack: Vec<(BlockId, bool)> = Vec::new();
+
+    for &start in cfg.successors.keys() {
+        if visited.contains(&start) {
+            continue;
+        }
+        stack.push((start, false));
+        while let Some((node, expanded)) = stack.pop() {
+            if expanded {
+                on_stack.remove(&node);
+                continue;
+            }
+            if visited.contains(&node) {
+                continue;
+            }
+            visited.insert(node);
+            on_stack.insert(node);
+            // Post-visit marker to pop `node` off the path once its subtree is done.
+            stack.push((node, true));
+            if let Some(succs) = cfg.successors.get(&node) {
+                for &s in succs {
+                    if back_set.contains(&(node, s)) {
+                        continue; // skip the removed back-edge
+                    }
+                    if on_stack.contains(&s) {
+                        return true;
+                    }
+                    if !visited.contains(&s) {
+                        stack.push((s, false));
+                    }
                 }
             }
         }
     }
-
-    // Sanity: the header block must actually exist in the function.
-    func.blocks.iter().find(|b| b.id == header)?;
-
-    Some(LoopInfo {
-        header,
-        latch,
-        body,
-        idom,
-    })
+    false
 }
 
 /// Does block `a` dominate block `b` (walk `b`'s immediate-dominator chain to the
@@ -1337,5 +1437,388 @@ mod tests {
         // overflow, so the non-unit step with a symbolic bound must abstain.
         let m = counter_loop(BinaryOp::ICmpSlt, Bound::Nondet, 2);
         assert!(!ranked(&m));
+    }
+
+    // --- Multi-loop decomposition -------------------------------------------
+
+    /// Build an i32 count-up loop `for (v = 0; v < bound; v += step)` as a chain of
+    /// four blocks `hdr → latch`, wired between `entry_pred` (fall-in) and `exit`
+    /// (fall-out). Returns the header phi/latch block ids plus the four blocks and
+    /// the constants they introduce. `tag` disambiguates value/block names so
+    /// several such loops can coexist in one function.
+    #[allow(clippy::too_many_arguments)]
+    fn build_count_up(
+        tag: &str,
+        i32t: TypeId,
+        i1t: TypeId,
+        entry_pred: BlockId,
+        exit: BlockId,
+        bound: i64,
+        step: i64,
+        constants: &mut BTreeMap<ValueId, Constant>,
+    ) -> (BlockId, Vec<AirBlock>) {
+        let h = bid(&format!("h_{tag}"));
+        let l = bid(&format!("l_{tag}"));
+        let v = vid(&format!("v_{tag}"));
+        let vn = vid(&format!("vn_{tag}"));
+        let cval = vid(&format!("c_{tag}"));
+        let v0 = vid(&format!("v0_{tag}"));
+        let stepv = vid(&format!("step_{tag}"));
+        let boundv = vid(&format!("bound_{tag}"));
+        constants.insert(v0, Constant::Int { value: 0, bits: 32 });
+        constants.insert(
+            stepv,
+            Constant::Int {
+                value: step,
+                bits: 32,
+            },
+        );
+        constants.insert(
+            boundv,
+            Constant::Int {
+                value: bound,
+                bits: 32,
+            },
+        );
+
+        let mut header = AirBlock::new(h);
+        header.instructions.push(vinst(
+            &format!("phi_{tag}"),
+            Operation::Phi {
+                incoming: vec![(entry_pred, v0), (l, vn)],
+            },
+            v,
+            vec![],
+            i32t,
+        ));
+        header.instructions.push(vinst(
+            &format!("cmp_{tag}"),
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt,
+            },
+            cval,
+            vec![v, boundv],
+            i1t,
+        ));
+        header.instructions.push(term(
+            &format!("condbr_{tag}"),
+            Operation::CondBr {
+                then_target: l,
+                else_target: exit,
+            },
+            vec![cval],
+        ));
+
+        let mut latch = AirBlock::new(l);
+        latch.instructions.push(vinst(
+            &format!("add_{tag}"),
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            vn,
+            vec![v, stepv],
+            i32t,
+        ));
+        latch.instructions.push(term(
+            &format!("br_{tag}"),
+            Operation::Br { target: h },
+            vec![],
+        ));
+
+        (h, vec![header, latch])
+    }
+
+    fn module_of(func: AirFunction, constants: BTreeMap<ValueId, Constant>) -> AirModule {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut types = BTreeMap::new();
+        types.insert(i32t, AirType::Integer { bits: 32 });
+        types.insert(i1t, AirType::Integer { bits: 1 });
+        AirModule {
+            id: ModuleId(make_id("module", b"t")),
+            name: Some("t".to_string()),
+            functions: vec![func],
+            globals: Vec::new(),
+            source_files: Vec::new(),
+            type_hierarchy: Vec::new(),
+            constants,
+            types,
+            target_pointer_width: 8,
+            function_index: BTreeMap::new(),
+            name_index: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn two_sequential_loops_both_ranked() {
+        // for (x=0;x<10;x++){}  for (y=0;y<20;y++){}  — two distinct-header loops,
+        // each individually ranked ⇒ the function terminates.
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let entry = bid("entry");
+        let mid = bid("mid");
+        let exit = bid("exit");
+
+        let (h1, l1_blocks) = build_count_up("a", i32t, i1t, entry, mid, 10, 1, &mut constants);
+        let (h2, l2_blocks) = build_count_up("b", i32t, i1t, mid, exit, 20, 1, &mut constants);
+
+        let mut e = AirBlock::new(entry);
+        e.instructions
+            .push(term("br_e", Operation::Br { target: h1 }, vec![]));
+        // `mid` is the fall-out of loop 1 and the pre-header of loop 2.
+        let mut midb = AirBlock::new(mid);
+        midb.instructions
+            .push(term("br_mid", Operation::Br { target: h2 }, vec![]));
+        let mut exitb = AirBlock::new(exit);
+        exitb.instructions.push(term("ret", Operation::Ret, vec![]));
+
+        let mut blocks = vec![e];
+        blocks.extend(l1_blocks);
+        blocks.push(midb);
+        blocks.extend(l2_blocks);
+        blocks.push(exitb);
+
+        let func = AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks,
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        assert!(ranked(&module_of(func, constants)));
+    }
+
+    #[test]
+    fn one_ranked_one_infinite_abstains() {
+        // for (x=0;x<10;x++){}  while (1) z++;  — the second loop has no exit and
+        // its counter overflows, so it is not ranked ⇒ the whole function abstains.
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let entry = bid("entry");
+        let mid = bid("mid");
+        let exit = bid("exit"); // unreachable, but keeps the loop1 exit target valid
+
+        let (h1, l1_blocks) = build_count_up("a", i32t, i1t, entry, mid, 10, 1, &mut constants);
+
+        let hz = bid("hz");
+        let z = vid("z");
+        let zn = vid("zn");
+        let z0 = vid("z0");
+        let one = vid("one");
+        constants.insert(z0, Constant::Int { value: 0, bits: 32 });
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+
+        let mut e = AirBlock::new(entry);
+        e.instructions
+            .push(term("br_e", Operation::Br { target: h1 }, vec![]));
+        let mut midb = AirBlock::new(mid);
+        midb.instructions
+            .push(term("br_mid", Operation::Br { target: hz }, vec![]));
+        // hz: phi z ; zn = z + 1 ; br hz   (infinite)
+        let mut hzb = AirBlock::new(hz);
+        hzb.instructions.push(vinst(
+            "phi_z",
+            Operation::Phi {
+                incoming: vec![(mid, z0), (hz, zn)],
+            },
+            z,
+            vec![],
+            i32t,
+        ));
+        hzb.instructions.push(vinst(
+            "add_z",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            zn,
+            vec![z, one],
+            i32t,
+        ));
+        hzb.instructions
+            .push(term("br_z", Operation::Br { target: hz }, vec![]));
+        let mut exitb = AirBlock::new(exit);
+        exitb.instructions.push(term("ret", Operation::Ret, vec![]));
+
+        let mut blocks = vec![e];
+        blocks.extend(l1_blocks);
+        blocks.push(midb);
+        blocks.push(hzb);
+        blocks.push(exitb);
+
+        let func = AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks,
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        assert!(!ranked(&module_of(func, constants)));
+    }
+
+    #[test]
+    fn nested_loops_both_ranked() {
+        // for (i=0;i<10;i++) for (j=0;j<20;j++) {}  — properly nested; the inner
+        // loop resets each outer iteration. Both natural loops rank independently
+        // (outer models the inner as havoc) ⇒ terminates.
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let entry = bid("entry");
+        let ho = bid("ho");
+        let pre_i = bid("pre_i");
+        let hi = bid("hi");
+        let li = bid("li");
+        let lo = bid("lo");
+        let exit = bid("exit");
+
+        let i = vid("i");
+        let i_n = vid("i_n");
+        let ci = vid("ci");
+        let i0 = vid("i0");
+        let one = vid("one");
+        let no = vid("no");
+        let j = vid("j");
+        let j_n = vid("j_n");
+        let cj = vid("cj");
+        let j0 = vid("j0");
+        let ni = vid("ni");
+        constants.insert(i0, Constant::Int { value: 0, bits: 32 });
+        constants.insert(j0, Constant::Int { value: 0, bits: 32 });
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+        constants.insert(
+            no,
+            Constant::Int {
+                value: 10,
+                bits: 32,
+            },
+        );
+        constants.insert(
+            ni,
+            Constant::Int {
+                value: 20,
+                bits: 32,
+            },
+        );
+
+        let mut e = AirBlock::new(entry);
+        e.instructions
+            .push(term("br_e", Operation::Br { target: ho }, vec![]));
+
+        // ho: phi i [(entry,0),(lo,i_n)] ; ci = i < 10 ; condbr -> pre_i / exit
+        let mut hob = AirBlock::new(ho);
+        hob.instructions.push(vinst(
+            "phi_i",
+            Operation::Phi {
+                incoming: vec![(entry, i0), (lo, i_n)],
+            },
+            i,
+            vec![],
+            i32t,
+        ));
+        hob.instructions.push(vinst(
+            "cmp_i",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt,
+            },
+            ci,
+            vec![i, no],
+            i1t,
+        ));
+        hob.instructions.push(term(
+            "condbr_i",
+            Operation::CondBr {
+                then_target: pre_i,
+                else_target: exit,
+            },
+            vec![ci],
+        ));
+
+        // pre_i: br hi   (inner pre-header, inside the outer body)
+        let mut pib = AirBlock::new(pre_i);
+        pib.instructions
+            .push(term("br_pi", Operation::Br { target: hi }, vec![]));
+
+        // hi: phi j [(pre_i,0),(li,j_n)] ; cj = j < 20 ; condbr -> li / lo
+        let mut hib = AirBlock::new(hi);
+        hib.instructions.push(vinst(
+            "phi_j",
+            Operation::Phi {
+                incoming: vec![(pre_i, j0), (li, j_n)],
+            },
+            j,
+            vec![],
+            i32t,
+        ));
+        hib.instructions.push(vinst(
+            "cmp_j",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt,
+            },
+            cj,
+            vec![j, ni],
+            i1t,
+        ));
+        hib.instructions.push(term(
+            "condbr_j",
+            Operation::CondBr {
+                then_target: li,
+                else_target: lo,
+            },
+            vec![cj],
+        ));
+
+        // li: j_n = j + 1 ; br hi
+        let mut lib = AirBlock::new(li);
+        lib.instructions.push(vinst(
+            "add_j",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            j_n,
+            vec![j, one],
+            i32t,
+        ));
+        lib.instructions
+            .push(term("br_li", Operation::Br { target: hi }, vec![]));
+
+        // lo: i_n = i + 1 ; br ho
+        let mut lob = AirBlock::new(lo);
+        lob.instructions.push(vinst(
+            "add_i",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            i_n,
+            vec![i, one],
+            i32t,
+        ));
+        lob.instructions
+            .push(term("br_lo", Operation::Br { target: ho }, vec![]));
+
+        let mut exitb = AirBlock::new(exit);
+        exitb.instructions.push(term("ret", Operation::Ret, vec![]));
+
+        let func = AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![e, hob, pib, hib, lib, lob, exitb],
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        assert!(ranked(&module_of(func, constants)));
     }
 }
