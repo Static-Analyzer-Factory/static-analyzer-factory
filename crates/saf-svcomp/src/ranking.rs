@@ -75,6 +75,8 @@ use saf_core::air::{AirFunction, AirModule, BinaryOp, CastKind, Constant, Operat
 use saf_core::id::make_id;
 use saf_core::ids::{BlockId, TypeId, ValueId};
 
+use crate::fast_paths::cfg_has_loops;
+
 /// Maximum recursion depth when expanding an SSA value into an affine form.
 /// Bounds work on pathological IR; exceeding it ⇒ treat the value as opaque.
 const AFFINE_DEPTH_LIMIT: u32 = 64;
@@ -773,6 +775,19 @@ fn type_bounds(
     module: &AirModule,
 ) -> Option<(i128, i128)> {
     let type_id = defs.get(&sym).and_then(|d| d.result_type)?;
+    bounds_from_type(sym, type_id, signs, module)
+}
+
+/// Integer range `[lo, hi]` for `sym` given an explicit `type_id` and its inferred
+/// signedness. Used for values whose type is not on a [`Def`] record — notably
+/// **function parameters** (their `TypeId` lives on [`AirParam`], not on any
+/// instruction) in the recursion model. `None` ⇒ no representable bound (kept free).
+fn bounds_from_type(
+    sym: ValueId,
+    type_id: TypeId,
+    signs: &BTreeMap<ValueId, Sign>,
+    module: &AirModule,
+) -> Option<(i128, i128)> {
     let width = i128::from(int_width(module, type_id)?);
     if width == 0 || width > 64 {
         return None;
@@ -1091,16 +1106,25 @@ struct MultiPathModel {
 /// the havoc model) when the model does not apply (nested inner loop, too many
 /// paths, no affine phi) or no lexicographic ranking is found.
 fn multipath_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg, li: &LoopInfo) -> bool {
-    let Some(model) = build_multipath_model(func, module, cfg, li) else {
-        return false;
-    };
+    match build_multipath_model(func, module, cfg, li) {
+        Some(model) => greedy_lex_rank(&model),
+        None => false,
+    }
+}
+
+/// Greedy lexicographic synthesis over a [`MultiPathModel`]: each round find one
+/// `f` that is bounded (`f ≥ 0`) and non-increasing (`f − f′ ≥ 0`) on every
+/// remaining branch and strictly decreasing (`f − f′ ≥ 1`) on one of them; remove
+/// that branch. All branches removed within [`MAX_LEX_ROUNDS`] ⇒ the branches
+/// jointly admit a lexicographic ranking tuple (⇒ termination). Shared by the
+/// loop path-sensitive model and the recursion model — a `MultiPathModel` only
+/// records per-transition guards + affine `next`, so the same driver ranks a
+/// loop's back-edge transitions or a self-recursive function's call-site
+/// transitions identically.
+fn greedy_lex_rank(model: &MultiPathModel) -> bool {
     if model.branches.is_empty() {
         return false;
     }
-
-    // Greedy lexicographic synthesis: each round find one `f` that is bounded and
-    // non-increasing on every remaining path and strictly decreasing on one of
-    // them; remove that path. All paths removed within `MAX_LEX_ROUNDS` ⇒ ranked.
     let mut remaining: Vec<usize> = (0..model.branches.len()).collect();
     let mut rounds = 0;
     while !remaining.is_empty() {
@@ -1109,7 +1133,7 @@ fn multipath_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg, li: &Loop
         }
         let mut removed_pos = None;
         for (pos, &strict) in remaining.iter().enumerate() {
-            if synthesize_round(&model, &remaining, strict) {
+            if synthesize_round(model, &remaining, strict) {
                 removed_pos = Some(pos);
                 break;
             }
@@ -1123,6 +1147,243 @@ fn multipath_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg, li: &Loop
         }
     }
     true
+}
+
+// ---------------------------------------------------------------------------
+// Recursion ranking (self-recursive functions)
+// ---------------------------------------------------------------------------
+
+/// Does the **self-recursive** function `func` admit a linear ranking function
+/// over its integer parameters that bounds the recursion depth (⇒ the recursion
+/// terminates)?
+///
+/// The recursion is modelled as a [`MultiPathModel`] exactly like a loop's
+/// back-edge transitions, but the ranking *state* is the function's integer
+/// parameters and each transition is one **entry → recursive-call-site path**:
+/// its guard is the conjunction of branch conditions along the path (a necessary
+/// condition on any frame that reaches that call — hence an over-approximation),
+/// and its `next` maps each parameter to the affine form of the corresponding
+/// call argument (or a type-bounded havoc symbol when the argument is not exactly
+/// affine). A ranking `f` that is `≥ 0` on every call's guard and strictly
+/// decreases by `≥ 1` from parameters to arguments bounds every root-to-leaf
+/// chain of recursive calls; with a finite number of call sites the whole call
+/// tree is finite ⇒ the recursion terminates. This is a **complete, sound**
+/// proof (Farkas over a superset relation, `Sat`-only), so it never yields a
+/// wrong `true`.
+///
+/// Restricted to a **loop-free** body (so entry→call paths are finite and
+/// enumerable); the caller already requires each reachable function's loops to be
+/// independently ranked. Abstains (`false` ⇒ `unknown`) on anything else.
+///
+/// Precondition: `func` is a defined function that directly calls itself (the
+/// caller identified it as a size-1 self-recursive call-graph SCC).
+#[must_use]
+pub fn recursion_is_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg) -> bool {
+    match build_recursion_model(func, module, cfg) {
+        Some(model) => greedy_lex_rank(&model),
+        None => false,
+    }
+}
+
+/// Build the recursion [`MultiPathModel`] for a self-recursive function, or `None`
+/// (⇒ abstain) when the shape is unsupported (looping body, no integer parameter,
+/// too many entry→call paths, or a non-affine ranking-relevant argument).
+// NOTE: one cohesive extraction pipeline (reject loops → collect params →
+// enumerate entry→call paths → per-path guards/transitions → classify overflow →
+// assemble); splitting it would only scatter the shared `defs`/`universe`/bounds
+// state, mirroring `build_multipath_model`.
+#[allow(clippy::too_many_lines)]
+fn build_recursion_model(
+    func: &AirFunction,
+    module: &AirModule,
+    cfg: &Cfg,
+) -> Option<MultiPathModel> {
+    // A looping body would make entry→call path enumeration incomplete (an
+    // unbounded loop between entry and the recursive call is not path-enumerable);
+    // abstain and let the loop-ranking gate handle loops separately.
+    if cfg_has_loops(cfg) {
+        return None;
+    }
+
+    let signs = infer_signs(func);
+
+    // Ranking state = the function's integer parameters (their `TypeId` lives on
+    // `AirParam`, not on any instruction). Non-integer params (pointers, floats)
+    // cannot carry a ranking coefficient and are treated as opaque leaves.
+    let mut param_ids: BTreeSet<ValueId> = BTreeSet::new();
+    let mut param_type_of: BTreeMap<ValueId, TypeId> = BTreeMap::new();
+    let mut ordered: Vec<&saf_core::air::AirParam> = func.params.iter().collect();
+    ordered.sort_by_key(|p| p.index);
+    for p in &ordered {
+        if let Some(ty) = p.param_type {
+            if int_width(module, ty).is_some() {
+                param_ids.insert(p.id);
+                param_type_of.insert(p.id, ty);
+            }
+        }
+    }
+    if param_ids.is_empty() {
+        return None;
+    }
+
+    // The whole (loop-free) body is the affine "region": every def is expandable,
+    // and the parameters are the leaves (played by `header_phis` in the shared
+    // helpers, which treat that set as un-expanded ranking leaves).
+    let all_blocks: BTreeSet<BlockId> = func.blocks.iter().map(|b| b.id).collect();
+    let defs = index_defs(func, &all_blocks);
+    let block_of = index_block_of(func);
+    let header_phis = param_ids.clone();
+
+    // Recursive call sites: a `CallDirect` to `func` itself. Operands are the call
+    // arguments (positional, matching `AirParam::index`).
+    let mut sites: Vec<(BlockId, Vec<ValueId>)> = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Operation::CallDirect { callee } = &inst.op {
+                if *callee == func.id {
+                    sites.push((block.id, inst.operands.clone()));
+                }
+            }
+        }
+    }
+    if sites.is_empty() {
+        return None;
+    }
+
+    let entry = func.entry_block.unwrap_or(func.blocks.first()?.id);
+
+    // --- Pass 1: one raw transition per (call site × entry→site path). ---------
+    let mut raws: Vec<RawBranch> = Vec::new();
+    let mut universe: BTreeSet<ValueId> = param_ids.clone();
+    for (cb, args) in &sites {
+        // Every simple path from the entry to the call-site block (the body minus
+        // no back-edges is already acyclic — we rejected loops above).
+        let paths = enumerate_body_paths(cfg, &all_blocks, entry, *cb)?;
+        for path in &paths {
+            let path_pred = path_pred_map(path);
+            let mut guards: Vec<Constraint> = Vec::new();
+            // Necessary stay-conditions of the branches entering the call block.
+            for pair in path.windows(2) {
+                if let Some(block) = func.blocks.iter().find(|b| b.id == pair[0]) {
+                    add_path_guards(
+                        &mut guards,
+                        &mut universe,
+                        block,
+                        pair[1],
+                        &defs,
+                        &block_of,
+                        &header_phis,
+                        module,
+                        &path_pred,
+                    );
+                }
+            }
+            // Transition: parameter i ↦ affine form of argument i on this path.
+            let mut raw_next: BTreeMap<ValueId, Option<Affine>> = BTreeMap::new();
+            for p in &ordered {
+                if !param_ids.contains(&p.id) {
+                    continue;
+                }
+                let a = args.get(p.index as usize).and_then(|&arg| {
+                    resolve_affine_path(arg, &defs, &block_of, &header_phis, module, &path_pred, 0)
+                });
+                if let Some(ref aff) = a {
+                    universe.extend(aff.terms.keys().copied());
+                }
+                raw_next.insert(p.id, a);
+            }
+            raws.push(RawBranch { guards, raw_next });
+        }
+    }
+    if raws.is_empty() {
+        return None;
+    }
+
+    // Invariant params: leaf symbols that are neither ranking state nor defined in
+    // the function (globals, opaque leaves) — eligible for a ranking coefficient.
+    let mut invariants: BTreeSet<ValueId> = BTreeSet::new();
+    for &sym in &universe {
+        if !param_ids.contains(&sym) && !defs.contains_key(&sym) {
+            invariants.insert(sym);
+        }
+    }
+
+    // Type bounds: parameters use their `AirParam` type; every other integer leaf
+    // uses its def's result type. True facts about the real values, shared by
+    // every branch region.
+    let mut base_bounds: Vec<Constraint> = Vec::new();
+    let mut bound_of: BTreeMap<ValueId, (i128, i128)> = BTreeMap::new();
+    for &sym in &universe {
+        let bound = match param_type_of.get(&sym) {
+            Some(&ty) => bounds_from_type(sym, ty, &signs, module),
+            None => type_bounds(sym, &defs, &signs, module),
+        };
+        if let Some((lo, hi)) = bound {
+            bound_of.insert(sym, (lo, hi));
+            base_bounds.push(Constraint {
+                coeffs: BTreeMap::from([(sym, 1)]),
+                constant: -lo,
+            });
+            base_bounds.push(Constraint {
+                coeffs: BTreeMap::from([(sym, -1)]),
+                constant: hi,
+            });
+        }
+    }
+
+    // --- Pass 2: classify each argument transition (affine-stable vs havoc). ----
+    let mut fresh_syms: BTreeSet<ValueId> = BTreeSet::new();
+    let mut branches: Vec<Branch> = Vec::with_capacity(raws.len());
+    for (bi, raw) in raws.into_iter().enumerate() {
+        let mut check_region = raw.guards;
+        check_region.extend(base_bounds.iter().cloned());
+
+        let mut next: BTreeMap<ValueId, Affine> = BTreeMap::new();
+        let mut fresh_bounds: Vec<Constraint> = Vec::new();
+        for (&param, cand) in &raw.raw_next {
+            // Stable iff the affine argument provably never wraps its type range on
+            // the region (⇒ affine model == machine value). Otherwise havoc: a
+            // fresh type-bounded free symbol (ranking must hold for every value).
+            let stable = match (cand, bound_of.get(&param)) {
+                (Some(a), Some(&(lo, hi)))
+                    if next_never_overflows(a, lo, hi, &check_region, &universe) =>
+                {
+                    Some(a.clone())
+                }
+                _ => None,
+            };
+            if let Some(a) = stable {
+                next.insert(param, a);
+            } else {
+                let fresh = havoc_id(param, bi);
+                fresh_syms.insert(fresh);
+                if let Some(&(lo, hi)) = bound_of.get(&param) {
+                    fresh_bounds.push(Constraint {
+                        coeffs: BTreeMap::from([(fresh, 1)]),
+                        constant: -lo,
+                    });
+                    fresh_bounds.push(Constraint {
+                        coeffs: BTreeMap::from([(fresh, -1)]),
+                        constant: hi,
+                    });
+                }
+                next.insert(param, Affine::symbol(fresh));
+            }
+        }
+        check_region.extend(fresh_bounds);
+        branches.push(Branch {
+            region: check_region,
+            next,
+        });
+    }
+    universe.extend(fresh_syms);
+
+    let template: BTreeSet<ValueId> = param_ids.iter().chain(invariants.iter()).copied().collect();
+    Some(MultiPathModel {
+        template,
+        universe,
+        branches,
+    })
 }
 
 /// Build the path-sensitive [`MultiPathModel`], or `None` (⇒ abstain / fall back)
@@ -1656,7 +1917,7 @@ fn synthesize_round(model: &MultiPathModel, remaining: &[usize], strict: usize) 
 mod tests {
     use super::*;
 
-    use saf_core::air::{AirBlock, AirFunction, AirModule, AirType, Instruction};
+    use saf_core::air::{AirBlock, AirFunction, AirModule, AirParam, AirType, Instruction};
     use saf_core::id::make_id;
     use saf_core::ids::{BlockId, FunctionId, InstId, ModuleId, TypeId, ValueId};
 
@@ -3030,5 +3291,242 @@ mod tests {
 
         let func = main_func(vec![eb, hb, bb, tb, elb, latb, exb], entry);
         assert!(!ranked(&module_of(func, constants)));
+    }
+
+    // --- recursion ranking --------------------------------------------------
+
+    /// Build `void f(int n) { if (n CMP bound) f(n + step); }` — a single-call-site
+    /// self-recursive function. `cmp`'s signedness drives type-bound inference.
+    fn self_rec(cmp: BinaryOp, bound: i64, step: i64) -> AirModule {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let bound_v = vid("bound");
+        let step_v = vid("step");
+        constants.insert(
+            bound_v,
+            Constant::Int {
+                value: bound,
+                bits: 32,
+            },
+        );
+        constants.insert(
+            step_v,
+            Constant::Int {
+                value: step,
+                bits: 32,
+            },
+        );
+
+        let f_id = FunctionId(make_id("func", b"f"));
+        let n = vid("n");
+        let c = vid("c");
+        let na = vid("na");
+        let entry = bid("f_entry");
+        let rec = bid("f_rec");
+        let base = bid("f_base");
+
+        let mut eb = AirBlock::new(entry);
+        eb.instructions.push(vinst(
+            "cmp",
+            Operation::BinaryOp { kind: cmp },
+            c,
+            vec![n, bound_v],
+            i1t,
+        ));
+        eb.instructions.push(term(
+            "condbr",
+            Operation::CondBr {
+                then_target: rec,
+                else_target: base,
+            },
+            vec![c],
+        ));
+
+        let mut rb = AirBlock::new(rec);
+        rb.instructions.push(vinst(
+            "add",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            na,
+            vec![n, step_v],
+            i32t,
+        ));
+        rb.instructions.push(term(
+            "call",
+            Operation::CallDirect { callee: f_id },
+            vec![na],
+        ));
+        rb.instructions
+            .push(term("br_rec", Operation::Br { target: base }, vec![]));
+
+        let mut bb = AirBlock::new(base);
+        bb.instructions.push(term("ret", Operation::Ret, vec![]));
+
+        let func = AirFunction {
+            id: f_id,
+            name: "f".to_string(),
+            params: vec![AirParam {
+                id: n,
+                name: None,
+                index: 0,
+                param_type: Some(i32t),
+            }],
+            blocks: vec![eb, rb, bb],
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        module_of(func, constants)
+    }
+
+    fn rec_ranked(m: &AirModule) -> bool {
+        let func = &m.functions[0];
+        let cfg = Cfg::build(func);
+        recursion_is_ranked(func, m, &cfg)
+    }
+
+    #[test]
+    fn count_down_recursion_is_ranked() {
+        // f(n){ if (n > 0) f(n - 1); }  (signed)  →  f = n.
+        assert!(rec_ranked(&self_rec(BinaryOp::ICmpSgt, 0, -1)));
+    }
+
+    #[test]
+    fn count_down_to_const_recursion_is_ranked() {
+        // f(n){ if (n > 5) f(n - 1); }  →  f = n - 5.
+        assert!(rec_ranked(&self_rec(BinaryOp::ICmpSgt, 5, -1)));
+    }
+
+    #[test]
+    fn count_up_recursion_not_ranked() {
+        // f(n){ if (n > 0) f(n + 1); }  — recurses forever for n > 0; no ranking.
+        assert!(!rec_ranked(&self_rec(BinaryOp::ICmpSgt, 0, 1)));
+    }
+
+    #[test]
+    fn wrong_direction_recursion_not_ranked() {
+        // f(n){ if (n < 0) f(n - 1); }  — n moves away from 0; non-terminating.
+        assert!(!rec_ranked(&self_rec(BinaryOp::ICmpSlt, 0, -1)));
+    }
+
+    #[test]
+    fn ne_guard_recursion_not_ranked() {
+        // f(n){ if (n != 0) f(n - 1); }  — `!=` is not convex; with only a type
+        // bound the argument can decrease past INT_MIN ⇒ abstain (sound: this is
+        // non-terminating for a negative signed `n`).
+        assert!(!rec_ranked(&self_rec(BinaryOp::ICmpNe, 0, -1)));
+    }
+
+    #[test]
+    fn identity_arg_recursion_not_ranked() {
+        // f(n){ if (n > 0) f(n); } — the argument never changes (step 0), so no
+        // ranking function strictly decreases ⇒ abstain (this recurses forever).
+        assert!(!rec_ranked(&self_rec(BinaryOp::ICmpSgt, 0, 0)));
+    }
+
+    /// Build `void f(int n) { if (n > 1) { f(n - 1); f(n - 2); } }` — a two-call-site
+    /// (tree) self-recursion ranked by the single `f = n`.
+    fn fib_rec() -> AirModule {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let one = vid("one");
+        let two = vid("two");
+        let bnd = vid("bnd");
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+        constants.insert(two, Constant::Int { value: 2, bits: 32 });
+        constants.insert(bnd, Constant::Int { value: 1, bits: 32 });
+
+        let f_id = FunctionId(make_id("func", b"f"));
+        let n = vid("n");
+        let c = vid("c");
+        let n1 = vid("n1");
+        let n2 = vid("n2");
+        let entry = bid("f_entry");
+        let rec = bid("f_rec");
+        let base = bid("f_base");
+
+        let mut eb = AirBlock::new(entry);
+        eb.instructions.push(vinst(
+            "cmp",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            c,
+            vec![n, bnd],
+            i1t,
+        ));
+        eb.instructions.push(term(
+            "condbr",
+            Operation::CondBr {
+                then_target: rec,
+                else_target: base,
+            },
+            vec![c],
+        ));
+
+        let mut rb = AirBlock::new(rec);
+        rb.instructions.push(vinst(
+            "sub1",
+            Operation::BinaryOp {
+                kind: BinaryOp::Sub,
+            },
+            n1,
+            vec![n, one],
+            i32t,
+        ));
+        rb.instructions.push(term(
+            "call1",
+            Operation::CallDirect { callee: f_id },
+            vec![n1],
+        ));
+        rb.instructions.push(vinst(
+            "sub2",
+            Operation::BinaryOp {
+                kind: BinaryOp::Sub,
+            },
+            n2,
+            vec![n, two],
+            i32t,
+        ));
+        rb.instructions.push(term(
+            "call2",
+            Operation::CallDirect { callee: f_id },
+            vec![n2],
+        ));
+        rb.instructions
+            .push(term("br_rec", Operation::Br { target: base }, vec![]));
+
+        let mut bb = AirBlock::new(base);
+        bb.instructions.push(term("ret", Operation::Ret, vec![]));
+
+        let func = AirFunction {
+            id: f_id,
+            name: "f".to_string(),
+            params: vec![AirParam {
+                id: n,
+                name: None,
+                index: 0,
+                param_type: Some(i32t),
+            }],
+            blocks: vec![eb, rb, bb],
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        module_of(func, constants)
+    }
+
+    #[test]
+    fn tree_recursion_is_ranked() {
+        // Both recursive call sites (n-1 and n-2) strictly decrease f = n under the
+        // shared guard n > 1 ⇒ ranked.
+        assert!(rec_ranked(&fib_rec()));
     }
 }

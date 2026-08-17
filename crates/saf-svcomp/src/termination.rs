@@ -197,46 +197,64 @@ pub fn program_structurally_terminates(module: &AirModule) -> bool {
         }
     }
 
-    // (A) the reachable call graph is acyclic (no recursion).
-    if !reachable_callgraph_is_acyclic(&cg, &reachable_nodes) {
+    // (A) Every reachable call-graph SCC is either a single non-recursive node
+    // (acyclic) or a single **self-recursive** function whose recursion admits a
+    // linear ranking function (`ranking::recursion_is_ranked` — a complete, sound
+    // termination proof over the recursion depth). Mutual recursion (any SCC of
+    // size > 1) forces abstain. Returns the set of self-recursive functions that
+    // must be recursion-ranked below, or `None` on mutual recursion.
+    let Some(recursive_selfs) = reachable_recursive_selfs(&cg, &reachable_nodes) else {
         return false;
-    }
+    };
 
     // (L) every reachable defined function is either loop-free OR has all of its
     // natural loops proven terminating by linear ranking-function synthesis
-    // (`ranking::loops_are_ranked`, R7 follow-on). A ranking function is a
+    // (`ranking::loops_are_ranked`, R7 follow-on), AND (A-ranking) every
+    // self-recursive function's recursion is ranked. A ranking function is a
     // complete, sound termination proof, so this preserves the −32 guarantee while
-    // extending recall past the plan-201 loop-free-only slice.
+    // extending recall past the plan-201 loop-free ∧ acyclic-callgraph slice.
     module.functions.iter().all(|f| {
         if !reachable_fids.contains(&f.id) || f.is_declaration {
             return true;
         }
         let cfg = Cfg::build(f);
-        !cfg_has_loops(&cfg) || crate::ranking::loops_are_ranked(f, module, &cfg)
+        let loops_ok = !cfg_has_loops(&cfg) || crate::ranking::loops_are_ranked(f, module, &cfg);
+        let recursion_ok = !recursive_selfs.contains(&f.id)
+            || crate::ranking::recursion_is_ranked(f, module, &cfg);
+        loops_ok && recursion_ok
     })
 }
 
-/// Is the reachable call graph acyclic (no recursion)?
+/// Classify the reachable call graph's SCCs for termination.
 ///
 /// `reachable` is the DFS closure from `main`'s node, so it is closed under the
 /// call graph's successor relation and [`tarjan_scc`] sees only intra-reachable
-/// edges. The graph is cyclic iff some SCC has more than one node (mutual
-/// recursion) or a node calls itself (self-recursion).
-fn reachable_callgraph_is_acyclic(cg: &CallGraph, reachable: &BTreeSet<CallGraphNode>) -> bool {
+/// edges. Returns `Some(selfs)` — the [`FunctionId`]s of the **self-recursive**
+/// functions (size-1 SCCs with a self-edge), which the caller must additionally
+/// prove recursion-ranked — or `None` if any SCC has more than one node (mutual
+/// recursion, unsupported ⇒ abstain) or a self-edge sits on a non-function node.
+fn reachable_recursive_selfs(
+    cg: &CallGraph,
+    reachable: &BTreeSet<CallGraphNode>,
+) -> Option<BTreeSet<FunctionId>> {
+    let mut selfs = BTreeSet::new();
     for scc in tarjan_scc(reachable, cg) {
         if scc.len() > 1 {
-            return false;
+            return None;
         }
         if let Some(node) = scc.iter().next() {
-            if cg
+            let self_edge = cg
                 .callees_of(node)
-                .is_some_and(|callees| callees.contains(node))
-            {
-                return false;
+                .is_some_and(|callees| callees.contains(node));
+            if self_edge {
+                // A self-recursive node must be a concrete function to be ranked;
+                // a self-edge on an external/indirect node (should not occur here —
+                // the (I) check already rejected indirect nodes) forces abstain.
+                selfs.insert(node.function_id()?);
             }
         }
     }
-    true
+    Some(selfs)
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +269,7 @@ mod tests {
 
     use saf_core::air::{AirBlock, AirFunction, AirGlobal, Instruction, Operation};
     use saf_core::id::make_id;
-    use saf_core::ids::{BlockId, FunctionId, InstId, ModuleId, ObjId, ValueId};
+    use saf_core::ids::{BlockId, FunctionId, InstId, ModuleId, ObjId, TypeId, ValueId};
 
     fn make_value_id(name: &str) -> ValueId {
         ValueId(make_id("value", name.as_bytes()))
@@ -637,5 +655,172 @@ mod tests {
             "llvm.global_dtors",
         ));
         assert!(!program_structurally_terminates(&m));
+    }
+
+    // --- self-recursion end-to-end (A-ranking) ------------------------------
+
+    /// A value-producing instruction carrying a result type (needed for the
+    /// recursion ranker's type-bound inference).
+    fn typed_inst(
+        id: &str,
+        op: Operation,
+        dst: ValueId,
+        operands: Vec<ValueId>,
+        ty: TypeId,
+    ) -> Instruction {
+        Instruction {
+            id: make_inst_id(id),
+            op,
+            operands,
+            dst: Some(dst),
+            span: None,
+            symbol: None,
+            result_type: Some(ty),
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    fn typed_term(id: &str, op: Operation, operands: Vec<ValueId>) -> Instruction {
+        Instruction {
+            id: make_inst_id(id),
+            op,
+            operands,
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    /// A module `main(){ f(0); }` with `void f(int n){ if (n > 0) f(n + step); }`,
+    /// typed `i32`, so the whole reachable call graph is `main → f → f` (a size-1
+    /// self-recursive SCC). `step = -1` ⇒ terminating (ranked); `step = +1` ⇒ not.
+    fn self_rec_program(step: i64) -> AirModule {
+        use saf_core::air::{AirParam, AirType, Constant};
+
+        let i32t = TypeId(make_id("type", b"i32"));
+        let i1t = TypeId(make_id("type", b"i1"));
+        let f_id = make_func_id("f");
+        let n = make_value_id("n");
+        let c = make_value_id("c");
+        let na = make_value_id("na");
+        let bound_v = make_value_id("bound");
+        let step_v = make_value_id("step");
+
+        // f blocks: entry (guard n>0), rec (na=n+step; call f(na); ret), base (ret).
+        let f_entry = make_block_id("f_entry");
+        let f_rec = make_block_id("f_rec");
+        let f_base = make_block_id("f_base");
+
+        let mut eb = AirBlock::new(f_entry);
+        eb.instructions.push(typed_inst(
+            "cmp",
+            Operation::BinaryOp {
+                kind: saf_core::air::BinaryOp::ICmpSgt,
+            },
+            c,
+            vec![n, bound_v],
+            i1t,
+        ));
+        eb.instructions.push(typed_term(
+            "condbr",
+            Operation::CondBr {
+                then_target: f_rec,
+                else_target: f_base,
+            },
+            vec![c],
+        ));
+
+        let mut rb = AirBlock::new(f_rec);
+        rb.instructions.push(typed_inst(
+            "add",
+            Operation::BinaryOp {
+                kind: saf_core::air::BinaryOp::Add,
+            },
+            na,
+            vec![n, step_v],
+            i32t,
+        ));
+        rb.instructions.push(typed_term(
+            "call",
+            Operation::CallDirect { callee: f_id },
+            vec![na],
+        ));
+        rb.instructions
+            .push(typed_term("ret_rec", Operation::Ret, vec![]));
+
+        let mut bb = AirBlock::new(f_base);
+        bb.instructions
+            .push(typed_term("ret_base", Operation::Ret, vec![]));
+
+        let f = AirFunction {
+            id: f_id,
+            name: "f".to_string(),
+            params: vec![AirParam {
+                id: n,
+                name: None,
+                index: 0,
+                param_type: Some(i32t),
+            }],
+            blocks: vec![eb, rb, bb],
+            entry_block: Some(f_entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+
+        // main: call f(zero); ret.
+        let zero = make_value_id("zero");
+        let m_entry = make_block_id("m_entry");
+        let mut mb = AirBlock::new(m_entry);
+        mb.instructions.push(typed_term(
+            "mcall",
+            Operation::CallDirect { callee: f_id },
+            vec![zero],
+        ));
+        mb.instructions
+            .push(typed_term("mret", Operation::Ret, vec![]));
+        let main_f = AirFunction {
+            id: make_func_id("main"),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![mb],
+            entry_block: Some(m_entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+
+        let mut m = module(vec![main_f, f]);
+        m.types.insert(i32t, AirType::Integer { bits: 32 });
+        m.types.insert(i1t, AirType::Integer { bits: 1 });
+        m.constants
+            .insert(zero, Constant::Int { value: 0, bits: 32 });
+        m.constants
+            .insert(bound_v, Constant::Int { value: 0, bits: 32 });
+        m.constants.insert(
+            step_v,
+            Constant::Int {
+                value: step,
+                bits: 32,
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn ranked_self_recursion_terminates() {
+        // main → f, f(n){ if (n>0) f(n-1); } — recursion ranked by f = n ⇒ TRUE.
+        assert!(program_structurally_terminates(&self_rec_program(-1)));
+    }
+
+    #[test]
+    fn unranked_self_recursion_abstains() {
+        // main → f, f(n){ if (n>0) f(n+1); } — recurses forever; no ranking ⇒
+        // abstain (never a wrong `true`).
+        assert!(!program_structurally_terminates(&self_rec_program(1)));
     }
 }
