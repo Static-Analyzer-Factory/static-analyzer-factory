@@ -658,6 +658,35 @@ pub fn reachable_is_loop_free(
         .all(|(_, cfg)| !cfg_has_loops(cfg))
 }
 
+/// Convenience wrapper: is the sub-program reachable from `main` loop-free?
+///
+/// Builds the call graph, the `main`-reachable function set, and the per-function
+/// CFGs internally, then defers to [`reachable_is_loop_free`]. A `true` result means
+/// no reachable function contains a CFG back-edge (recursion, which is a call-graph
+/// cycle rather than a CFG loop, is NOT considered a loop here — each recursive
+/// function's own CFG may still be acyclic).
+///
+/// The overflow confirmer uses this to decide whether it is safe to feed `INT_MAX`
+/// / `INT_MIN` boundary values as nondet inputs: with no reachable loop there is no
+/// counter/accumulator a boundary input could drive to a *spurious* `+1`-at-`INT_MAX`
+/// overflow (the loop-driven false alarm the fixed `2^30` probe is capped to avoid),
+/// so any `UBSan` signed-overflow trap under a boundary input is a genuine direct
+/// overflow of the program.
+#[must_use]
+pub fn module_reachable_is_loop_free(module: &AirModule) -> bool {
+    let callgraph = CallGraph::build(module);
+    let reachable = reachable_functions(&callgraph, module);
+    // An empty reachable set (no `main`) is vacuously loop-free, but the caller's
+    // confirmer never runs without a `main`, so the value is immaterial there.
+    let cfgs: BTreeMap<FunctionId, Cfg> = module
+        .functions
+        .iter()
+        .filter(|f| !f.is_declaration)
+        .map(|f| (f.id, Cfg::build(f)))
+        .collect();
+    reachable_is_loop_free(&cfgs, &reachable)
+}
+
 /// Check if a specific function's CFG is loop-free.
 ///
 /// Returns true if the function has no loops (back-edges) in its CFG,
@@ -1178,6 +1207,60 @@ mod tests {
         // Only main is reachable, so the loopy function is excluded
         let reachable: BTreeSet<FunctionId> = [main_id].into_iter().collect();
         assert!(reachable_is_loop_free(&cfgs, &reachable));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for module_reachable_is_loop_free (module-level convenience)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_module_reachable_is_loop_free_linear_main() {
+        // A single-block `main` (no back-edge) is loop-free.
+        let module = make_module(vec![make_defined_function("main")]);
+        assert!(module_reachable_is_loop_free(&module));
+    }
+
+    #[test]
+    fn test_module_reachable_is_loop_free_detects_back_edge() {
+        // `main` with `b0 -> b1 -> b0` has a reachable CFG loop.
+        let fid = make_func_id("main");
+        let b0 = make_block_id("main_b0");
+        let b1 = make_block_id("main_b1");
+        let mut block0 = AirBlock::new(b0);
+        block0.instructions.push(Instruction {
+            id: make_inst_id("b0_term"),
+            op: Operation::Br { target: b1 },
+            operands: vec![],
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        });
+        let mut block1 = AirBlock::new(b1);
+        block1.instructions.push(Instruction {
+            id: make_inst_id("b1_term"),
+            op: Operation::Br { target: b0 },
+            operands: vec![],
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        });
+        let main = AirFunction {
+            id: fid,
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![block0, block1],
+            entry_block: None,
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let module = make_module(vec![main]);
+        assert!(!module_reachable_is_loop_free(&module));
     }
 
     // -----------------------------------------------------------------------

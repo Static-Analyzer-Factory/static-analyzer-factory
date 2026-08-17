@@ -1626,6 +1626,78 @@ const OVERFLOW_CONSTS: &[i64] = &[
 /// candidate. Dropped candidates are logged implicitly by not confirming.
 const MAX_REPLAY_CANDIDATES: usize = 16;
 
+/// Cap on the overflow confirmer's candidate list. Larger than
+/// [`MAX_REPLAY_CANDIDATES`] because the overflow sweep layers three sources —
+/// the fixed [`OVERFLOW_CONSTS`] spread, the loop-free type-boundary values
+/// ([`overflow_boundary_consts`]), and program-literal branch steering — and each
+/// boundary value is a high-yield direct-overflow probe that must not be squeezed
+/// out by steered literals. Loop-free programs (the only ones the boundary values
+/// are added for) have no infinite loops, so the extra native runs stay cheap.
+const OVERFLOW_MAX_CANDIDATES: usize = 24;
+
+/// Signed-overflow type-BOUNDARY nondet candidates, appended to the overflow
+/// mini-fuzz sweep ONLY when the reachable program is loop-free
+/// ([`saf_svcomp::fast_paths::module_reachable_is_loop_free`]).
+///
+/// [`OVERFLOW_CONSTS`] deliberately caps its large positive probe at `2^30` (not
+/// `INT_MAX`) so a nondet-driven loop counter cannot be pushed to a *spurious*
+/// `+1`-at-`INT_MAX` trap on a TRUE `termination-*` task. With **no reachable CFG
+/// loop** that hazard is gone: there is no counter/accumulator to drive, so a
+/// near-boundary input can only trigger a *genuine direct* overflow (`x+1` at
+/// `INT_MAX`, `x*2`, a recursive `addition(m+1, …)` at `m == INT_MAX`). `UBSan`
+/// stays the sole arbiter (R2) and re-triggers deterministically (R6); a value that
+/// does not actually overflow simply yields no report.
+///
+/// The 32-bit boundaries always apply. The 64-bit boundaries are added ONLY under
+/// LP64 (where `long`/`int64_t` sinks are 64-bit, closing the 64-bit direct-overflow
+/// gap) — under ILP32 the driver's `atol` parses into a 32-bit `long`, so a 64-bit
+/// literal would overflow the parse itself; excluding it keeps the driver defined.
+fn overflow_boundary_consts(data_model: saf_svcomp::DataModel) -> Vec<i64> {
+    // 32-bit boundaries: INT_MAX and its immediate neighbours. INT_MIN itself is
+    // already in OVERFLOW_CONSTS; INT_MIN+1 lets `-x` / `x-1` near the low boundary
+    // trap, and INT_MAX-1 covers `x+2` / `2*x` just under the high boundary.
+    let mut v = vec![2_147_483_647, 2_147_483_646, -2_147_483_647];
+    if matches!(data_model, saf_svcomp::DataModel::LP64) {
+        // 64-bit boundaries for `long`/`long long`/`int64_t` sinks.
+        v.extend_from_slice(&[
+            9_223_372_036_854_775_807,  // LONG_MAX
+            9_223_372_036_854_775_806,  // LONG_MAX - 1
+            -9_223_372_036_854_775_807, // LONG_MIN + 1
+        ]);
+    }
+    v
+}
+
+/// Assemble the overflow confirmer's mini-fuzz candidate list: the fixed
+/// [`OVERFLOW_CONSTS`] spread FIRST (byte-for-byte prefix — 0 regression on tasks
+/// the committed sweep already confirms), then — when the reachable program is
+/// loop-free — the type-boundary probes ([`overflow_boundary_consts`]), then
+/// program-literal branch steering to fill the remaining budget. Deduplicated;
+/// bounded by [`OVERFLOW_MAX_CANDIDATES`]. Deterministic (`BTreeSet`-ordered
+/// steering, fixed prefixes).
+fn overflow_replay_candidates(
+    module: &saf_core::air::AirModule,
+    data_model: saf_svcomp::DataModel,
+) -> Vec<i64> {
+    let mut candidates: Vec<i64> = OVERFLOW_CONSTS.to_vec();
+    if saf_svcomp::fast_paths::module_reachable_is_loop_free(module) {
+        for b in overflow_boundary_consts(data_model) {
+            if !candidates.contains(&b) {
+                candidates.push(b);
+            }
+        }
+    }
+    for k in saf_svcomp::fast_paths::branch_steering_constants(module) {
+        if candidates.len() >= OVERFLOW_MAX_CANDIDATES {
+            break;
+        }
+        if !candidates.contains(&k) {
+            candidates.push(k);
+        }
+    }
+    candidates
+}
+
 /// Assemble the mini-fuzz candidate constant list for a native-replay confirmer:
 /// the fixed `fixed` spread FIRST (so a confirmer's committed behavior is a
 /// byte-for-byte prefix — 0 regression), then the program's OWN integer comparison /
@@ -2571,7 +2643,14 @@ fn ubsan_confirm(
     // below 2^30 (so no steered value can widen the loop-counter-to-INT_MAX false-alarm
     // surface) and are still just concrete nondet inputs — soundness is unchanged (a
     // trap is re-triggered on the ORIGINAL program).
-    let candidates = replay_candidates(OVERFLOW_CONSTS, module);
+    //
+    // Loop-free boundary injection: when NO reachable function has a CFG loop,
+    // `overflow_replay_candidates` also appends the type-boundary values (INT_MAX,
+    // near-INT_MAX/INT_MIN, plus the 64-bit boundaries under LP64). With no loop
+    // counter to drive spuriously, a boundary input can only trigger a genuine
+    // DIRECT overflow, so this widens reachability without re-admitting the
+    // termination-* loop false alarm (see `overflow_boundary_consts`).
+    let candidates = overflow_replay_candidates(module, data_model);
 
     let timeout = replay_timeout();
     for &k in &candidates {
@@ -3494,6 +3573,141 @@ mod verify_tests {
         assert!(
             got.starts_with(NONDET_CONSTS),
             "fixed spread must be preserved under the cap"
+        );
+    }
+
+    // --- overflow loop-free boundary injection -----------------------------
+
+    /// A defined `main` with a two-block CFG back-edge (`b0 -> b1 -> b0`) — a
+    /// reachable CFG loop, so `module_reachable_is_loop_free` is false. Includes the
+    /// `guard_consts` as `icmp` literals in `b0` (branch-steering fodder).
+    fn module_with_loop(guard_consts: &[i64]) -> AirModule {
+        let b0 = BlockId(make_id("block", b"main_b0"));
+        let b1 = BlockId(make_id("block", b"main_b1"));
+        let mut block0 = AirBlock::new(b0);
+        let mut constants: BTreeMap<ValueId, Constant> = BTreeMap::new();
+        for (i, &k) in guard_consts.iter().enumerate() {
+            let cvid = ValueId(make_id("value", format!("c{i}").as_bytes()));
+            let xvid = ValueId(make_id("value", format!("x{i}").as_bytes()));
+            constants.insert(cvid, Constant::int(k, 32));
+            block0.instructions.push(Instruction {
+                id: InstId(make_id("inst", format!("i{i}").as_bytes())),
+                op: Operation::BinaryOp {
+                    kind: BinaryOp::ICmpEq,
+                },
+                operands: vec![xvid, cvid],
+                dst: Some(ValueId(make_id("value", format!("r{i}").as_bytes()))),
+                span: None,
+                symbol: None,
+                result_type: None,
+                extensions: BTreeMap::new(),
+            });
+        }
+        // b0 terminator: unconditional branch to b1.
+        block0.instructions.push(Instruction {
+            id: InstId(make_id("inst", b"b0_term")),
+            op: Operation::Br { target: b1 },
+            operands: vec![],
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        });
+        // b1 terminator: unconditional branch back to b0 (the back-edge).
+        let mut block1 = AirBlock::new(b1);
+        block1.instructions.push(Instruction {
+            id: InstId(make_id("inst", b"b1_term")),
+            op: Operation::Br { target: b0 },
+            operands: vec![],
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        });
+        let main = AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![block0, block1],
+            entry_block: None,
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let mut module = AirModule::new(ModuleId(make_id("module", b"test_loop")));
+        module.functions.push(main);
+        module.constants = constants;
+        module
+    }
+
+    #[test]
+    fn overflow_boundary_consts_are_width_specific() {
+        let ilp32 = overflow_boundary_consts(saf_svcomp::DataModel::ILP32);
+        let lp64 = overflow_boundary_consts(saf_svcomp::DataModel::LP64);
+        // 32-bit boundaries always present; INT_MAX is the load-bearing one.
+        assert!(ilp32.contains(&2_147_483_647), "INT_MAX under ILP32");
+        // ILP32 must NOT carry a 64-bit literal (the driver's atol would overflow).
+        assert!(!ilp32.contains(&9_223_372_036_854_775_807));
+        // LP64 adds the 64-bit boundaries on top of the 32-bit ones.
+        assert!(lp64.contains(&2_147_483_647), "INT_MAX under LP64");
+        assert!(
+            lp64.contains(&9_223_372_036_854_775_807),
+            "LONG_MAX under LP64"
+        );
+        assert!(lp64.len() > ilp32.len());
+    }
+
+    #[test]
+    fn overflow_candidates_inject_boundary_when_loop_free() {
+        // A single-block main (no back-edge) is loop-free -> INT_MAX is injected.
+        let module = module_with_guard_constants(&[]);
+        let got = overflow_replay_candidates(&module, saf_svcomp::DataModel::LP64);
+        assert!(
+            got.starts_with(OVERFLOW_CONSTS),
+            "fixed spread must remain the prefix (0 regression)"
+        );
+        assert!(
+            got.contains(&2_147_483_647),
+            "loop-free program must get the INT_MAX boundary probe"
+        );
+        assert!(
+            got.contains(&9_223_372_036_854_775_807),
+            "LP64 loop-free program must get the 64-bit boundary probe"
+        );
+        assert!(got.len() <= OVERFLOW_MAX_CANDIDATES);
+    }
+
+    #[test]
+    fn overflow_candidates_omit_boundary_when_looping() {
+        // A program with a reachable CFG loop must NOT get the boundary probes — this
+        // is the gate that keeps the termination-* loop-counter false alarm out.
+        let module = module_with_loop(&[]);
+        let got = overflow_replay_candidates(&module, saf_svcomp::DataModel::LP64);
+        assert_eq!(
+            got,
+            OVERFLOW_CONSTS.to_vec(),
+            "looping program keeps exactly the committed fixed spread"
+        );
+        assert!(
+            !got.contains(&2_147_483_647),
+            "no INT_MAX boundary under a loop"
+        );
+    }
+
+    #[test]
+    fn overflow_candidates_boundary_precedes_branch_steering() {
+        // Boundary probes are appended before branch-steered literals, and both land
+        // after the fixed spread. A loop-free module with a novel guard literal 777.
+        let module = module_with_guard_constants(&[777]);
+        let got = overflow_replay_candidates(&module, saf_svcomp::DataModel::LP64);
+        let pos_boundary = got.iter().position(|&v| v == 2_147_483_647).unwrap();
+        let pos_guard = got.iter().position(|&v| v == 777).unwrap();
+        assert!(
+            pos_boundary < pos_guard,
+            "boundary probes come before branch-steered guard literals"
         );
     }
 }
