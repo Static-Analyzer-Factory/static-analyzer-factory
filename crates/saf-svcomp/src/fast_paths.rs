@@ -698,6 +698,110 @@ pub fn build_value_function_map(module: &AirModule) -> BTreeMap<ValueId, Functio
 }
 
 // ---------------------------------------------------------------------------
+// Branch-steering constant harvesting (overflow / memsafety mini-fuzz reachability)
+// ---------------------------------------------------------------------------
+
+/// Magnitude cap for a harvested branch-steering constant: strictly below `2^30`.
+///
+/// A program literal at or above this (e.g. a near-`INT_MAX` loop bound) fed as a
+/// nondet input could drive a loop counter/accumulator to `INT_MAX` and then spuriously
+/// trap on the next `+1` — the `termination-*` loop-counter false alarm that the fixed
+/// `2^30` probe already avoids. Keeping harvested literals strictly below `2^30`
+/// preserves the identical soundness margin (the existing large-positive probe is `2^30`
+/// exactly, so nothing steered in exceeds it).
+const BRANCH_STEERING_MAGNITUDE_CAP: i64 = 1 << 30;
+
+/// Cap on how many distinct program-literal branch-steering constants to harvest,
+/// bounding the extra native replay runs. Deterministic `BTreeSet` iteration makes the
+/// first-N selection reproducible (`NFR-DET`).
+const MAX_BRANCH_STEERING_CONSTS: usize = 16;
+
+/// True iff `kind` is an integer comparison (`ICmp*`) — the guards whose constant
+/// operand is a branch threshold worth steering the mini-fuzz toward. Float compares
+/// and arithmetic are excluded (their literals are not integer input thresholds).
+fn is_integer_compare(kind: saf_core::air::BinaryOp) -> bool {
+    use saf_core::air::BinaryOp::{
+        ICmpEq, ICmpNe, ICmpSge, ICmpSgt, ICmpSle, ICmpSlt, ICmpUge, ICmpUgt, ICmpUle, ICmpUlt,
+    };
+    matches!(
+        kind,
+        ICmpEq
+            | ICmpNe
+            | ICmpUgt
+            | ICmpUge
+            | ICmpUlt
+            | ICmpUle
+            | ICmpSgt
+            | ICmpSge
+            | ICmpSlt
+            | ICmpSle
+    )
+}
+
+/// Insert `v` into `set` iff its magnitude is under [`BRANCH_STEERING_MAGNITUDE_CAP`].
+fn push_capped(set: &mut BTreeSet<i64>, v: i64) {
+    // `unsigned_abs` cannot overflow (unlike `abs` at `i64::MIN`); the cap is well
+    // within `u64` range, so the comparison is exact.
+    if v.unsigned_abs() < BRANCH_STEERING_MAGNITUDE_CAP as u64 {
+        set.insert(v);
+    }
+}
+
+/// Harvest integer comparison / switch literals from the program to steer the
+/// mini-fuzz toward guard-gated violations (cpa-witness2test-style input steering).
+///
+/// A guard such as `if (x == 500) INT_MAX + x;` is only reached when the nondet input
+/// equals the program's own literal `500` — a value the fixed constant spread will
+/// never guess. This pass collects the integer literal operand of every `ICmp*`
+/// comparison and every `Switch` case value, so those exact guard thresholds enter the
+/// sweep as candidate inputs. It widens the *reachability* that feeds the overflow
+/// confirmer without touching how a violation is confirmed.
+///
+/// Soundness: each harvested value is a concrete integer the verifier may legally
+/// choose for the nondet input; `__VERIFIER_assume` still prunes any that are
+/// infeasible, and the confirmer only emits `false` on a re-triggered concrete trap on
+/// the ORIGINAL program. Literals of magnitude `≥ 2^30` are dropped (see
+/// [`BRANCH_STEERING_MAGNITUDE_CAP`]) so no steered value can widen the
+/// loop-counter-to-`INT_MAX` false-alarm surface. The result is deterministic
+/// (`BTreeSet` order) and capped at [`MAX_BRANCH_STEERING_CONSTS`].
+#[must_use]
+pub fn branch_steering_constants(module: &AirModule) -> Vec<i64> {
+    use saf_core::air::Constant;
+
+    let mut consts: BTreeSet<i64> = BTreeSet::new();
+
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match &inst.op {
+                    Operation::BinaryOp { kind } if is_integer_compare(*kind) => {
+                        for v in &inst.operands {
+                            if let Some(Constant::Int { value, .. }) = module.constants.get(v) {
+                                push_capped(&mut consts, *value);
+                            }
+                        }
+                    }
+                    Operation::Switch { cases, .. } => {
+                        for (case_val, _) in cases {
+                            push_capped(&mut consts, *case_val);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    consts
+        .into_iter()
+        .take(MAX_BRANCH_STEERING_CONSTS)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1268,5 +1372,132 @@ mod tests {
         let module = make_module(vec![foo, pthread_create]);
         let cg = CallGraph::build(&module);
         assert!(!reachable_spawns_threads(&module, &cg));
+    }
+
+    // --- branch_steering_constants ---------------------------------------
+
+    /// Build a one-block function whose single instruction is `op` with `operands`.
+    fn make_func_with_inst(name: &str, op: Operation, operands: Vec<ValueId>) -> AirFunction {
+        let bid = make_block_id(&format!("{name}_entry"));
+        let mut block = AirBlock::new(bid);
+        block.instructions.push(Instruction {
+            id: make_inst_id(&format!("{name}_i0")),
+            op,
+            operands,
+            dst: Some(make_value_id(&format!("{name}_r0"))),
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        });
+        AirFunction {
+            id: make_func_id(name),
+            name: name.to_string(),
+            params: Vec::new(),
+            blocks: vec![block],
+            entry_block: None,
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn branch_steering_harvests_icmp_literal() {
+        use saf_core::air::{BinaryOp, Constant};
+        let c = make_value_id("c500");
+        let x = make_value_id("x");
+        let main = make_func_with_inst(
+            "main",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpEq,
+            },
+            vec![x, c],
+        );
+        let mut module = make_module(vec![main]);
+        module.constants.insert(c, Constant::int(500, 32));
+        assert_eq!(branch_steering_constants(&module), vec![500]);
+    }
+
+    #[test]
+    fn branch_steering_harvests_switch_cases() {
+        let d = make_value_id("disc");
+        let target = make_block_id("case_target");
+        let main = make_func_with_inst(
+            "main",
+            Operation::Switch {
+                default: make_block_id("default"),
+                cases: vec![(7, target), (42, target), (7, target)],
+            },
+            vec![d],
+        );
+        let module = make_module(vec![main]);
+        // Deduplicated + sorted (BTreeSet), determinism holds.
+        assert_eq!(branch_steering_constants(&module), vec![7, 42]);
+    }
+
+    #[test]
+    fn branch_steering_drops_out_of_range_and_keeps_in_range_negative() {
+        use saf_core::air::{BinaryOp, Constant};
+        let big = make_value_id("big");
+        let neg = make_value_id("neg");
+        let x = make_value_id("x");
+        let cmp_big = make_func_with_inst(
+            "f_big",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            vec![x, big],
+        );
+        let cmp_neg = make_func_with_inst(
+            "f_neg",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt,
+            },
+            vec![x, neg],
+        );
+        let mut module = make_module(vec![cmp_big, cmp_neg]);
+        // 2^30 is at the cap (excluded, `< cap` is strict); i64::MIN excluded; -5 kept.
+        module.constants.insert(big, Constant::int(1 << 30, 32));
+        module.constants.insert(neg, Constant::int(-5, 32));
+        assert_eq!(branch_steering_constants(&module), vec![-5]);
+    }
+
+    #[test]
+    fn branch_steering_ignores_float_compare_and_declarations() {
+        use saf_core::air::{BinaryOp, Constant};
+        let c = make_value_id("cf");
+        let x = make_value_id("xf");
+        // A float compare's literal is not an integer input threshold -> ignored.
+        let ffn = make_func_with_inst(
+            "ffn",
+            Operation::BinaryOp {
+                kind: BinaryOp::FCmpOeq,
+            },
+            vec![x, c],
+        );
+        let decl = make_declaration("some_decl");
+        let mut module = make_module(vec![ffn, decl]);
+        module.constants.insert(c, Constant::int(9, 32));
+        assert!(branch_steering_constants(&module).is_empty());
+    }
+
+    #[test]
+    fn branch_steering_handles_i64_min_without_panic() {
+        // `abs(i64::MIN)` would overflow; `unsigned_abs` must be used. The value is
+        // out of range so it is dropped, and the call must not panic.
+        let d = make_value_id("disc");
+        let target = make_block_id("t");
+        let main = make_func_with_inst(
+            "main",
+            Operation::Switch {
+                default: make_block_id("default"),
+                cases: vec![(i64::MIN, target), (3, target)],
+            },
+            vec![d],
+        );
+        let module = make_module(vec![main]);
+        assert_eq!(branch_steering_constants(&module), vec![3]);
     }
 }

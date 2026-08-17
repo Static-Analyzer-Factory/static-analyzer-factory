@@ -2068,8 +2068,27 @@ fn ubsan_confirm(
     // scalar-guarded/scalar-sized overflow the zeroed probe misses is reproduced by the
     // matching constant. Sound: each constant is a valid concrete input, and
     // __VERIFIER_assume still prunes infeasible ones. Confirm on the FIRST trap.
+    //
+    // Branch-steering (cpa-witness2test-style input steering): after the fixed spread,
+    // append the program's OWN integer comparison / switch literals so a guard-gated
+    // overflow (`if (x == K) INT_MAX + x;`) is reached when the fixed spread never
+    // guesses `K`. Harvested literals are magnitude-capped below 2^30 (so no steered
+    // value can widen the loop-counter-to-INT_MAX false-alarm surface) and are still
+    // just concrete nondet inputs — soundness is unchanged (a trap is re-triggered on
+    // the ORIGINAL program). The fixed spread runs FIRST so committed behavior is a
+    // prefix (0 regression); the total is capped at MAX_REPLAY_CANDIDATES.
+    let mut candidates: Vec<i64> = OVERFLOW_CONSTS.to_vec();
+    for k in saf_svcomp::fast_paths::branch_steering_constants(module) {
+        if candidates.len() >= MAX_REPLAY_CANDIDATES {
+            break;
+        }
+        if !candidates.contains(&k) {
+            candidates.push(k);
+        }
+    }
+
     let timeout = replay_timeout();
-    for &k in OVERFLOW_CONSTS {
+    for &k in &candidates {
         let errfile =
             std::fs::File::create(&errpath).with_context(|| "creating UBSan stderr file")?;
         let mut child = Command::new(&harness)
