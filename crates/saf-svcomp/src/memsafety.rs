@@ -18,8 +18,9 @@
 //!   memory-safety violation of the program under test → abstain.
 //! - **R2 (high-fidelity sub-property only):** map only the unambiguous ASan
 //!   classes to a sub-property (`*-buffer-overflow/underflow/overread/underread`,
-//!   `*use-after-free/scope/return`, `SEGV` → `valid-deref`; `double-free` →
-//!   `valid-free`); abstain on bad-free-of-non-heap and any unmapped class.
+//!   `*use-after-free/scope/return`, `SEGV` → `valid-deref`; `double-free` and
+//!   `free on address which was not malloc()-ed` → `valid-free`); abstain on any
+//!   unmapped class (`alloc-dealloc-mismatch`, `memcpy-param-overlap`, leaks, …).
 
 use crate::witness_yaml::{Action, SourceWaypoint, WaypointKind};
 
@@ -39,15 +40,21 @@ pub struct AsanHit {
 
 /// Map an AddressSanitizer error-class phrase (the text after
 /// `ERROR: AddressSanitizer: `) to the SV-COMP sub-property, or `None` to abstain
-/// (R2). Only high-fidelity classes map; bad-free / leak / overlap / mismatch /
-/// unknown all abstain.
+/// (R2). Only high-fidelity classes map; leak / overlap / mismatch / unknown abstain.
 #[must_use]
 pub fn asan_class_to_subproperty(class_phrase: &str) -> Option<&'static str> {
     let p = class_phrase;
-    // valid-free: an unambiguous double-free. Bad-free-of-non-heap is ambiguous
-    // with valid-deref (SV-COMP may expect either — the CWE590 −16 case), so it
-    // abstains below.
-    if p.contains("double-free") {
+    // valid-free: freeing a pointer that is not the base of a currently-allocated
+    // block. SV-COMP's `valid-free` is violated exactly when `free`/`realloc` is
+    // applied to such a pointer, so both ASan free-classes map here:
+    //   - `attempting double-free` (a block freed twice), and
+    //   - `attempting free on address which was not malloc()-ed` (an offset-into-heap
+    //     pointer as in `p = malloc(n); free(p + 1)`, or a non-heap/stack/global
+    //     address). ASan attributes the fault to the `free` operation itself, so this
+    //     is unambiguously a free violation — never a dereference. A `SEGV` reached
+    //     THROUGH a deallocator stays abstained in `parse_asan_report` (the class
+    //     `SEGV` alone cannot tell a wild deref from a bad free).
+    if p.contains("double-free") || p.contains("not malloc()-ed") {
         return Some("valid-free");
     }
     // valid-deref: an invalid dereference of any kind.
@@ -399,9 +406,16 @@ WRITE of size 40 at 0x502 thread T0
     }
 
     #[test]
-    fn bad_free_of_non_heap_abstains_r2() {
-        // Ambiguous with valid-deref (the CWE590 −16 case) -> abstain.
-        assert_eq!(parse_asan_report(BAD_FREE_NON_HEAP), None);
+    fn free_of_non_malloced_address_is_valid_free() {
+        // ASan attributes the fault to the `free` operation itself (`attempting free on
+        // address which was not malloc()-ed`), so it is unambiguously a `valid-free`
+        // violation — the located program frame is the offending `free` call site.
+        // Real reasoning task: memsafety/960521-1-1 (`p = malloc(n); free(p + 1)`),
+        // expected_verdict false, subproperty valid-free.
+        let hit = parse_asan_report(BAD_FREE_NON_HEAP).expect("a hit");
+        assert_eq!(hit.subproperty, "valid-free");
+        assert_eq!(hit.file, "badfree.c");
+        assert_eq!(hit.line, 10);
     }
 
     #[test]
@@ -449,11 +463,11 @@ WRITE of size 40 at 0x502 thread T0
             asan_class_to_subproperty("attempting double-free on 0x5"),
             Some("valid-free")
         );
-        // abstain:
         assert_eq!(
             asan_class_to_subproperty("attempting free on address which was not malloc()-ed"),
-            None
+            Some("valid-free")
         );
+        // abstain:
         assert_eq!(asan_class_to_subproperty("memcpy-param-overlap ..."), None);
         assert_eq!(
             asan_class_to_subproperty("alloc-dealloc-mismatch ..."),
