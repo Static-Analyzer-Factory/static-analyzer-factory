@@ -1603,6 +1603,30 @@ const OVERFLOW_CONSTS: &[i64] = &[
 /// candidate. Dropped candidates are logged implicitly by not confirming.
 const MAX_REPLAY_CANDIDATES: usize = 16;
 
+/// Assemble the mini-fuzz candidate constant list for a native-replay confirmer:
+/// the fixed `fixed` spread FIRST (so a confirmer's committed behavior is a
+/// byte-for-byte prefix — 0 regression), then the program's OWN integer comparison /
+/// switch literals appended via branch-steering (cpa-witness2test-style input
+/// steering). A guard-gated fault (`if (nondet() == K) …`) is unreachable when the
+/// fixed spread never guesses the guard constant `K`; feeding the program's own `K`
+/// reaches it. Every steered value is just another concrete nondet input the verifier
+/// may choose (so soundness is unchanged — the sanitizer remains the sole arbiter and
+/// `__VERIFIER_assume` still prunes infeasible paths), harvested literals are
+/// magnitude-capped and de-duplicated, and the total is bounded by
+/// `MAX_REPLAY_CANDIDATES` to keep the per-task replay budget finite.
+fn replay_candidates(fixed: &[i64], module: &saf_core::air::AirModule) -> Vec<i64> {
+    let mut candidates: Vec<i64> = fixed.to_vec();
+    for k in saf_svcomp::fast_paths::branch_steering_constants(module) {
+        if candidates.len() >= MAX_REPLAY_CANDIDATES {
+            break;
+        }
+        if !candidates.contains(&k) {
+            candidates.push(k);
+        }
+    }
+    candidates
+}
+
 /// Scalar-integer nondet functions and their C return types, in a fixed order.
 /// The replay driver always defines all of them (so the native link succeeds
 /// regardless of which the program references); the ones with model values
@@ -1946,6 +1970,14 @@ fn asan_confirm(
     let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
     let timeout = replay_timeout();
 
+    // Mini-fuzz candidate constants: the fixed NONDET_CONSTS spread followed by the
+    // program's own branch-steering literals (see `replay_candidates`). A guard-gated
+    // memory fault (`if (nondet() == K) buf[BIG] = 0;`) that the fixed spread never
+    // reaches is reproduced by feeding the program's own guard constant `K`. Sound: the
+    // steered values are ordinary concrete inputs, ASan stays the sole arbiter, and
+    // R1/R2 in `parse_asan_report` still gate the report — a safe program never faults.
+    let candidates = replay_candidates(NONDET_CONSTS, module);
+
     // One ASan compile-and-mini-fuzz pass. `auto_var_init` toggles the second
     // (uninitialized-variable) pass; see the two-pass rationale at the call below.
     // Returns `Ok(Some(hit))` on the first constant that reproduces a violation,
@@ -2007,7 +2039,7 @@ fn asan_confirm(
         // stops ASan aborting at a benign printf artifact BEFORE the real fault; it can
         // never add a false alarm (only suppresses reports), so it stays sound. R2 still
         // abstains on any ambiguous secondary fault a suppressed intended-fault exposes.
-        for &k in NONDET_CONSTS {
+        for &k in &candidates {
             // Redirect the child's stderr to a FILE (not a pipe) so a large ASan report
             // cannot deadlock on a full pipe buffer while we poll for the timeout.
             let errfile =
@@ -2501,20 +2533,11 @@ fn ubsan_confirm(
     // Branch-steering (cpa-witness2test-style input steering): after the fixed spread,
     // append the program's OWN integer comparison / switch literals so a guard-gated
     // overflow (`if (x == K) INT_MAX + x;`) is reached when the fixed spread never
-    // guesses `K`. Harvested literals are magnitude-capped below 2^30 (so no steered
-    // value can widen the loop-counter-to-INT_MAX false-alarm surface) and are still
-    // just concrete nondet inputs — soundness is unchanged (a trap is re-triggered on
-    // the ORIGINAL program). The fixed spread runs FIRST so committed behavior is a
-    // prefix (0 regression); the total is capped at MAX_REPLAY_CANDIDATES.
-    let mut candidates: Vec<i64> = OVERFLOW_CONSTS.to_vec();
-    for k in saf_svcomp::fast_paths::branch_steering_constants(module) {
-        if candidates.len() >= MAX_REPLAY_CANDIDATES {
-            break;
-        }
-        if !candidates.contains(&k) {
-            candidates.push(k);
-        }
-    }
+    // guesses `K` (see `replay_candidates`). Harvested literals are magnitude-capped
+    // below 2^30 (so no steered value can widen the loop-counter-to-INT_MAX false-alarm
+    // surface) and are still just concrete nondet inputs — soundness is unchanged (a
+    // trap is re-triggered on the ORIGINAL program).
+    let candidates = replay_candidates(OVERFLOW_CONSTS, module);
 
     let timeout = replay_timeout();
     for &k in &candidates {
@@ -3310,5 +3333,106 @@ mod verify_tests {
         let a = std::fs::read_to_string(write_assert_neutralizer(dir.path()).unwrap()).unwrap();
         let b = std::fs::read_to_string(write_assert_neutralizer(dir.path()).unwrap()).unwrap();
         assert_eq!(a, b);
+    }
+
+    // --- replay_candidates (branch-steering merge) -------------------------
+
+    use saf_core::air::{
+        AirBlock, AirFunction, AirModule, BinaryOp, Constant, Instruction, Operation,
+    };
+    use saf_core::id::make_id;
+    use saf_core::ids::{BlockId, FunctionId, InstId, ModuleId, ValueId};
+    use std::collections::BTreeMap;
+
+    /// A defined `main` whose body is a sequence of `icmp eq x, K` instructions, one
+    /// per constant in `guard_consts` — the branch-steering harvester reads these.
+    fn module_with_guard_constants(guard_consts: &[i64]) -> AirModule {
+        let bid = BlockId(make_id("block", b"main_entry"));
+        let mut block = AirBlock::new(bid);
+        let mut constants: BTreeMap<ValueId, Constant> = BTreeMap::new();
+        for (i, &k) in guard_consts.iter().enumerate() {
+            let cvid = ValueId(make_id("value", format!("c{i}").as_bytes()));
+            let xvid = ValueId(make_id("value", format!("x{i}").as_bytes()));
+            constants.insert(cvid, Constant::int(k, 32));
+            block.instructions.push(Instruction {
+                id: InstId(make_id("inst", format!("i{i}").as_bytes())),
+                op: Operation::BinaryOp {
+                    kind: BinaryOp::ICmpEq,
+                },
+                operands: vec![xvid, cvid],
+                dst: Some(ValueId(make_id("value", format!("r{i}").as_bytes()))),
+                span: None,
+                symbol: None,
+                result_type: None,
+                extensions: BTreeMap::new(),
+            });
+        }
+        let main = AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![block],
+            entry_block: None,
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let mut module = AirModule::new(ModuleId(make_id("module", b"test")));
+        module.functions.push(main);
+        module.constants = constants;
+        module
+    }
+
+    #[test]
+    fn replay_candidates_is_a_prefix_of_the_fixed_spread() {
+        // No program guard literals -> the candidate list is EXACTLY the fixed spread
+        // (the committed behavior is byte-for-byte preserved: 0 regression).
+        let module = module_with_guard_constants(&[]);
+        assert_eq!(
+            replay_candidates(NONDET_CONSTS, &module),
+            NONDET_CONSTS.to_vec()
+        );
+        assert_eq!(
+            replay_candidates(OVERFLOW_CONSTS, &module),
+            OVERFLOW_CONSTS.to_vec()
+        );
+    }
+
+    #[test]
+    fn replay_candidates_appends_novel_guard_literals_after_the_fixed_spread() {
+        // A guard constant absent from the fixed spread is appended AFTER it, so the
+        // fixed spread still runs first and a guard-gated fault becomes reachable.
+        let module = module_with_guard_constants(&[500]);
+        let got = replay_candidates(NONDET_CONSTS, &module);
+        assert!(
+            got.starts_with(NONDET_CONSTS),
+            "fixed spread must be the prefix"
+        );
+        assert_eq!(*got.last().unwrap(), 500);
+    }
+
+    #[test]
+    fn replay_candidates_dedups_literals_already_in_the_fixed_spread() {
+        // A guard constant that equals a fixed-spread value adds nothing (no duplicate
+        // replay run) — 42 is already in NONDET_CONSTS.
+        let module = module_with_guard_constants(&[42]);
+        assert_eq!(
+            replay_candidates(NONDET_CONSTS, &module),
+            NONDET_CONSTS.to_vec()
+        );
+    }
+
+    #[test]
+    fn replay_candidates_is_capped_at_max_replay_candidates() {
+        // Many distinct guard literals -> the list is bounded (per-task replay budget).
+        let many: Vec<i64> = (1000..1100).collect();
+        let module = module_with_guard_constants(&many);
+        let got = replay_candidates(NONDET_CONSTS, &module);
+        assert!(got.len() <= MAX_REPLAY_CANDIDATES);
+        assert!(
+            got.starts_with(NONDET_CONSTS),
+            "fixed spread must be preserved under the cap"
+        );
     }
 }
