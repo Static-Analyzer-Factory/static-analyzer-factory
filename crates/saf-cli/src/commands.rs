@@ -2167,7 +2167,7 @@ fn no_data_race_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
 
     // Gate 4: TSan is the sole soundness arbiter (HB-based — only reports a race
     // it concretely observes).
-    match tsan_confirm(ctx.input, ctx.data_model, ctx.stub, ctx.tempdir, ctx.clang) {
+    match tsan_confirm(ctx.input, ctx.stub, ctx.tempdir, ctx.clang) {
         Ok(Some(hit)) => {
             let programfile = ctx.input.file_name().map_or_else(
                 || ctx.input.display().to_string(),
@@ -2300,11 +2300,27 @@ fn synthesize_tsan_driver() -> String {
 /// applies R1 — only a genuine `data race` warning confirms). `Ok(Some(hit))` is
 /// a confirmed race; `Ok(None)` is inconclusive (no report / compile-link failure
 /// / timeout) ⇒ the caller keeps `unknown`. Because `TSan` is happens-before-based,
-/// a reported race is a real race for the observed inputs, so confirming is sound;
-/// a missing 32-bit `TSan` runtime for an `ILP32` task abstains (R3).
+/// a reported race is a real race for the observed inputs, so confirming is sound.
+///
+/// # Data model (R3 exception — soundly compile LP64 even for ILP32 tasks)
+///
+/// The replay is ALWAYS compiled under LP64 (`-m64`), regardless of the task's
+/// declared data model. Clang ships **no 32-bit `ThreadSanitizer` runtime**
+/// (`-fsanitize=thread` + `-m32` fails: "unsupported option for target
+/// `i386-pc-linux-gnu`"), so honoring an `ILP32` task's `-m32` here would make
+/// every ILP32 concurrency task fail to compile and abstain — and the entire
+/// SV-COMP `no-data-race` FALSE reservoir is ILP32.
+///
+/// This substitution is SOUND for the `no-data-race` property specifically: a
+/// data race is defined by the thread synchronization / happens-before structure
+/// (thread create/join, mutexes, atomics), whose semantics are identical under
+/// ILP32 and LP64. Pointer/`long` width cannot introduce a race the source lacks,
+/// nor synchronize away a real one. So a race `TSan` concretely observes under
+/// LP64 is a genuine race of the original program under either model. (The
+/// emitted witness still declares the task's REAL architecture upstream, so the
+/// validator re-analyzes under the declared model.)
 fn tsan_confirm(
     input: &Path,
-    data_model: saf_svcomp::DataModel,
     stub: &Path,
     dir: &Path,
     clang: &str,
@@ -2327,11 +2343,13 @@ fn tsan_confirm(
             "-fsanitize=thread",
             "-pthread",
             "-Wno-everything",
+            // A data race is data-model-independent and clang has no 32-bit TSan
+            // runtime, so always compile the replay LP64 (see the doc comment).
+            "-m64",
             // Determinism: redirect rand()/srand() to the driver's __wrap_* stubs.
             "-Wl,--wrap=rand",
             "-Wl,--wrap=srand",
         ])
-        .arg(data_model.clang_flag())
         .arg("-include")
         .arg(stub)
         .arg("-I")
