@@ -907,13 +907,47 @@ fn resolve_svcomp_stub() -> Option<PathBuf> {
     None
 }
 
+/// Write a one-shot header that neutralizes the stub's `__VERIFIER_assert` MACRO,
+/// returning its path for a second `-include`. The stub guards the macro with
+/// `#ifndef __VERIFIER_assert`, but `-include`ing the stub first still defines it;
+/// `-include`ing THIS header after the stub `#undef`s the macro, so a program that
+/// provides its OWN `void __VERIFIER_assert(int)` definition (loop-zilu,
+/// nla-digbench, bitvector, recursified families) parses as C instead of hitting a
+/// macro-vs-function-definition conflict. Reused by ingestion and the `UBSan` replay
+/// compile so a fallback-compiled program also replays.
+fn write_assert_neutralizer(dir: &Path) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    let p = dir.join("saf_undef_assert.h");
+    std::fs::write(
+        &p,
+        "#ifdef __VERIFIER_assert\n#undef __VERIFIER_assert\n#endif\n",
+    )
+    .with_context(|| "writing __VERIFIER_assert neutralizer header")?;
+    Ok(p)
+}
+
+/// Run a prepared clang command, returning `Ok(true)` iff it exited successfully.
+/// Subprocess stdout is always discarded (the parent's stdout stays verdict-only);
+/// `quiet` also discards stderr — used for the first pass of a two-pass compile so
+/// a to-be-retried failure is not reported as a fatal diagnostic.
+fn clang_emit_ok(mut cmd: std::process::Command, quiet: bool) -> std::io::Result<bool> {
+    use std::process::Stdio;
+    cmd.stdout(Stdio::null());
+    if quiet {
+        cmd.stderr(Stdio::null());
+    }
+    Ok(cmd.status()?.success())
+}
+
 /// Compile a C program to mem2reg'd LLVM IR in `dir`, returning the `.ll` path.
 ///
 /// Mirrors the offline SV-COMP recipe: clang emits `-O0` IR with
 /// `-disable-O0-optnone` (so `opt`'s mem2reg pass is not a no-op), the data-model
 /// flag, and the `-include`d stub header; then `opt -passes=mem2reg` promotes
 /// allocas to SSA. Subprocess stdout is discarded so the parent's stdout stays
-/// verdict-only; stderr is inherited (diagnostics).
+/// verdict-only; stderr is inherited (diagnostics). A two-pass assert-macro
+/// fallback (see [`write_assert_neutralizer`]) rescues programs that define their
+/// own `__VERIFIER_assert` function.
 fn compile_to_ir(
     input: &Path,
     data_model: saf_svcomp::DataModel,
@@ -928,8 +962,13 @@ fn compile_to_ir(
     let ir = dir.join("input.ll");
     let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
 
-    let clang_status = Command::new(&clang)
-        .args([
+    // Build the base emit-LLVM invocation; `assert_neutralizer` (when Some) is a
+    // second `-include`d header that `#undef`s the stub's `__VERIFIER_assert`
+    // MACRO so a program that DEFINES its own `void __VERIFIER_assert(int)`
+    // compiles (two-pass fallback below).
+    let build_cmd = |assert_neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(&clang);
+        cmd.args([
             "-g",
             "-S",
             "-emit-llvm",
@@ -940,20 +979,30 @@ fn compile_to_ir(
         ])
         .arg(data_model.clang_flag())
         .arg("-include")
-        .arg(stub)
-        .arg("-I")
-        .arg(srcdir)
-        .arg(input)
-        .arg("-o")
-        .arg(&ir)
-        .stdout(Stdio::null())
-        .status()
-        .with_context(|| format!("failed to spawn {clang}"))?;
-    anyhow::ensure!(
-        clang_status.success(),
-        "{clang} failed to compile {}",
-        input.display()
-    );
+        .arg(stub);
+        if let Some(neutralizer) = assert_neutralizer {
+            cmd.arg("-include").arg(neutralizer);
+        }
+        cmd.arg("-I").arg(srcdir).arg(input).arg("-o").arg(&ir);
+        cmd
+    };
+
+    // Pass 1: the plain compile (stub `__VERIFIER_assert` macro active). Suppress
+    // its stderr — a failure here is retried before it is ever reported as fatal.
+    let mut ok =
+        clang_emit_ok(build_cmd(None), true).with_context(|| format!("failed to spawn {clang}"))?;
+    // Pass 2 (assert-macro fallback): only when pass 1 failed. Neutralize the
+    // stub's `__VERIFIER_assert` macro so a program that provides its own function
+    // definition (loop-zilu / nla-digbench / bitvector / recursified families)
+    // parses. Additive: pass 1's committed behavior is unchanged; this only
+    // rescues previously-failing ingestions. Pass 2's stderr is shown so a genuine
+    // compile error still surfaces.
+    if !ok {
+        let neutralizer = write_assert_neutralizer(dir)?;
+        ok = clang_emit_ok(build_cmd(Some(&neutralizer)), false)
+            .with_context(|| format!("failed to spawn {clang}"))?;
+    }
+    anyhow::ensure!(ok, "{clang} failed to compile {}", input.display());
 
     let opt_status = Command::new(&opt)
         .args(["-S", "-passes=mem2reg"])
@@ -2377,8 +2426,12 @@ fn ubsan_confirm(
         .with_context(|| "writing UBSan replay driver")?;
 
     let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
-    let status = Command::new(clang)
-        .args([
+    // Build the sanitizer compile+link; `assert_neutralizer` (when Some) is the
+    // two-pass assert-macro fallback (see `write_assert_neutralizer`) so a program
+    // that defines its own `__VERIFIER_assert` links its replay binary.
+    let build_replay = |assert_neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(clang);
+        cmd.args([
             "-O0",
             "-g",
             "-fsanitize=signed-integer-overflow",
@@ -2390,18 +2443,34 @@ fn ubsan_confirm(
         ])
         .arg(data_model.clang_flag())
         .arg("-include")
-        .arg(stub)
-        .arg("-I")
-        .arg(srcdir)
-        .arg(input)
-        .arg(&driver_src)
-        .arg("-o")
-        .arg(&harness)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .arg(stub);
+        if let Some(neutralizer) = assert_neutralizer {
+            cmd.arg("-include").arg(neutralizer);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(input)
+            .arg(&driver_src)
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    let mut linked = build_replay(None)
         .status()
-        .with_context(|| format!("failed to spawn {clang} for UBSan replay"))?;
-    if !status.success() {
+        .with_context(|| format!("failed to spawn {clang} for UBSan replay"))?
+        .success();
+    if !linked {
+        // Assert-macro fallback: mirror the ingestion two-pass so a task whose IR
+        // was only obtainable with the neutralizer also produces a replay binary.
+        let neutralizer = write_assert_neutralizer(dir)?;
+        linked = build_replay(Some(&neutralizer))
+            .status()
+            .with_context(|| format!("failed to spawn {clang} for UBSan replay"))?
+            .success();
+    }
+    if !linked {
         // Compile/link failure (e.g. a task defining its own nondet) -> inconclusive.
         return Ok(None);
     }
@@ -3194,5 +3263,34 @@ pub fn specs(args: &SpecsArgs) -> anyhow::Result<()> {
 
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+
+    #[test]
+    fn assert_neutralizer_undefs_the_macro() {
+        // The fallback header must `#undef __VERIFIER_assert` (guarded so it is a
+        // no-op when the program never triggered the stub macro), so a program
+        // that defines its own `void __VERIFIER_assert(int)` parses. Guarding the
+        // `#undef` keeps the header safe to `-include` unconditionally.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = write_assert_neutralizer(dir.path()).expect("write header");
+        let body = std::fs::read_to_string(&p).expect("read header");
+        assert!(body.contains("#undef __VERIFIER_assert"), "{body}");
+        assert!(body.contains("#ifdef __VERIFIER_assert"), "{body}");
+        // Deterministic path/name so a second `-include` is stable across runs.
+        assert!(p.ends_with("saf_undef_assert.h"), "{}", p.display());
+    }
+
+    #[test]
+    fn assert_neutralizer_is_byte_stable() {
+        // Determinism (NFR-DET): identical content on every write.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = std::fs::read_to_string(write_assert_neutralizer(dir.path()).unwrap()).unwrap();
+        let b = std::fs::read_to_string(write_assert_neutralizer(dir.path()).unwrap()).unwrap();
+        assert_eq!(a, b);
     }
 }
