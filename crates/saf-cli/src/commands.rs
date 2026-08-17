@@ -1856,6 +1856,13 @@ fn synthesize_asan_driver() -> String {
 /// compile-link failure / timeout) ⇒ the caller keeps `unknown`. Multithreaded
 /// programs are out of R5 scope (schedule-dependent memory safety) and abstain up
 /// front.
+///
+/// Two replay passes run in sequence, both through the same R1/R2 report gate:
+/// pass 1 is the committed stack-garbage replay; pass 2 (only when pass 1 is
+/// inconclusive) adds `-ftrivial-auto-var-init=pattern` so a deref of an
+/// uninitialized local reproduces deterministically. Pass 2 is sound-additive — an
+/// uninitialized read is nondeterministic under SV-COMP semantics, so it can only
+/// confirm a violation the program genuinely has.
 fn asan_confirm(
     input: &Path,
     data_model: saf_svcomp::DataModel,
@@ -1888,8 +1895,15 @@ fn asan_confirm(
         .with_context(|| "writing ASan replay driver")?;
 
     let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
-    let status = Command::new(clang)
-        .args([
+    let timeout = replay_timeout();
+
+    // One ASan compile-and-mini-fuzz pass. `auto_var_init` toggles the second
+    // (uninitialized-variable) pass; see the two-pass rationale at the call below.
+    // Returns `Ok(Some(hit))` on the first constant that reproduces a violation,
+    // `Ok(None)` if this pass is inconclusive (compile/link failure or no trap).
+    let run_pass = |auto_var_init: bool| -> anyhow::Result<Option<saf_svcomp::AsanHit>> {
+        let mut cmd = Command::new(clang);
+        cmd.args([
             "-O0",
             "-g",
             "-fsanitize=address",
@@ -1898,76 +1912,103 @@ fn asan_confirm(
             // Determinism: redirect rand()/srand() to the driver's __wrap_* stubs.
             "-Wl,--wrap=rand",
             "-Wl,--wrap=srand",
-        ])
-        .arg(data_model.clang_flag())
-        .arg("-include")
-        .arg(stub)
-        .arg("-I")
-        .arg(srcdir)
-        .arg(input)
-        .arg(&driver_src)
-        .arg("-o")
-        .arg(&harness)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("failed to spawn {clang} for ASan replay"))?;
-    if !status.success() {
-        // Compile/link failure (e.g. a missing 32-bit ASan runtime) -> inconclusive.
-        return Ok(None);
-    }
-
-    // Multi-constant mini-fuzz (Slice 2): the nondet generators return
-    // $SAF_NONDET_CONST, so one binary is run under a spread of constants — a
-    // scalar-guarded/scalar-sized fault (e.g. `if (nondet()==42) OOB`, or a
-    // nondet-sized alloc/index) that the zeroed probe misses is reproduced by the
-    // matching constant. Sound: each constant is a valid concrete input the verifier
-    // may choose, and __VERIFIER_assume still prunes infeasible ones. 0 first (the
-    // common unconditional case); confirm on the FIRST trap.
-    //
-    // check_printf=0: SV-COMP valid-memsafety does not count a libc printf("%s")
-    // string read (ASan's printf_common interceptor from Juliet's printLine on a
-    // non-terminated buffer). Suppressing it — in addition to the R1 frame filter —
-    // stops ASan aborting at a benign printf artifact BEFORE the real fault; it can
-    // never add a false alarm (only suppresses reports), so it stays sound. R2 still
-    // abstains on any ambiguous secondary fault a suppressed intended-fault exposes.
-    let timeout = replay_timeout();
-    for &k in NONDET_CONSTS {
-        // Redirect the child's stderr to a FILE (not a pipe) so a large ASan report
-        // cannot deadlock on a full pipe buffer while we poll for the timeout.
-        let errfile =
-            std::fs::File::create(&errpath).with_context(|| "creating ASan stderr file")?;
-        let mut child = Command::new(&harness)
-            .stdin(Stdio::null())
+        ]);
+        if auto_var_init {
+            // Pass 2: make every otherwise-uninitialized local a fixed, non-canonical
+            // bit pattern (0xAA…) instead of whatever stack garbage happened to be
+            // there. This is deterministic (reproducibility, R6) and SOUND for
+            // `valid-memsafety`: an uninitialized read is nondeterministic under
+            // SV-COMP semantics, so a program that dereferences (or indexes with) an
+            // indeterminate value ALREADY violates the property — the pattern is one
+            // concrete value the verifier may pick. It never converts a safe program
+            // into a violation (a safe program does not dereference indeterminate
+            // memory). R1/R2 in `parse_asan_report` still gate the report.
+            cmd.arg("-ftrivial-auto-var-init=pattern");
+        }
+        let status = cmd
+            .arg(data_model.clang_flag())
+            .arg("-include")
+            .arg(stub)
+            .arg("-I")
+            .arg(srcdir)
+            .arg(input)
+            .arg(&driver_src)
+            .arg("-o")
+            .arg(&harness)
             .stdout(Stdio::null())
-            .stderr(Stdio::from(errfile))
-            .env("ASAN_OPTIONS", ASAN_OPTS)
-            .env("SAF_NONDET_CONST", k.to_string())
-            .spawn()
-            .with_context(|| "spawning ASan harness")?;
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("failed to spawn {clang} for ASan replay"))?;
+        if !status.success() {
+            // Compile/link failure (e.g. a missing 32-bit ASan runtime) -> inconclusive.
+            return Ok(None);
+        }
 
-        let start = std::time::Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if start.elapsed() >= timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break; // runaway -> parse whatever exists (likely no report)
+        // Multi-constant mini-fuzz (Slice 2): the nondet generators return
+        // $SAF_NONDET_CONST, so one binary is run under a spread of constants — a
+        // scalar-guarded/scalar-sized fault (e.g. `if (nondet()==42) OOB`, or a
+        // nondet-sized alloc/index) that the zeroed probe misses is reproduced by the
+        // matching constant. Sound: each constant is a valid concrete input the verifier
+        // may choose, and __VERIFIER_assume still prunes infeasible ones. 0 first (the
+        // common unconditional case); confirm on the FIRST trap.
+        //
+        // check_printf=0: SV-COMP valid-memsafety does not count a libc printf("%s")
+        // string read (ASan's printf_common interceptor from Juliet's printLine on a
+        // non-terminated buffer). Suppressing it — in addition to the R1 frame filter —
+        // stops ASan aborting at a benign printf artifact BEFORE the real fault; it can
+        // never add a false alarm (only suppresses reports), so it stays sound. R2 still
+        // abstains on any ambiguous secondary fault a suppressed intended-fault exposes.
+        for &k in NONDET_CONSTS {
+            // Redirect the child's stderr to a FILE (not a pipe) so a large ASan report
+            // cannot deadlock on a full pipe buffer while we poll for the timeout.
+            let errfile =
+                std::fs::File::create(&errpath).with_context(|| "creating ASan stderr file")?;
+            let mut child = Command::new(&harness)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(errfile))
+                .env("ASAN_OPTIONS", ASAN_OPTS)
+                .env("SAF_NONDET_CONST", k.to_string())
+                .spawn()
+                .with_context(|| "spawning ASan harness")?;
+
+            let start = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if start.elapsed() >= timeout {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break; // runaway -> parse whatever exists (likely no report)
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    Err(e) => return Err(e).context("waiting on ASan harness"),
                 }
-                Err(e) => return Err(e).context("waiting on ASan harness"),
+            }
+
+            let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+            if let Some(hit) = saf_svcomp::parse_asan_report(&report) {
+                return Ok(Some(hit)); // first constant that reproduces a violation wins
             }
         }
+        Ok(None)
+    };
 
-        let report = std::fs::read_to_string(&errpath).unwrap_or_default();
-        if let Some(hit) = saf_svcomp::parse_asan_report(&report) {
-            return Ok(Some(hit)); // first constant that reproduces a violation wins
-        }
+    // Pass 1 is the committed, byte-for-byte-unchanged R5 replay (stack garbage as-is).
+    if let Some(hit) = run_pass(false)? {
+        return Ok(Some(hit));
     }
-    Ok(None)
+    // Pass 2 (additive, uninitialized-variable replay): only when pass 1 is
+    // inconclusive. Many array/string reasoning tasks (`array-memsafety`,
+    // `ldv-memsafety`, …) dereference or index through a local that `main` never
+    // initializes — `int *a; foo(a, n);` or `char *s1; cstrcat(s1, s2);`. With real
+    // stack garbage the fault is nondeterministic (may or may not SEGV run-to-run);
+    // pattern-init makes the indeterminate pointer a fixed wild address that SEGVs
+    // deterministically, so ASan reproduces the genuine `valid-deref` violation. It
+    // can only ADD confirmations, never a false alarm (see the pass-2 rationale above).
+    run_pass(true)
 }
 
 /// The `no-overflow` FALSE pipeline (plan 199, R6): confirmer-first, propose-free.

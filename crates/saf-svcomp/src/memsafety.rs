@@ -418,6 +418,31 @@ WRITE of size 40 at 0x502 thread T0
         assert_eq!(hit.line, 10);
     }
 
+    // A real report from the pass-2 (`-ftrivial-auto-var-init=pattern`) replay on
+    // `array-memsafety/cstrcat_unsafe.c`: `main` declares `char *s1;` and passes the
+    // uninitialized pointer to `cstrcat`, which dereferences it. Pattern-init makes
+    // the indeterminate pointer a fixed wild address, so the deref SEGVs
+    // deterministically. Frame #0 is the program's own `cstrcat`, so this must map to
+    // `valid-deref` at the faulting line (NOT abstain — it is a genuine violation of a
+    // program that reads an indeterminate pointer). Locks in the pass-2 output shape.
+    const UNINIT_PTR_SEGV: &str = "\
+AddressSanitizer:DEADLYSIGNAL
+==23==ERROR: AddressSanitizer: SEGV on unknown address 0xffffffff (pc 0x56648147 bp 0xffffdac8 sp 0xffffda90 T0)
+==23==The signal is caused by a READ memory access.
+    #0 0x56648147 in cstrcat /workspace/x/cstrcat_unsafe.c:5:13
+    #1 0x5664825b in main /workspace/x/cstrcat_unsafe.c:17:3
+    #2 0xf7c4ecb8  (/lib/i386-linux-gnu/libc.so.6+0x24cb8)
+";
+
+    #[test]
+    fn uninitialized_pointer_segv_in_program_is_valid_deref() {
+        let hit = parse_asan_report(UNINIT_PTR_SEGV).expect("a hit");
+        assert_eq!(hit.subproperty, "valid-deref");
+        assert_eq!(hit.file, "cstrcat_unsafe.c");
+        assert_eq!(hit.line, 5);
+        assert_eq!(hit.column, Some(13));
+    }
+
     #[test]
     fn no_asan_banner_is_none() {
         assert_eq!(parse_asan_report("just some program output\nexit\n"), None);
