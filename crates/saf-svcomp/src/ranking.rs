@@ -72,11 +72,22 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use saf_analysis::cfg::Cfg;
 use saf_analysis::z3_utils::compute_dominators;
 use saf_core::air::{AirFunction, AirModule, BinaryOp, CastKind, Constant, Operation};
+use saf_core::id::make_id;
 use saf_core::ids::{BlockId, TypeId, ValueId};
 
 /// Maximum recursion depth when expanding an SSA value into an affine form.
 /// Bounds work on pathological IR; exceeding it ⇒ treat the value as opaque.
 const AFFINE_DEPTH_LIMIT: u32 = 64;
+
+/// Cap on the number of enumerated header→latch paths of one loop body. A body
+/// with more control-flow paths than this is not modelled path-sensitively
+/// (⇒ abstain / fall back to the single-transition havoc model) — this bounds the
+/// per-loop Z3 work and keeps the pass well within the SV-COMP time budget.
+const MAX_PATHS: usize = 8;
+
+/// Cap on the lexicographic ranking depth (number of greedy rounds). Real
+/// programs almost never need a deeper lexicographic tuple; exceeding it abstains.
+const MAX_LEX_ROUNDS: usize = 4;
 
 /// Deterministic Z3 knobs (mirror `saf-analysis`'s solver): a wall-clock backstop,
 /// a deterministic work budget, and a fixed random seed (NFR-DET).
@@ -100,11 +111,30 @@ pub fn loops_are_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg) -> bo
     let Some(loops) = extract_natural_loops(func, cfg) else {
         return false;
     };
-    // Every natural loop must build an affine model *and* be ranked; any failure
-    // (unmodelable loop, or Z3 `Unsat`/`Unknown`) abstains the whole function.
-    loops.iter().all(|li| {
-        build_loop_model(func, module, li).is_some_and(|model| synthesize_ranking_function(&model))
-    })
+    // Every natural loop must be ranked; any failure (unmodelable loop, or Z3
+    // `Unsat`/`Unknown`) abstains the whole function.
+    loops.iter().all(|li| loop_is_ranked(func, module, cfg, li))
+}
+
+/// Rank a single natural loop.
+///
+/// First tries the **path-sensitive** model — enumerate every header→latch path,
+/// derive each path's guard + affine transition, and synthesize a (possibly
+/// **lexicographic**) linear ranking function that is bounded and decreasing on
+/// every path. This proves multi-path loops (`if (…) i++; else i+=2;`) and
+/// phase/lexicographic loops (`while (x>=0 && y>=0){ y--; if (y<0){ x--; y=*; } }`)
+/// that a single conjunctive transition cannot.
+///
+/// If the path-sensitive model does not apply (a **nested** inner loop in the
+/// body, too many paths) or fails to rank, falls back to the single-transition
+/// **havoc** model ([`build_loop_model`] + [`synthesize_ranking_function`]), which
+/// models an inner loop's effect as havoc and handles the common counter loops.
+/// Both are complete, sound termination proofs (Farkas over a superset relation),
+/// so a `true` here never ranks a non-terminating loop.
+fn loop_is_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg, li: &LoopInfo) -> bool {
+    multipath_ranked(func, module, cfg, li)
+        || build_loop_model(func, module, li)
+            .is_some_and(|model| synthesize_ranking_function(&model))
 }
 
 // ---------------------------------------------------------------------------
@@ -997,6 +1027,628 @@ fn i128_to_i64(v: i128) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
+// Path-sensitive (disjunctive + lexicographic) ranking
+// ---------------------------------------------------------------------------
+//
+// A loop body with internal branches has *several* continuing transitions (one
+// per header→latch path). The single-transition model above resolves only the
+// back-edge phi value, which for a multi-path loop is a merge (⇒ opaque) — so it
+// abstains. Here we enumerate every path, build a per-path guard + affine
+// transition, and synthesize a **lexicographic** linear ranking function
+// (Podelski–Rybalchenko transition invariants; Cook/Bradley–Manna–Sipma greedy
+// lexicographic synthesis): a tuple `(f₁,…,f_k)` such that every path strictly
+// decreases some `f_i` while all `f_j` (j<i) do not increase, each `f_i` bounded
+// below where it decides. A `k=1` tuple is the ordinary single linear function.
+//
+// # Soundness
+//
+// Identical to the single model: each path's transition is modelled by an affine
+// relation over a region that is a **superset** of the real continuing states —
+// guards are only-ever-necessary conditions (anything non-affine is dropped,
+// weakening the region), each affine `next` is overflow-checked to equal the
+// machine update (else demoted to a free in-range **havoc** symbol), and all
+// other values are universally quantified. Because we enumerate **every** path of
+// an acyclic body (bailing to the havoc model on any nested inner loop, and
+// abstaining when the path count exceeds [`MAX_PATHS`]), the union of modelled
+// transitions contains the real loop transition. A lexicographic ranking of a
+// superset ranks the real loop, so termination follows and no wrong `true` is
+// possible. Each greedy round's `f_r` is bounded-below and non-increasing on all
+// branches still present, and strictly decreasing on the one it removes, which is
+// exactly the lexicographic-ranking soundness condition.
+
+/// A path's raw guards + un-classified affine transitions, before overflow
+/// classification and universe/type-bound assembly (a build-time intermediate).
+struct RawBranch {
+    guards: Vec<Constraint>,
+    raw_next: BTreeMap<ValueId, Option<Affine>>,
+}
+
+/// One continuing transition of a loop: the path's guard region plus, for every
+/// header phi, the affine value it takes at the latch along this path (an
+/// overflow-safe affine form, or a free in-range havoc symbol).
+struct Branch {
+    /// Type bounds + this path's (necessary) guard constraints, each `expr ≥ 0`.
+    region: Vec<Constraint>,
+    /// header phi ↦ its affine `next` on this path (havoc phis map to a fresh
+    /// free symbol that is type-bounded in `region`).
+    next: BTreeMap<ValueId, Affine>,
+}
+
+/// The path-sensitive model of one natural loop: the ranking template (symbols
+/// eligible for a coefficient), the full leaf universe, and one [`Branch`] per
+/// enumerated header→latch path.
+struct MultiPathModel {
+    /// Symbols that may carry a ranking coefficient: header phis ∪ loop-invariant
+    /// parameters.
+    template: BTreeSet<ValueId>,
+    /// Every leaf symbol appearing anywhere in the model (for the Farkas identity
+    /// and the Z3 variable index).
+    universe: BTreeSet<ValueId>,
+    branches: Vec<Branch>,
+}
+
+/// Try to prove `li` terminates path-sensitively. Returns `false` (⇒ fall back to
+/// the havoc model) when the model does not apply (nested inner loop, too many
+/// paths, no affine phi) or no lexicographic ranking is found.
+fn multipath_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg, li: &LoopInfo) -> bool {
+    let Some(model) = build_multipath_model(func, module, cfg, li) else {
+        return false;
+    };
+    if model.branches.is_empty() {
+        return false;
+    }
+
+    // Greedy lexicographic synthesis: each round find one `f` that is bounded and
+    // non-increasing on every remaining path and strictly decreasing on one of
+    // them; remove that path. All paths removed within `MAX_LEX_ROUNDS` ⇒ ranked.
+    let mut remaining: Vec<usize> = (0..model.branches.len()).collect();
+    let mut rounds = 0;
+    while !remaining.is_empty() {
+        if rounds >= MAX_LEX_ROUNDS {
+            return false;
+        }
+        let mut removed_pos = None;
+        for (pos, &strict) in remaining.iter().enumerate() {
+            if synthesize_round(&model, &remaining, strict) {
+                removed_pos = Some(pos);
+                break;
+            }
+        }
+        match removed_pos {
+            Some(pos) => {
+                remaining.remove(pos);
+                rounds += 1;
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Build the path-sensitive [`MultiPathModel`], or `None` (⇒ abstain / fall back)
+/// when the loop is not in the supported path-sensitive shape.
+// NOTE: this is one cohesive extraction pipeline (reject-nested → collect phis →
+// enumerate paths → per-path guards/transitions → classify overflow → assemble);
+// splitting it would only scatter the shared `defs`/`universe`/`bound_of` state.
+#[allow(clippy::too_many_lines)]
+fn build_multipath_model(
+    func: &AirFunction,
+    module: &AirModule,
+    cfg: &Cfg,
+    li: &LoopInfo,
+) -> Option<MultiPathModel> {
+    let defs = index_defs(func, &li.body);
+    let block_of = index_block_of(func);
+    let signs = infer_signs(func);
+
+    // Reject a **nested inner loop**: the only dominance back-edge inside the body
+    // may be this loop's own `latch → header`. Any other in-body back-edge is an
+    // inner loop whose many iterations path enumeration would miss (unsound) — bail
+    // to the single-transition havoc model, which over-approximates it as havoc.
+    // (The function is reducible — `extract_natural_loops` rejected irreducible
+    // CFGs — so every in-body cycle has a dominance back-edge and is caught here.)
+    for (&u, succs) in &cfg.successors {
+        if !li.body.contains(&u) {
+            continue;
+        }
+        for &v in succs {
+            if li.body.contains(&v)
+                && dominates(v, u, &li.idom)
+                && !(u == li.latch && v == li.header)
+            {
+                return None;
+            }
+        }
+    }
+
+    // Header phis and their back-edge (latch) incoming value.
+    let header_block = func.blocks.iter().find(|b| b.id == li.header)?;
+    let mut phi_next: BTreeMap<ValueId, ValueId> = BTreeMap::new();
+    for inst in &header_block.instructions {
+        if let Operation::Phi { incoming } = &inst.op {
+            let Some(dst) = inst.dst else { continue };
+            if let Some((_, v)) = incoming.iter().find(|(pred, _)| *pred == li.latch) {
+                phi_next.insert(dst, *v);
+            }
+        }
+    }
+    if phi_next.is_empty() {
+        return None;
+    }
+    let header_phis: BTreeSet<ValueId> = phi_next.keys().copied().collect();
+
+    // Enumerate every header→latch path of the (acyclic) body.
+    let paths = enumerate_body_paths(cfg, &li.body, li.header, li.latch)?;
+    let latch_block = func.blocks.iter().find(|b| b.id == li.latch)?;
+
+    // --- Pass 1: per-path guards + raw affine transitions; collect the universe.
+    let mut raws: Vec<RawBranch> = Vec::with_capacity(paths.len());
+    let mut universe: BTreeSet<ValueId> = header_phis.clone();
+    for path in &paths {
+        let path_pred = path_pred_map(path);
+        let mut guards: Vec<Constraint> = Vec::new();
+        // Necessary stay-conditions along the path's internal/exit branches …
+        for pair in path.windows(2) {
+            if let Some(block) = func.blocks.iter().find(|b| b.id == pair[0]) {
+                add_path_guards(
+                    &mut guards,
+                    &mut universe,
+                    block,
+                    pair[1],
+                    &defs,
+                    &block_of,
+                    &header_phis,
+                    module,
+                    &path_pred,
+                );
+            }
+        }
+        // … plus the back-edge branch itself (`latch → header`): in a `do…while`
+        // the continuing condition lives here.
+        add_path_guards(
+            &mut guards,
+            &mut universe,
+            latch_block,
+            li.header,
+            &defs,
+            &block_of,
+            &header_phis,
+            module,
+            &path_pred,
+        );
+
+        let mut raw_next: BTreeMap<ValueId, Option<Affine>> = BTreeMap::new();
+        for (&phi, &nv) in &phi_next {
+            let a = resolve_affine_path(nv, &defs, &block_of, &header_phis, module, &path_pred, 0);
+            if let Some(ref aff) = a {
+                universe.extend(aff.terms.keys().copied());
+            }
+            raw_next.insert(phi, a);
+        }
+        raws.push(RawBranch { guards, raw_next });
+    }
+
+    // Invariant params: leaf symbols that are neither header phis nor defined
+    // inside the loop (function params, nondet results, globals) — eligible for a
+    // ranking coefficient (identity transition ⇒ they only bound `f` below).
+    let mut invariants: BTreeSet<ValueId> = BTreeSet::new();
+    for &sym in &universe {
+        if !header_phis.contains(&sym) && !defs.get(&sym).is_some_and(|d| d.in_loop) {
+            invariants.insert(sym);
+        }
+    }
+
+    // Type bounds for every integer leaf with a known signedness/width — true facts
+    // about the real state, shared by every branch region.
+    let mut base_bounds: Vec<Constraint> = Vec::new();
+    let mut bound_of: BTreeMap<ValueId, (i128, i128)> = BTreeMap::new();
+    for &sym in &universe {
+        if let Some((lo, hi)) = type_bounds(sym, &defs, &signs, module) {
+            bound_of.insert(sym, (lo, hi));
+            base_bounds.push(Constraint {
+                coeffs: BTreeMap::from([(sym, 1)]),
+                constant: -lo,
+            });
+            base_bounds.push(Constraint {
+                coeffs: BTreeMap::from([(sym, -1)]),
+                constant: hi,
+            });
+        }
+    }
+
+    // --- Pass 2: classify each transition (affine-stable vs havoc) and assemble
+    // the final per-branch regions.
+    let mut fresh_syms: BTreeSet<ValueId> = BTreeSet::new();
+    let mut branches: Vec<Branch> = Vec::with_capacity(raws.len());
+    for (bi, raw) in raws.into_iter().enumerate() {
+        // Region used to *check* overflow-freedom (guards + type bounds only).
+        let mut check_region = raw.guards;
+        check_region.extend(base_bounds.iter().cloned());
+
+        let mut next: BTreeMap<ValueId, Affine> = BTreeMap::new();
+        let mut fresh_bounds: Vec<Constraint> = Vec::new();
+        for (&phi, cand) in &raw.raw_next {
+            // A phi is stable on this path iff its affine `next` provably never
+            // wraps its type range on the path region (⇒ affine model == machine
+            // update). Otherwise it is havoc: a fresh free symbol, type-bounded, so
+            // the ranking must hold for *every* in-range successor value.
+            let stable = match (cand, bound_of.get(&phi)) {
+                (Some(a), Some(&(lo, hi)))
+                    if next_never_overflows(a, lo, hi, &check_region, &universe) =>
+                {
+                    Some(a.clone())
+                }
+                _ => None,
+            };
+            if let Some(a) = stable {
+                next.insert(phi, a);
+            } else {
+                let fresh = havoc_id(phi, bi);
+                fresh_syms.insert(fresh);
+                if let Some(&(lo, hi)) = bound_of.get(&phi) {
+                    fresh_bounds.push(Constraint {
+                        coeffs: BTreeMap::from([(fresh, 1)]),
+                        constant: -lo,
+                    });
+                    fresh_bounds.push(Constraint {
+                        coeffs: BTreeMap::from([(fresh, -1)]),
+                        constant: hi,
+                    });
+                }
+                next.insert(phi, Affine::symbol(fresh));
+            }
+        }
+        check_region.extend(fresh_bounds);
+        branches.push(Branch {
+            region: check_region,
+            next,
+        });
+    }
+    universe.extend(fresh_syms);
+
+    let template: BTreeSet<ValueId> = header_phis
+        .iter()
+        .chain(invariants.iter())
+        .copied()
+        .collect();
+    Some(MultiPathModel {
+        template,
+        universe,
+        branches,
+    })
+}
+
+/// Build `ValueId → defining block` for path-sensitive phi resolution.
+fn index_block_of(func: &AirFunction) -> BTreeMap<ValueId, BlockId> {
+    let mut out = BTreeMap::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dst) = inst.dst {
+                out.insert(dst, block.id);
+            }
+        }
+    }
+    out
+}
+
+/// A deterministic fresh **havoc** symbol for header phi `phi` on branch `bi`
+/// (used when the phi's `next` on that path is non-affine or may overflow).
+fn havoc_id(phi: ValueId, bi: usize) -> ValueId {
+    let mut bytes = format!("{phi:?}").into_bytes();
+    bytes.extend_from_slice(&bi.to_le_bytes());
+    ValueId(make_id("ranking_havoc", &bytes))
+}
+
+/// `block ↦ its predecessor on this path` (the header, at index 0, has none).
+fn path_pred_map(path: &[BlockId]) -> BTreeMap<BlockId, BlockId> {
+    let mut out = BTreeMap::new();
+    for pair in path.windows(2) {
+        out.insert(pair[1], pair[0]);
+    }
+    out
+}
+
+/// Enumerate **every** simple path from `header` to `latch` through the loop body,
+/// excluding the `latch → header` back-edge (a continuing transition ends *at* the
+/// latch, about to take the back-edge). The body minus that back-edge is acyclic
+/// (the caller rejected nested loops), so simple-path enumeration is complete.
+/// Returns `None` if the path count would exceed [`MAX_PATHS`] (⇒ abstain).
+fn enumerate_body_paths(
+    cfg: &Cfg,
+    body: &BTreeSet<BlockId>,
+    header: BlockId,
+    latch: BlockId,
+) -> Option<Vec<Vec<BlockId>>> {
+    if header == latch {
+        // A single-block loop: the header *is* the latch; its self back-edge's
+        // guard is captured separately from the `latch → header` branch.
+        return Some(vec![vec![header]]);
+    }
+    let mut out: Vec<Vec<BlockId>> = Vec::new();
+    let mut path = vec![header];
+    let mut on_path: BTreeSet<BlockId> = BTreeSet::from([header]);
+    if dfs_body_paths(header, cfg, body, latch, &mut path, &mut on_path, &mut out) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// DFS helper for [`enumerate_body_paths`]; returns `false` once the [`MAX_PATHS`]
+/// cap is exceeded (deterministic: successors iterate in sorted `BTreeSet` order).
+fn dfs_body_paths(
+    node: BlockId,
+    cfg: &Cfg,
+    body: &BTreeSet<BlockId>,
+    latch: BlockId,
+    path: &mut Vec<BlockId>,
+    on_path: &mut BTreeSet<BlockId>,
+    out: &mut Vec<Vec<BlockId>>,
+) -> bool {
+    if node == latch {
+        out.push(path.clone());
+        return out.len() <= MAX_PATHS;
+    }
+    if let Some(succs) = cfg.successors.get(&node) {
+        for &s in succs {
+            if !body.contains(&s) || on_path.contains(&s) {
+                continue;
+            }
+            path.push(s);
+            on_path.insert(s);
+            let ok = dfs_body_paths(s, cfg, body, latch, path, on_path, out);
+            path.pop();
+            on_path.remove(&s);
+            if !ok {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Add the necessary stay-condition imposed by taking the `block → next_block`
+/// edge (a `CondBr` in the taken polarity), path-sensitively resolved. Non-affine
+/// conditions and non-`CondBr` terminators contribute nothing (a sound weakening).
+#[allow(clippy::too_many_arguments)]
+fn add_path_guards(
+    region: &mut Vec<Constraint>,
+    universe: &mut BTreeSet<ValueId>,
+    block: &saf_core::air::AirBlock,
+    next_block: BlockId,
+    defs: &BTreeMap<ValueId, Def>,
+    block_of: &BTreeMap<ValueId, BlockId>,
+    header_phis: &BTreeSet<ValueId>,
+    module: &AirModule,
+    path_pred: &BTreeMap<BlockId, BlockId>,
+) {
+    let Some(term) = block.terminator() else {
+        return;
+    };
+    let Operation::CondBr {
+        then_target,
+        else_target,
+    } = &term.op
+    else {
+        return;
+    };
+    let taken_true = if next_block == *then_target {
+        true
+    } else if next_block == *else_target {
+        false
+    } else {
+        return;
+    };
+    let Some(&cond) = term.operands.first() else {
+        return;
+    };
+    let Some(def) = defs.get(&cond) else {
+        return;
+    };
+    let Operation::BinaryOp { kind } = &def.op else {
+        return;
+    };
+    let (Some(&lo), Some(&ro)) = (def.operands.first(), def.operands.get(1)) else {
+        return;
+    };
+    let (Some(lhs), Some(rhs)) = (
+        resolve_affine_path(lo, defs, block_of, header_phis, module, path_pred, 0),
+        resolve_affine_path(ro, defs, block_of, header_phis, module, path_pred, 0),
+    ) else {
+        return;
+    };
+    if let Some(cons) = comparison_constraints(*kind, &lhs, &rhs, taken_true) {
+        for c in cons {
+            universe.extend(c.coeffs.keys().copied());
+            region.push(c);
+        }
+    }
+}
+
+/// Path-sensitive affine expansion: like [`resolve_affine`], but a **non-header
+/// `Phi`** on the path resolves to its incoming value from the path predecessor
+/// of the phi's block (so a join-block merge becomes the concrete value taken on
+/// *this* path). `None` ⇒ not affine on this path.
+#[allow(clippy::too_many_arguments)]
+fn resolve_affine_path(
+    v: ValueId,
+    defs: &BTreeMap<ValueId, Def>,
+    block_of: &BTreeMap<ValueId, BlockId>,
+    header_phis: &BTreeSet<ValueId>,
+    module: &AirModule,
+    path_pred: &BTreeMap<BlockId, BlockId>,
+    depth: u32,
+) -> Option<Affine> {
+    if depth > AFFINE_DEPTH_LIMIT {
+        return None;
+    }
+    if let Some(Constant::Int { value, .. }) = module.constants.get(&v) {
+        return Some(Affine::constant(i128::from(*value)));
+    }
+    if header_phis.contains(&v) {
+        return Some(Affine::symbol(v));
+    }
+    let Some(def) = defs.get(&v) else {
+        return Some(Affine::symbol(v));
+    };
+    if !def.in_loop {
+        return Some(Affine::symbol(v));
+    }
+    let recur = |x: ValueId| {
+        resolve_affine_path(x, defs, block_of, header_phis, module, path_pred, depth + 1)
+    };
+    match &def.op {
+        Operation::BinaryOp {
+            kind: kind @ (BinaryOp::Add | BinaryOp::Sub),
+        } => {
+            let a = recur(*def.operands.first()?)?;
+            let b = recur(*def.operands.get(1)?)?;
+            if matches!(kind, BinaryOp::Add) {
+                a.add(&b)
+            } else {
+                a.sub(&b)
+            }
+        }
+        Operation::BinaryOp {
+            kind: BinaryOp::Mul,
+        } => {
+            let a = recur(*def.operands.first()?)?;
+            let b = recur(*def.operands.get(1)?)?;
+            if let Some(k) = b.as_constant() {
+                a.scale(k)
+            } else if let Some(k) = a.as_constant() {
+                b.scale(k)
+            } else {
+                None
+            }
+        }
+        Operation::Cast {
+            kind: CastKind::ZExt | CastKind::SExt,
+            ..
+        }
+        | Operation::Copy
+        | Operation::Freeze => recur(*def.operands.first()?),
+        // A non-header phi resolves along the current path to its incoming value
+        // from the path predecessor of the phi's own block.
+        Operation::Phi { incoming } => {
+            let blk = block_of.get(&v)?;
+            let Some(pred) = path_pred.get(blk) else {
+                // The phi's block is not on this path (defensive) ⇒ opaque leaf.
+                return Some(Affine::symbol(v));
+            };
+            let val = incoming
+                .iter()
+                .find(|(p, _)| p == pred)
+                .map(|(_, val)| *val)?;
+            recur(val)
+        }
+        // Load / Call / Select / Trunc / … ⇒ opaque free leaf (sound).
+        _ => Some(Affine::symbol(v)),
+    }
+}
+
+/// One greedy lexicographic round: is there a single linear `f` that is bounded
+/// (`f ≥ 0`) and **non-increasing** (`f − f′ ≥ 0`) on every `remaining` branch and
+/// **strictly** decreasing (`f − f′ ≥ 1`) on branch `strict`? Discharged by the
+/// same Farkas reduction as [`synthesize_ranking_function`], summed over branches.
+fn synthesize_round(model: &MultiPathModel, remaining: &[usize], strict: usize) -> bool {
+    let universe: Vec<ValueId> = model.universe.iter().copied().collect();
+
+    let solver = new_solver();
+
+    // Ranking coefficients (template symbols only) + constant + strict decrease δ.
+    let mut coeff: BTreeMap<ValueId, z3::ast::Int> = BTreeMap::new();
+    for (i, m) in model.template.iter().enumerate() {
+        coeff.insert(*m, z3::ast::Int::new_const(format!("coef_{i}")));
+    }
+    let c0 = z3::ast::Int::new_const("rank_const");
+    let delta = z3::ast::Int::new_const("rank_delta");
+    solver.assert(delta.ge(z3::ast::Int::from_i64(1)));
+
+    let zero = || z3::ast::Int::from_i64(0);
+    let coeff_f = |m: &ValueId| -> z3::ast::Int { coeff.get(m).cloned().unwrap_or_else(zero) };
+
+    for &b in remaining {
+        let branch = &model.branches[b];
+        let region = &branch.region;
+
+        // Non-negative Farkas multipliers for this branch's two requirements.
+        let make_lambdas = |tag: char| -> Vec<z3::ast::Int> {
+            (0..region.len())
+                .map(|j| {
+                    let l = z3::ast::Int::new_const(format!("lam_{tag}_{b}_{j}"));
+                    solver.assert(l.ge(z3::ast::Int::from_i64(0)));
+                    l
+                })
+                .collect()
+        };
+        let lam_a = make_lambdas('a');
+        let lam_d = make_lambdas('d');
+
+        let region_coeff = |lams: &[z3::ast::Int], m: &ValueId| -> Option<z3::ast::Int> {
+            let mut acc = zero();
+            for (j, c) in region.iter().enumerate() {
+                if let Some(&a) = c.coeffs.get(m) {
+                    acc += &lams[j] * z3::ast::Int::from_i64(i128_to_i64(a)?);
+                }
+            }
+            Some(acc)
+        };
+        let region_const = |lams: &[z3::ast::Int]| -> Option<z3::ast::Int> {
+            let mut acc = zero();
+            for (j, c) in region.iter().enumerate() {
+                acc += &lams[j] * z3::ast::Int::from_i64(i128_to_i64(c.constant)?);
+            }
+            Some(acc)
+        };
+
+        // Per-symbol coefficient identities (requirement A: f ≥ 0; requirement B:
+        // f − f∘next_b ≥ k_b — only header phis change, so only they appear in B).
+        for m in &universe {
+            let Some(ra) = region_coeff(&lam_a, m) else {
+                return false;
+            };
+            solver.assert(coeff_f(m).eq(ra));
+
+            let mut lb_m = zero();
+            for (phi, nxt) in &branch.next {
+                let indicator = i128::from(phi == m);
+                let in_next = nxt.terms.get(m).copied().unwrap_or(0);
+                let Some(k) = i128_to_i64(indicator - in_next) else {
+                    return false;
+                };
+                lb_m += &coeff_f(phi) * z3::ast::Int::from_i64(k);
+            }
+            let Some(rb) = region_coeff(&lam_d, m) else {
+                return false;
+            };
+            solver.assert(lb_m.eq(rb));
+        }
+
+        // Constant-term inequalities: const_L − k − Σ λ·bⱼ ≥ 0.
+        let Some(const_a) = region_const(&lam_a) else {
+            return false;
+        };
+        solver.assert((c0.clone() - const_a).ge(zero()));
+
+        let mut lb_const = zero();
+        for (phi, nxt) in &branch.next {
+            let Some(k) = i128_to_i64(-nxt.constant) else {
+                return false;
+            };
+            lb_const += &coeff_f(phi) * z3::ast::Int::from_i64(k);
+        }
+        let k_b = if b == strict { delta.clone() } else { zero() };
+        let Some(const_d) = region_const(&lam_d) else {
+            return false;
+        };
+        solver.assert((lb_const - k_b - const_d).ge(zero()));
+    }
+
+    matches!(solver.check(), z3::SatResult::Sat)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1820,5 +2472,563 @@ mod tests {
             block_index: BTreeMap::new(),
         };
         assert!(ranked(&module_of(func, constants)));
+    }
+
+    // --- Path-sensitive (disjunctive + lexicographic) ------------------------
+
+    /// A `__VERIFIER_nondet_*` call producing an opaque typed value.
+    fn ndcall(id: &str, fname: &str, dst: ValueId, ty: TypeId) -> Instruction {
+        vinst(
+            id,
+            Operation::CallDirect {
+                callee: FunctionId(make_id("func", fname.as_bytes())),
+            },
+            dst,
+            vec![],
+            ty,
+        )
+    }
+
+    fn main_func(blocks: Vec<AirBlock>, entry: BlockId) -> AirFunction {
+        AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks,
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn multipath_two_increments_const_bound_is_ranked() {
+        // while (i < 100) { if (nondet) i += 1; else i += 2; }
+        // A single f = 100 - i decreases by 1 or 2 on both paths ⇒ ranked, but the
+        // single-transition model sees the join phi as opaque and cannot.
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let entry = bid("entry");
+        let h = bid("h");
+        let body = bid("body");
+        let bthen = bid("bthen");
+        let bels = bid("bels");
+        let latch = bid("latch");
+        let exit = bid("exit");
+
+        let i = vid("i");
+        let i_n = vid("i_n");
+        let ci = vid("ci");
+        let cnd = vid("cnd");
+        let ip1 = vid("ip1");
+        let ip2 = vid("ip2");
+        let i0 = vid("i0");
+        let one = vid("one");
+        let two = vid("two");
+        let hundred = vid("hundred");
+        constants.insert(i0, Constant::Int { value: 0, bits: 32 });
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+        constants.insert(two, Constant::Int { value: 2, bits: 32 });
+        constants.insert(
+            hundred,
+            Constant::Int {
+                value: 100,
+                bits: 32,
+            },
+        );
+
+        let mut eb = AirBlock::new(entry);
+        eb.instructions
+            .push(term("br_e", Operation::Br { target: h }, vec![]));
+
+        let mut hb = AirBlock::new(h);
+        hb.instructions.push(vinst(
+            "phi_i",
+            Operation::Phi {
+                incoming: vec![(entry, i0), (latch, i_n)],
+            },
+            i,
+            vec![],
+            i32t,
+        ));
+        hb.instructions.push(vinst(
+            "cmp_i",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt,
+            },
+            ci,
+            vec![i, hundred],
+            i1t,
+        ));
+        hb.instructions.push(term(
+            "cb_h",
+            Operation::CondBr {
+                then_target: body,
+                else_target: exit,
+            },
+            vec![ci],
+        ));
+
+        let mut bb = AirBlock::new(body);
+        bb.instructions
+            .push(ndcall("nd", "__VERIFIER_nondet_bool", cnd, i1t));
+        bb.instructions.push(term(
+            "cb_b",
+            Operation::CondBr {
+                then_target: bthen,
+                else_target: bels,
+            },
+            vec![cnd],
+        ));
+
+        let mut tb = AirBlock::new(bthen);
+        tb.instructions.push(vinst(
+            "add1",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            ip1,
+            vec![i, one],
+            i32t,
+        ));
+        tb.instructions
+            .push(term("br_t", Operation::Br { target: latch }, vec![]));
+
+        let mut lb = AirBlock::new(bels);
+        lb.instructions.push(vinst(
+            "add2",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            ip2,
+            vec![i, two],
+            i32t,
+        ));
+        lb.instructions
+            .push(term("br_l", Operation::Br { target: latch }, vec![]));
+
+        let mut latb = AirBlock::new(latch);
+        latb.instructions.push(vinst(
+            "phi_in",
+            Operation::Phi {
+                incoming: vec![(bthen, ip1), (bels, ip2)],
+            },
+            i_n,
+            vec![],
+            i32t,
+        ));
+        latb.instructions
+            .push(term("br_lat", Operation::Br { target: h }, vec![]));
+
+        let mut exb = AirBlock::new(exit);
+        exb.instructions.push(term("ret", Operation::Ret, vec![i]));
+
+        let func = main_func(vec![eb, hb, bb, tb, lb, latb, exb], entry);
+        assert!(ranked(&module_of(func, constants)));
+    }
+
+    #[test]
+    fn multipath_two_increments_symbolic_bound_abstains() {
+        // while (i < n) { if (nondet) i += 1; else i += 2; }  — the `i += 2` path
+        // can overflow near INT_MAX (n symbolic), so it is not stable ⇒ abstain.
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let entry = bid("entry");
+        let h = bid("h");
+        let body = bid("body");
+        let bthen = bid("bthen");
+        let bels = bid("bels");
+        let latch = bid("latch");
+        let exit = bid("exit");
+
+        let i = vid("i");
+        let i_n = vid("i_n");
+        let ci = vid("ci");
+        let cnd = vid("cnd");
+        let ip1 = vid("ip1");
+        let ip2 = vid("ip2");
+        let i0 = vid("i0");
+        let one = vid("one");
+        let two = vid("two");
+        let n = vid("n");
+        constants.insert(i0, Constant::Int { value: 0, bits: 32 });
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+        constants.insert(two, Constant::Int { value: 2, bits: 32 });
+
+        let mut eb = AirBlock::new(entry);
+        eb.instructions
+            .push(ndcall("nd_n", "__VERIFIER_nondet_int", n, i32t));
+        eb.instructions
+            .push(term("br_e", Operation::Br { target: h }, vec![]));
+
+        let mut hb = AirBlock::new(h);
+        hb.instructions.push(vinst(
+            "phi_i",
+            Operation::Phi {
+                incoming: vec![(entry, i0), (latch, i_n)],
+            },
+            i,
+            vec![],
+            i32t,
+        ));
+        hb.instructions.push(vinst(
+            "cmp_i",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt,
+            },
+            ci,
+            vec![i, n],
+            i1t,
+        ));
+        hb.instructions.push(term(
+            "cb_h",
+            Operation::CondBr {
+                then_target: body,
+                else_target: exit,
+            },
+            vec![ci],
+        ));
+
+        let mut bb = AirBlock::new(body);
+        bb.instructions
+            .push(ndcall("nd", "__VERIFIER_nondet_bool", cnd, i1t));
+        bb.instructions.push(term(
+            "cb_b",
+            Operation::CondBr {
+                then_target: bthen,
+                else_target: bels,
+            },
+            vec![cnd],
+        ));
+
+        let mut tb = AirBlock::new(bthen);
+        tb.instructions.push(vinst(
+            "add1",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            ip1,
+            vec![i, one],
+            i32t,
+        ));
+        tb.instructions
+            .push(term("br_t", Operation::Br { target: latch }, vec![]));
+
+        let mut lb = AirBlock::new(bels);
+        lb.instructions.push(vinst(
+            "add2",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            ip2,
+            vec![i, two],
+            i32t,
+        ));
+        lb.instructions
+            .push(term("br_l", Operation::Br { target: latch }, vec![]));
+
+        let mut latb = AirBlock::new(latch);
+        latb.instructions.push(vinst(
+            "phi_in",
+            Operation::Phi {
+                incoming: vec![(bthen, ip1), (bels, ip2)],
+            },
+            i_n,
+            vec![],
+            i32t,
+        ));
+        latb.instructions
+            .push(term("br_lat", Operation::Br { target: h }, vec![]));
+
+        let mut exb = AirBlock::new(exit);
+        exb.instructions.push(term("ret", Operation::Ret, vec![i]));
+
+        let func = main_func(vec![eb, hb, bb, tb, lb, latb, exb], entry);
+        assert!(!ranked(&module_of(func, constants)));
+    }
+
+    #[test]
+    fn lexicographic_two_phase_is_ranked() {
+        // while (x >= 0 && y >= 0) { y = y - 1; if (y < 0) { x = x - 1; y = *; } }
+        // No single linear ranking function; the lexicographic f = <x, y> works
+        // (round 1 ranks x on the inner-if path, round 2 ranks y on the other).
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let entry = bid("entry");
+        let h = bid("h");
+        let h2 = bid("h2");
+        let body = bid("body");
+        let bthen = bid("bthen");
+        let latch = bid("latch");
+        let exit = bid("exit");
+
+        let x = vid("x");
+        let y = vid("y");
+        let x_n = vid("x_n");
+        let y_n = vid("y_n");
+        let cx = vid("cx");
+        let cy = vid("cy");
+        let y1 = vid("y1");
+        let c2 = vid("c2");
+        let x1 = vid("x1");
+        let ynd = vid("ynd");
+        let x0 = vid("x0");
+        let y0 = vid("y0");
+        let zero = vid("zero");
+        let one = vid("one");
+        constants.insert(x0, Constant::Int { value: 0, bits: 32 });
+        constants.insert(y0, Constant::Int { value: 0, bits: 32 });
+        constants.insert(zero, Constant::Int { value: 0, bits: 32 });
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+
+        let mut eb = AirBlock::new(entry);
+        eb.instructions
+            .push(term("br_e", Operation::Br { target: h }, vec![]));
+
+        // h: phi x, phi y ; cx = x >= 0 ; condbr -> h2 / exit
+        let mut hb = AirBlock::new(h);
+        hb.instructions.push(vinst(
+            "phi_x",
+            Operation::Phi {
+                incoming: vec![(entry, x0), (latch, x_n)],
+            },
+            x,
+            vec![],
+            i32t,
+        ));
+        hb.instructions.push(vinst(
+            "phi_y",
+            Operation::Phi {
+                incoming: vec![(entry, y0), (latch, y_n)],
+            },
+            y,
+            vec![],
+            i32t,
+        ));
+        hb.instructions.push(vinst(
+            "cmp_x",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSge,
+            },
+            cx,
+            vec![x, zero],
+            i1t,
+        ));
+        hb.instructions.push(term(
+            "cb_x",
+            Operation::CondBr {
+                then_target: h2,
+                else_target: exit,
+            },
+            vec![cx],
+        ));
+
+        // h2: cy = y >= 0 ; condbr -> body / exit
+        let mut h2b = AirBlock::new(h2);
+        h2b.instructions.push(vinst(
+            "cmp_y",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSge,
+            },
+            cy,
+            vec![y, zero],
+            i1t,
+        ));
+        h2b.instructions.push(term(
+            "cb_y",
+            Operation::CondBr {
+                then_target: body,
+                else_target: exit,
+            },
+            vec![cy],
+        ));
+
+        // body: y1 = y - 1 ; c2 = y1 < 0 ; condbr -> bthen / latch
+        let mut bb = AirBlock::new(body);
+        bb.instructions.push(vinst(
+            "sub_y",
+            Operation::BinaryOp {
+                kind: BinaryOp::Sub,
+            },
+            y1,
+            vec![y, one],
+            i32t,
+        ));
+        bb.instructions.push(vinst(
+            "cmp_y1",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt,
+            },
+            c2,
+            vec![y1, zero],
+            i1t,
+        ));
+        bb.instructions.push(term(
+            "cb_y1",
+            Operation::CondBr {
+                then_target: bthen,
+                else_target: latch,
+            },
+            vec![c2],
+        ));
+
+        // bthen: x1 = x - 1 ; ynd = nondet ; br latch
+        let mut tb = AirBlock::new(bthen);
+        tb.instructions.push(vinst(
+            "sub_x",
+            Operation::BinaryOp {
+                kind: BinaryOp::Sub,
+            },
+            x1,
+            vec![x, one],
+            i32t,
+        ));
+        tb.instructions
+            .push(ndcall("nd_y", "__VERIFIER_nondet_int", ynd, i32t));
+        tb.instructions
+            .push(term("br_t", Operation::Br { target: latch }, vec![]));
+
+        // latch: x_n = phi[body:x, bthen:x1] ; y_n = phi[body:y1, bthen:ynd] ; br h
+        let mut latb = AirBlock::new(latch);
+        latb.instructions.push(vinst(
+            "phi_xn",
+            Operation::Phi {
+                incoming: vec![(body, x), (bthen, x1)],
+            },
+            x_n,
+            vec![],
+            i32t,
+        ));
+        latb.instructions.push(vinst(
+            "phi_yn",
+            Operation::Phi {
+                incoming: vec![(body, y1), (bthen, ynd)],
+            },
+            y_n,
+            vec![],
+            i32t,
+        ));
+        latb.instructions
+            .push(term("br_lat", Operation::Br { target: h }, vec![]));
+
+        let mut exb = AirBlock::new(exit);
+        exb.instructions.push(term("ret", Operation::Ret, vec![x]));
+
+        let func = main_func(vec![eb, hb, h2b, bb, tb, latb, exb], entry);
+        assert!(ranked(&module_of(func, constants)));
+    }
+
+    #[test]
+    fn multipath_stutter_path_abstains() {
+        // while (x > 0) { if (nondet) x = x - 1; else /* x unchanged */; }
+        // The stuttering (`x = x`) path makes no progress ⇒ non-terminating when it
+        // is taken forever, so no ranking function exists ⇒ abstain (soundness).
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let entry = bid("entry");
+        let h = bid("h");
+        let body = bid("body");
+        let bthen = bid("bthen");
+        let bels = bid("bels");
+        let latch = bid("latch");
+        let exit = bid("exit");
+
+        let x = vid("x");
+        let x_n = vid("x_n");
+        let cx = vid("cx");
+        let cnd = vid("cnd");
+        let xd = vid("xd");
+        let x0 = vid("x0");
+        let zero = vid("zero");
+        let one = vid("one");
+        constants.insert(x0, Constant::Int { value: 5, bits: 32 });
+        constants.insert(zero, Constant::Int { value: 0, bits: 32 });
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+
+        let mut eb = AirBlock::new(entry);
+        eb.instructions
+            .push(term("br_e", Operation::Br { target: h }, vec![]));
+
+        let mut hb = AirBlock::new(h);
+        hb.instructions.push(vinst(
+            "phi_x",
+            Operation::Phi {
+                incoming: vec![(entry, x0), (latch, x_n)],
+            },
+            x,
+            vec![],
+            i32t,
+        ));
+        hb.instructions.push(vinst(
+            "cmp_x",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            cx,
+            vec![x, zero],
+            i1t,
+        ));
+        hb.instructions.push(term(
+            "cb_h",
+            Operation::CondBr {
+                then_target: body,
+                else_target: exit,
+            },
+            vec![cx],
+        ));
+
+        let mut bb = AirBlock::new(body);
+        bb.instructions
+            .push(ndcall("nd", "__VERIFIER_nondet_bool", cnd, i1t));
+        bb.instructions.push(term(
+            "cb_b",
+            Operation::CondBr {
+                then_target: bthen,
+                else_target: bels,
+            },
+            vec![cnd],
+        ));
+
+        let mut tb = AirBlock::new(bthen);
+        tb.instructions.push(vinst(
+            "sub_x",
+            Operation::BinaryOp {
+                kind: BinaryOp::Sub,
+            },
+            xd,
+            vec![x, one],
+            i32t,
+        ));
+        tb.instructions
+            .push(term("br_t", Operation::Br { target: latch }, vec![]));
+
+        let mut elb = AirBlock::new(bels);
+        elb.instructions
+            .push(term("br_el", Operation::Br { target: latch }, vec![]));
+
+        let mut latb = AirBlock::new(latch);
+        latb.instructions.push(vinst(
+            "phi_xn",
+            Operation::Phi {
+                incoming: vec![(bthen, xd), (bels, x)],
+            },
+            x_n,
+            vec![],
+            i32t,
+        ));
+        latb.instructions
+            .push(term("br_lat", Operation::Br { target: h }, vec![]));
+
+        let mut exb = AirBlock::new(exit);
+        exb.instructions.push(term("ret", Operation::Ret, vec![x]));
+
+        let func = main_func(vec![eb, hb, bb, tb, elb, latb, exb], entry);
+        assert!(!ranked(&module_of(func, constants)));
     }
 }
