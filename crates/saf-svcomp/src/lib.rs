@@ -19,6 +19,7 @@ pub mod memsafety;
 pub mod overflow;
 pub mod property;
 pub mod property_kind;
+pub mod race;
 pub mod ranking;
 pub mod summaries;
 pub mod termination;
@@ -35,6 +36,9 @@ pub use property::{
     enumerate_false_candidates_interproc, must_reach_error, reach_error_call_sites,
 };
 pub use property_kind::{DataModel, Language, Property};
+pub use race::{
+    RaceCandidate, RaceHit, find_race_candidates, parse_tsan_report, race_graphml_witness,
+};
 pub use termination::{
     is_known_returning_external, program_structurally_terminates, termination_verdict,
 };

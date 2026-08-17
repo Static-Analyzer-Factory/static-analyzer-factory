@@ -830,7 +830,20 @@ pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
     // alongside a sound FALSE. The verdict is printed regardless: a `false`
     // whose witness is missing/unwritable is still sound (it just scores 0).
     if outcome.verdict.starts_with("false") {
-        if let Some(witness) = &outcome.witness {
+        if let Some(graphml) = &outcome.graphml {
+            // Concurrency witnesses are GraphML 1.0 (R7); write the pre-serialized
+            // string verbatim.
+            match std::fs::write(&args.witness, graphml) {
+                Ok(()) => eprintln!(
+                    "saf verify: wrote GraphML violation witness to {}",
+                    args.witness.display()
+                ),
+                Err(e) => eprintln!(
+                    "saf verify: failed to write GraphML witness to {}: {e} (verdict still emitted)",
+                    args.witness.display()
+                ),
+            }
+        } else if let Some(witness) = &outcome.witness {
             match witness.to_yaml_string() {
                 Ok(yaml) => match std::fs::write(&args.witness, yaml) {
                     Ok(()) => eprintln!(
@@ -957,9 +970,16 @@ fn compile_to_ir(
 
 /// The result of a verdict computation: the stdout line plus an optional
 /// violation witness (present only for a sound `false`).
+///
+/// A sound `false` may carry EITHER a YAML-2.0 sequential witness (`witness`,
+/// the default for unreach-call/memsafety/overflow) OR a raw GraphML-1.0
+/// concurrency witness string (`graphml`, required for `no-data-race` — R7). At
+/// most one is populated; `graphml` takes precedence when present.
 struct VerdictOutcome {
     verdict: String,
     witness: Option<saf_svcomp::ViolationWitness>,
+    /// Pre-serialized `GraphML` 1.0 witness (concurrency properties, R7).
+    graphml: Option<String>,
 }
 
 /// The safe fallback: `unknown` with no witness.
@@ -967,6 +987,7 @@ fn unknown_outcome() -> VerdictOutcome {
     VerdictOutcome {
         verdict: "unknown".to_string(),
         witness: None,
+        graphml: None,
     }
 }
 
@@ -994,6 +1015,7 @@ fn strategy_for(property: saf_svcomp::Property) -> Option<StrategyFn> {
         saf_svcomp::Property::ValidMemsafety => Some(memsafety_strategy),
         saf_svcomp::Property::NoOverflow => Some(overflow_strategy),
         saf_svcomp::Property::Termination => Some(termination_strategy),
+        saf_svcomp::Property::NoDataRace => Some(no_data_race_strategy),
         _ => None,
     }
 }
@@ -1097,6 +1119,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         return VerdictOutcome {
             verdict: format!("false({})", Property::UnreachCall.name()),
             witness,
+            graphml: None,
         };
     }
 
@@ -1146,6 +1169,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
                 return VerdictOutcome {
                     verdict: format!("false({})", Property::UnreachCall.name()),
                     witness,
+                    graphml: None,
                 };
             }
             Ok(false) => {}
@@ -1192,6 +1216,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
                 return VerdictOutcome {
                     verdict: format!("false({})", Property::UnreachCall.name()),
                     witness,
+                    graphml: None,
                 };
             }
             Ok(false) => {}
@@ -1240,6 +1265,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             VerdictOutcome {
                 verdict: format!("false({})", Property::UnreachCall.name()),
                 witness,
+                graphml: None,
             }
         }
         None => unknown_outcome(),
@@ -1764,6 +1790,7 @@ fn memsafety_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             VerdictOutcome {
                 verdict: saf_svcomp::memsafety_verdict(hit.subproperty),
                 witness,
+                graphml: None,
             }
         }
         Ok(None) => {
@@ -1965,6 +1992,7 @@ fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             VerdictOutcome {
                 verdict: saf_svcomp::overflow_verdict(),
                 witness,
+                graphml: None,
             }
         }
         Ok(None) => {
@@ -1991,10 +2019,283 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         VerdictOutcome {
             verdict: saf_svcomp::termination_verdict().to_string(),
             witness: None,
+            graphml: None,
         }
     } else {
         unknown_outcome()
     }
+}
+
+/// `ThreadSanitizer` runtime options for the `no-data-race` confirmer: stop at the
+/// first race so the report is captured promptly; do not `abort()` (which would
+/// mangle the report); a distinct exit code aids debugging (the verdict is driven
+/// by the parsed report, not the exit code).
+const TSAN_OPTS: &str = "halt_on_error=1:abort_on_error=0:exitcode=66";
+
+/// The `no-data-race` FALSE pipeline (lever `race-find`): finder-gated,
+/// `ThreadSanitizer`-confirmed, `GraphML`-witnessed.
+///
+/// 1. Gate: require an actually-reachable thread spawn (else the program is
+///    sequential — no race possible — and we abstain; SAF is FALSE-only).
+/// 2. R7 scope gate: abstain on `OpenMP` / relaxed-memory / custom
+///    `__VERIFIER_atomic_*` sections a native x86 (TSO/SC) `TSan` replay cannot
+///    soundly arbitrate.
+/// 3. Propose: run the over-approximate lockset+MHP finder
+///    ([`saf_svcomp::find_race_candidates`]). No candidate ⇒ abstain.
+/// 4. Confirm: compile the ORIGINAL program with `-fsanitize=thread` and run it
+///    under the nondet driver; emit `false(no-data-race)` IFF `TSan` concretely
+///    observes a genuine data race (R1). `TSan` is the sole soundness arbiter; the
+///    witness is `GraphML` 1.0 (R7).
+fn no_data_race_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
+    // Gate 1: a race needs a real second thread reachable from main.
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if !saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        eprintln!("saf verify: no reachable thread spawn (sequential -> no race) -> unknown");
+        return unknown_outcome();
+    }
+
+    // Gate 2 (R7): out-of-scope concurrency features TSan-on-x86 cannot soundly
+    // arbitrate. Read the source once (also used for the witness hash upstream).
+    let source = std::fs::read_to_string(ctx.input).unwrap_or_default();
+    if let Some(reason) = tsan_out_of_scope(&source) {
+        eprintln!("saf verify: no-data-race out of scope ({reason}) -> unknown");
+        return unknown_outcome();
+    }
+
+    // Gate 3: the finder must PROPOSE at least one candidate racing pair. An
+    // empty result means the over-approximate lockset+MHP analysis proved the
+    // program race-free, so we abstain without paying for a TSan run.
+    let candidates = saf_svcomp::find_race_candidates(ctx.module);
+    if candidates.is_empty() {
+        eprintln!("saf verify: lockset+MHP finder found no race candidate -> unknown");
+        return unknown_outcome();
+    }
+    eprintln!(
+        "saf verify: finder proposed {} race candidate(s); attempting TSan confirmation",
+        candidates.len()
+    );
+
+    // Gate 4: TSan is the sole soundness arbiter (HB-based — only reports a race
+    // it concretely observes).
+    match tsan_confirm(ctx.input, ctx.data_model, ctx.stub, ctx.tempdir, ctx.clang) {
+        Ok(Some(hit)) => {
+            let programfile = ctx.input.file_name().map_or_else(
+                || ctx.input.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let programhash = saf_svcomp::compute_file_hash(ctx.input);
+            let architecture = match ctx.data_model {
+                saf_svcomp::DataModel::ILP32 => "32bit",
+                saf_svcomp::DataModel::LP64 => "64bit",
+            };
+            let graphml = saf_svcomp::race_graphml_witness(
+                ctx.meta.specification.trim(),
+                &programfile,
+                &programhash,
+                architecture,
+                &hit,
+            );
+            VerdictOutcome {
+                verdict: format!("false({})", saf_svcomp::Property::NoDataRace.name()),
+                witness: None,
+                graphml: Some(graphml),
+            }
+        }
+        Ok(None) => {
+            eprintln!("saf verify: TSan replay observed no data race -> unknown");
+            unknown_outcome()
+        }
+        Err(e) => {
+            eprintln!("saf verify: TSan replay errored: {e:#} -> unknown");
+            unknown_outcome()
+        }
+    }
+}
+
+/// R7 scope gate for `no-data-race`: returns `Some(reason)` when the program
+/// uses concurrency features that a native x86 (TSO/SC) `TSan` replay cannot
+/// soundly arbitrate, so the strategy must abstain (fail-closed).
+///
+/// - `#pragma omp` — SAF's frontend drops `OpenMP` pragmas and native replay
+///   cannot reproduce the `OpenMP` runtime.
+/// - non-seq_cst C11 atomic orderings — weak-memory behaviour is not observable
+///   under x86 TSO, so a weak-memory-only race would be missed and, conversely,
+///   `TSan`'s treatment of relaxed atomics as synchronization could hide a real
+///   SV-COMP race. Out of scope either way.
+/// - custom whole-function atomic sections `__VERIFIER_atomic_<name>` (other
+///   than the modelled `begin`/`end`) — SV-COMP executes these atomically but
+///   `TSan` does not model them, so it would false-alarm a race the semantics
+///   forbid.
+fn tsan_out_of_scope(source: &str) -> Option<&'static str> {
+    if source.contains("#pragma omp") {
+        return Some("OpenMP");
+    }
+    if source.contains("memory_order_relaxed")
+        || source.contains("memory_order_consume")
+        || source.contains("memory_order_acquire")
+        || source.contains("memory_order_release")
+        || source.contains("memory_order_acq_rel")
+    {
+        return Some("relaxed-memory atomics");
+    }
+    if references_custom_verifier_atomic(source) {
+        return Some("custom __VERIFIER_atomic_* section");
+    }
+    None
+}
+
+/// True if the source references a `__VERIFIER_atomic_<suffix>` identifier whose
+/// suffix is NOT the modelled `begin`/`end` — i.e. a custom whole-function
+/// atomic that `TSan` cannot arbitrate.
+fn references_custom_verifier_atomic(source: &str) -> bool {
+    const MARK: &str = "__VERIFIER_atomic_";
+    let mut i = 0;
+    while let Some(off) = source[i..].find(MARK) {
+        let start = i + off + MARK.len();
+        let suffix: String = source[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !suffix.is_empty() && suffix != "begin" && suffix != "end" {
+            return true;
+        }
+        // Advance past this occurrence (at least one byte) to avoid looping.
+        i = start.max(i + MARK.len());
+    }
+    false
+}
+
+/// Build the `TSan`-replay driver: SV-COMP nondet generators (returning
+/// `$SAF_NONDET_CONST`, default 0), `__VERIFIER_assume` as a hard path filter
+/// (R4), and `__VERIFIER_atomic_begin/end` modelled as a global RECURSIVE mutex
+/// so `TSan` sees the atomic-section synchronization (else it would false-alarm a
+/// race the SV-COMP semantics forbid). `rand`/`srand` are pinned for determinism.
+fn synthesize_tsan_driver() -> String {
+    use std::fmt::Write as _;
+
+    let mut s = String::new();
+    s.push_str("/* no-data-race TSan-replay driver (generated) */\n");
+    s.push_str("#define _GNU_SOURCE 1\n");
+    s.push_str("#include <stddef.h>\n#include <stdlib.h>\n#include <pthread.h>\n");
+    s.push_str("extern void _exit(int) __attribute__((noreturn));\n");
+    s.push_str(
+        "static long __saf_c(void) { const char *e = getenv(\"SAF_NONDET_CONST\"); return e ? atol(e) : 0; }\n",
+    );
+    for (fname, cty) in SCALAR_NONDET {
+        let suffix = fname.trim_start_matches("__VERIFIER_nondet_");
+        let _ = writeln!(
+            s,
+            "{cty} __VERIFIER_nondet_{suffix}(void) {{ return ({cty})__saf_c(); }}"
+        );
+    }
+    s.push_str("void* __VERIFIER_nondet_pointer(void) { return (void*)0; }\n");
+    s.push_str("float __VERIFIER_nondet_float(void) { return 0.0f; }\n");
+    s.push_str("double __VERIFIER_nondet_double(void) { return 0.0; }\n");
+    s.push_str("void __VERIFIER_assume(int c) { if (!c) _exit(0); }\n");
+    // Atomic sections modelled as a global recursive mutex (visible to TSan).
+    s.push_str("static pthread_mutex_t __saf_atomic = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;\n");
+    s.push_str("void __VERIFIER_atomic_begin(void) { pthread_mutex_lock(&__saf_atomic); }\n");
+    s.push_str("void __VERIFIER_atomic_end(void) { pthread_mutex_unlock(&__saf_atomic); }\n");
+    s.push_str("int __wrap_rand(void) { return (int)__saf_c(); }\n");
+    s.push_str("void __wrap_srand(unsigned s) { (void)s; }\n");
+    s
+}
+
+/// Confirm a `no-data-race` FALSE by `ThreadSanitizer`-instrumented native
+/// execution.
+///
+/// Compiles the ORIGINAL program with `-fsanitize=thread -pthread -g` + the
+/// nondet driver, runs it under the [`NONDET_CONSTS`] mini-fuzz capturing stderr
+/// to a file, and parses the report ([`saf_svcomp::parse_tsan_report`], which
+/// applies R1 — only a genuine `data race` warning confirms). `Ok(Some(hit))` is
+/// a confirmed race; `Ok(None)` is inconclusive (no report / compile-link failure
+/// / timeout) ⇒ the caller keeps `unknown`. Because `TSan` is happens-before-based,
+/// a reported race is a real race for the observed inputs, so confirming is sound;
+/// a missing 32-bit `TSan` runtime for an `ILP32` task abstains (R3).
+fn tsan_confirm(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    stub: &Path,
+    dir: &Path,
+    clang: &str,
+) -> anyhow::Result<Option<saf_svcomp::RaceHit>> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+
+    let driver_src = dir.join("saf_tsan_driver.c");
+    let harness = dir.join("saf_tsan_harness");
+    let errpath = dir.join("saf_tsan_stderr.txt");
+
+    std::fs::write(&driver_src, synthesize_tsan_driver())
+        .with_context(|| "writing TSan replay driver")?;
+
+    let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
+    let status = Command::new(clang)
+        .args([
+            "-O0",
+            "-g",
+            "-fsanitize=thread",
+            "-pthread",
+            "-Wno-everything",
+            // Determinism: redirect rand()/srand() to the driver's __wrap_* stubs.
+            "-Wl,--wrap=rand",
+            "-Wl,--wrap=srand",
+        ])
+        .arg(data_model.clang_flag())
+        .arg("-include")
+        .arg(stub)
+        .arg("-I")
+        .arg(srcdir)
+        .arg(input)
+        .arg(&driver_src)
+        .arg("-o")
+        .arg(&harness)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to spawn {clang} for TSan replay"))?;
+    if !status.success() {
+        // Compile/link failure (e.g. a missing 32-bit TSan runtime) -> inconclusive.
+        return Ok(None);
+    }
+
+    let timeout = replay_timeout();
+    for &k in NONDET_CONSTS {
+        // Redirect the child's stderr to a FILE (not a pipe) so a large TSan
+        // report cannot deadlock on a full pipe buffer while we poll the timeout.
+        let errfile =
+            std::fs::File::create(&errpath).with_context(|| "creating TSan stderr file")?;
+        let mut child = Command::new(&harness)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(errfile))
+            .env("TSAN_OPTIONS", TSAN_OPTS)
+            .env("SAF_NONDET_CONST", k.to_string())
+            .spawn()
+            .with_context(|| "spawning TSan harness")?;
+
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break; // runaway (e.g. a thread blocked forever) -> parse what exists
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => return Err(e).context("waiting on TSan harness"),
+            }
+        }
+
+        let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+        if let Some(hit) = saf_svcomp::parse_tsan_report(&report) {
+            return Ok(Some(hit)); // first constant that reproduces a race wins
+        }
+    }
+    Ok(None)
 }
 
 /// Confirm a `no-overflow` FALSE by UBSan-instrumented native execution (plan 199, R6).
