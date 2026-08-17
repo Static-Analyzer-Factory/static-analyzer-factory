@@ -1559,6 +1559,29 @@ const NONDET_CONSTS: &[i64] = &[0, 1, 2, 42, 255, 256, 1024, 65_535, 2_147_483_6
 const ASAN_OPTS: &str = "exitcode=1:abort_on_error=0:detect_leaks=0:check_printf=0:\
 max_allocation_size_mb=1024:hard_rss_limit_mb=3072";
 
+/// A second `ASAN_OPTIONS` variant that DISABLES the heap quarantine
+/// (`quarantine_size_mb=0:thread_local_quarantine_size_kb=0`) on top of the same
+/// bounds as [`ASAN_OPTS`]. Rationale: `ASan`'s default quarantine holds a freed
+/// block out of circulation for a while, so `malloc` after a `free` returns a
+/// FRESH address. A whole class of `valid-free` bugs only manifests when the
+/// allocator RE-USES a just-freed address — e.g. `p=malloc(); free(p); q=malloc();
+/// if ((intptr_t)q==(intptr_t)p) free(q); free(q);` double-frees exactly when `q`
+/// lands on `p`'s recycled address (memsafety/`cmp-freed-ptr`), and freelist-LIFO
+/// address recycling is a legal allocator behavior the verifier may pick. With the
+/// quarantine on, the address never collides and `ASan` sees no bug; with it off the
+/// recycle happens promptly and the genuine violation reproduces.
+///
+/// SOUND for FALSE-only (never adds a false alarm): shrinking the quarantine only
+/// changes WHICH concrete addresses `malloc` returns and HOW SOON freed memory is
+/// recycled — it never makes a safe program free a live/foreign pointer or index
+/// out of bounds (per-allocation redzones are unaffected, so a genuine
+/// buffer-overflow is still caught and a safe access still passes). Its only
+/// downside is RECALL: a use-after-free READ can land on recycled (unpoisoned)
+/// memory and go unreported — which is why this variant runs SECOND, after the
+/// full default-quarantine sweep has had its chance to catch exactly those.
+const ASAN_OPTS_NO_QUARANTINE: &str = "exitcode=1:abort_on_error=0:detect_leaks=0:check_printf=0:\
+max_allocation_size_mb=1024:hard_rss_limit_mb=3072:quarantine_size_mb=0:thread_local_quarantine_size_kb=0";
+
 /// `UBSAN_OPTIONS` for the `no-overflow` replay (plan 199, R6): a deterministic,
 /// non-coredumping exit (`halt_on_error=1:abort_on_error=0` — the default
 /// `abort_on_error` is platform-dependent, so pin it) plus a symbolized frame #0
@@ -2039,39 +2062,50 @@ fn asan_confirm(
         // stops ASan aborting at a benign printf artifact BEFORE the real fault; it can
         // never add a false alarm (only suppresses reports), so it stays sound. R2 still
         // abstains on any ambiguous secondary fault a suppressed intended-fault exposes.
-        for &k in &candidates {
-            // Redirect the child's stderr to a FILE (not a pipe) so a large ASan report
-            // cannot deadlock on a full pipe buffer while we poll for the timeout.
-            let errfile =
-                std::fs::File::create(&errpath).with_context(|| "creating ASan stderr file")?;
-            let mut child = Command::new(&harness)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(errfile))
-                .env("ASAN_OPTIONS", ASAN_OPTS)
-                .env("SAF_NONDET_CONST", k.to_string())
-                .spawn()
-                .with_context(|| "spawning ASan harness")?;
+        // Sweep the mini-fuzz constants twice: first under the default
+        // (quarantine-on) `ASAN_OPTS`, then under `ASAN_OPTS_NO_QUARANTINE`. The
+        // default sweep runs to completion FIRST so the committed behavior is
+        // byte-for-byte unchanged for any task it already confirms; the
+        // no-quarantine sweep is purely ADDITIVE, reproducing the address-recycle
+        // class of `valid-free` bugs the quarantine masks (see the const doc). Both
+        // reuse the SAME compiled binary — only the runtime option string differs —
+        // so this adds no compile cost. R1/R2 in `parse_asan_report` still gate.
+        for opts in [ASAN_OPTS, ASAN_OPTS_NO_QUARANTINE] {
+            for &k in &candidates {
+                // Redirect the child's stderr to a FILE (not a pipe) so a large ASan
+                // report cannot deadlock on a full pipe buffer while we poll for the
+                // timeout.
+                let errfile =
+                    std::fs::File::create(&errpath).with_context(|| "creating ASan stderr file")?;
+                let mut child = Command::new(&harness)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::from(errfile))
+                    .env("ASAN_OPTIONS", opts)
+                    .env("SAF_NONDET_CONST", k.to_string())
+                    .spawn()
+                    .with_context(|| "spawning ASan harness")?;
 
-            let start = std::time::Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if start.elapsed() >= timeout {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            break; // runaway -> parse whatever exists (likely no report)
+                let start = std::time::Instant::now();
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => {
+                            if start.elapsed() >= timeout {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                break; // runaway -> parse whatever exists (likely no report)
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(5));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        Err(e) => return Err(e).context("waiting on ASan harness"),
                     }
-                    Err(e) => return Err(e).context("waiting on ASan harness"),
                 }
-            }
 
-            let report = std::fs::read_to_string(&errpath).unwrap_or_default();
-            if let Some(hit) = saf_svcomp::parse_asan_report(&report) {
-                return Ok(Some(hit)); // first constant that reproduces a violation wins
+                let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+                if let Some(hit) = saf_svcomp::parse_asan_report(&report) {
+                    return Ok(Some(hit)); // first (opts, constant) that reproduces wins
+                }
             }
         }
         Ok(None)
@@ -3324,6 +3358,33 @@ mod verify_tests {
         assert!(body.contains("#ifdef __VERIFIER_assert"), "{body}");
         // Deterministic path/name so a second `-include` is stable across runs.
         assert!(p.ends_with("saf_undef_assert.h"), "{}", p.display());
+    }
+
+    #[test]
+    fn no_quarantine_opts_disable_quarantine_and_keep_base_bounds() {
+        // The address-recycle `valid-free` variant (memsafety/`cmp-freed-ptr`) only
+        // reproduces when the quarantine is off, so both keys must be present and
+        // zeroed. It must ALSO keep every safety/determinism bound of the default
+        // `ASAN_OPTS` (leaks off, printf checks off, the RSS/allocation caps) so the
+        // second sweep does not regress determinism or reintroduce the OOM risk.
+        assert!(ASAN_OPTS_NO_QUARANTINE.contains("quarantine_size_mb=0"));
+        assert!(ASAN_OPTS_NO_QUARANTINE.contains("thread_local_quarantine_size_kb=0"));
+        for bound in [
+            "detect_leaks=0",
+            "check_printf=0",
+            "max_allocation_size_mb=1024",
+            "hard_rss_limit_mb=3072",
+            "abort_on_error=0",
+        ] {
+            assert!(ASAN_OPTS.contains(bound), "default missing {bound}");
+            assert!(
+                ASAN_OPTS_NO_QUARANTINE.contains(bound),
+                "no-quarantine missing {bound}"
+            );
+        }
+        // The default sweep (run FIRST) must NOT disable the quarantine — that is what
+        // preserves its committed use-after-free recall before the additive variant.
+        assert!(!ASAN_OPTS.contains("quarantine_size_mb=0"));
     }
 
     #[test]
