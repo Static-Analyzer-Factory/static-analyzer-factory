@@ -444,6 +444,24 @@ AddressSanitizer:DEADLYSIGNAL
     }
 
     #[test]
+    fn stack_overflow_class_is_not_mapped() {
+        // Real-stack exhaustion (a large-but-in-bounds VLA/`alloca`, or deep recursion)
+        // is NOT a `valid-memsafety` violation under SV-COMP's unbounded-abstract-stack
+        // model — e.g. `array-memsafety/count_down-alloca-1.i` clamps `length < 2^31/4`
+        // yet still overflows an 8 MB native stack, but is expected TRUE. So the
+        // `stack-overflow` class must stay unmapped (abstain), never `valid-deref`.
+        assert_eq!(
+            asan_class_to_subproperty("stack-overflow on address 0x1"),
+            None
+        );
+        const SO: &str = "\
+==30==ERROR: AddressSanitizer: stack-overflow on address 0xff0bb534 (pc 0x1 bp 0x2 sp 0x3 T0)
+    #0 0x1 in main /workspace/x/count_down-alloca-1.i:17:3
+";
+        assert_eq!(parse_asan_report(SO), None);
+    }
+
+    #[test]
     fn no_asan_banner_is_none() {
         assert_eq!(parse_asan_report("just some program output\nexit\n"), None);
         assert_eq!(parse_asan_report(""), None);

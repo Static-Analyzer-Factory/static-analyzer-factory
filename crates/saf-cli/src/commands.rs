@@ -2078,44 +2078,66 @@ fn asan_confirm(
     // Returns `Ok(Some(hit))` on the first constant that reproduces a violation,
     // `Ok(None)` if this pass is inconclusive (compile/link failure or no trap).
     let run_pass = |auto_var_init: bool| -> anyhow::Result<Option<saf_svcomp::AsanHit>> {
-        let mut cmd = Command::new(clang);
-        cmd.args([
-            "-O0",
-            "-g",
-            "-fsanitize=address",
-            "-fno-sanitize-recover=address",
-            "-Wno-everything",
-            // Determinism: redirect rand()/srand() to the driver's __wrap_* stubs.
-            "-Wl,--wrap=rand",
-            "-Wl,--wrap=srand",
-        ]);
-        if auto_var_init {
-            // Pass 2: make every otherwise-uninitialized local a fixed, non-canonical
-            // bit pattern (0xAA…) instead of whatever stack garbage happened to be
-            // there. This is deterministic (reproducibility, R6) and SOUND for
-            // `valid-memsafety`: an uninitialized read is nondeterministic under
-            // SV-COMP semantics, so a program that dereferences (or indexes with) an
-            // indeterminate value ALREADY violates the property — the pattern is one
-            // concrete value the verifier may pick. It never converts a safe program
-            // into a violation (a safe program does not dereference indeterminate
-            // memory). R1/R2 in `parse_asan_report` still gate the report.
-            cmd.arg("-ftrivial-auto-var-init=pattern");
-        }
-        let status = cmd
-            .arg(data_model.clang_flag())
-            .arg("-include")
-            .arg(stub)
-            .arg("-I")
-            .arg(srcdir)
-            .arg(input)
-            .arg(&driver_src)
-            .arg("-o")
-            .arg(&harness)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+        // Build the ASan compile+link; `assert_neutralizer` (when Some) is the two-pass
+        // assert-macro fallback (see `write_assert_neutralizer`) so a program that
+        // defines its own `void __VERIFIER_assert(int)` — the `loops`/`array-examples`/
+        // `memsafety` reasoning idiom — links its replay binary instead of failing on
+        // the stub's `__VERIFIER_assert` MACRO. `auto_var_init` toggles the second
+        // (uninitialized-variable) pass.
+        let build_compile = |assert_neutralizer: Option<&Path>| {
+            let mut cmd = Command::new(clang);
+            cmd.args([
+                "-O0",
+                "-g",
+                "-fsanitize=address",
+                "-fno-sanitize-recover=address",
+                "-Wno-everything",
+                // Determinism: redirect rand()/srand() to the driver's __wrap_* stubs.
+                "-Wl,--wrap=rand",
+                "-Wl,--wrap=srand",
+            ]);
+            if auto_var_init {
+                // Pass 2: make every otherwise-uninitialized local a fixed, non-canonical
+                // bit pattern (0xAA…) instead of whatever stack garbage happened to be
+                // there. This is deterministic (reproducibility, R6) and SOUND for
+                // `valid-memsafety`: an uninitialized read is nondeterministic under
+                // SV-COMP semantics, so a program that dereferences (or indexes with) an
+                // indeterminate value ALREADY violates the property — the pattern is one
+                // concrete value the verifier may pick. It never converts a safe program
+                // into a violation (a safe program does not dereference indeterminate
+                // memory). R1/R2 in `parse_asan_report` still gate the report.
+                cmd.arg("-ftrivial-auto-var-init=pattern");
+            }
+            cmd.arg(data_model.clang_flag()).arg("-include").arg(stub);
+            if let Some(neutralizer) = assert_neutralizer {
+                cmd.arg("-include").arg(neutralizer);
+            }
+            cmd.arg("-I")
+                .arg(srcdir)
+                .arg(input)
+                .arg(&driver_src)
+                .arg("-o")
+                .arg(&harness)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        };
+        let mut linked = build_compile(None)
             .status()
-            .with_context(|| format!("failed to spawn {clang} for ASan replay"))?;
-        if !status.success() {
+            .with_context(|| format!("failed to spawn {clang} for ASan replay"))?
+            .success();
+        if !linked {
+            // Assert-macro fallback: `#undef` the stub's `__VERIFIER_assert` macro via a
+            // second `-include` so a program providing its own definition compiles
+            // (mirrors ingestion + the UBSan replay). Purely additive — a program that
+            // already linked is byte-for-byte unchanged.
+            let neutralizer = write_assert_neutralizer(dir)?;
+            linked = build_compile(Some(&neutralizer))
+                .status()
+                .with_context(|| format!("failed to spawn {clang} for ASan replay"))?
+                .success();
+        }
+        if !linked {
             // Compile/link failure (e.g. a missing 32-bit ASan runtime) -> inconclusive.
             return Ok(None);
         }
