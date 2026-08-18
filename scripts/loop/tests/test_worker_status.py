@@ -106,6 +106,40 @@ def test_cli_result_subcommand_emits_json_and_default_classifies():
         assert out2.stdout.strip() == "success", out2.stdout
 
 
+def test_classify_transcript_outage_on_503_no_available_accounts():
+    # the real leak (arm-14 on cd-vm-15): 4x api_retry server_error/503, then a bogus
+    # result:success + is_error=True whose text is the proxy outage message.
+    with tempfile.TemporaryDirectory() as dd:
+        p = _write(Path(dd) / "t.jsonl", [
+            {"type": "system", "subtype": "api_retry", "error": "server_error", "error_status": 503},
+            {"type": "assistant", "message": {"content": [{"type": "text",
+                "text": "API Error: 503 No available accounts: no available accounts. Temporary."}]}},
+            {"type": "result", "subtype": "success", "is_error": True, "num_turns": 1,
+             "result": "API Error: 503 No available accounts: no available accounts. Temporary."},
+        ])
+        assert ws.classify_transcript(p) == "outage"
+
+
+def test_classify_transcript_outage_from_assistant_when_no_result_event():
+    # transcript cut off after the assistant outage message, no terminal result
+    with tempfile.TemporaryDirectory() as dd:
+        p = _write(Path(dd) / "t.jsonl", [
+            {"type": "assistant", "message": {"content": [{"type": "text",
+                "text": "API Error: 503 No available accounts: no available accounts."}]}},
+        ])
+        assert ws.classify_transcript(p) == "outage"
+
+
+def test_classify_transcript_genuine_success_quoting_phrase_stays_success():
+    # guard: a real success (is_error=False) is NOT clobbered even if it quotes the phrase
+    with tempfile.TemporaryDirectory() as dd:
+        p = _write(Path(dd) / "t.jsonl", [
+            {"type": "result", "subtype": "success", "is_error": False, "num_turns": 22,
+             "result": "handled the 503 'no available accounts' path in the proxy client"},
+        ])
+        assert ws.classify_transcript(p) == "success"
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

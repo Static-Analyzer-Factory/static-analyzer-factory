@@ -20,6 +20,23 @@ _ABORT = {
 
 _PIPE_EPOCH = re.compile(r"\|(\d{10})\b")
 _RESETS_AT = re.compile(r"resets_at\"?\s*[:=]\s*\"?(\d{10})\b")
+# Proxy-capacity 503: the whole account pool is momentarily empty ("No available accounts").
+_OUTAGE_PHRASE = re.compile(r"no available accounts", re.IGNORECASE)
+
+
+def is_account_outage(text: str | None) -> bool:
+    """True for a proxy-capacity 503 that leaked into a worker message
+    ('API Error: 503 No available accounts…').
+
+    This is NOT a per-account throttle (a `rate_limit`/usage-window carries a reset epoch we
+    sleep-to): the entire proxy pool is transiently empty, so the CLI's short auto-retries are
+    futile and the run finishes as a bogus `result: success` (is_error=True, num_turns=1). The
+    supervisor nudge-resumes with a long backoff and does NOT give up on the arm. Requires BOTH
+    the 503 status and the distinctive phrase so a real summary that merely says '503' can't trip it.
+    """
+    if not text:
+        return False
+    return "503" in text and bool(_OUTAGE_PHRASE.search(text))
 
 
 def classify_api_retry(event: dict) -> str:

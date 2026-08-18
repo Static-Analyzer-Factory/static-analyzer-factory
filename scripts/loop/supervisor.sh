@@ -175,7 +175,7 @@ saf_worker() {
   local sid; sid="$(py -c 'import uuid;print(uuid.uuid4())')"; echo "$sid" > "$sid_out"
   [ -f "$CLAUDE_ENV_FILE" ] && { set -a; . "$CLAUDE_ENV_FILE"; set +a; }
   export SAF_FORBIDDEN_READS="$FORBIDDEN_READS"   # consumed by the PreToolUse denylist hook
-  local attempt=0 max_hard="${WORKER_MAX_ATTEMPTS:-8}" wall="${WORKER_WALL_TIMEOUT:-3600}"
+  local attempt=0 onudge=0 max_hard="${WORKER_MAX_ATTEMPTS:-8}" wall="${WORKER_WALL_TIMEOUT:-3600}"
   local common=(-p --output-format stream-json --verbose --max-turns "$MAX_TURNS"
                 --allowedTools "$ALLOWED_TOOLS" --dangerously-skip-permissions)
   [ -f "$WORKER_SETTINGS" ] && common+=(--settings "$WORKER_SETTINGS")
@@ -197,6 +197,15 @@ saf_worker() {
       sleep:*)   sleep_to_reset "${verdict#sleep:}" ;;
       transient) local b=$(( (RANDOM % 30) + 15 * attempt )); log "transient; backoff ${b}s"; sleep "$b" ;;
       abort)     log "worker abort (auth/billing/quota-per-request)"; return 2 ;;
+      outage)    # proxy pool momentarily empty (503 "No available accounts") — NOT a real arm
+                 # failure. Nudge-resume the SAME session with a long backoff and DON'T give up
+                 # (the whole pool is out, so spinning short retries or trying another lever is
+                 # futile). `continue` skips the give-up check below; attempt++ keeps the resume path.
+                 onudge=$((onudge+1))
+                 [ "$onudge" -ge "${API_OUTAGE_MAX_NUDGES:-48}" ] && { log "API outage persisted ($onudge nudges); giving up"; return 3; }
+                 local b="${API_OUTAGE_BACKOFF:-18000}"
+                 log "API outage (503 no available accounts): nudge #$onudge, resuming $sid in ${b}s (not counting toward give-up)"
+                 sleep "$b"; continue ;;
       *)         [ "$attempt" -ge "$max_hard" ] && { log "worker error, giving up after $attempt"; return 3; }
                  sleep $(( 30 * attempt )) ;;
     esac

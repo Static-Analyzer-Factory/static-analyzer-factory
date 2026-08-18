@@ -19,6 +19,9 @@ import ratelimit as rl  # noqa: E402
 
 def classify_transcript(path: str) -> str:
     result_kind = None
+    result_is_error = None
+    result_text = ""
+    last_assistant = ""
     hard_epoch = None
     saw_abort = False
     saw_transient = False
@@ -44,8 +47,24 @@ def classify_transcript(path: str) -> str:
                 saw_abort = True
             elif c == "transient":
                 saw_transient = True
+        elif t == "assistant":
+            for blk in (rec.get("message", {}) or {}).get("content", []) or []:
+                if isinstance(blk, dict) and blk.get("type") == "text":
+                    last_assistant = blk.get("text", "") or last_assistant
         elif t == "result":
             result_kind = rl.classify_result(rec)
+            result_is_error = rec.get("is_error")
+            result_text = rec.get("result") or ""
+
+    # A proxy-capacity 503 ("No available accounts") leaks into a terminal `result` with
+    # subtype=success + is_error=True (or into the last assistant text). Catch it BEFORE the
+    # `success` return so the supervisor nudge-resumes instead of banking an empty no-gain arm.
+    # Guard: only override a `success` when is_error is set, so a genuine run that merely quotes
+    # the phrase is never clobbered.
+    if (rl.is_account_outage(result_text) or rl.is_account_outage(last_assistant)) and (
+        result_is_error or result_kind != "success"
+    ):
+        return "outage"
 
     if result_kind == "success":
         return "success"

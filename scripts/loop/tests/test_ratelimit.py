@@ -43,6 +43,18 @@ def test_parse_reset_epoch_from_pipe_or_statusline():
     assert rl.parse_reset_epoch("retry_delay_ms=3000") is None
 
 
+def test_is_account_outage_needs_503_and_phrase():
+    # the real proxy-capacity leak -> outage (nudge-resume, don't give up)
+    assert rl.is_account_outage("API Error: 503 No available accounts: no available accounts.") is True
+    assert rl.is_account_outage("503 no available accounts") is True
+    # NOT this outage: a normal summary, a bare 503, or the phrase without 503
+    assert rl.is_account_outage("widened the reach interval to [0, 2^30)") is False
+    assert rl.is_account_outage("got a 503 server_error, retrying") is False   # no phrase
+    assert rl.is_account_outage("no available accounts") is False              # no 503
+    assert rl.is_account_outage("") is False
+    assert rl.is_account_outage(None) is False
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
