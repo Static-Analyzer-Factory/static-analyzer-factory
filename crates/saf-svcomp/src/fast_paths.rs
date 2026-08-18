@@ -687,6 +687,56 @@ pub fn module_reachable_is_loop_free(module: &AirModule) -> bool {
     reachable_is_loop_free(&cfgs, &reachable)
 }
 
+/// Is every reachable-from-`main` loop provably **ranked** (or is the sub-program
+/// loop-free)?
+///
+/// A strict widening of [`module_reachable_is_loop_free`]: every reachable defined
+/// function must be loop-free **OR** have all of its natural loops proven
+/// terminating by linear ranking-function synthesis
+/// ([`crate::ranking::loops_are_ranked`]). A loop-free program passes trivially, so
+/// this returns `true` on a superset of the programs `module_reachable_is_loop_free`
+/// accepts.
+///
+/// # Why this is the sound gate for `INT_MAX`-boundary injection
+///
+/// The overflow confirmer feeds type-boundary values (`INT_MAX`, `INT_MIN`, …) as
+/// nondet inputs. The one false-alarm hazard is an injected value driving a **loop
+/// counter/accumulator** to `INT_MAX` and then spuriously trapping on the next `+1`
+/// — a `+1`-at-`INT_MAX` overflow that a TRUE `termination-*` task would never reach
+/// under its real (constrained) inputs. `module_reachable_is_loop_free` sidesteps
+/// this by requiring *no* reachable loop at all, which needlessly excludes every
+/// **counted** loop (`for (i = 0; i < n; i++) …`).
+///
+/// `loops_are_ranked` closes the gap soundly: a ranked loop's induction variable is
+/// admitted into the ranking model **only** when its per-iteration update provably
+/// stays inside the type range on the loop's (over-approximate) region
+/// ([`crate::ranking::next_never_overflows`]). A loop whose counter *could* reach
+/// `INT_MAX` and overflow on the next step (e.g. a `<=`-guarded counter) has no
+/// overflow-safe induction variable, so synthesis fails and the loop is **rejected**
+/// — the gate then stays `false` and no boundary value is injected. Conversely, when
+/// every reachable loop is ranked there is no counter an injected boundary value can
+/// drive to a *spurious* overflow, so any `UBSan` signed-overflow trap is a genuine
+/// direct violation (`UBSan` remains the sole R2 arbiter, re-triggered on the
+/// original program per R6).
+///
+/// Recursion is treated exactly as in [`module_reachable_is_loop_free`]: a
+/// call-graph cycle is not a CFG loop, so a recursive-but-CFG-loop-free function
+/// passes (a nondet-driven recursion depth manifests as a stack overflow crash, not
+/// a spurious integer-counter trap; a recursive accumulator overflow is genuine).
+#[must_use]
+pub fn module_reachable_loops_all_ranked(module: &AirModule) -> bool {
+    let callgraph = CallGraph::build(module);
+    let reachable = reachable_functions(&callgraph, module);
+    module
+        .functions
+        .iter()
+        .filter(|f| !f.is_declaration && reachable.contains(&f.id))
+        .all(|f| {
+            let cfg = Cfg::build(f);
+            !cfg_has_loops(&cfg) || crate::ranking::loops_are_ranked(f, module, &cfg)
+        })
+}
+
 /// Check if a specific function's CFG is loop-free.
 ///
 /// Returns true if the function has no loops (back-edges) in its CFG,
@@ -1261,6 +1311,228 @@ mod tests {
         };
         let module = make_module(vec![main]);
         assert!(!module_reachable_is_loop_free(&module));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for module_reachable_loops_all_ranked (INT_MAX-boundary gate)
+    // -----------------------------------------------------------------------
+
+    /// A value-producing instruction with a result type (local test helper).
+    fn typed_inst(
+        id: &str,
+        op: Operation,
+        dst: ValueId,
+        operands: Vec<ValueId>,
+        ty: saf_core::ids::TypeId,
+    ) -> Instruction {
+        Instruction {
+            id: make_inst_id(id),
+            op,
+            operands,
+            dst: Some(dst),
+            span: None,
+            symbol: None,
+            result_type: Some(ty),
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    /// A terminator (no dst / result) (local test helper).
+    fn term_inst(id: &str, op: Operation, operands: Vec<ValueId>) -> Instruction {
+        Instruction {
+            id: make_inst_id(id),
+            op,
+            operands,
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    /// Build a module whose `main` is a single ranked counter loop
+    /// `while (x < 10) x += 1;` (x : i32), which `loops_are_ranked` proves
+    /// terminating with an overflow-safe counter (f = 10 - x).
+    fn ranked_counter_loop_module() -> AirModule {
+        use saf_core::air::{AirType, BinaryOp, Constant};
+        use saf_core::ids::TypeId;
+
+        let i32t = TypeId(make_id("type", b"i32"));
+        let i1t = TypeId(make_id("type", b"i1"));
+        let mut types = BTreeMap::new();
+        types.insert(i32t, AirType::Integer { bits: 32 });
+        types.insert(i1t, AirType::Integer { bits: 1 });
+        let mut constants = BTreeMap::new();
+
+        let b0 = make_block_id("rl_entry");
+        let h = make_block_id("rl_header");
+        let l = make_block_id("rl_latch");
+        let e = make_block_id("rl_exit");
+
+        let x = make_value_id("rl_x");
+        let xn = make_value_id("rl_xn");
+        let cval = make_value_id("rl_c");
+        let x_init = make_value_id("rl_x_init");
+        let step_v = make_value_id("rl_step");
+        let bound_v = make_value_id("rl_bound");
+        constants.insert(x_init, Constant::Int { value: 0, bits: 32 });
+        constants.insert(step_v, Constant::Int { value: 1, bits: 32 });
+        constants.insert(
+            bound_v,
+            Constant::Int {
+                value: 10,
+                bits: 32,
+            },
+        );
+
+        // entry: br header
+        let mut entry = AirBlock::new(b0);
+        entry
+            .instructions
+            .push(term_inst("rl_br0", Operation::Br { target: h }, vec![]));
+
+        // header: x = phi[entry:0, latch:xn]; c = icmp slt(x, 10); condbr c -> latch/exit
+        let mut header = AirBlock::new(h);
+        header.instructions.push(typed_inst(
+            "rl_phi",
+            Operation::Phi {
+                incoming: vec![(b0, x_init), (l, xn)],
+            },
+            x,
+            vec![],
+            i32t,
+        ));
+        header.instructions.push(typed_inst(
+            "rl_cmp",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt,
+            },
+            cval,
+            vec![x, bound_v],
+            i1t,
+        ));
+        header.instructions.push(term_inst(
+            "rl_condbr",
+            Operation::CondBr {
+                then_target: l,
+                else_target: e,
+            },
+            vec![cval],
+        ));
+
+        // latch: xn = add(x, 1); br header
+        let mut latch = AirBlock::new(l);
+        latch.instructions.push(typed_inst(
+            "rl_add",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            xn,
+            vec![x, step_v],
+            i32t,
+        ));
+        latch
+            .instructions
+            .push(term_inst("rl_br1", Operation::Br { target: h }, vec![]));
+
+        // exit: ret
+        let mut exit = AirBlock::new(e);
+        exit.instructions
+            .push(term_inst("rl_ret", Operation::Ret, vec![]));
+
+        let main = AirFunction {
+            id: make_func_id("main"),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![entry, header, latch, exit],
+            entry_block: Some(b0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+
+        let mut module = make_module(vec![main]);
+        module.types = types;
+        module.constants = constants;
+        module
+    }
+
+    #[test]
+    fn all_ranked_accepts_loop_free_program() {
+        // Subsumption: a loop-free program the old gate accepted still passes.
+        let module = make_module(vec![make_defined_function("main")]);
+        assert!(module_reachable_is_loop_free(&module));
+        assert!(module_reachable_loops_all_ranked(&module));
+    }
+
+    #[test]
+    fn all_ranked_accepts_a_ranked_counter_loop() {
+        // The widening: a counted `while (x < 10) x++;` loop is rejected by the old
+        // loop-free gate but accepted here (its counter is provably overflow-safe),
+        // so the INT_MAX-boundary probes are now injected for such programs.
+        let module = ranked_counter_loop_module();
+        assert!(!module_reachable_is_loop_free(&module));
+        assert!(module_reachable_loops_all_ranked(&module));
+    }
+
+    #[test]
+    fn all_ranked_rejects_an_unranked_infinite_loop() {
+        // Soundness: an unguarded `b0 -> b1 -> b0` infinite loop has no ranking
+        // function, so the gate stays closed and no boundary value is injected.
+        let fid = make_func_id("main");
+        let b0 = make_block_id("main_b0");
+        let b1 = make_block_id("main_b1");
+        let mut block0 = AirBlock::new(b0);
+        block0
+            .instructions
+            .push(term_inst("b0_term", Operation::Br { target: b1 }, vec![]));
+        let mut block1 = AirBlock::new(b1);
+        block1
+            .instructions
+            .push(term_inst("b1_term", Operation::Br { target: b0 }, vec![]));
+        let main = AirFunction {
+            id: fid,
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![block0, block1],
+            entry_block: Some(b0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let module = make_module(vec![main]);
+        assert!(!module_reachable_is_loop_free(&module));
+        assert!(!module_reachable_loops_all_ranked(&module));
+    }
+
+    #[test]
+    fn all_ranked_ignores_loop_in_unreachable_function() {
+        // A loopy function not reachable from main does not close the gate.
+        let module = ranked_counter_loop_module();
+        // main IS the ranked loop here; add an unreachable infinite-loop function.
+        let fid = make_func_id("dead");
+        let b0 = make_block_id("dead_b0");
+        let mut block0 = AirBlock::new(b0);
+        block0
+            .instructions
+            .push(term_inst("dead_term", Operation::Br { target: b0 }, vec![]));
+        let dead = AirFunction {
+            id: fid,
+            name: "dead".to_string(),
+            params: Vec::new(),
+            blocks: vec![block0],
+            entry_block: Some(b0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let mut module = module;
+        module.functions.push(dead);
+        assert!(module_reachable_loops_all_ranked(&module));
     }
 
     // -----------------------------------------------------------------------

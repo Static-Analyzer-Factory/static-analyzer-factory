@@ -1636,17 +1636,21 @@ const MAX_REPLAY_CANDIDATES: usize = 16;
 const OVERFLOW_MAX_CANDIDATES: usize = 24;
 
 /// Signed-overflow type-BOUNDARY nondet candidates, appended to the overflow
-/// mini-fuzz sweep ONLY when the reachable program is loop-free
-/// ([`saf_svcomp::fast_paths::module_reachable_is_loop_free`]).
+/// mini-fuzz sweep ONLY when every reachable loop is provably ranked
+/// ([`saf_svcomp::fast_paths::module_reachable_loops_all_ranked`], which subsumes the
+/// loop-free case).
 ///
 /// [`OVERFLOW_CONSTS`] deliberately caps its large positive probe at `2^30` (not
 /// `INT_MAX`) so a nondet-driven loop counter cannot be pushed to a *spurious*
-/// `+1`-at-`INT_MAX` trap on a TRUE `termination-*` task. With **no reachable CFG
-/// loop** that hazard is gone: there is no counter/accumulator to drive, so a
+/// `+1`-at-`INT_MAX` trap on a TRUE `termination-*` task. When every reachable loop
+/// is **ranked** that hazard is gone: `loops_are_ranked` admits a loop only when its
+/// induction variable's per-iteration update provably stays inside the type range
+/// (so no counter can reach `INT_MAX` and overflow on the next step), so a
 /// near-boundary input can only trigger a *genuine direct* overflow (`x+1` at
-/// `INT_MAX`, `x*2`, a recursive `addition(m+1, …)` at `m == INT_MAX`). `UBSan`
-/// stays the sole arbiter (R2) and re-triggers deterministically (R6); a value that
-/// does not actually overflow simply yields no report.
+/// `INT_MAX`, `x*2`, a counted-loop sink `sum += INT_MAX`, or a recursive
+/// `addition(m+1, …)` at `m == INT_MAX`). `UBSan` stays the sole arbiter (R2) and
+/// re-triggers deterministically (R6); a value that does not actually overflow
+/// simply yields no report.
 ///
 /// The 32-bit boundaries always apply. The 64-bit boundaries are added ONLY under
 /// LP64 (where `long`/`int64_t` sinks are 64-bit, closing the 64-bit direct-overflow
@@ -1680,7 +1684,7 @@ fn overflow_replay_candidates(
     data_model: saf_svcomp::DataModel,
 ) -> Vec<i64> {
     let mut candidates: Vec<i64> = OVERFLOW_CONSTS.to_vec();
-    if saf_svcomp::fast_paths::module_reachable_is_loop_free(module) {
+    if saf_svcomp::fast_paths::module_reachable_loops_all_ranked(module) {
         for b in overflow_boundary_consts(data_model) {
             if !candidates.contains(&b) {
                 candidates.push(b);
@@ -2684,11 +2688,12 @@ fn ubsan_confirm(
     // surface) and are still just concrete nondet inputs — soundness is unchanged (a
     // trap is re-triggered on the ORIGINAL program).
     //
-    // Loop-free boundary injection: when NO reachable function has a CFG loop,
-    // `overflow_replay_candidates` also appends the type-boundary values (INT_MAX,
-    // near-INT_MAX/INT_MIN, plus the 64-bit boundaries under LP64). With no loop
-    // counter to drive spuriously, a boundary input can only trigger a genuine
-    // DIRECT overflow, so this widens reachability without re-admitting the
+    // Ranked-loop boundary injection: when every reachable loop is provably ranked
+    // (or the program is loop-free), `overflow_replay_candidates` also appends the
+    // type-boundary values (INT_MAX, near-INT_MAX/INT_MIN, plus the 64-bit
+    // boundaries under LP64). A ranked loop's counter provably cannot reach INT_MAX
+    // and overflow on the next step, so a boundary input can only trigger a genuine
+    // DIRECT overflow — this unlocks counted-loop sinks without re-admitting the
     // termination-* loop false alarm (see `overflow_boundary_consts`).
     let candidates = overflow_replay_candidates(module, data_model);
 
