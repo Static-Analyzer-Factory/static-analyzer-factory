@@ -71,9 +71,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use saf_analysis::cfg::Cfg;
 use saf_analysis::z3_utils::compute_dominators;
-use saf_core::air::{AirFunction, AirModule, BinaryOp, CastKind, Constant, Operation};
+use saf_core::air::{AirFunction, AirModule, AirParam, BinaryOp, CastKind, Constant, Operation};
 use saf_core::id::make_id;
-use saf_core::ids::{BlockId, TypeId, ValueId};
+use saf_core::ids::{BlockId, FunctionId, TypeId, ValueId};
 
 use crate::fast_paths::cfg_has_loops;
 
@@ -1381,6 +1381,354 @@ fn build_recursion_model(
     let template: BTreeSet<ValueId> = param_ids.iter().chain(invariants.iter()).copied().collect();
     Some(MultiPathModel {
         template,
+        universe,
+        branches,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Mutual recursion ranking (an SCC of ≥2 mutually-recursive functions)
+// ---------------------------------------------------------------------------
+
+/// Does an SCC of **mutually-recursive** functions (`scc`, a set of ≥2 function
+/// ids forming a single call-graph strongly-connected component) admit a linear
+/// ranking function that bounds the recursion depth over the whole cycle (⇒ the
+/// mutual recursion terminates)?
+///
+/// The whole SCC is modelled as one [`MultiPathModel`] over a **positionally
+/// unified** ranking state: because every member has an *identical* parameter
+/// signature (enforced below), parameter *position* `p` is identified with a
+/// single ranking symbol shared across all members. Each model branch is one
+/// **entry → intra-SCC-call-site path** of some member `fi` calling some member
+/// `fj`: its guard is the conjunction of the path's branch stay-conditions (a
+/// necessary condition on any frame reaching that call — an over-approximation),
+/// and its `next` maps each position symbol to the affine form of the
+/// corresponding call argument passed to `fj` (or a type-bounded havoc symbol
+/// when that argument is not exactly affine). A ranking `f` that is `≥ 0` on
+/// every call's guard and strictly decreases by `≥ 1` from a caller frame to the
+/// callee frame it spawns bounds every root-to-leaf chain of intra-SCC calls;
+/// with finitely many call sites the whole mutual-recursion call tree is finite
+/// ⇒ it terminates.
+///
+/// # Soundness
+///
+/// Choosing a *single* formula over parameter positions is one valid (if
+/// restrictive) ranking assignment for the SCC's configuration graph — it can
+/// only make the search less complete, never unsound. Every branch's transition
+/// relation over-approximates the real caller→callee step (guards are only
+/// necessary conditions; each affine `next` is overflow-checked to equal the
+/// machine value, else demoted to a free in-range havoc; all other leaves are
+/// universally quantified), so a lexicographic ranking of the modelled
+/// (superset) relation ranks the real one. `greedy_lex_rank`'s `Sat`-only Farkas
+/// synthesis therefore never yields a wrong `true`. Abstains (`false`) on any
+/// member that is a declaration, has a loop (entry→call paths not enumerable),
+/// has a non-integer or mismatched parameter signature, or whose transitions are
+/// not affine.
+#[must_use]
+pub fn mutual_recursion_is_ranked(module: &AirModule, scc: &BTreeSet<FunctionId>) -> bool {
+    match build_mutual_recursion_model(module, scc) {
+        Some(model) => greedy_lex_rank(&model),
+        None => false,
+    }
+}
+
+/// Remap an affine form's leaf symbols through `map` (identity for absent keys),
+/// merging coefficients that collide onto the same target symbol.
+fn remap_affine(a: &Affine, map: &BTreeMap<ValueId, ValueId>) -> Affine {
+    let mut terms: BTreeMap<ValueId, i128> = BTreeMap::new();
+    for (&s, &c) in &a.terms {
+        let key = map.get(&s).copied().unwrap_or(s);
+        let e = terms.entry(key).or_insert(0);
+        *e = e.saturating_add(c);
+    }
+    terms.retain(|_, c| *c != 0);
+    Affine {
+        terms,
+        constant: a.constant,
+    }
+}
+
+/// Remap a constraint's leaf symbols through `map` (see [`remap_affine`]).
+fn remap_constraint(c: &Constraint, map: &BTreeMap<ValueId, ValueId>) -> Constraint {
+    let mut coeffs: BTreeMap<ValueId, i128> = BTreeMap::new();
+    for (&s, &k) in &c.coeffs {
+        let key = map.get(&s).copied().unwrap_or(s);
+        let e = coeffs.entry(key).or_insert(0);
+        *e = e.saturating_add(k);
+    }
+    coeffs.retain(|_, v| *v != 0);
+    Constraint {
+        coeffs,
+        constant: c.constant,
+    }
+}
+
+/// Order a function's parameters by their positional `index`.
+fn ordered_params(f: &AirFunction) -> Vec<&AirParam> {
+    let mut v: Vec<&AirParam> = f.params.iter().collect();
+    v.sort_by_key(|p| p.index);
+    v
+}
+
+/// Build the mutual-recursion [`MultiPathModel`] for the SCC `scc`, or `None`
+/// (⇒ abstain) when its shape is unsupported. See [`mutual_recursion_is_ranked`].
+// NOTE: one cohesive extraction pipeline (validate members → unify param
+// positions → collect intra-SCC call paths → per-path guards/transitions,
+// remapped to the shared vocabulary → classify overflow → assemble), mirroring
+// `build_recursion_model`; splitting it would only scatter the shared state.
+#[allow(clippy::too_many_lines)]
+fn build_mutual_recursion_model(
+    module: &AirModule,
+    scc: &BTreeSet<FunctionId>,
+) -> Option<MultiPathModel> {
+    if scc.len() < 2 {
+        return None;
+    }
+    // Collect member functions (deterministic canonical order = by id).
+    let mut members: Vec<&AirFunction> = module
+        .functions
+        .iter()
+        .filter(|f| scc.contains(&f.id))
+        .collect();
+    if members.len() != scc.len() {
+        return None; // a member is missing from the module (should not happen)
+    }
+    members.sort_by_key(|f| f.id);
+    for f in &members {
+        if f.is_declaration {
+            return None;
+        }
+    }
+    // Loop-free bodies: entry→call-site path enumeration requires acyclic CFGs.
+    let cfgs: Vec<Cfg> = members.iter().map(|f| Cfg::build(f)).collect();
+    if cfgs.iter().any(cfg_has_loops) {
+        return None;
+    }
+
+    // Require identical parameter signatures across all members — same `index` set
+    // and the same `TypeId` at each index — so parameter *position* is a
+    // well-defined, type-consistent ranking symbol across the SCC. Abstain else.
+    let canonical = members[0];
+    let canon_params = ordered_params(canonical);
+    for f in &members {
+        let ps = ordered_params(f);
+        if ps.len() != canon_params.len() {
+            return None;
+        }
+        if canon_params
+            .iter()
+            .zip(ps.iter())
+            .any(|(a, b)| a.index != b.index || a.param_type != b.param_type)
+        {
+            return None;
+        }
+    }
+
+    // Integer positions carry a ranking symbol = the canonical member's param id.
+    let mut param_ids: BTreeSet<ValueId> = BTreeSet::new();
+    let mut param_type_of: BTreeMap<ValueId, TypeId> = BTreeMap::new();
+    let mut shared_of_index: BTreeMap<u32, ValueId> = BTreeMap::new();
+    for p in &canon_params {
+        if let Some(ty) = p.param_type {
+            if int_width(module, ty).is_some() {
+                param_ids.insert(p.id);
+                param_type_of.insert(p.id, ty);
+                shared_of_index.insert(p.index, p.id);
+            }
+        }
+    }
+    if param_ids.is_empty() {
+        return None;
+    }
+
+    // Per-member remap: this member's param at index `i` ↦ the shared symbol for
+    // position `i` (integer positions only).
+    let member_remap: Vec<BTreeMap<ValueId, ValueId>> = members
+        .iter()
+        .map(|f| {
+            ordered_params(f)
+                .iter()
+                .filter_map(|p| shared_of_index.get(&p.index).map(|&s| (p.id, s)))
+                .collect()
+        })
+        .collect();
+
+    // Merged signedness over the shared symbols: a position keeps a concrete sign
+    // only if every member that determines it agrees (else stays unbounded/free).
+    let mut signs: BTreeMap<ValueId, Sign> = BTreeMap::new();
+    let mut sign_conflict: BTreeSet<ValueId> = BTreeSet::new();
+    for (i, f) in members.iter().enumerate() {
+        for (vid, sign) in infer_signs(f) {
+            if matches!(sign, Sign::Unknown) {
+                continue;
+            }
+            if let Some(&shared) = member_remap[i].get(&vid) {
+                match signs.get(&shared) {
+                    None => {
+                        signs.insert(shared, sign);
+                    }
+                    Some(&prev) if prev != sign => {
+                        sign_conflict.insert(shared);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    for c in &sign_conflict {
+        signs.remove(c);
+    }
+
+    // --- Pass 1: one raw transition per (member × call site × entry→site path),
+    // remapped into the shared positional vocabulary. ---------------------------
+    let mut raws: Vec<RawBranch> = Vec::new();
+    let mut universe: BTreeSet<ValueId> = param_ids.clone();
+    for (mi, f) in members.iter().enumerate() {
+        let cfg = &cfgs[mi];
+        let remap = &member_remap[mi];
+        let all_blocks: BTreeSet<BlockId> = f.blocks.iter().map(|b| b.id).collect();
+        let defs = index_defs(f, &all_blocks);
+        let block_of = index_block_of(f);
+        // This member's own integer params are the affine leaves for resolution.
+        let header_phis: BTreeSet<ValueId> = remap.keys().copied().collect();
+        let entry = f.entry_block.unwrap_or(f.blocks.first()?.id);
+
+        // Intra-SCC recursive call sites: a `CallDirect` to any SCC member.
+        let mut sites: Vec<(BlockId, Vec<ValueId>)> = Vec::new();
+        for block in &f.blocks {
+            for inst in &block.instructions {
+                if let Operation::CallDirect { callee } = &inst.op {
+                    if scc.contains(callee) {
+                        sites.push((block.id, inst.operands.clone()));
+                    }
+                }
+            }
+        }
+
+        for (cb, args) in &sites {
+            let paths = enumerate_body_paths(cfg, &all_blocks, entry, *cb)?;
+            for path in &paths {
+                let path_pred = path_pred_map(path);
+                let mut guards_local: Vec<Constraint> = Vec::new();
+                let mut local_universe: BTreeSet<ValueId> = BTreeSet::new();
+                for pair in path.windows(2) {
+                    if let Some(block) = f.blocks.iter().find(|b| b.id == pair[0]) {
+                        add_path_guards(
+                            &mut guards_local,
+                            &mut local_universe,
+                            block,
+                            pair[1],
+                            &defs,
+                            &block_of,
+                            &header_phis,
+                            module,
+                            &path_pred,
+                        );
+                    }
+                }
+                // Transition: shared symbol at position `p` ↦ affine of the call's
+                // argument operand `p` (the callee's param `p`), remapped.
+                let mut raw_next: BTreeMap<ValueId, Option<Affine>> = BTreeMap::new();
+                for p in &canon_params {
+                    let Some(&shared) = shared_of_index.get(&p.index) else {
+                        continue;
+                    };
+                    let a = args.get(p.index as usize).and_then(|&arg| {
+                        resolve_affine_path(
+                            arg,
+                            &defs,
+                            &block_of,
+                            &header_phis,
+                            module,
+                            &path_pred,
+                            0,
+                        )
+                    });
+                    let a = a.map(|aff| remap_affine(&aff, remap));
+                    if let Some(ref aff) = a {
+                        universe.extend(aff.terms.keys().copied());
+                    }
+                    raw_next.insert(shared, a);
+                }
+                let guards: Vec<Constraint> = guards_local
+                    .iter()
+                    .map(|c| remap_constraint(c, remap))
+                    .collect();
+                for c in &guards {
+                    universe.extend(c.coeffs.keys().copied());
+                }
+                raws.push(RawBranch { guards, raw_next });
+            }
+        }
+    }
+    if raws.is_empty() {
+        return None;
+    }
+
+    // Type bounds for the shared ranking symbols only (true facts about the integer
+    // value at each position). Other leaves stay free (universally quantified).
+    let mut base_bounds: Vec<Constraint> = Vec::new();
+    let mut bound_of: BTreeMap<ValueId, (i128, i128)> = BTreeMap::new();
+    for (&sym, &ty) in &param_type_of {
+        if let Some((lo, hi)) = bounds_from_type(sym, ty, &signs, module) {
+            bound_of.insert(sym, (lo, hi));
+            base_bounds.push(Constraint {
+                coeffs: BTreeMap::from([(sym, 1)]),
+                constant: -lo,
+            });
+            base_bounds.push(Constraint {
+                coeffs: BTreeMap::from([(sym, -1)]),
+                constant: hi,
+            });
+        }
+    }
+
+    // --- Pass 2: classify each argument transition (affine-stable vs havoc). ----
+    let mut fresh_syms: BTreeSet<ValueId> = BTreeSet::new();
+    let mut branches: Vec<Branch> = Vec::with_capacity(raws.len());
+    for (bi, raw) in raws.into_iter().enumerate() {
+        let mut check_region = raw.guards;
+        check_region.extend(base_bounds.iter().cloned());
+
+        let mut next: BTreeMap<ValueId, Affine> = BTreeMap::new();
+        let mut fresh_bounds: Vec<Constraint> = Vec::new();
+        for (&param, cand) in &raw.raw_next {
+            let stable = match (cand, bound_of.get(&param)) {
+                (Some(a), Some(&(lo, hi)))
+                    if next_never_overflows(a, lo, hi, &check_region, &universe) =>
+                {
+                    Some(a.clone())
+                }
+                _ => None,
+            };
+            if let Some(a) = stable {
+                next.insert(param, a);
+            } else {
+                let fresh = havoc_id(param, bi);
+                fresh_syms.insert(fresh);
+                if let Some(&(lo, hi)) = bound_of.get(&param) {
+                    fresh_bounds.push(Constraint {
+                        coeffs: BTreeMap::from([(fresh, 1)]),
+                        constant: -lo,
+                    });
+                    fresh_bounds.push(Constraint {
+                        coeffs: BTreeMap::from([(fresh, -1)]),
+                        constant: hi,
+                    });
+                }
+                next.insert(param, Affine::symbol(fresh));
+            }
+        }
+        check_region.extend(fresh_bounds);
+        branches.push(Branch {
+            region: check_region,
+            next,
+        });
+    }
+    universe.extend(fresh_syms);
+
+    Some(MultiPathModel {
+        template: param_ids,
         universe,
         branches,
     })
@@ -3921,5 +4269,162 @@ mod tests {
         // Both recursive call sites (n-1 and n-2) strictly decrease f = n under the
         // shared guard n > 1 ⇒ ranked.
         assert!(rec_ranked(&fib_rec()));
+    }
+
+    // --- mutual recursion ranking -------------------------------------------
+
+    /// Build one member `void <name>(int n) { if (n CMP bound) <callee>(n+step); }`
+    /// of a mutually-recursive pair. `fid`/`callee_id` identify this member and the
+    /// function it recurses into; `n` is this member's parameter symbol.
+    fn mutual_member(
+        name: &str,
+        fid: FunctionId,
+        callee_id: FunctionId,
+        n: ValueId,
+        cmp: BinaryOp,
+        bound_v: ValueId,
+        step_v: ValueId,
+        i32t: TypeId,
+        i1t: TypeId,
+    ) -> AirFunction {
+        let c = vid(&format!("{name}_c"));
+        let na = vid(&format!("{name}_na"));
+        let entry = bid(&format!("{name}_entry"));
+        let rec = bid(&format!("{name}_rec"));
+        let base = bid(&format!("{name}_base"));
+
+        let mut eb = AirBlock::new(entry);
+        eb.instructions.push(vinst(
+            &format!("{name}_cmp"),
+            Operation::BinaryOp { kind: cmp },
+            c,
+            vec![n, bound_v],
+            i1t,
+        ));
+        eb.instructions.push(term(
+            &format!("{name}_condbr"),
+            Operation::CondBr {
+                then_target: rec,
+                else_target: base,
+            },
+            vec![c],
+        ));
+
+        let mut rb = AirBlock::new(rec);
+        rb.instructions.push(vinst(
+            &format!("{name}_add"),
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            na,
+            vec![n, step_v],
+            i32t,
+        ));
+        rb.instructions.push(term(
+            &format!("{name}_call"),
+            Operation::CallDirect { callee: callee_id },
+            vec![na],
+        ));
+        rb.instructions.push(term(
+            &format!("{name}_br"),
+            Operation::Br { target: base },
+            vec![],
+        ));
+
+        let mut bb = AirBlock::new(base);
+        bb.instructions
+            .push(term(&format!("{name}_ret"), Operation::Ret, vec![]));
+
+        AirFunction {
+            id: fid,
+            name: name.to_string(),
+            params: vec![AirParam {
+                id: n,
+                name: None,
+                index: 0,
+                param_type: Some(i32t),
+            }],
+            blocks: vec![eb, rb, bb],
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    /// Build a module with a mutually-recursive pair `f`/`g`, each
+    /// `void h(int n){ if (n CMP bound) other(n+step); }`, plus the shared
+    /// `{f, g}` SCC set. Both members share one signature so positions unify.
+    fn mutual_pair(cmp: BinaryOp, bound: i64, step: i64) -> (AirModule, BTreeSet<FunctionId>) {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let bound_v = vid("bound");
+        let step_v = vid("step");
+        constants.insert(
+            bound_v,
+            Constant::Int {
+                value: bound,
+                bits: 32,
+            },
+        );
+        constants.insert(
+            step_v,
+            Constant::Int {
+                value: step,
+                bits: 32,
+            },
+        );
+
+        let f_id = FunctionId(make_id("func", b"f"));
+        let g_id = FunctionId(make_id("func", b"g"));
+        let f = mutual_member("f", f_id, g_id, vid("f_n"), cmp, bound_v, step_v, i32t, i1t);
+        let g = mutual_member("g", g_id, f_id, vid("g_n"), cmp, bound_v, step_v, i32t, i1t);
+
+        let mut m = module_of(f, constants);
+        m.functions.push(g);
+        let scc: BTreeSet<FunctionId> = [f_id, g_id].into_iter().collect();
+        (m, scc)
+    }
+
+    #[test]
+    fn mutual_count_down_is_ranked() {
+        // f(n){ if (n>0) g(n-1); }  g(n){ if (n>0) f(n-1); }  — |n| decreases on
+        // every cross-call under the shared guard n>0 ⇒ the SCC is ranked by f=n.
+        let (m, scc) = mutual_pair(BinaryOp::ICmpSgt, 0, -1);
+        assert!(mutual_recursion_is_ranked(&m, &scc));
+    }
+
+    #[test]
+    fn mutual_count_down_to_const_is_ranked() {
+        // f(n){ if (n>3) g(n-1); }  g(n){ if (n>3) f(n-1); }  → f = n - 3.
+        let (m, scc) = mutual_pair(BinaryOp::ICmpSgt, 3, -1);
+        assert!(mutual_recursion_is_ranked(&m, &scc));
+    }
+
+    #[test]
+    fn mutual_count_up_not_ranked() {
+        // f(n){ if (n>0) g(n+1); }  g(n){ if (n>0) f(n+1); }  — recurses forever for
+        // n > 0; no ranking function ⇒ abstain (never a wrong `true`).
+        let (m, scc) = mutual_pair(BinaryOp::ICmpSgt, 0, 1);
+        assert!(!mutual_recursion_is_ranked(&m, &scc));
+    }
+
+    #[test]
+    fn mutual_ne_guard_not_ranked() {
+        // A `!=` guard is not convex; with only a type bound the argument can walk
+        // past INT_MIN ⇒ abstain (this diverges for a negative signed `n`).
+        let (m, scc) = mutual_pair(BinaryOp::ICmpNe, 0, -1);
+        assert!(!mutual_recursion_is_ranked(&m, &scc));
+    }
+
+    #[test]
+    fn mutual_singleton_scc_abstains() {
+        // A size-1 SCC is not mutual recursion — the dedicated `recursion_is_ranked`
+        // path handles it; the mutual builder abstains.
+        let (m, _) = mutual_pair(BinaryOp::ICmpSgt, 0, -1);
+        let solo: BTreeSet<FunctionId> = [m.functions[0].id].into_iter().collect();
+        assert!(!mutual_recursion_is_ranked(&m, &solo));
     }
 }

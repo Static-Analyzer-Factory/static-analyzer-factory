@@ -198,14 +198,26 @@ pub fn program_structurally_terminates(module: &AirModule) -> bool {
     }
 
     // (A) Every reachable call-graph SCC is either a single non-recursive node
-    // (acyclic) or a single **self-recursive** function whose recursion admits a
-    // linear ranking function (`ranking::recursion_is_ranked` — a complete, sound
-    // termination proof over the recursion depth). Mutual recursion (any SCC of
-    // size > 1) forces abstain. Returns the set of self-recursive functions that
-    // must be recursion-ranked below, or `None` on mutual recursion.
-    let Some(recursive_selfs) = reachable_recursive_selfs(&cg, &reachable_nodes) else {
+    // (acyclic), a single **self-recursive** function whose recursion admits a
+    // linear ranking function (`ranking::recursion_is_ranked`), or an SCC of ≥2
+    // **mutually-recursive** functions whose whole cycle admits a linear ranking
+    // function (`ranking::mutual_recursion_is_ranked`) — each a complete, sound
+    // termination proof over the recursion depth. Returns the self-recursive
+    // functions that must be recursion-ranked and the mutual-recursion SCCs that
+    // must be mutual-ranked below, or `None` if any SCC contains a non-function
+    // (indirect/external) node on a cycle.
+    let Some((recursive_selfs, mutual_sccs)) = reachable_recursive_selfs(&cg, &reachable_nodes)
+    else {
         return false;
     };
+
+    // (A-mutual) every mutually-recursive SCC must be jointly ranked.
+    if !mutual_sccs
+        .iter()
+        .all(|scc| crate::ranking::mutual_recursion_is_ranked(module, scc))
+    {
+        return false;
+    }
 
     // (L) every reachable defined function is either loop-free OR has all of its
     // natural loops proven terminating by linear ranking-function synthesis
@@ -229,18 +241,31 @@ pub fn program_structurally_terminates(module: &AirModule) -> bool {
 ///
 /// `reachable` is the DFS closure from `main`'s node, so it is closed under the
 /// call graph's successor relation and [`tarjan_scc`] sees only intra-reachable
-/// edges. Returns `Some(selfs)` — the [`FunctionId`]s of the **self-recursive**
-/// functions (size-1 SCCs with a self-edge), which the caller must additionally
-/// prove recursion-ranked — or `None` if any SCC has more than one node (mutual
-/// recursion, unsupported ⇒ abstain) or a self-edge sits on a non-function node.
+/// edges. Returns `Some((selfs, mutual_sccs))`:
+/// - `selfs` — the [`FunctionId`]s of the **self-recursive** functions (size-1
+///   SCCs with a self-edge), which the caller must prove recursion-ranked;
+/// - `mutual_sccs` — one [`FunctionId`] set per **mutual-recursion** SCC (size
+///   > 1), which the caller must prove jointly mutual-ranked.
+///
+/// Returns `None` if any recursive SCC (self-edge, or size > 1) contains a
+/// non-function node — an external/indirect node cannot be ranked (the (I) check
+/// already rejected indirect nodes, so this is defense-in-depth).
 fn reachable_recursive_selfs(
     cg: &CallGraph,
     reachable: &BTreeSet<CallGraphNode>,
-) -> Option<BTreeSet<FunctionId>> {
+) -> Option<(BTreeSet<FunctionId>, Vec<BTreeSet<FunctionId>>)> {
     let mut selfs = BTreeSet::new();
+    let mut mutual_sccs: Vec<BTreeSet<FunctionId>> = Vec::new();
     for scc in tarjan_scc(reachable, cg) {
         if scc.len() > 1 {
-            return None;
+            // Mutual recursion: every node on the cycle must be a concrete
+            // function to be jointly ranked.
+            let mut fids = BTreeSet::new();
+            for node in &scc {
+                fids.insert(node.function_id()?);
+            }
+            mutual_sccs.push(fids);
+            continue;
         }
         if let Some(node) = scc.iter().next() {
             let self_edge = cg
@@ -254,7 +279,7 @@ fn reachable_recursive_selfs(
             }
         }
     }
-    Some(selfs)
+    Some((selfs, mutual_sccs))
 }
 
 // ---------------------------------------------------------------------------
