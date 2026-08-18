@@ -2305,7 +2305,7 @@ fn no_data_race_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
 
     // Gate 4: TSan is the sole soundness arbiter (HB-based — only reports a race
     // it concretely observes).
-    match tsan_confirm(ctx.input, ctx.stub, ctx.tempdir, ctx.clang) {
+    match tsan_confirm(ctx.input, ctx.module, ctx.stub, ctx.tempdir, ctx.clang) {
         Ok(Some(hit)) => {
             let programfile = ctx.input.file_name().map_or_else(
                 || ctx.input.display().to_string(),
@@ -2433,12 +2433,26 @@ fn synthesize_tsan_driver() -> String {
 /// execution.
 ///
 /// Compiles the ORIGINAL program with `-fsanitize=thread -pthread -g` + the
-/// nondet driver, runs it under the [`NONDET_CONSTS`] mini-fuzz capturing stderr
-/// to a file, and parses the report ([`saf_svcomp::parse_tsan_report`], which
-/// applies R1 — only a genuine `data race` warning confirms). `Ok(Some(hit))` is
-/// a confirmed race; `Ok(None)` is inconclusive (no report / compile-link failure
-/// / timeout) ⇒ the caller keeps `unknown`. Because `TSan` is happens-before-based,
-/// a reported race is a real race for the observed inputs, so confirming is sound.
+/// nondet driver, runs it under the [`replay_candidates`] mini-fuzz (the fixed
+/// [`NONDET_CONSTS`] spread followed by the program's own branch-steering
+/// literals) capturing stderr to a file, and parses the report
+/// ([`saf_svcomp::parse_tsan_report`], which applies R1 — only a genuine `data
+/// race` warning confirms). `Ok(Some(hit))` is a confirmed race; `Ok(None)` is
+/// inconclusive (no report / compile-link failure / timeout) ⇒ the caller keeps
+/// `unknown`. Because `TSan` is happens-before-based, a reported race is a real
+/// race for the observed inputs, so confirming is sound.
+///
+/// # Input steering (R5-legal nondet choices)
+///
+/// Many concurrency FALSEs gate their racing path on a nondet input range — e.g.
+/// `n = __VERIFIER_nondet_uint(); assume_abort_if_not(n >= 5 && n <= 10);` before
+/// spawning `n` racing threads. The fixed spread (`0,1,2,42,255,…`) contains no
+/// value in `[5,10]`, so the program aborts before any thread is created and the
+/// race is never observed. Feeding the program's OWN comparison literals (`5`,
+/// `10`) into the sweep via [`replay_candidates`] reaches the spawn. Each steered
+/// value is just another concrete nondet input the verifier may legally choose
+/// (R5); `TSan` remains the sole arbiter, so this only widens *reachability* and
+/// cannot manufacture a race the program does not have.
 ///
 /// # Data model (R3 exception — soundly compile LP64 even for ILP32 tasks)
 ///
@@ -2459,6 +2473,7 @@ fn synthesize_tsan_driver() -> String {
 /// validator re-analyzes under the declared model.)
 fn tsan_confirm(
     input: &Path,
+    module: &saf_core::air::AirModule,
     stub: &Path,
     dir: &Path,
     clang: &str,
@@ -2506,7 +2521,10 @@ fn tsan_confirm(
     }
 
     let timeout = replay_timeout();
-    for &k in NONDET_CONSTS {
+    // Fixed spread FIRST (committed byte-for-byte behavior is a prefix), then the
+    // program's own guard literals for nondet-input-gated racing paths.
+    let candidates = replay_candidates(NONDET_CONSTS, module);
+    for &k in &candidates {
         // Redirect the child's stderr to a FILE (not a pipe) so a large TSan
         // report cannot deadlock on a full pipe buffer while we poll the timeout.
         let errfile =
@@ -3560,6 +3578,35 @@ mod verify_tests {
         assert_eq!(
             replay_candidates(NONDET_CONSTS, &module),
             NONDET_CONSTS.to_vec()
+        );
+    }
+
+    #[test]
+    fn tsan_sweep_includes_range_guard_literals_absent_from_the_fixed_spread() {
+        // Regression for the no-data-race input-steering gap: a program that gates
+        // its racing thread spawns behind `assume_abort_if_not(n >= 5 && n <= 10)`
+        // aborts under every fixed NONDET_CONSTS value (none lands in [5,10]), so the
+        // TSan replay never observes the race. The confirmer now derives its sweep
+        // from `replay_candidates(NONDET_CONSTS, module)`, which appends the program's
+        // OWN comparison literals (5 and 10) — reaching the spawn so TSan can arbitrate.
+        let module = module_with_guard_constants(&[5, 10]);
+        let sweep = replay_candidates(NONDET_CONSTS, &module);
+        assert!(
+            sweep.starts_with(NONDET_CONSTS),
+            "committed fixed spread stays the prefix (0 regression)"
+        );
+        assert!(
+            sweep.contains(&5),
+            "range-lower guard literal must be steered"
+        );
+        assert!(
+            sweep.contains(&10),
+            "range-upper guard literal must be steered"
+        );
+        // None of the fixed constants satisfy 5 <= n <= 10, so steering is essential.
+        assert!(
+            !NONDET_CONSTS.iter().any(|&k| (5..=10).contains(&k)),
+            "the fixed spread alone cannot reach the [5,10]-gated spawn"
         );
     }
 
