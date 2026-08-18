@@ -1672,13 +1672,38 @@ fn overflow_boundary_consts(data_model: saf_svcomp::DataModel) -> Vec<i64> {
     v
 }
 
-/// Assemble the overflow confirmer's mini-fuzz candidate list: the fixed
-/// [`OVERFLOW_CONSTS`] spread FIRST (byte-for-byte prefix — 0 regression on tasks
-/// the committed sweep already confirms), then — when the reachable program is
-/// loop-free — the type-boundary probes ([`overflow_boundary_consts`]), then
-/// program-literal branch steering to fill the remaining budget. Deduplicated;
-/// bounded by [`OVERFLOW_MAX_CANDIDATES`]. Deterministic (`BTreeSet`-ordered
-/// steering, fixed prefixes).
+/// Yield-ordering key for an overflow mini-fuzz candidate: sorts by DESCENDING
+/// magnitude, with `0` placed last.
+///
+/// A large-magnitude input drives a *direct* signed overflow on the first few
+/// operations (`k*nondet()`, `nondet()+nondet()`, `nondet()*nondet()`), whereas a
+/// small input rarely overflows a straight-line computation. Ordering the sweep so
+/// the high-magnitude probes run FIRST is the load-bearing fix for
+/// infinite/long-running loops (`while (1) { acc += 2*nondet(); }`, the CIL
+/// `while(1)` state machines): every *non*-overflowing constant spins that loop to
+/// the per-candidate replay timeout, so a productive constant buried behind a dozen
+/// small ones is never reached before the task-level budget is spent — and the
+/// confirmable FALSE is lost. Sorting is SOUND and DETERMINISTIC: it changes only
+/// the ORDER of an unchanged constant SET; `UBSan` remains the sole R2 arbiter and
+/// the trap is re-triggered on the original program (R6).
+fn overflow_yield_rank(v: i64) -> (u8, std::cmp::Reverse<u64>) {
+    // (bucket, key): bucket 0 = nonzero (sorted by descending magnitude), 1 = zero
+    // (last). `unsigned_abs` avoids the `i64::MIN` `abs` overflow.
+    if v == 0 {
+        (1, std::cmp::Reverse(0))
+    } else {
+        (0, std::cmp::Reverse(v.unsigned_abs()))
+    }
+}
+
+/// Assemble the overflow confirmer's mini-fuzz candidate list from three sources —
+/// the fixed [`OVERFLOW_CONSTS`] spread, the type-boundary probes
+/// ([`overflow_boundary_consts`], only when every reachable loop is provably ranked),
+/// and program-literal branch steering — then order them by DESCENDING overflow
+/// yield ([`overflow_yield_rank`]) so the high-magnitude, direct-overflow probes run
+/// first. Deduplicated (first occurrence wins after the stable sort); bounded by
+/// [`OVERFLOW_MAX_CANDIDATES`]. Deterministic (fixed spread + `BTreeSet`-ordered
+/// steering, then a total order on the values).
 fn overflow_replay_candidates(
     module: &saf_core::air::AirModule,
     data_model: saf_svcomp::DataModel,
@@ -1699,6 +1724,11 @@ fn overflow_replay_candidates(
             candidates.push(k);
         }
     }
+    // Order by descending overflow yield so long-running loops reach a productive
+    // constant before the per-candidate replay budget is exhausted (see
+    // `overflow_yield_rank`). `sort_by_key` is a stable sort over a deduplicated,
+    // deterministic input, so the result is a fixed total order.
+    candidates.sort_by_key(|&v| overflow_yield_rank(v));
     candidates
 }
 
@@ -3758,10 +3788,14 @@ mod verify_tests {
         // A single-block main (no back-edge) is loop-free -> INT_MAX is injected.
         let module = module_with_guard_constants(&[]);
         let got = overflow_replay_candidates(&module, saf_svcomp::DataModel::LP64);
-        assert!(
-            got.starts_with(OVERFLOW_CONSTS),
-            "fixed spread must remain the prefix (0 regression)"
-        );
+        // Same constant SET as before (order is now by yield): every fixed spread value
+        // is still probed, plus the boundary probes.
+        for &v in OVERFLOW_CONSTS {
+            assert!(
+                got.contains(&v),
+                "fixed spread value {v} must still be probed"
+            );
+        }
         assert!(
             got.contains(&2_147_483_647),
             "loop-free program must get the INT_MAX boundary probe"
@@ -3771,6 +3805,13 @@ mod verify_tests {
             "LP64 loop-free program must get the 64-bit boundary probe"
         );
         assert!(got.len() <= OVERFLOW_MAX_CANDIDATES);
+        // Yield order: the largest magnitude runs first, `0` runs last.
+        assert_eq!(
+            got.first(),
+            Some(&9_223_372_036_854_775_807),
+            "highest-magnitude probe (LONG_MAX) runs first"
+        );
+        assert_eq!(got.last(), Some(&0), "the 0 probe runs last");
     }
 
     #[test]
@@ -3779,10 +3820,14 @@ mod verify_tests {
         // is the gate that keeps the termination-* loop-counter false alarm out.
         let module = module_with_loop(&[]);
         let got = overflow_replay_candidates(&module, saf_svcomp::DataModel::LP64);
+        // Same SET as the committed fixed spread (no boundary), only reordered by yield.
+        let mut sorted_got = got.clone();
+        sorted_got.sort_unstable();
+        let mut expect = OVERFLOW_CONSTS.to_vec();
+        expect.sort_unstable();
         assert_eq!(
-            got,
-            OVERFLOW_CONSTS.to_vec(),
-            "looping program keeps exactly the committed fixed spread"
+            sorted_got, expect,
+            "looping program keeps exactly the committed fixed spread (set)"
         );
         assert!(
             !got.contains(&2_147_483_647),
@@ -3791,16 +3836,24 @@ mod verify_tests {
     }
 
     #[test]
-    fn overflow_candidates_boundary_precedes_branch_steering() {
-        // Boundary probes are appended before branch-steered literals, and both land
-        // after the fixed spread. A loop-free module with a novel guard literal 777.
+    fn overflow_candidates_are_ordered_by_descending_yield() {
+        // The sweep is ordered so high-magnitude direct-overflow probes run first and
+        // the (non-overflowing) `0` probe runs last — the load-bearing ordering that
+        // lets long-running loops confirm before the per-candidate budget is spent.
         let module = module_with_guard_constants(&[777]);
         let got = overflow_replay_candidates(&module, saf_svcomp::DataModel::LP64);
+        // Magnitudes are non-increasing until the final `0`.
+        let nonzero: Vec<i64> = got.iter().copied().filter(|&v| v != 0).collect();
+        for w in nonzero.windows(2) {
+            assert!(
+                w[0].unsigned_abs() >= w[1].unsigned_abs(),
+                "candidates must be ordered by descending magnitude: {w:?}"
+            );
+        }
+        assert_eq!(got.last(), Some(&0), "0 is probed last");
+        // The boundary probe still precedes the smaller branch-steered guard literal.
         let pos_boundary = got.iter().position(|&v| v == 2_147_483_647).unwrap();
         let pos_guard = got.iter().position(|&v| v == 777).unwrap();
-        assert!(
-            pos_boundary < pos_guard,
-            "boundary probes come before branch-steered guard literals"
-        );
+        assert!(pos_boundary < pos_guard);
     }
 }
