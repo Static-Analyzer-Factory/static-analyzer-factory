@@ -954,6 +954,34 @@ fn compile_to_ir(
     stub: &Path,
     dir: &Path,
 ) -> anyhow::Result<PathBuf> {
+    // The default ingestion recipe: no extra clang flags, mem2reg-only promotion.
+    // This is the IR every confirmer (unreach/memsafety/overflow/race) sees.
+    compile_to_ir_with(input, data_model, stub, dir, &[], "mem2reg")
+}
+
+/// Compile a C program to promoted LLVM IR in `dir`, returning the `.ll` path.
+///
+/// Generalizes [`compile_to_ir`] with two knobs: `extra_clang_args` (appended to
+/// the `-emit-llvm` invocation) and `opt_passes` (the `opt -passes=<…>` pipeline
+/// run after emission). The default recipe (`compile_to_ir`) passes no extra clang
+/// args and `"mem2reg"`. The `termination` re-ingestion (see
+/// [`compile_to_ir_termination`]) uses a richer promotion pipeline to expose
+/// memory-backed loop induction variables to the ranking synthesizer.
+///
+/// Mirrors the offline SV-COMP recipe: clang emits `-O0` IR with
+/// `-disable-O0-optnone` (so `opt`'s promotion passes are not a no-op), the
+/// data-model flag, and the `-include`d stub header. Subprocess stdout is discarded
+/// so the parent's stdout stays verdict-only; stderr is inherited (diagnostics). A
+/// two-pass assert-macro fallback (see [`write_assert_neutralizer`]) rescues
+/// programs that define their own `__VERIFIER_assert` function.
+fn compile_to_ir_with(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    stub: &Path,
+    dir: &Path,
+    extra_clang_args: &[&str],
+    opt_passes: &str,
+) -> anyhow::Result<PathBuf> {
     use anyhow::Context;
     use std::process::{Command, Stdio};
 
@@ -977,6 +1005,7 @@ fn compile_to_ir(
             "-disable-O0-optnone",
             "-Wno-everything",
         ])
+        .args(extra_clang_args)
         .arg(data_model.clang_flag())
         .arg("-include")
         .arg(stub);
@@ -1005,16 +1034,64 @@ fn compile_to_ir(
     anyhow::ensure!(ok, "{clang} failed to compile {}", input.display());
 
     let opt_status = Command::new(&opt)
-        .args(["-S", "-passes=mem2reg"])
+        .arg("-S")
+        .arg(format!("-passes={opt_passes}"))
         .arg(&ir)
         .arg("-o")
         .arg(&ir)
         .stdout(Stdio::null())
         .status()
         .with_context(|| format!("failed to spawn {opt}"))?;
-    anyhow::ensure!(opt_status.success(), "{opt} mem2reg pass failed");
+    anyhow::ensure!(opt_status.success(), "{opt} promotion pass failed");
 
     Ok(ir)
+}
+
+/// Re-compile `input` for the `termination` structural proof with a richer
+/// promotion pipeline, ingest it, and return the fresh `AirModule`.
+///
+/// # Why a second ingestion
+///
+/// The shared [`compile_to_ir`] runs only `mem2reg`, which promotes *static*
+/// scalar allocas to SSA. The `termination-memory-alloca` / `-linkedlists`
+/// families deliberately place each loop induction variable in a heap/stack cell
+/// obtained via the `alloca()` **library call** (`int *i = alloca(sizeof(int))`).
+/// Clang lowers that to a dynamically-sized `alloca i8, i64 4` accessed through a
+/// bit-cast `i32` pointer — a shape `mem2reg` refuses to promote — so the loop has
+/// **no header phi**, the ranking synthesizer sees no induction variable, and the
+/// proof abstains on the entire family. Running `instcombine` (canonicalizes the
+/// alloca to `[4 x i8]`), then `sroa` (splits the single-scalar cell), then
+/// `mem2reg` (promotes to phis) recovers the SSA induction variables the ranker
+/// needs.
+///
+/// # Soundness
+///
+/// All three passes are semantics-preserving, so the promoted module terminates on
+/// a given input **iff** the original does — a structural-termination proof over
+/// the promoted module therefore soundly implies the original terminates. To keep
+/// that equivalence airtight we additionally pass `-fno-finite-loops`, which strips
+/// the C `mustprogress` forward-progress attribute: without it an optimizer is
+/// permitted to *delete* a side-effect-free infinite loop, which could turn a
+/// genuinely non-terminating program into a terminating one and yield a wrong
+/// `true`. None of `instcombine`/`sroa`/`mem2reg` perform loop deletion, and with
+/// `mustprogress` gone none is even licensed to; the ranking synthesizer remains
+/// the sole termination arbiter.
+fn compile_to_ir_termination(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    stub: &Path,
+    dir: &Path,
+) -> anyhow::Result<saf_core::air::AirModule> {
+    let ir = compile_to_ir_with(
+        input,
+        data_model,
+        stub,
+        dir,
+        &["-fno-finite-loops"],
+        "instcombine,sroa,mem2reg",
+    )?;
+    let bundle = driver::AnalysisDriver::ingest(&[ir], CliFrontend::Llvm)?;
+    Ok(bundle.module)
 }
 
 /// The result of a verdict computation: the stdout line plus an optional
@@ -2299,7 +2376,25 @@ fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
 /// ∧ acyclic reachable call graph ∧ no reachable indirect call ∧ allowlisted
 /// externals); otherwise `unknown`. Never emits `false`.
 fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
-    if saf_svcomp::program_structurally_terminates(ctx.module) {
+    // Path 1: the shared mem2reg-only module (current behavior, preserved as a
+    // floor so this arm never regresses an already-emitted `true`).
+    let mut proven = saf_svcomp::program_structurally_terminates(ctx.module);
+
+    // Path 2 (additive): re-ingest with a richer promotion pipeline that exposes
+    // memory-backed loop induction variables (the `alloca()`-library-call families)
+    // to the ranking synthesizer. Both proofs are independently sound, so a `true`
+    // from either is sound; OR-ing them is strictly recall-additive. Any failure of
+    // the second ingestion falls through to Path 1's verdict.
+    if !proven {
+        match compile_to_ir_termination(ctx.input, ctx.data_model, ctx.stub, ctx.tempdir) {
+            Ok(promoted) => proven = saf_svcomp::program_structurally_terminates(&promoted),
+            Err(e) => eprintln!(
+                "saf verify: termination promotion re-ingest failed: {e:#} -> using mem2reg module"
+            ),
+        }
+    }
+
+    if proven {
         VerdictOutcome {
             verdict: saf_svcomp::termination_verdict().to_string(),
             witness: None,

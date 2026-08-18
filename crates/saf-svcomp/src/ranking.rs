@@ -462,12 +462,28 @@ fn build_loop_model(func: &AirFunction, module: &AirModule, li: &LoopInfo) -> Op
     }
     universe.extend(header_phis.iter().copied());
 
+    // Function parameters carry their declared type on [`AirParam`], not on any
+    // instruction [`Def`], so [`type_bounds`] (which reads `defs`) misses them.
+    // Index each param's `TypeId` so a param used as a loop bound (`for(;i<y;i++)`
+    // with `y` a parameter) still gets its type range — without it the `i+1`
+    // overflow check cannot bound `y ≤ INT_MAX`, so the counter is judged unstable
+    // and the (otherwise trivially ranked) increasing loop abstains.
+    let param_types: BTreeMap<ValueId, TypeId> = func
+        .params
+        .iter()
+        .filter_map(|p| p.param_type.map(|t| (p.id, t)))
+        .collect();
+
     // Type bounds for every integer leaf symbol with a *known* signedness and a
     // representable width — a valid fact about the real state, so adding it only
     // shrinks the region by truths (keeping it a superset of real states).
     let mut bounds: BTreeMap<ValueId, (i128, i128)> = BTreeMap::new();
     for &sym in &universe {
-        if let Some((lo, hi)) = type_bounds(sym, &defs, &signs, module) {
+        if let Some((lo, hi)) = type_bounds(sym, &defs, &signs, module).or_else(|| {
+            param_types
+                .get(&sym)
+                .and_then(|&t| bounds_from_type(sym, t, &signs, module))
+        }) {
             bounds.insert(sym, (lo, hi));
             region.push(Constraint {
                 coeffs: BTreeMap::from([(sym, 1)]),
@@ -2492,6 +2508,10 @@ mod tests {
     enum Bound {
         Const(i64),
         Nondet,
+        /// The bound is a **function parameter** (`i32`): its `TypeId` lives on
+        /// [`AirParam`], not on any instruction `Def`, so the loop model must read
+        /// the param table to bound it (regression guard for that fix).
+        Param,
     }
 
     /// Build a single-counter `while (x CMP bound) x += step;` loop as a module,
@@ -2545,6 +2565,8 @@ mod tests {
                 );
                 (bv, vec![call])
             }
+            // A parameter bound is added to `func.params` below (no Def record).
+            Bound::Param => (vid("param_bound"), vec![]),
         };
 
         // entry: [nondet?] ; br header
@@ -2600,10 +2622,23 @@ mod tests {
         let mut exit = AirBlock::new(e);
         exit.instructions.push(term("ret", Operation::Ret, vec![x]));
 
+        // When the bound is a parameter, declare it (typed `i32`) so the loop model
+        // can recover its type range from the param table.
+        let params = if matches!(bound, Bound::Param) {
+            vec![AirParam {
+                id: bound_v,
+                name: None,
+                index: 0,
+                param_type: Some(i32t),
+            }]
+        } else {
+            Vec::new()
+        };
+
         let func = AirFunction {
             id: FunctionId(make_id("func", b"main")),
             name: "main".to_string(),
-            params: Vec::new(),
+            params,
             blocks: vec![entry, header, latch, exit],
             entry_block: Some(b0),
             is_declaration: false,
@@ -2651,6 +2686,16 @@ mod tests {
     fn count_up_strict_const_bound_is_ranked() {
         // while (i < 100) i++  (signed)  →  f = 100 - i.
         let m = counter_loop(BinaryOp::ICmpSlt, Bound::Const(100), 1);
+        assert!(ranked(&m));
+    }
+
+    #[test]
+    fn count_up_strict_param_bound_is_ranked() {
+        // for (i = 0; i < y; i++) where `y` is a FUNCTION PARAMETER → f = y - i.
+        // Without the param-table type bound the `i + 1` overflow check cannot
+        // bound `y ≤ INT_MAX`, judges the counter unstable, and abstains; with it,
+        // this ranks like the `Bound::Nondet` sibling above.
+        let m = counter_loop(BinaryOp::ICmpSlt, Bound::Param, 1);
         assert!(ranked(&m));
     }
 
