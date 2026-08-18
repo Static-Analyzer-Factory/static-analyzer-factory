@@ -2515,8 +2515,14 @@ fn tsan_confirm(
         .with_context(|| "writing TSan replay driver")?;
 
     let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
-    let status = Command::new(clang)
-        .args([
+    // Shared compile of ORIGINAL program + driver under TSan. `extra` carries the
+    // inline-linkage flag on the first attempt; on failure we retry without it (a
+    // rare program with both an `inline` and an external definition would
+    // duplicate-define under GNU89 semantics — the fallback preserves the prior
+    // C99 behavior so we never regress a previously-compiling task).
+    let compile = |extra: &[&str]| -> anyhow::Result<bool> {
+        let mut cmd = Command::new(clang);
+        cmd.args([
             "-O0",
             "-g",
             "-fsanitize=thread",
@@ -2528,20 +2534,33 @@ fn tsan_confirm(
             // Determinism: redirect rand()/srand() to the driver's __wrap_* stubs.
             "-Wl,--wrap=rand",
             "-Wl,--wrap=srand",
-        ])
-        .arg("-include")
-        .arg(stub)
-        .arg("-I")
-        .arg(srcdir)
-        .arg(input)
-        .arg(&driver_src)
-        .arg("-o")
-        .arg(&harness)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("failed to spawn {clang} for TSan replay"))?;
-    if !status.success() {
+        ]);
+        cmd.args(extra)
+            .arg("-include")
+            .arg(stub)
+            .arg("-I")
+            .arg(srcdir)
+            .arg(input)
+            .arg(&driver_src)
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        Ok(cmd
+            .status()
+            .with_context(|| format!("failed to spawn {clang} for TSan replay"))?
+            .success())
+    };
+
+    // Emit out-of-line definitions for C99 `inline` helpers. Many SV-COMP
+    // concurrency programs (e.g. `pthread-ext`) define lock helpers as bare
+    // `inline void acquire_lock() { … }`; under C99 semantics at -O0 clang emits
+    // an *inline definition* with no external symbol, so a non-inlined call
+    // link-fails ("undefined reference to acquire_lock") and the whole confirm
+    // aborts — indistinguishable from "no race observed". GNU89 inline semantics
+    // always emit a definition, fixing the link. This is a pure linkage change
+    // (identical function bodies) and cannot alter the race.
+    if !compile(&["-fgnu89-inline"])? && !compile(&[])? {
         // Compile/link failure (e.g. a missing 32-bit TSan runtime) -> inconclusive.
         return Ok(None);
     }

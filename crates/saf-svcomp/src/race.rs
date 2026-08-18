@@ -33,9 +33,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use saf_core::air::{AirModule, Operation};
-use saf_core::ids::{FunctionId, InstId, LocId, ValueId};
+use saf_core::ids::{BlockId, FunctionId, InstId, LocId, ValueId};
 
 use saf_analysis::callgraph::CallGraph;
+use saf_analysis::cfg::Cfg;
 use saf_analysis::icfg::Icfg;
 use saf_analysis::mta::{MtaAnalysis, MtaConfig, ThreadId, compute_module_locksets};
 use saf_analysis::{PtaConfig, PtaContext, PtaResult};
@@ -112,6 +113,12 @@ pub fn find_race_candidates(module: &AirModule) -> Vec<RaceCandidate> {
     let locksets = compute_module_locksets(module, &icfg, &mta_config);
     let accesses = collect_thread_accesses(module, &callgraph, &pta, &mta, &locksets);
 
+    // Threads that may have ≥2 concurrently-live instances. Such a thread races
+    // with a *sibling instance of itself*, so its own accesses form same-thread
+    // race candidates the cross-thread scan below would miss (it rejects pairs
+    // sharing a thread id).
+    let recurrent = recurrent_thread_ids(module, &mta);
+
     // Eraser-style state refinement: a location accessed by only ONE thread is
     // not shared, so it cannot race — suppress it. (This subsumes the
     // virgin/exclusive states of Eraser's machine for the purpose of candidate
@@ -127,13 +134,16 @@ pub fn find_race_candidates(module: &AirModule) -> Vec<RaceCandidate> {
             }
         }
     }
+    // A location is "shared" if ≥2 distinct threads touch it OR a single
+    // recurrent thread touches it (two instances of that thread = two logical
+    // accessors of the same location).
     let shared: BTreeSet<LocId> = loc_threads
         .iter()
-        .filter(|(_, ts)| ts.len() >= 2)
+        .filter(|(_, ts)| ts.len() >= 2 || ts.iter().any(|t| recurrent.contains(t)))
         .map(|(loc, _)| *loc)
         .collect();
 
-    enumerate_candidates(&pta, &mta, &accesses, &shared)
+    enumerate_candidates(&pta, &mta, &accesses, &shared, &recurrent)
 }
 
 /// Collect every thread's static load/store footprint, canonicalizing the
@@ -196,6 +206,7 @@ fn enumerate_candidates(
     mta: &saf_analysis::mta::MtaResult,
     accesses: &[ThreadAccess],
     shared: &BTreeSet<LocId>,
+    recurrent: &BTreeSet<u32>,
 ) -> Vec<RaceCandidate> {
     let touches_shared = |a: &ThreadAccess| -> bool {
         pta.points_to_ref(a.ptr)
@@ -207,12 +218,22 @@ fn enumerate_candidates(
         if !touches_shared(a) {
             continue;
         }
-        for b in accesses.iter().skip(i + 1) {
-            // A race needs two distinct threads that may run concurrently, with
-            // at least one write and no provably common lock, on a MAY-aliasing
-            // shared location.
-            if a.thread_id == b.thread_id
-                || !mta.may_run_concurrently(ThreadId(a.thread_id), ThreadId(b.thread_id))
+        // Cross-thread pairs, and — for a recurrent thread — pairs with a sibling
+        // instance of ITSELF. `skip(i)` (not `i + 1`) so the diagonal is included
+        // for the self-race case: a single write instruction executed by two
+        // instances of a recurrent thread races on a self-aliasing location.
+        for b in accesses.iter().skip(i) {
+            let same_thread = a.thread_id == b.thread_id;
+            let concurrent = if same_thread {
+                // Two instances of one recurrent thread always may-run-in-parallel.
+                recurrent.contains(&a.thread_id)
+            } else {
+                mta.may_run_concurrently(ThreadId(a.thread_id), ThreadId(b.thread_id))
+            };
+            // A race needs two accesses that may run concurrently, with at least
+            // one write and no provably common lock, on a MAY-aliasing shared
+            // location.
+            if !concurrent
                 || (!a.write && !b.write)
                 || !touches_shared(b)
                 || !a.locks.is_disjoint(&b.locks)
@@ -234,6 +255,101 @@ fn enumerate_candidates(
         }
     }
     candidates.into_iter().collect()
+}
+
+/// Identify thread entry-functions that may have **≥2 concurrently-live
+/// instances**, so their accesses can race with a sibling instance of the same
+/// function.
+///
+/// A spawned thread is *recurrent* if EITHER:
+/// - ≥2 distinct thread contexts share it as their entry function (spawned from
+///   ≥2 call sites), OR
+/// - its `pthread_create` call site lies inside a CFG loop of the spawning
+///   function (spawned repeatedly, e.g. `while (1) { pthread_create(…, thr, …); }`
+///   or `for (i < N) pthread_create(…, thr, …)`).
+///
+/// This is a finder-only refinement: it can only *widen* the candidate set and
+/// so *gate* an extra TSan confirm run — `ThreadSanitizer` remains the sole
+/// soundness arbiter, so an over-broad recurrence guess never yields a verdict.
+fn recurrent_thread_ids(module: &AirModule, mta: &saf_analysis::mta::MtaResult) -> BTreeSet<u32> {
+    let mut recurrent = BTreeSet::new();
+
+    // (1) Same entry function reached by ≥2 distinct thread contexts.
+    let mut by_entry: BTreeMap<FunctionId, Vec<u32>> = BTreeMap::new();
+    for (tid, ctx) in &mta.thread_graph.threads {
+        if ctx.creation_site.is_some() {
+            by_entry.entry(ctx.entry_function).or_default().push(tid.0);
+        }
+    }
+    for ids in by_entry.values() {
+        if ids.len() >= 2 {
+            recurrent.extend(ids.iter().copied());
+        }
+    }
+
+    // (2) Creation site inside a CFG loop of its spawning function. Cache each
+    // function's CFG (a create site may be shared across contexts).
+    let mut cfg_cache: BTreeMap<FunctionId, Option<Cfg>> = BTreeMap::new();
+    for (tid, ctx) in &mta.thread_graph.threads {
+        if recurrent.contains(&tid.0) {
+            continue;
+        }
+        let Some(site) = ctx.creation_site else {
+            continue;
+        };
+        let Some((fid, bid)) = locate_inst(module, site) else {
+            continue;
+        };
+        let cfg = cfg_cache.entry(fid).or_insert_with(|| {
+            module
+                .functions
+                .iter()
+                .find(|f| f.id == fid)
+                .map(Cfg::build)
+        });
+        if let Some(cfg) = cfg {
+            if block_in_cycle(cfg, bid) {
+                recurrent.insert(tid.0);
+            }
+        }
+    }
+
+    recurrent
+}
+
+/// Locate the `(function, block)` containing instruction `target`.
+fn locate_inst(module: &AirModule, target: InstId) -> Option<(FunctionId, BlockId)> {
+    for func in &module.functions {
+        for block in &func.blocks {
+            if block.instructions.iter().any(|inst| inst.id == target) {
+                return Some((func.id, block.id));
+            }
+        }
+    }
+    None
+}
+
+/// Whether `start` lies on a cycle in `cfg` (i.e. a nontrivial path
+/// `start → … → start` exists — the block is inside a loop).
+fn block_in_cycle(cfg: &Cfg, start: BlockId) -> bool {
+    let mut seen: BTreeSet<BlockId> = BTreeSet::new();
+    let mut stack: Vec<BlockId> = cfg
+        .successors
+        .get(&start)
+        .map(|s| s.iter().copied().collect())
+        .unwrap_or_default();
+    while let Some(b) = stack.pop() {
+        if b == start {
+            return true;
+        }
+        if !seen.insert(b) {
+            continue;
+        }
+        if let Some(succs) = cfg.successors.get(&b) {
+            stack.extend(succs.iter().copied());
+        }
+    }
+    false
 }
 
 /// Canonical ordering of a candidate pair so that `(a,b)` and `(b,a)` dedup to
@@ -569,6 +685,56 @@ SUMMARY: ThreadSanitizer: data race /tmp/race.c:8 in worker
         let report =
             "WARNING: ThreadSanitizer: data race on vptr (ctor/dtor vs virtual call) (pid=1)\n";
         assert!(parse_tsan_report(report).is_some());
+    }
+
+    #[test]
+    fn block_in_cycle_detects_self_and_back_edges() {
+        use saf_analysis::cfg::Cfg;
+        use saf_core::id::make_id;
+        use saf_core::ids::FunctionId;
+
+        let b0 = BlockId::new(0);
+        let b1 = BlockId::new(1);
+        let b2 = BlockId::new(2);
+        let mut successors: BTreeMap<BlockId, BTreeSet<BlockId>> = BTreeMap::new();
+        // b0 -> b1 -> b1 (self loop) ; b1 -> b2 (exit). b0 is acyclic, b1 cyclic.
+        successors.insert(b0, [b1].into_iter().collect());
+        successors.insert(b1, [b1, b2].into_iter().collect());
+        successors.insert(b2, BTreeSet::new());
+        let cfg = Cfg {
+            function: FunctionId(make_id("f", b"race")),
+            entry: b0,
+            exits: [b2].into_iter().collect(),
+            successors,
+            predecessors: BTreeMap::new(),
+        };
+        assert!(block_in_cycle(&cfg, b1), "b1 self-loops -> in cycle");
+        assert!(!block_in_cycle(&cfg, b0), "b0 is not on any cycle");
+        assert!(!block_in_cycle(&cfg, b2), "b2 is a leaf");
+    }
+
+    #[test]
+    fn block_in_cycle_detects_multi_block_loop() {
+        use saf_analysis::cfg::Cfg;
+        use saf_core::id::make_id;
+        use saf_core::ids::FunctionId;
+
+        let (h, body, exit) = (BlockId::new(10), BlockId::new(11), BlockId::new(12));
+        let mut successors: BTreeMap<BlockId, BTreeSet<BlockId>> = BTreeMap::new();
+        // h -> body -> h (back edge) ; h -> exit.
+        successors.insert(h, [body, exit].into_iter().collect());
+        successors.insert(body, [h].into_iter().collect());
+        successors.insert(exit, BTreeSet::new());
+        let cfg = Cfg {
+            function: FunctionId(make_id("g", b"race")),
+            entry: h,
+            exits: [exit].into_iter().collect(),
+            successors,
+            predecessors: BTreeMap::new(),
+        };
+        assert!(block_in_cycle(&cfg, h), "loop header is on the cycle");
+        assert!(block_in_cycle(&cfg, body), "loop body is on the cycle");
+        assert!(!block_in_cycle(&cfg, exit), "exit is not on the cycle");
     }
 
     #[test]
