@@ -1703,27 +1703,199 @@ fn add_path_guards(
     let Some(&cond) = term.operands.first() else {
         return;
     };
-    let Some(def) = defs.get(&cond) else {
+    resolve_bool_guard(
+        region,
+        universe,
+        cond,
+        taken_true,
+        defs,
+        block_of,
+        header_phis,
+        module,
+        path_pred,
+        0,
+    );
+}
+
+/// Emit into `region` the affine constraints implied by boolean value `cond`
+/// holding polarity `want_true` along the current path.
+///
+/// The direct case is a comparison ([`comparison_constraints`]). But a
+/// `while (A && B)` / `while (A || B)` header condition is *not* a single
+/// comparison: clang short-circuits it into an `i1` **phi** (`%c = phi [false, …],
+/// [%b, …]`), and a `!x` guard into `xor %x, true`. Without following these, the
+/// second conjunct's guard is silently dropped, so the loop's true bound is
+/// invisible and an otherwise-rankable loop abstains. This resolver follows, along
+/// the *current path*:
+///
+/// - an **`i1` phi** to its incoming value from the path predecessor of the phi's
+///   block (the concrete branch taken here), same polarity;
+/// - a logical **`and`** taken *true* ⇒ both operands are true; a logical **`or`**
+///   taken *false* ⇒ both operands are false (the only convex, sound directions —
+///   the other direction is dropped);
+/// - a **`xor c, 1`** negation ⇒ recurse on the other operand with flipped
+///   polarity;
+/// - a **copy / freeze / integer cast** ⇒ recurse on the source, same polarity.
+///
+/// Every emitted constraint is a *necessary* condition of the branch being taken,
+/// so `region` stays a sound over-approximation (superset) of the reachable
+/// continuing states — adding it only shrinks the region, never drops a real
+/// transition. A boolean **constant** that contradicts `want_true` proves this
+/// path is infeasible; we record an unsatisfiable `−1 ≥ 0` so the branch region is
+/// empty and vacuously ranked (a `while (A && B)` body entered from the `A`-false
+/// side is such an infeasible path).
+// NOTE: one cohesive boolean-guard resolution (constant → comparison → phi →
+// and/or → xor → carrier); splitting the match arms into helpers would only
+// scatter the shared `recurse` closure and the `defs`/`path_pred` context.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn resolve_bool_guard(
+    region: &mut Vec<Constraint>,
+    universe: &mut BTreeSet<ValueId>,
+    cond: ValueId,
+    want_true: bool,
+    defs: &BTreeMap<ValueId, Def>,
+    block_of: &BTreeMap<ValueId, BlockId>,
+    header_phis: &BTreeSet<ValueId>,
+    module: &AirModule,
+    path_pred: &BTreeMap<BlockId, BlockId>,
+    depth: u32,
+) {
+    if depth > AFFINE_DEPTH_LIMIT {
         return;
-    };
-    let Operation::BinaryOp { kind } = &def.op else {
-        return;
-    };
-    let (Some(&lo), Some(&ro)) = (def.operands.first(), def.operands.get(1)) else {
-        return;
-    };
-    let (Some(lhs), Some(rhs)) = (
-        resolve_affine_path(lo, defs, block_of, header_phis, module, path_pred, 0),
-        resolve_affine_path(ro, defs, block_of, header_phis, module, path_pred, 0),
-    ) else {
-        return;
-    };
-    if let Some(cons) = comparison_constraints(*kind, &lhs, &rhs, taken_true) {
-        for c in cons {
-            universe.extend(c.coeffs.keys().copied());
-            region.push(c);
-        }
     }
+    // A boolean constant: consistent with `want_true` ⇒ vacuous (no constraint);
+    // contradictory ⇒ this path is infeasible, so make the region unsatisfiable.
+    if let Some(Constant::Int { value, .. }) = module.constants.get(&cond) {
+        if (*value != 0) != want_true {
+            region.push(Constraint {
+                coeffs: BTreeMap::new(),
+                constant: -1,
+            });
+        }
+        return;
+    }
+    let Some(def) = defs.get(&cond) else {
+        return; // opaque leaf (param / nondet / global) ⇒ no usable constraint.
+    };
+    let recurse =
+        |region: &mut Vec<Constraint>, universe: &mut BTreeSet<ValueId>, v: ValueId, want: bool| {
+            resolve_bool_guard(
+                region,
+                universe,
+                v,
+                want,
+                defs,
+                block_of,
+                header_phis,
+                module,
+                path_pred,
+                depth + 1,
+            );
+        };
+    match &def.op {
+        // Direct integer comparison — the base case.
+        Operation::BinaryOp { kind } if is_int_comparison(*kind) => {
+            let (Some(&lo), Some(&ro)) = (def.operands.first(), def.operands.get(1)) else {
+                return;
+            };
+            let (Some(lhs), Some(rhs)) = (
+                resolve_affine_path(lo, defs, block_of, header_phis, module, path_pred, 0),
+                resolve_affine_path(ro, defs, block_of, header_phis, module, path_pred, 0),
+            ) else {
+                return;
+            };
+            if let Some(cons) = comparison_constraints(*kind, &lhs, &rhs, want_true) {
+                for c in cons {
+                    universe.extend(c.coeffs.keys().copied());
+                    region.push(c);
+                }
+            }
+        }
+        // `i1` short-circuit phi (the `&&` / `||` lowering): resolve to the value
+        // incoming from this path's predecessor of the phi's block, same polarity.
+        Operation::Phi { incoming } => {
+            let Some(blk) = block_of.get(&cond) else {
+                return;
+            };
+            let Some(pred) = path_pred.get(blk) else {
+                return;
+            };
+            if let Some((_, val)) = incoming.iter().find(|(p, _)| p == pred) {
+                recurse(region, universe, *val, want_true);
+            }
+        }
+        // Logical `and` taken true ⇒ both conjuncts true; logical `or` taken false
+        // ⇒ both disjuncts false. The opposite directions are non-convex (drop).
+        Operation::BinaryOp {
+            kind: BinaryOp::And,
+        } if want_true => {
+            for &op in def.operands.iter().take(2) {
+                recurse(region, universe, op, true);
+            }
+        }
+        Operation::BinaryOp { kind: BinaryOp::Or } if !want_true => {
+            for &op in def.operands.iter().take(2) {
+                recurse(region, universe, op, false);
+            }
+        }
+        // `xor v, 1` is `!v` on an `i1`; recurse on `v` with flipped polarity.
+        Operation::BinaryOp {
+            kind: BinaryOp::Xor,
+        } => {
+            let a = def.operands.first().copied();
+            let b = def.operands.get(1).copied();
+            let const_bit = |v: Option<ValueId>| {
+                v.and_then(|v| match module.constants.get(&v) {
+                    Some(Constant::Int { value, .. }) => Some(*value & 1 == 1),
+                    _ => None,
+                })
+            };
+            match (const_bit(a), const_bit(b)) {
+                // `xor v, true` ⇒ negate `v`; `xor v, false` ⇒ passthrough.
+                (Some(bit), _) => {
+                    if let Some(v) = b {
+                        recurse(region, universe, v, want_true ^ bit);
+                    }
+                }
+                (_, Some(bit)) => {
+                    if let Some(v) = a {
+                        recurse(region, universe, v, want_true ^ bit);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Value-preserving carriers of an `i1`: recurse on the source unchanged.
+        Operation::Copy
+        | Operation::Freeze
+        | Operation::Cast {
+            kind: CastKind::ZExt | CastKind::SExt | CastKind::Trunc,
+            ..
+        } => {
+            if let Some(&src) = def.operands.first() {
+                recurse(region, universe, src, want_true);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Is `kind` an integer comparison predicate (the ones [`comparison_constraints`]
+/// turns into affine half-spaces)?
+fn is_int_comparison(kind: BinaryOp) -> bool {
+    matches!(
+        kind,
+        BinaryOp::ICmpEq
+            | BinaryOp::ICmpNe
+            | BinaryOp::ICmpUgt
+            | BinaryOp::ICmpUge
+            | BinaryOp::ICmpUlt
+            | BinaryOp::ICmpUle
+            | BinaryOp::ICmpSgt
+            | BinaryOp::ICmpSge
+            | BinaryOp::ICmpSlt
+            | BinaryOp::ICmpSle
+    )
 }
 
 /// Path-sensitive affine expansion: like [`resolve_affine`], but a **non-header
@@ -3291,6 +3463,227 @@ mod tests {
 
         let func = main_func(vec![eb, hb, bb, tb, elb, latb, exb], entry);
         assert!(!ranked(&module_of(func, constants)));
+    }
+
+    // --- short-circuit `&&` header guard (i1 phi) ---------------------------
+
+    /// Build the CookSeeZuleger loop
+    /// `while (x > 0 && y > 0) { if (nondet) x = x - 1; else { x = *; y = y - 1; } }`,
+    /// whose `&&` header condition clang lowers to an `i1` **phi**
+    /// (`gp = phi [false, header], [y>0, h2]`). If `strict` is `false` the `else`
+    /// branch does `y = y + 1` instead — a genuinely non-terminating loop.
+    ///
+    /// Ranking needs the lexicographic tuple `(y, x)`: `y` bounds/ranks the
+    /// `y`-decreasing branch (whose `x` is havoced), `x` ranks the `x`-decreasing
+    /// branch. The `y ≥ 1` bound comes ONLY from the second `&&` conjunct, which is
+    /// hidden behind the `i1` phi — so this loop ranks iff the guard resolver
+    /// follows that phi.
+    #[allow(clippy::too_many_lines)]
+    fn cook_see_zuleger(decreasing: bool) -> AirModule {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+
+        let entry = bid("entry");
+        let h = bid("h");
+        let h2 = bid("h2");
+        let g = bid("g");
+        let body = bid("body");
+        let pa = bid("pa");
+        let pb = bid("pb");
+        let latch = bid("latch");
+        let exit = bid("exit");
+
+        let x = vid("x");
+        let y = vid("y");
+        let x0 = vid("x0");
+        let y0 = vid("y0");
+        let xn = vid("xn");
+        let yn = vid("yn");
+        let cx = vid("cx");
+        let cy = vid("cy");
+        let gp = vid("gp");
+        let cnd = vid("cnd");
+        let xa = vid("xa");
+        let xb = vid("xb");
+        let yb = vid("yb");
+        let zero = vid("zero");
+        let one = vid("one");
+        let false_c = vid("false_c");
+        constants.insert(zero, Constant::Int { value: 0, bits: 32 });
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+        constants.insert(false_c, Constant::Int { value: 0, bits: 1 });
+
+        // entry: x0 = nondet; y0 = nondet; br h
+        let mut eb = AirBlock::new(entry);
+        eb.instructions
+            .push(ndcall("nd_x0", "__VERIFIER_nondet_int", x0, i32t));
+        eb.instructions
+            .push(ndcall("nd_y0", "__VERIFIER_nondet_int", y0, i32t));
+        eb.instructions
+            .push(term("br_e", Operation::Br { target: h }, vec![]));
+
+        // h: phi x, phi y; cx = x > 0; condbr cx -> h2 else g
+        let mut hb = AirBlock::new(h);
+        hb.instructions.push(vinst(
+            "phi_x",
+            Operation::Phi {
+                incoming: vec![(entry, x0), (latch, xn)],
+            },
+            x,
+            vec![],
+            i32t,
+        ));
+        hb.instructions.push(vinst(
+            "phi_y",
+            Operation::Phi {
+                incoming: vec![(entry, y0), (latch, yn)],
+            },
+            y,
+            vec![],
+            i32t,
+        ));
+        hb.instructions.push(vinst(
+            "cmp_x",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            cx,
+            vec![x, zero],
+            i1t,
+        ));
+        hb.instructions.push(term(
+            "cb_h",
+            Operation::CondBr {
+                then_target: h2,
+                else_target: g,
+            },
+            vec![cx],
+        ));
+
+        // h2: cy = y > 0; br g
+        let mut h2b = AirBlock::new(h2);
+        h2b.instructions.push(vinst(
+            "cmp_y",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            cy,
+            vec![y, zero],
+            i1t,
+        ));
+        h2b.instructions
+            .push(term("br_h2", Operation::Br { target: g }, vec![]));
+
+        // g: gp = phi [false, h], [cy, h2]; condbr gp -> body else exit
+        let mut gb = AirBlock::new(g);
+        gb.instructions.push(vinst(
+            "phi_g",
+            Operation::Phi {
+                incoming: vec![(h, false_c), (h2, cy)],
+            },
+            gp,
+            vec![],
+            i1t,
+        ));
+        gb.instructions.push(term(
+            "cb_g",
+            Operation::CondBr {
+                then_target: body,
+                else_target: exit,
+            },
+            vec![gp],
+        ));
+
+        // body: cnd = nondet_bool; condbr cnd -> pa else pb
+        let mut bb = AirBlock::new(body);
+        bb.instructions
+            .push(ndcall("nd_c", "__VERIFIER_nondet_bool", cnd, i1t));
+        bb.instructions.push(term(
+            "cb_b",
+            Operation::CondBr {
+                then_target: pa,
+                else_target: pb,
+            },
+            vec![cnd],
+        ));
+
+        // pa: xa = x - 1; br latch   (y unchanged)
+        let mut pab = AirBlock::new(pa);
+        pab.instructions.push(vinst(
+            "sub_x",
+            Operation::BinaryOp {
+                kind: BinaryOp::Sub,
+            },
+            xa,
+            vec![x, one],
+            i32t,
+        ));
+        pab.instructions
+            .push(term("br_pa", Operation::Br { target: latch }, vec![]));
+
+        // pb: xb = nondet (havoc x); yb = y ∓ 1; br latch
+        let mut pbb = AirBlock::new(pb);
+        pbb.instructions
+            .push(ndcall("nd_xb", "__VERIFIER_nondet_int", xb, i32t));
+        pbb.instructions.push(vinst(
+            "step_y",
+            Operation::BinaryOp {
+                kind: if decreasing {
+                    BinaryOp::Sub
+                } else {
+                    BinaryOp::Add
+                },
+            },
+            yb,
+            vec![y, one],
+            i32t,
+        ));
+        pbb.instructions
+            .push(term("br_pb", Operation::Br { target: latch }, vec![]));
+
+        // latch: xn = phi [xa, pa], [xb, pb]; yn = phi [y, pa], [yb, pb]; br h
+        let mut latb = AirBlock::new(latch);
+        latb.instructions.push(vinst(
+            "phi_xn",
+            Operation::Phi {
+                incoming: vec![(pa, xa), (pb, xb)],
+            },
+            xn,
+            vec![],
+            i32t,
+        ));
+        latb.instructions.push(vinst(
+            "phi_yn",
+            Operation::Phi {
+                incoming: vec![(pa, y), (pb, yb)],
+            },
+            yn,
+            vec![],
+            i32t,
+        ));
+        latb.instructions
+            .push(term("br_lat", Operation::Br { target: h }, vec![]));
+
+        let mut exb = AirBlock::new(exit);
+        exb.instructions.push(term("ret", Operation::Ret, vec![]));
+
+        let func = main_func(vec![eb, hb, h2b, gb, bb, pab, pbb, latb, exb], entry);
+        module_of(func, constants)
+    }
+
+    #[test]
+    fn short_circuit_and_guard_is_ranked() {
+        // The `y > 0` bound is reachable only by following the `&&` i1 phi; with it,
+        // the lexicographic tuple `(y, x)` ranks the loop.
+        assert!(ranked(&cook_see_zuleger(true)));
+    }
+
+    #[test]
+    fn short_circuit_and_nonterminating_abstains() {
+        // Same short-circuit shape, but the `else` branch does `y = y + 1` while
+        // havocing `x` — no ranking tuple exists ⇒ abstain (never a wrong `true`).
+        assert!(!ranked(&cook_see_zuleger(false)));
     }
 
     // --- recursion ranking --------------------------------------------------
