@@ -2406,10 +2406,15 @@ fn no_data_race_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
 ///   under x86 TSO, so a weak-memory-only race would be missed and, conversely,
 ///   `TSan`'s treatment of relaxed atomics as synchronization could hide a real
 ///   SV-COMP race. Out of scope either way.
-/// - custom whole-function atomic sections `__VERIFIER_atomic_<name>` (other
-///   than the modelled `begin`/`end`) — SV-COMP executes these atomically but
-///   `TSan` does not model them, so it would false-alarm a race the semantics
-///   forbid.
+///
+/// Custom whole-function atomic sections `__VERIFIER_atomic_<name>` (other than
+/// the modelled `begin`/`end`) are NOT abstained here: they are modelled in the
+/// `TSan` replay driver as a global recursive mutex acquired around the whole
+/// function body via `-finstrument-functions` (see
+/// [`custom_verifier_atomic_fns`] / [`synthesize_tsan_driver`]), which matches
+/// SV-COMP's "the function executes atomically" semantics (atomic↔atomic never
+/// races; atomic↔plain still races). Only genuinely-unarbitratable features stay
+/// out of scope.
 fn tsan_out_of_scope(source: &str) -> Option<&'static str> {
     if source.contains("#pragma omp") {
         return Some("OpenMP");
@@ -2422,17 +2427,23 @@ fn tsan_out_of_scope(source: &str) -> Option<&'static str> {
     {
         return Some("relaxed-memory atomics");
     }
-    if references_custom_verifier_atomic(source) {
-        return Some("custom __VERIFIER_atomic_* section");
-    }
     None
 }
 
-/// True if the source references a `__VERIFIER_atomic_<suffix>` identifier whose
-/// suffix is NOT the modelled `begin`/`end` — i.e. a custom whole-function
-/// atomic that `TSan` cannot arbitrate.
-fn references_custom_verifier_atomic(source: &str) -> bool {
+/// Collect the full identifiers of every custom whole-function atomic the source
+/// references — `__VERIFIER_atomic_<suffix>` where `<suffix>` is NOT the modelled
+/// `begin`/`end`. Deterministic (`BTreeSet`-ordered).
+///
+/// SV-COMP defines a function named `__VERIFIER_atomic_<name>` to execute
+/// atomically (its whole body runs without interleaving). The returned set is
+/// modelled in the `TSan` driver: each such function's entry/exit is wrapped in a
+/// global recursive mutex via `-finstrument-functions` so `TSan` sees the
+/// serialization. An atomic function that is only declared (never defined) or is
+/// `static` yields an unresolved `extern` symbol at link time → the confirm link
+/// fails → the strategy abstains (fail-closed, sound).
+fn custom_verifier_atomic_fns(source: &str) -> std::collections::BTreeSet<String> {
     const MARK: &str = "__VERIFIER_atomic_";
+    let mut out = std::collections::BTreeSet::new();
     let mut i = 0;
     while let Some(off) = source[i..].find(MARK) {
         let start = i + off + MARK.len();
@@ -2441,12 +2452,12 @@ fn references_custom_verifier_atomic(source: &str) -> bool {
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
         if !suffix.is_empty() && suffix != "begin" && suffix != "end" {
-            return true;
+            out.insert(format!("{MARK}{suffix}"));
         }
         // Advance past this occurrence (at least one byte) to avoid looping.
         i = start.max(i + MARK.len());
     }
-    false
+    out
 }
 
 /// Build the `TSan`-replay driver: SV-COMP nondet generators (returning
@@ -2454,7 +2465,17 @@ fn references_custom_verifier_atomic(source: &str) -> bool {
 /// (R4), and `__VERIFIER_atomic_begin/end` modelled as a global RECURSIVE mutex
 /// so `TSan` sees the atomic-section synchronization (else it would false-alarm a
 /// race the SV-COMP semantics forbid). `rand`/`srand` are pinned for determinism.
-fn synthesize_tsan_driver() -> String {
+///
+/// `atomic_fns` is the set of custom whole-function atomics
+/// (`__VERIFIER_atomic_<name>`) the program defines. When non-empty the driver
+/// also emits `-finstrument-functions` entry/exit hooks (`__cyg_profile_func_*`)
+/// that acquire/release the SAME global recursive mutex around each such
+/// function's body, giving them SV-COMP whole-function atomicity under `TSan`.
+/// The hooks are marked `no_instrument_function` to avoid self-recursion, and
+/// identify the atomic functions by comparing the runtime frame address
+/// (`this_fn`) against each function's taken address — `extern void f();` is a
+/// signature-agnostic forward declaration, so no signature knowledge is needed.
+fn synthesize_tsan_driver(atomic_fns: &std::collections::BTreeSet<String>) -> String {
     use std::fmt::Write as _;
 
     let mut s = String::new();
@@ -2482,6 +2503,34 @@ fn synthesize_tsan_driver() -> String {
     s.push_str("void __VERIFIER_atomic_end(void) { pthread_mutex_unlock(&__saf_atomic); }\n");
     s.push_str("int __wrap_rand(void) { return (int)__saf_c(); }\n");
     s.push_str("void __wrap_srand(unsigned s) { (void)s; }\n");
+
+    // Custom whole-function atomics: serialize each on the SAME global recursive
+    // mutex via -finstrument-functions hooks (compiled in by the caller). The
+    // recursive mutex composes with a nested __VERIFIER_atomic_begin/end.
+    if !atomic_fns.is_empty() {
+        s.push_str("/* custom __VERIFIER_atomic_* whole-function atomicity */\n");
+        for fname in atomic_fns {
+            let _ = writeln!(s, "extern void {fname}();");
+        }
+        s.push_str("static void *const __saf_atomic_fns[] = {");
+        for fname in atomic_fns {
+            let _ = write!(s, " (void*){fname},");
+        }
+        s.push_str(" };\n");
+        s.push_str(
+            "__attribute__((no_instrument_function)) static int __saf_is_atomic_fn(void *f) {\n\
+             unsigned i; for (i = 0; i < sizeof(__saf_atomic_fns)/sizeof(__saf_atomic_fns[0]); i++)\n\
+             if (__saf_atomic_fns[i] == f) return 1; return 0; }\n",
+        );
+        s.push_str(
+            "__attribute__((no_instrument_function)) void __cyg_profile_func_enter(void *f, void *c) {\n\
+             (void)c; if (__saf_is_atomic_fn(f)) pthread_mutex_lock(&__saf_atomic); }\n",
+        );
+        s.push_str(
+            "__attribute__((no_instrument_function)) void __cyg_profile_func_exit(void *f, void *c) {\n\
+             (void)c; if (__saf_is_atomic_fn(f)) pthread_mutex_unlock(&__saf_atomic); }\n",
+        );
+    }
     s
 }
 
@@ -2541,7 +2590,19 @@ fn tsan_confirm(
     let harness = dir.join("saf_tsan_harness");
     let errpath = dir.join("saf_tsan_stderr.txt");
 
-    std::fs::write(&driver_src, synthesize_tsan_driver())
+    // Custom whole-function atomics (`__VERIFIER_atomic_<name>`) are modelled in
+    // the driver via `-finstrument-functions` hooks. When the program uses any,
+    // we must both emit their entry/exit serialization AND compile with
+    // instrumentation enabled so the hooks actually fire.
+    let source = std::fs::read_to_string(input).unwrap_or_default();
+    let atomic_fns = custom_verifier_atomic_fns(&source);
+    let instrument: &[&str] = if atomic_fns.is_empty() {
+        &[]
+    } else {
+        &["-finstrument-functions"]
+    };
+
+    std::fs::write(&driver_src, synthesize_tsan_driver(&atomic_fns))
         .with_context(|| "writing TSan replay driver")?;
 
     let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
@@ -2565,6 +2626,7 @@ fn tsan_confirm(
             "-Wl,--wrap=rand",
             "-Wl,--wrap=srand",
         ]);
+        cmd.args(instrument);
         cmd.args(extra)
             .arg("-include")
             .arg(stub)
@@ -3855,5 +3917,71 @@ mod verify_tests {
         let pos_boundary = got.iter().position(|&v| v == 2_147_483_647).unwrap();
         let pos_guard = got.iter().position(|&v| v == 777).unwrap();
         assert!(pos_boundary < pos_guard);
+    }
+
+    #[test]
+    fn custom_verifier_atomic_fns_collects_named_atomics() {
+        let src = "\
+void __VERIFIER_atomic_begin(void);
+void __VERIFIER_atomic_end(void);
+void __VERIFIER_atomic_acquire(void) { }
+void worker(void) { __VERIFIER_atomic_inc(&g); __VERIFIER_atomic_acquire(); }
+";
+        let got = custom_verifier_atomic_fns(src);
+        // begin/end are modelled separately and must NOT be collected.
+        assert!(!got.contains("__VERIFIER_atomic_begin"));
+        assert!(!got.contains("__VERIFIER_atomic_end"));
+        // Named custom atomics are collected (deduplicated, sorted).
+        assert!(got.contains("__VERIFIER_atomic_acquire"));
+        assert!(got.contains("__VERIFIER_atomic_inc"));
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn custom_verifier_atomic_fns_empty_when_only_begin_end() {
+        let src = "void f(void){__VERIFIER_atomic_begin();g++;__VERIFIER_atomic_end();}";
+        assert!(custom_verifier_atomic_fns(src).is_empty());
+    }
+
+    #[test]
+    fn tsan_no_longer_abstains_on_custom_atomics() {
+        // Custom whole-function atomics are now modelled, not abstained. Only
+        // OpenMP / relaxed-memory remain out of scope.
+        assert_eq!(
+            tsan_out_of_scope("void __VERIFIER_atomic_foo(void){}"),
+            None
+        );
+        assert_eq!(tsan_out_of_scope("#pragma omp parallel"), Some("OpenMP"));
+        assert_eq!(
+            tsan_out_of_scope("atomic_load_explicit(&x, memory_order_acquire)"),
+            Some("relaxed-memory atomics")
+        );
+    }
+
+    #[test]
+    fn driver_models_custom_atomics_with_instrument_hooks() {
+        let mut fns = std::collections::BTreeSet::new();
+        fns.insert("__VERIFIER_atomic_acquire".to_string());
+        fns.insert("__VERIFIER_atomic_release".to_string());
+        let d = synthesize_tsan_driver(&fns);
+        // Forward declares each atomic and takes its address into the table.
+        assert!(d.contains("extern void __VERIFIER_atomic_acquire();"));
+        assert!(d.contains("(void*)__VERIFIER_atomic_release"));
+        // Emits the instrument-functions hooks locking the SAME global mutex.
+        assert!(d.contains("__cyg_profile_func_enter"));
+        assert!(d.contains("__cyg_profile_func_exit"));
+        assert!(d.contains("pthread_mutex_lock(&__saf_atomic)"));
+        assert!(d.contains("no_instrument_function"));
+        // Deterministic: identical inputs → identical bytes.
+        assert_eq!(d, synthesize_tsan_driver(&fns));
+    }
+
+    #[test]
+    fn driver_omits_hooks_when_no_custom_atomics() {
+        let d = synthesize_tsan_driver(&std::collections::BTreeSet::new());
+        // begin/end are still modelled, but no instrument-functions hooks are
+        // emitted so the common case is unperturbed.
+        assert!(d.contains("__VERIFIER_atomic_begin"));
+        assert!(!d.contains("__cyg_profile_func_enter"));
     }
 }
