@@ -305,8 +305,10 @@ gen_credit_priority() {  # §2.5: within a family, pick_lever prefers the highes
   rm -rf "$tmp" 2>/dev/null || true
 }
 
-heldout_brake_park() {  # §1a/§2.4 END-TO-END (gen mode): a lever KEEPs on val each arm but the svcomp26
-                        # holdout stays flat -> the actionable brake PARKS it as overfit after two misses.
+heldout_brake_park() {  # §1a/§2.4 END-TO-END (gen mode): a lever KEEPs on val each arm and the svcomp26
+                        # holdout stays FLAT. 2026-08-20 fix: flat is INCONCLUSIVE (the dedup-weighted holdout
+                        # is tiny, ~1 pt), so the brake must NOT park it. Regression-park + the per-family
+                        # power guard are covered by test_heldout_action.py / test_gates.py.
   local tmp; tmp="$(mktemp -d)"
   mkdir -p "$tmp/scripts/loop/lib" "$tmp/tests/benchmarks/svcomp-splits" "$tmp/crates/saf-svcomp/src"
   echo SCORER > "$tmp/scripts/svcomp_split_eval.py"
@@ -333,11 +335,11 @@ heldout_brake_park() {  # §1a/§2.4 END-TO-END (gen mode): a lever KEEPs on val
   [ -e "$tmp/state/ALERT_OVERFIT_gk" ] && alerted=yes || alerted=no
   grep -q 'no active levers remain' "$tmp.log" && broke=yes || broke=no
   grep -q 'PARK-OVERFIT gk' "$tmp/state/journal.md" && overfit=yes || overfit=no
-  if [ "$keeps" = 3 ] && [ "$parked" = yes ] && [ "$alerted" = yes ] && [ "$broke" = yes ] && [ "$overfit" = yes ]; then
-    printf '  ok   %-16s keeps=%s parked=%s alert=%s overfit-note=%s broke=%s (holdout brake works)\n' \
-      heldout_brake_park "$keeps" "$parked" "$alerted" "$overfit" "$broke"; pass=$((pass+1))
+  if [ "$keeps" = 6 ] && [ "$parked" = no ] && [ "$alerted" = no ] && [ "$overfit" = no ]; then
+    printf '  ok   %-16s keeps=%s parked=%s alert=%s overfit=%s (flat holdout is INCONCLUSIVE -> no false park)\n' \
+      heldout_brake_park "$keeps" "$parked" "$alerted" "$overfit"; pass=$((pass+1))
   else
-    printf '  FAIL %-16s keeps=%s(want 3) parked=%s alert=%s overfit=%s broke=%s\n' \
+    printf '  FAIL %-16s keeps=%s(want 6) parked=%s(want no) alert=%s(want no) overfit=%s(want no) broke=%s\n' \
       heldout_brake_park "$keeps" "$parked" "$alerted" "$overfit" "$broke"; fail=$((fail+1))
     tail -30 "$tmp.log" | sed 's/^/       /'
   fi

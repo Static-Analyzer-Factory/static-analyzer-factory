@@ -168,30 +168,50 @@ def test_decide_v2_rewards_generalization_not_memorization():
 
 
 def test_holdout_updates_boosts_reproducing_levers():
-    # holdout weighted rose -> every lever that banked val lift this window reproduced -> boost + clear stall.
-    upd = gates.holdout_lever_updates(holdout_increased=True,
+    # holdout weighted ROSE -> every lever that banked val lift this window reproduced -> boost + clear stall.
+    upd = gates.holdout_lever_updates(holdout_direction="up",
                                       per_lever_lift={"la": 3, "lb": 0, "lc": 5},
-                                      holdout_stall={"la": 1, "lc": 0}, min_lift=2)
+                                      holdout_stall={"la": 1, "lc": 0}, min_lift=2,
+                                      resolvable_levers={"la", "lc"})
     assert upd["boost"] == ["la", "lc"]  # lb had no lift -> not boosted
     assert upd["park"] == []
     assert upd["new_stall"] == {"la": 0}  # la's stall cleared; lc already 0 -> unchanged/omitted
 
 
-def test_holdout_updates_stalls_but_needs_two_checks_to_park():
-    # holdout flat, a lever banked >= min_lift that didn't reproduce -> stall++ (but not parked at 1).
-    upd = gates.holdout_lever_updates(holdout_increased=False,
-                                      per_lever_lift={"la": 4}, holdout_stall={"la": 0}, min_lift=2)
+def test_holdout_flat_is_inconclusive_no_stall_no_park():
+    # 2026-08-20 fix: a FLAT holdout is the DEFAULT outcome on a tiny dedup-weighted holdout, NOT evidence
+    # of overfit -> a lever that banked >= min_lift is neither stalled nor parked (the core fix).
+    upd = gates.holdout_lever_updates(holdout_direction="flat",
+                                      per_lever_lift={"la": 4}, holdout_stall={"la": 1}, min_lift=2,
+                                      resolvable_levers={"la"})
+    assert upd["park"] == [] and upd["boost"] == [] and upd["new_stall"] == {}
+
+
+def test_holdout_regression_parks_after_two_when_family_resolvable():
+    # only an ACTUAL weighted regression ('down') counts against a lever, and only for a resolvable family.
+    upd = gates.holdout_lever_updates(holdout_direction="down",
+                                      per_lever_lift={"la": 4}, holdout_stall={"la": 0}, min_lift=2,
+                                      resolvable_levers={"la"})
     assert upd["park"] == [] and upd["new_stall"] == {"la": 1}
-    # second consecutive non-reproducing checkpoint -> park as overfit.
-    upd2 = gates.holdout_lever_updates(holdout_increased=False,
-                                       per_lever_lift={"la": 4}, holdout_stall={"la": 1}, min_lift=2)
+    upd2 = gates.holdout_lever_updates(holdout_direction="down",
+                                       per_lever_lift={"la": 4}, holdout_stall={"la": 1}, min_lift=2,
+                                       resolvable_levers={"la"})
     assert upd2["park"] == ["la"] and upd2["new_stall"] == {"la": 2}
 
 
+def test_holdout_regression_never_parks_unresolvable_family():
+    # a family the holdout cannot resolve (e.g. ~1 held-out task) can NEVER park a lever, even on a drop.
+    upd = gates.holdout_lever_updates(holdout_direction="down",
+                                      per_lever_lift={"term": 9}, holdout_stall={"term": 1}, min_lift=2,
+                                      resolvable_levers=set())  # term's family below min_family_tasks
+    assert upd["park"] == [] and upd["new_stall"] == {}
+
+
 def test_holdout_updates_ignores_sub_threshold_and_zero_lift():
-    # a tiny lift below min_lift is NOT strong evidence of overfitting -> no stall; zero-lift untouched.
-    upd = gates.holdout_lever_updates(holdout_increased=False,
-                                      per_lever_lift={"la": 1, "lb": 0}, holdout_stall={}, min_lift=2)
+    # a tiny lift below min_lift is NOT strong evidence -> no stall even on a regression; zero-lift untouched.
+    upd = gates.holdout_lever_updates(holdout_direction="down",
+                                      per_lever_lift={"la": 1, "lb": 0}, holdout_stall={}, min_lift=2,
+                                      resolvable_levers={"la", "lb"})
     assert upd["park"] == [] and upd["boost"] == [] and upd["new_stall"] == {}
 
 

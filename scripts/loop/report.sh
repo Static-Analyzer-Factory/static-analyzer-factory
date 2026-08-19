@@ -84,9 +84,9 @@ for k in sorted(set(tr)|set(hr)):
     tcf,tft=tr.get(k,(0,0)); hcf,hft=hr.get(k,(0,0))
     tf=(tcf/tft) if tft else 0.0; hff=(hcf/hft) if hft else 0.0
     gap.append(f"{k} Δ={tf-hff:+.2f}")
-if gap: print("  gap (recall frac, train−holdout): " + "  ".join(gap) + "   <- widening = memorizing")
+if gap: print("  gap (recall frac, train−holdout): " + "  ".join(gap) + "   <- interpret with care: small-n holdout families are noisy")
 trend=rv.holdout_trend(state)
-if trend: print("  holdout trend: " + " -> ".join(str(t[1]) for t in trend) + "   <- flat under rising train = overfit")
+if trend: print("  holdout trend: " + " -> ".join(str(t[1]) for t in trend) + "   <- flat is INCONCLUSIVE (dedup-weighted holdout is tiny, ~1 pt); only a sustained DROP = overfit")
 PY
 
 # ---------------------------------------------------------------- LEVER ROI

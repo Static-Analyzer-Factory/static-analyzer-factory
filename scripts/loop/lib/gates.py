@@ -191,8 +191,9 @@ def decide_v2(*, immutable_violations: list[str], forbidden_reads: list[str],
     return "REVERT"
 
 
-def holdout_lever_updates(*, holdout_increased: bool, per_lever_lift: dict[str, int],
+def holdout_lever_updates(*, holdout_direction: str, per_lever_lift: dict[str, int],
                           holdout_stall: dict[str, int], min_lift: int,
+                          resolvable_levers: set[str] | None = None,
                           stall_to_park: int = 2) -> dict:
     """Decide per-lever park/boost from ONE global svcomp26-holdout checkpoint (plan 205 §1a/§2.4).
 
@@ -203,13 +204,19 @@ def holdout_lever_updates(*, holdout_increased: bool, per_lever_lift: dict[str, 
     checkpoint (`per_lever_lift`, from arms.jsonl KEEP-bucket deltas), since the holdout number is not
     itself per-lever.
 
-      * `holdout_increased` (weighted score rose vs the previous checkpoint):
-          BOOST every lever that contributed lift (>0) this window — its gains reproduced on
+    `holdout_direction` is the 3-state change of the DEDUP-WEIGHTED holdout score vs the previous
+    checkpoint: 'up' | 'flat' | 'down'.
+
+      * 'up': BOOST every lever that contributed lift (>0) this window — its gains reproduced on
           genuinely-new tasks → reset its holdout-stall and grant a priority (gen_credit) boost.
-      * NOT increased (flat or down):
-          every lever that banked `>= min_lift` this window is one whose train gains did NOT reproduce →
-          `holdout_stall += 1`; PARK it once it reaches `stall_to_park` CONSECUTIVE non-reproducing
-          checkpoints (two, to ride out holdout-eval noise — redesign §2.4).
+      * 'down' (an ACTUAL regression): every lever that banked `>= min_lift` this window AND whose family
+          the holdout can actually RESOLVE (`lever in resolvable_levers`) gets `holdout_stall += 1`; PARK
+          it at `stall_to_park` such checkpoints (two, to ride out eval noise).
+      * 'flat': INCONCLUSIVE — nothing happens. This is the 2026-08-20 fix: the dedup-weighted holdout is
+          tiny (order 1 distinct point), so "did not increase" is the DEFAULT outcome and is NOT evidence
+          of memorization. Only a genuine regression counts against a lever, and only for a family the
+          holdout has enough tasks to measure (`resolvable_levers`; a family with ~1 held-out task can
+          never park a lever). The primary anti-overfit remains the dedup-weighted `val` KEEP gate.
       * a lever with no lift this window is untouched (neither boosted nor stalled).
 
     Returns `{'park': sorted[str], 'boost': sorted[str], 'new_stall': {lever: int}}` where `new_stall`
@@ -218,18 +225,21 @@ def holdout_lever_updates(*, holdout_increased: bool, per_lever_lift: dict[str, 
     park: list[str] = []
     boost: list[str] = []
     new_stall: dict[str, int] = {}
+    resolvable = resolvable_levers if resolvable_levers is not None else set()
     for lever, lift in per_lever_lift.items():
         if lift <= 0:
             continue
-        if holdout_increased:
+        if holdout_direction == "up":
             boost.append(lever)
             if holdout_stall.get(lever, 0) != 0:
                 new_stall[lever] = 0  # reproduced → clear the overfit stall
-        elif lift >= min_lift:
+        elif holdout_direction == "down" and lift >= min_lift and lever in resolvable:
             n = holdout_stall.get(lever, 0) + 1
             new_stall[lever] = n
             if n >= stall_to_park:
                 park.append(lever)
+        # 'flat', or a regression whose family the holdout cannot resolve, or sub-threshold lift:
+        # inconclusive — neither boost nor stall (flat ≠ overfit; the holdout is too small to resolve).
     return {"park": sorted(park), "boost": sorted(boost), "new_stall": new_stall}
 
 
