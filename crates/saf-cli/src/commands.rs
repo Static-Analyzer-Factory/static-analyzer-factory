@@ -1575,6 +1575,41 @@ const MAX_FUZZ_CORPUS: usize = 256;
 /// Run the byte-stream fuzz harness on one input under a short timeout, feeding
 /// `$SAF_FUZZ_INPUT` / `$SAF_FUZZ_LOG`. Success/normal-exit/timeout all return
 /// `Ok(())`; the caller inspects the sentinel/log. A runaway harness is killed.
+/// Harden a native-replay harness spawn so a hung/spinning sanitizer harness can NEVER outlive us
+/// and leak (the 2026-08-19 load runaway that took cd-vm-15 to load 2600+): (a) `PR_SET_PDEATHSIG`
+/// so the harness is SIGKILLed if this `saf verify` dies mid-replay (the eval RSS watchdog / a
+/// supervisor restart) -- the case that previously orphaned harnesses to init for hours; (b) its own
+/// process group so a timeout kill (`kill_replay_group`) reaches every descendant (symbolizer, forks).
+/// Call immediately before `.spawn()`. Linux-only (SV-COMP runs on Linux).
+fn harden_replay_spawn(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the forked child before exec and only calls async-signal-safe
+    // libc functions (prctl / getppid / _exit).
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0);
+            // Cover the race where the parent already died between fork and prctl.
+            if libc::getppid() == 1 {
+                libc::_exit(0);
+            }
+            Ok(())
+        });
+    }
+    cmd.process_group(0)
+}
+
+/// SIGKILL a hardened replay harness's ENTIRE process group (leader + descendants), then reap it.
+/// Replaces a bare `child.kill()`, which killed only the direct child and orphaned any grandchildren.
+fn kill_replay_group(child: &mut std::process::Child) {
+    // `harden_replay_spawn` put the child in its own group, so its pgid == child.id().
+    // SAFETY: kill(2) with a negative pid targets the whole process group; a no-op if already gone.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn run_fuzz_harness(
     harness: &Path,
     input_path: &Path,
@@ -1584,12 +1619,13 @@ fn run_fuzz_harness(
     use anyhow::Context;
     use std::process::{Command, Stdio};
 
-    let mut child = Command::new(harness)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(harness);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .env("SAF_FUZZ_INPUT", input_path)
-        .env("SAF_FUZZ_LOG", log_path)
+        .env("SAF_FUZZ_LOG", log_path);
+    let mut child = harden_replay_spawn(&mut cmd)
         .spawn()
         .with_context(|| "spawning fuzz harness")?;
 
@@ -1599,8 +1635,7 @@ fn run_fuzz_harness(
             Ok(Some(_)) => break,
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_replay_group(&mut child);
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
@@ -2036,10 +2071,11 @@ fn replay_confirms_false(
         return Ok(false);
     }
 
-    let mut child = Command::new(&harness)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(&harness);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = harden_replay_spawn(&mut cmd)
         .spawn()
         .with_context(|| "spawning replay harness")?;
 
@@ -2050,8 +2086,7 @@ fn replay_confirms_false(
             Ok(Some(_)) => break,
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_replay_group(&mut child);
                     return Ok(false); // runaway program → inconclusive
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2324,12 +2359,13 @@ fn asan_confirm(
                 // timeout.
                 let errfile =
                     std::fs::File::create(&errpath).with_context(|| "creating ASan stderr file")?;
-                let mut child = Command::new(&harness)
-                    .stdin(Stdio::null())
+                let mut cmd = Command::new(&harness);
+                cmd.stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::from(errfile))
                     .env("ASAN_OPTIONS", opts)
-                    .env("SAF_NONDET_CONST", k.to_string())
+                    .env("SAF_NONDET_CONST", k.to_string());
+                let mut child = harden_replay_spawn(&mut cmd)
                     .spawn()
                     .with_context(|| "spawning ASan harness")?;
 
@@ -2339,8 +2375,7 @@ fn asan_confirm(
                         Ok(Some(_)) => break,
                         Ok(None) => {
                             if start.elapsed() >= timeout {
-                                let _ = child.kill();
-                                let _ = child.wait();
+                                kill_replay_group(&mut child);
                                 break; // runaway -> parse whatever exists (likely no report)
                             }
                             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2803,12 +2838,13 @@ fn tsan_confirm(
         // report cannot deadlock on a full pipe buffer while we poll the timeout.
         let errfile =
             std::fs::File::create(&errpath).with_context(|| "creating TSan stderr file")?;
-        let mut child = Command::new(&harness)
-            .stdin(Stdio::null())
+        let mut cmd = Command::new(&harness);
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(errfile))
             .env("TSAN_OPTIONS", TSAN_OPTS)
-            .env("SAF_NONDET_CONST", k.to_string())
+            .env("SAF_NONDET_CONST", k.to_string());
+        let mut child = harden_replay_spawn(&mut cmd)
             .spawn()
             .with_context(|| "spawning TSan harness")?;
 
@@ -2818,8 +2854,7 @@ fn tsan_confirm(
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     if start.elapsed() >= timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_replay_group(&mut child);
                         break; // runaway (e.g. a thread blocked forever) -> parse what exists
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2970,7 +3005,7 @@ fn ubsan_confirm(
             if let Some(bc) = bool_const {
                 cmd.env("SAF_BOOL_CONST", bc);
             }
-            let mut child = cmd.spawn().with_context(|| "spawning UBSan harness")?;
+            let mut child = harden_replay_spawn(&mut cmd).spawn().with_context(|| "spawning UBSan harness")?;
 
             let start = std::time::Instant::now();
             loop {
@@ -2978,8 +3013,7 @@ fn ubsan_confirm(
                     Ok(Some(_)) => break,
                     Ok(None) => {
                         if start.elapsed() >= timeout {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            kill_replay_group(&mut child);
                             break; // runaway -> parse whatever exists (likely no report)
                         }
                         std::thread::sleep(std::time::Duration::from_millis(5));

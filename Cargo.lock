@@ -2138,6 +2138,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "glob",
+ "libc",
  "predicates",
  "saf-analysis",
  "saf-core",

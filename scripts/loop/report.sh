@@ -21,6 +21,30 @@ print(f"baseline TRAIN: confirmed={d.get('confirmed_score')} raw={d.get('raw_sco
 PY
 fi
 
+# ---------------------------------------------------------------- SOUNDNESS (kept-arm anomaly)
+# A KEPT arm must never carry a false alarm (-16) or a wrong-TRUE (-32). The gate reverts such arms,
+# so this is a belt-and-suspenders check over the recorded history. NOTE: the real arms.jsonl keys are
+# false_alarms_after / wrong_true_after (NOT false_alarms / wrong_true).
+echo
+python3 - "$ARMS" <<'PYSND' 2>/dev/null || true
+import json, sys
+try:
+    rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+except OSError:
+    rows = []
+bad = [r for r in rows if str(r.get("decision", "")).startswith("KEEP")
+       and ((r.get("false_alarms_after") or 0) > 0 or (r.get("wrong_true_after") or 0) > 0)]
+if bad:
+    print("-- SOUNDNESS: *** KEPT ARM WITH FALSE ALARM / WRONG-TRUE -- INVARIANT VIOLATION ***")
+    for r in bad:
+        print(f"   !!! arm {r.get('arm')} {r.get('decision')} lever={r.get('lever')} "
+              f"FP_after={r.get('false_alarms_after')} wrongTRUE_after={r.get('wrong_true_after')}")
+else:
+    nfp = sum(1 for r in rows if (r.get("false_alarms_after") or 0) > 0 or (r.get("wrong_true_after") or 0) > 0)
+    print(f"-- SOUNDNESS: OK -- no KEPT arm has a false alarm or wrong-TRUE "
+          f"({nfp} reverted arm(s) had FP/wT, correctly discarded by the gate)")
+PYSND
+
 # ---------------------------------------------------------------- GENERALIZATION (the headline)
 echo
 echo "-- GENERALIZATION (train vs holdout) ----------------------------  [the headline]"
