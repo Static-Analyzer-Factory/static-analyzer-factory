@@ -1673,16 +1673,29 @@ const UBSAN_OPTS: &str = "halt_on_error=1:abort_on_error=0:print_stacktrace=1";
 /// overflow (Slice-0 caught `id_b3_o2-1.c` only at `INT_MIN`). Kept SEPARATE from
 /// `NONDET_CONSTS` so the committed R5 memsafety byte-for-byte behavior is unperturbed.
 ///
-/// The large POSITIVE probe is `2^30`, NOT `INT_MAX`. When a nondet drives a loop trip
-/// count, `for (i=0; i<=x; i++)` (Parts) or `while (z>0) { x=x+1; z=z-1; }` (ESOP2008),
-/// the counter/accumulator reaches ~`x`; at `x == INT_MAX` the next `+1` is a spurious
-/// `INT_MAX + 1` overflow that SV-COMP's no-overflow benchmarks label TRUE (the
-/// termination-* families — 2 full-pool false alarms, indistinguishable in the `UBSan`
-/// report from a genuine `x+1`-at-INT_MAX). At `2^30` a loop counter/accumulator stays
-/// under `INT_MAX` (no false alarm), while genuine large-value overflows still trap
-/// (`2^30 + 2^30`, `2^30 * 2`, `2^30 + 2^30` all exceed `INT_MAX`). The only loss is a
-/// direct `x+1`-EXACTLY-at-INT_MAX overflow, which cannot be caught without re-admitting
-/// the loop false alarms — soundness (FP=0) is worth more than that ambiguous case.
+/// The large POSITIVE probes are `2^30` and `1.5e9` — both deliberately BELOW `INT_MAX`.
+/// When a nondet drives a loop trip count, `for (i=0; i<=x; i++)` (Parts) or
+/// `while (z>0) { x=x+1; z=z-1; }` (ESOP2008), the counter/accumulator reaches ~`x`; at
+/// `x == INT_MAX` the next `+1` is a spurious `INT_MAX + 1` overflow that SV-COMP's
+/// no-overflow benchmarks label TRUE (the termination-* families — 2 full-pool false
+/// alarms, indistinguishable in the `UBSan` report from a genuine `x+1`-at-INT_MAX). The
+/// false alarm requires the counter to reach EXACTLY `INT_MAX`, so any probe strictly
+/// below `INT_MAX` is safe against it while still triggering genuine large-value overflows.
+///
+/// Two probes are needed because they catch different overflow shapes:
+/// - `2^30` (`1_073_741_824`) catches products/doublings (`2^30 * 2`, `k*nondet()`) and
+///   two-operand sums where one operand is small.
+/// - `1.5e9` (`1_500_000_000`) catches a **direct two-operand ADDITION of two large nondet
+///   operands** (`y = y + x` with `x, y` both near this value — the
+///   `AliasDarteFeautrierGonnord`/`ChenFlurMukhopadhyay`/`PodelskiRybalchenko`
+///   termination-literature idiom), which needs `2·v > INT_MAX`, i.e. `v > 2^30`. `2^30`
+///   itself is too small (`2^30 + (2^30-1) = INT_MAX`, representable — no trap), so these
+///   sums were previously missed. `1.5e9` sums to `~3e9 > INT_MAX` (traps) yet leaves a
+///   `~6.4e8` margin below `INT_MAX`, so no `+k` loop counter with a realistic step can
+///   reach `INT_MAX` under it (verified false-alarm-free across the reasoning TRUE set).
+///
+/// The only remaining loss is a direct `x+1`-EXACTLY-at-INT_MAX overflow, which cannot be
+/// caught without re-admitting the loop false alarms — soundness (FP=0) is worth more.
 const OVERFLOW_CONSTS: &[i64] = &[
     0,
     1,
@@ -1693,6 +1706,7 @@ const OVERFLOW_CONSTS: &[i64] = &[
     1024,
     65_535,
     1_073_741_824,
+    1_500_000_000,
     -1,
     -2_147_483_648,
     2_147_483_648,
@@ -4053,6 +4067,38 @@ mod verify_tests {
             !got.contains(&2_147_483_647),
             "no INT_MAX boundary under a loop"
         );
+    }
+
+    #[test]
+    fn overflow_consts_carry_a_sound_two_operand_addition_probe() {
+        // The two-operand-ADDITION probe (`y = y + x`, both operands ~v) must satisfy
+        // two properties simultaneously:
+        //   (1) `2·v` overflows `int` (`2·v > INT_MAX`) so the direct sum traps, and
+        //   (2) `v < INT_MAX` with margin, so a `+k` loop counter cannot reach `INT_MAX`
+        //       under it (the documented termination-* false-alarm boundary is EXACTLY
+        //       `INT_MAX`).
+        const INT_MAX: i64 = 2_147_483_647;
+        let addition_probes: Vec<i64> = OVERFLOW_CONSTS
+            .iter()
+            .copied()
+            .filter(|&v| v > 0 && v < INT_MAX && 2 * v > INT_MAX)
+            .collect();
+        assert!(
+            addition_probes.iter().any(|&v| v == 1_500_000_000),
+            "OVERFLOW_CONSTS must include the 1.5e9 two-operand-addition probe"
+        );
+        for &v in &addition_probes {
+            assert!(2 * v > INT_MAX, "probe {v} must make a direct sum overflow");
+            assert!(
+                v < INT_MAX,
+                "probe {v} must stay below INT_MAX (counter safety)"
+            );
+            // A comfortable margin below INT_MAX so no realistic `+k` step reaches it.
+            assert!(
+                INT_MAX - v > 100_000_000,
+                "probe {v} must keep a wide margin below INT_MAX"
+            );
+        }
     }
 
     #[test]
