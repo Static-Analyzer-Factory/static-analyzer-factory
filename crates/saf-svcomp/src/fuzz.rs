@@ -99,6 +99,20 @@ pub fn references_scalar_nondet(module: &AirModule) -> bool {
         .any(|f| SCALAR_NONDET.iter().any(|(name, _)| *name == f.name))
 }
 
+/// True iff the program references `__VERIFIER_nondet_bool` (declared or defined).
+///
+/// Used by the overflow confirmer to decide whether the loop-sustaining bool-decoupling
+/// replay pass can change behaviour — a program with no `nondet_bool` cannot have a
+/// `while (__VERIFIER_nondet_bool()) { … }` guard, so the extra pass would only waste
+/// native runs. Cheap and conservative (a mere declaration counts).
+#[must_use]
+pub fn references_nondet_bool(module: &AirModule) -> bool {
+    module
+        .functions
+        .iter()
+        .any(|f| f.name == "__VERIFIER_nondet_bool")
+}
+
 /// Harvest a mutation dictionary: every distinct integer constant in the module
 /// (the values guards compare against) plus [`INTERESTING_VALUES`]. Deterministic
 /// (`BTreeSet` ordering), deduplicated, and bounded to keep the mutation loop
@@ -519,5 +533,39 @@ mod tests {
             block_index: BTreeMap::new(),
         });
         assert!(references_scalar_nondet(&m));
+    }
+
+    #[test]
+    fn references_nondet_bool_detects_declared_bool() {
+        use saf_core::air::AirFunction;
+        use saf_core::ids::FunctionId;
+        use std::collections::BTreeMap;
+        let mut m = AirModule::new(ModuleId::new(1));
+        assert!(!references_nondet_bool(&m));
+        // A non-bool nondet must NOT trigger the bool pass.
+        m.functions.push(AirFunction {
+            id: FunctionId::new(7),
+            name: "__VERIFIER_nondet_int".to_string(),
+            params: vec![],
+            blocks: vec![],
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        });
+        assert!(!references_nondet_bool(&m));
+        m.functions.push(AirFunction {
+            id: FunctionId::new(9),
+            name: "__VERIFIER_nondet_bool".to_string(),
+            params: vec![],
+            blocks: vec![],
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        });
+        assert!(references_nondet_bool(&m));
     }
 }

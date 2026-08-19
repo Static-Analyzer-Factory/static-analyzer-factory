@@ -1712,6 +1712,17 @@ const MAX_REPLAY_CANDIDATES: usize = 16;
 /// are added for) have no infinite loops, so the extra native runs stay cheap.
 const OVERFLOW_MAX_CANDIDATES: usize = 24;
 
+/// Data-nondet constants swept in the loop-sustaining bool pass (see the
+/// `SAF_BOOL_CONST` decoupling in [`synthesize_asan_driver`]). This pass fixes
+/// `__VERIFIER_nondet_bool()` to `1` so a `while (nondet_bool()) { … }` loop runs,
+/// and sweeps the DATA nondets over this small list. `0` comes first because the
+/// dominant idiom is an accumulator whose data variables must start at zero
+/// (`if (!(i==0 && j==0)) return; while (nondet_bool()) i += ++x;`); the remaining
+/// values cover small-nonzero and large-magnitude initialisations. Kept short so
+/// the extra native runs stay bounded even on a TRUE task whose bool-guarded loop
+/// is unbounded-but-safe (each candidate then spins to the per-run replay timeout).
+const OVERFLOW_BOOL_SWEEP: &[i64] = &[0, 1, -1, 2, 1_073_741_824];
+
 /// Signed-overflow type-BOUNDARY nondet candidates, appended to the overflow
 /// mini-fuzz sweep ONLY when every reachable loop is provably ranked
 /// ([`saf_svcomp::fast_paths::module_reachable_loops_all_ranked`], which subsumes the
@@ -2102,6 +2113,23 @@ fn synthesize_asan_driver() -> String {
         "static long __saf_c(void) { const char *e = getenv(\"SAF_NONDET_CONST\"); return e ? atol(e) : 0; }\n",
     );
     for (fname, cty) in SCALAR_NONDET {
+        if *fname == "__VERIFIER_nondet_bool" {
+            // Loop-sustaining bool decoupling (overflow confirmer): when `SAF_BOOL_CONST`
+            // is set, `nondet_bool()` returns that fixed 0/1 value INDEPENDENT of
+            // `SAF_NONDET_CONST`. This lets an accumulator loop `while (nondet_bool())
+            // { … }` be driven to run even when the program's data nondets must take a
+            // DIFFERENT value (e.g. `if (!(i==0 && j==0)) return; while (nondet_bool())
+            // { i += ++x; }` needs `i==0` AND the guard true — impossible with one shared
+            // constant). Every returned bool is a value `__VERIFIER_nondet_bool` is
+            // allowed to return, so a resulting overflow is a genuine feasible execution
+            // and UBSan stays the sole sound arbiter (R2, R6). When `SAF_BOOL_CONST` is
+            // UNSET — the ASan/memsafety path and the primary overflow sweep — this is
+            // byte-identical to the previous `(_Bool)__saf_c()` behaviour.
+            s.push_str(
+                "_Bool __VERIFIER_nondet_bool(void) { const char *b = getenv(\"SAF_BOOL_CONST\"); return b ? (_Bool)(atoi(b) & 1) : (_Bool)__saf_c(); }\n",
+            );
+            continue;
+        }
         let suffix = fname.trim_start_matches("__VERIFIER_nondet_");
         let _ = writeln!(
             s,
@@ -2807,6 +2835,11 @@ fn tsan_confirm(
 /// is schedule-independent so confirming a threaded task is sound, but the concurrency
 /// reservoir is small and low-recall, so the R5 reachability gate is kept until a gated
 /// slice measures it worth dropping.
+// NOTE: this is one cohesive confirmer — compile (with the assert-macro fallback),
+// then two mini-fuzz sweeps (primary + the loop-sustaining bool pass) sharing a
+// spawn/wait closure. Splitting it would scatter the tightly-coupled harness/errpath
+// state across helpers for no readability gain.
+#[allow(clippy::too_many_lines)]
 fn ubsan_confirm(
     input: &Path,
     data_model: saf_svcomp::DataModel,
@@ -2904,37 +2937,67 @@ fn ubsan_confirm(
     let candidates = overflow_replay_candidates(module, data_model);
 
     let timeout = replay_timeout();
-    for &k in &candidates {
-        let errfile =
-            std::fs::File::create(&errpath).with_context(|| "creating UBSan stderr file")?;
-        let mut child = Command::new(&harness)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(errfile))
-            .env("UBSAN_OPTIONS", UBSAN_OPTS)
-            .env("SAF_NONDET_CONST", k.to_string())
-            .spawn()
-            .with_context(|| "spawning UBSan harness")?;
+    // Run one mini-fuzz sweep: for each data constant `k` in `sweep`, run the harness
+    // with `SAF_NONDET_CONST=k` (and, when `bool_const` is set, `SAF_BOOL_CONST` too),
+    // returning the first constant that reproduces a signed overflow. Factored out so
+    // the primary sweep and the loop-sustaining bool pass share the spawn/wait logic.
+    let run_sweep = |sweep: &[i64],
+                     bool_const: Option<&str>|
+     -> anyhow::Result<Option<saf_svcomp::OverflowHit>> {
+        for &k in sweep {
+            let errfile =
+                std::fs::File::create(&errpath).with_context(|| "creating UBSan stderr file")?;
+            let mut cmd = Command::new(&harness);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(errfile))
+                .env("UBSAN_OPTIONS", UBSAN_OPTS)
+                .env("SAF_NONDET_CONST", k.to_string());
+            if let Some(bc) = bool_const {
+                cmd.env("SAF_BOOL_CONST", bc);
+            }
+            let mut child = cmd.spawn().with_context(|| "spawning UBSan harness")?;
 
-        let start = std::time::Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if start.elapsed() >= timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break; // runaway -> parse whatever exists (likely no report)
+            let start = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if start.elapsed() >= timeout {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break; // runaway -> parse whatever exists (likely no report)
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    Err(e) => return Err(e).context("waiting on UBSan harness"),
                 }
-                Err(e) => return Err(e).context("waiting on UBSan harness"),
+            }
+
+            let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+            if let Some(hit) = saf_svcomp::parse_ubsan_overflow(&report) {
+                return Ok(Some(hit)); // first constant that reproduces an overflow wins
             }
         }
+        Ok(None)
+    };
 
-        let report = std::fs::read_to_string(&errpath).unwrap_or_default();
-        if let Some(hit) = saf_svcomp::parse_ubsan_overflow(&report) {
-            return Ok(Some(hit)); // first constant that reproduces an overflow wins
+    // Primary sweep: nondet_bool tracks SAF_NONDET_CONST (the committed behaviour).
+    if let Some(hit) = run_sweep(&candidates, None)? {
+        return Ok(Some(hit));
+    }
+
+    // Loop-sustaining bool pass: when the program has a `__VERIFIER_nondet_bool()`
+    // (so it may have a `while (nondet_bool()) { … }` guard the primary sweep cannot
+    // both keep true AND supply the right data value for), fix the bool to `1` and
+    // re-sweep the data nondets. Any resulting UBSan trap is a genuine feasible
+    // execution — `1` is a legal `nondet_bool` return and the data value is a legal
+    // nondet input — so soundness is unchanged (UBSan is the sole R2 arbiter, the trap
+    // re-triggers on the ORIGINAL program per R6). Gated on the presence of nondet_bool
+    // so the extra native runs never touch a program that cannot benefit.
+    if saf_svcomp::fuzz::references_nondet_bool(module) {
+        if let Some(hit) = run_sweep(OVERFLOW_BOOL_SWEEP, Some("1"))? {
+            return Ok(Some(hit));
         }
     }
     Ok(None)
