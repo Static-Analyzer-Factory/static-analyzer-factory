@@ -13,6 +13,8 @@ supervisor-measured, sound, held-out-checked gain (or, for a capability arm, a m
 
 {{PRIOR_WIP}}
 
+{{PRIOR_OUTCOMES}}
+
 ## What SAF is (do not break this)
 SAF is a SOUND, FALSE-only bug-finder in C.FalseOverall. It emits `false(<prop>)` ONLY when it can (a)
 prove must-reach unconditionally, or (b) concretely reproduce the violation (native replay / ASan for
@@ -62,7 +64,10 @@ builds/tests are Docker-only: `docker compose run --rm -T -e SKIP_MATURIN_BUILD=
 Add or extend unit tests for any new confirmer/logic (TDD). Keep the change SCOPED to this lever.
 **Put any scratch/probe/temp files in `/tmp`, NEVER in the repo.** The supervisor only commits `crates/` +
 manifest changes; stray files in the repo (probe outputs, temp dirs, large binaries) bloat the branch and
-are ignored — keep the working tree clean except for your real source change.
+are ignored — keep the working tree clean except for your real source change. **Do NOT write to `MEMORY.md`,
+`plans/PROGRESS.md`, `plans/*`, or any `memory/*.md`** — those are the human dev workflow, not arms;
+cross-arm memory is handled FOR you (the "Prior WIP" / "Prior outcomes on this lever" sections above).
+Writing them only wastes turns (they are not committed) and causes cross-arm mis-attribution.
 **Container hygiene (do not leak containers):** any ad-hoc `docker compose run` probe MUST use `--rm` and an
 OUTER hard `timeout` on the `docker` invocation itself (not just the inner binary), and kill the process
 group on timeout — e.g. `timeout -k 5 60 docker compose run --rm -T dev sh -c '... timeout 8 ./probe ...'`.
@@ -99,6 +104,14 @@ slicing, harness/havoc synthesis) — never a pattern that keys on one cluster's
 dedup AND is caught by the read-forbidden holdout brake). You MAY read `tests/benchmarks/svcomp-splits/val.jsonl`
 and its per-task diagnostics (stderr tails) to see which reasoning tasks you miss and why — it's TRAIN,
 freely readable; only `holdout.jsonl` is off-limits.
+
+**The gate keeps you on the DEDUPED WEIGHTED val score (`confirmed_score_weighted`), NOT raw recall:**
+re-confirming N near-duplicate members of one generator cluster is worth ~1 point, not N. So a change that
+adds raw confirmed FALSEs which are near-duplicates of tasks already solved (check "Prior outcomes on this
+lever" above) moves your kept score by ~0 — and if that change also slows compilation/analysis enough to
+push OTHER tasks past the eval timeout, it silently NET-LOSES confirmed FALSEs (a regression revert).
+Prefer solving a NEW *class* of reasoning tasks over piling more members onto an already-saturated cluster,
+and keep per-task cost low (do not add global instrumentation that slows every task).
 
 **Use your FULL turn budget to actually move the score.** Building a helper, a shim, or a scaffold is a
 MEANS, not the end: after you build it, WIRE IT INTO the verdict path and keep iterating — run the

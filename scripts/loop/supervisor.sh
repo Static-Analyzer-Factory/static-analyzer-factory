@@ -369,7 +369,12 @@ run_arm() {
     saf_eval "$TRAIN_MANIFEST" "$wk/pool_after.json" $prop_arg --group-weight --per-task "$wk/after.pertask.jsonl"
     gen_delta="$(py -c "import json,os;b=json.load(open('$wk/val_before.json'));a=json.load(open('$wk/val_after.json')) if os.path.exists('$wk/val_after.json') else {};c=a.get('confirmed_score_weighted');print((c-b.get('confirmed_score_weighted',0)) if c is not None else -999999999)")"
     pool_delta="$(py -c "import json,os;b=json.load(open('$wk/pool_before.json'));a=json.load(open('$wk/pool_after.json')) if os.path.exists('$wk/pool_after.json') else {};c=a.get('confirmed_score_weighted');print((c-b.get('confirmed_score_weighted',0)) if c is not None else -999999999)")"
-    local novel=0; [ "$mode" = capability ] && novel=1
+    # novel_solved must be MEASURED, not just mode==capability. Only a capability arm that actually
+    # ADDED net raw confirmed FALSEs (real solving progress) earns ACCUMULATE_PLUS's park-countdown
+    # immunity; a zero/negative-progress capability arm falls through to ACCUMULATE/REVERT so the lever
+    # parks (fixes race-find never parking over 6 zero-yield ACCUMULATE_PLUS arms). [arm-review 2026-08-19]
+    local rawpd; rawpd="$(py -c "import json,os;b=json.load(open('$wk/pool_before.json'));a=json.load(open('$wk/pool_after.json')) if os.path.exists('$wk/pool_after.json') else {};print(int((a.get('confirmed_score',0) or 0)-(b.get('confirmed_score',0) or 0)))" 2>/dev/null || echo 0)"
+    local novel=0; { [ "$mode" = capability ] && [ "${rawpd:-0}" -gt 0 ]; } 2>/dev/null && novel=1
     decision="$(py "$LIB/verify_arm.py" --gen-mode \
         --before "$wk/val_before.json" --after "$wk/val_after.json" \
         --pool-before "$wk/pool_before.json" --pool-after "$wk/pool_after.json" \
@@ -641,15 +646,66 @@ manage_capability_wip() {
   esac
 }
 
-render_arm_prompt() {  # id mode family desc -> stdout (fixed prompt + this arm's lever + any prior WIP)
+# lever_outcome_digest <id> — a compact multiline digest of THIS lever's prior arms (from arms.jsonl)
+# so the worker LEARNS from them instead of re-deriving a change that already reverted (the verified
+# 6x fuzz-mut-nondet regression). Observability-derived, never gates a decision. [arm-review 2026-08-19]
+lever_outcome_digest() {
+  local id="$1" af="$STATE_DIR/arms.jsonl"
+  [ -s "$af" ] || return 0
+  py - "$af" "$id" <<'PY' 2>/dev/null || true
+import json, sys
+af, lid = sys.argv[1], sys.argv[2]
+rows = []
+for l in open(af):
+    l = l.strip()
+    if not l:
+        continue
+    try:
+        r = json.loads(l)
+    except Exception:
+        continue
+    if r.get("lever") == lid:
+        rows.append(r)
+if not rows:
+    sys.exit(0)
+rows = rows[-6:]
+out = ["## Prior arms on THIS lever — LEARN from them (do NOT repeat a change that already reverted)"]
+nregr = 0
+for r in rows:
+    dec = r.get("decision", "?"); rr = (r.get("revert_reason") or "")
+    if rr == "regression":
+        nregr += 1
+    cd = r.get("confirmed_delta", "?"); ppd = r.get("per_property_delta", {})
+    fl = r.get("flips", {}) or {}
+    g = fl.get("gained_confirmed", []) or []; lo = fl.get("lost_confirmed", []) or []
+    line = f"- arm {r.get('arm','?')}: {dec}{('/'+rr) if rr else ''} | confirmed_delta={cd} | per_property_delta={ppd}"
+    if g:
+        fams = sorted({x.split('/')[-2] for x in g if '/' in x})[:4]
+        line += f" | added {len(g)} confirmed (clusters {', '.join(fams)} — now dedup-saturated)"
+    if lo:
+        line += f" | LOST {len(lo)} previously-confirmed (regression)"
+    out.append(line)
+if nregr:
+    out.append(f"WARNING: {nregr} of the last {len(rows)} arms here REVERTED as REGRESSIONS — the same approach keeps NET-LOSING confirmed FALSEs (a raw recall gain that dedups to ~0 while its added compile/analysis cost times other tasks out past the eval timeout). Do NOT re-apply that change; try a genuinely DIFFERENT mechanism or a lower-cost path, and target reasoning tasks you still miss.")
+out.append("Do not pile more near-duplicate members onto clusters already gained above (they score ~0 under dedup); solve a NEW class.")
+print("\n".join(out))
+PY
+}
+
+render_arm_prompt() {  # id mode family desc -> stdout (fixed prompt + this arm's lever + prior WIP + prior outcomes)
   local id="$1" mode="$2" family="$3" desc="$4"
   local patch="$STATE_DIR/lever.$id.wip.patch" wip=""
   if [ -s "$patch" ]; then
     # single line (portable across GNU/BSD sed — no embedded newline in the replacement)
     wip="**Prior WIP on this lever to CONTINUE (do NOT re-derive):** an earlier arm built reusable code that was reverted (it did not score yet). Its diff is saved at \`$patch\` ($(wc -l < "$patch" | tr -d ' ') lines). START by applying it and building further toward a scored improvement:  \`git apply $patch\`  — review it first; if it does not apply cleanly, use it as a reference implementation. Do not rebuild it from scratch."
   fi
+  # prior-outcomes digest is multiline -> inject via sed r/d (read file after the placeholder, delete it)
+  local odf; odf="$(mktemp 2>/dev/null || echo "/tmp/saf_outcomes.$$")"
+  lever_outcome_digest "$id" > "$odf" 2>/dev/null || : > "$odf"
   sed -e "s|{{LEVER_ID}}|$id|g" -e "s|{{MODE}}|$mode|g" -e "s|{{FAMILY}}|$family|g" \
-      -e "s|{{DESC}}|$desc|g" -e "s|{{PRIOR_WIP}}|$wip|g" "$ARM_PROMPT_FILE"
+      -e "s|{{DESC}}|$desc|g" -e "s|{{PRIOR_WIP}}|$wip|g" \
+      -e "/{{PRIOR_OUTCOMES}}/r $odf" -e "/{{PRIOR_OUTCOMES}}/d" "$ARM_PROMPT_FILE"
+  rm -f "$odf" 2>/dev/null || true
 }
 
 # ----------------------------------------------------------------------------- entrypoints
