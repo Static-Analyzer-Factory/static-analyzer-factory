@@ -1480,8 +1480,18 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
         _ => return None, // link/compile failure -> inconclusive
     }
 
-    let dict = fuzz::harvest_dictionary(ctx.module);
+    // Backward AIR slice from the reach_error criteria (+ __VERIFIER_assume as a
+    // secondary criterion) steers the blind search WITHOUT changing what confirms:
+    // the guard constants front-load the dictionary (so they survive the cap and
+    // are tried first), and multi-guard sequence seeds cover chains of
+    // distinct-valued guards that single-value tiling cannot reach. The verdict is
+    // still produced by native replay on the ORIGINAL program below (R6). An empty
+    // slice yields a dictionary byte-identical to the plain harvest and no sequence
+    // seeds, so this never regresses.
+    let slice = saf_svcomp::slicing::backward_slice(ctx.module);
+    let dict = saf_svcomp::slicing::slice_directed_dictionary(ctx.module, &slice);
     let mut corpus = fuzz::seed_corpus(&dict);
+    corpus.extend(saf_svcomp::slicing::sequence_seeds(&slice.guard_constants));
     // Fixed seed -> the whole search (and therefore the verdict) is reproducible.
     let mut rng = fuzz::XorShift64::new(0x5AF3_C0DE);
     let per_run = replay_timeout();

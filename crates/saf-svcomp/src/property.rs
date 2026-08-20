@@ -1645,7 +1645,7 @@ pub(crate) const REACH_ERROR_NAMES: &[&str] = &["reach_error", "__VERIFIER_error
 /// Assumption intrinsics. An assumption conditions all downstream execution
 /// (`assume(false)` blocks the path entirely), so nothing after one is
 /// *unconditionally* reached — the must-reach walk stops at an assume.
-const ASSUME_FUNCTIONS: &[&str] = &["__VERIFIER_assume", "__CPROVER_assume"];
+pub(crate) const ASSUME_FUNCTIONS: &[&str] = &["__VERIFIER_assume", "__CPROVER_assume"];
 
 /// Functions that never return — execution stops before anything after the call.
 const NORETURN_FUNCTIONS: &[&str] = &[

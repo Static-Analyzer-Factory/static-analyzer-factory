@@ -21,6 +21,7 @@ pub mod property;
 pub mod property_kind;
 pub mod race;
 pub mod ranking;
+pub mod slicing;
 pub mod summaries;
 pub mod termination;
 pub mod witness_lower;

@@ -171,7 +171,7 @@ pub fn harvest_dictionary(module: &AirModule) -> Vec<i64> {
 }
 
 /// Cap on dictionary size — keeps mutation cheap and reproducible.
-const MAX_DICT_ENTRIES: usize = 256;
+pub const MAX_DICT_ENTRIES: usize = 256;
 
 /// Fixed length of every fuzz input buffer (bytes). 256 bytes covers 32 `int`
 /// reads / 64 `short` reads — deep enough for the sv-benchmarks reach tasks, while
