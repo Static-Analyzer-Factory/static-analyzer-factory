@@ -110,12 +110,131 @@ const Z3_SEED: u32 = 42;
 /// checks `cfg_has_loops` first); a loop-free function is handled upstream.
 #[must_use]
 pub fn loops_are_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg) -> bool {
-    let Some(loops) = extract_natural_loops(func, cfg) else {
-        return false;
-    };
-    // Every natural loop must be ranked; any failure (unmodelable loop, or Z3
-    // `Unsat`/`Unknown`) abstains the whole function.
-    loops.iter().all(|li| loop_is_ranked(func, module, cfg, li))
+    // Fast path: a reducible CFG with one latch per header — the full existing
+    // machinery applies (path-sensitive multipath model with a havoc fallback that
+    // also covers nested loops).
+    if let Some(loops) = extract_natural_loops(func, cfg) {
+        // Every natural loop must be ranked; any failure (unmodelable loop, or Z3
+        // `Unsat`/`Unknown`) abstains the whole function.
+        return loops.iter().all(|li| loop_is_ranked(func, module, cfg, li));
+    }
+    // Additive fallback: a reducible CFG where some header has **more than one**
+    // back-edge (a `continue`, or a short-circuit `while (a && b)`). The single-
+    // latch extractor rejected it; rank each header's loop with one common
+    // lexicographic function over *all* its back-edge transitions (multi-latch
+    // soundness: see [`build_multipath_model_multi`]). Irreducible CFGs are still
+    // rejected here (⇒ abstain).
+    match extract_multilatch_loops(func, cfg) {
+        Some(loops) => loops
+            .iter()
+            .all(|ml| multilatch_loop_is_ranked(func, module, cfg, ml)),
+        None => false,
+    }
+}
+
+/// A natural loop identified by a header and **all** of its back-edge latches
+/// (`latchᵢ → header`). Unlike [`LoopInfo`] this admits more than one latch.
+struct MultiLatchLoop {
+    header: BlockId,
+    /// Every latch with a back-edge into `header` (sorted, deduped — deterministic).
+    latches: Vec<BlockId>,
+    /// The natural-loop body: `{header}` ∪ every node reaching some latch without
+    /// passing through `header`.
+    body: BTreeSet<BlockId>,
+    /// Immediate-dominator map for the function CFG.
+    idom: BTreeMap<BlockId, BlockId>,
+}
+
+/// Identify every natural loop grouping *all* back-edges by their header (so a
+/// header with several latches becomes ONE [`MultiLatchLoop`]), or `None` if the
+/// CFG is **irreducible** (removing dominance back-edges leaves a cycle) or has no
+/// back-edge. Mirrors [`extract_natural_loops`] but does not reject multi-latch.
+fn extract_multilatch_loops(func: &AirFunction, cfg: &Cfg) -> Option<Vec<MultiLatchLoop>> {
+    let idom = compute_dominators(cfg);
+
+    // Back-edges `u → v` where the head `v` dominates its tail `u`.
+    let mut back_edges: Vec<(BlockId, BlockId)> = Vec::new();
+    for (&u, succs) in &cfg.successors {
+        for &v in succs {
+            if dominates(v, u, &idom) {
+                back_edges.push((u, v));
+            }
+        }
+    }
+    if back_edges.is_empty() {
+        return None;
+    }
+
+    // Reducibility: with all dominance back-edges removed a reducible CFG is acyclic.
+    // A surviving cycle is an irreducible retreating edge natural-loop enumeration
+    // would miss ⇒ abstain (same guard as the single-latch extractor).
+    let back_set: BTreeSet<(BlockId, BlockId)> = back_edges.iter().copied().collect();
+    if forward_graph_has_cycle(cfg, &back_set) {
+        return None;
+    }
+
+    // Group latches by header (BTreeMap ⇒ deterministic header + latch order).
+    let mut by_header: BTreeMap<BlockId, BTreeSet<BlockId>> = BTreeMap::new();
+    for &(latch, header) in &back_edges {
+        by_header.entry(header).or_default().insert(latch);
+    }
+
+    let mut loops = Vec::with_capacity(by_header.len());
+    for (header, latches) in by_header {
+        // Sanity: the header must exist.
+        func.blocks.iter().find(|b| b.id == header)?;
+
+        // Body: {header} ∪ nodes reaching any latch without passing through header.
+        let mut body: BTreeSet<BlockId> = BTreeSet::new();
+        body.insert(header);
+        let mut queue: VecDeque<BlockId> = VecDeque::new();
+        for &latch in &latches {
+            if latch != header && body.insert(latch) {
+                queue.push_back(latch);
+            }
+        }
+        while let Some(b) = queue.pop_front() {
+            if let Some(preds) = cfg.predecessors.get(&b) {
+                for &p in preds {
+                    if p != header && body.insert(p) {
+                        queue.push_back(p);
+                    }
+                }
+            }
+        }
+
+        loops.push(MultiLatchLoop {
+            header,
+            latches: latches.into_iter().collect(),
+            body,
+            idom: idom.clone(),
+        });
+    }
+    Some(loops)
+}
+
+/// Rank one [`MultiLatchLoop`] with a single lexicographic ranking function that is
+/// bounded and strictly decreasing on every back-edge transition. Path-sensitive
+/// only (no havoc fallback): a nested inner loop, too many paths, or a non-affine
+/// update abstains (⇒ `unknown`). Sound — see [`build_multipath_model_multi`].
+fn multilatch_loop_is_ranked(
+    func: &AirFunction,
+    module: &AirModule,
+    cfg: &Cfg,
+    ml: &MultiLatchLoop,
+) -> bool {
+    match build_multipath_model_multi(
+        func,
+        module,
+        cfg,
+        ml.header,
+        &ml.latches,
+        &ml.body,
+        &ml.idom,
+    ) {
+        Some(model) => greedy_lex_rank(&model),
+        None => false,
+    }
 }
 
 /// Rank a single natural loop.
@@ -1750,107 +1869,163 @@ fn build_mutual_recursion_model(
     })
 }
 
-/// Build the path-sensitive [`MultiPathModel`], or `None` (⇒ abstain / fall back)
-/// when the loop is not in the supported path-sensitive shape.
-// NOTE: this is one cohesive extraction pipeline (reject-nested → collect phis →
-// enumerate paths → per-path guards/transitions → classify overflow → assemble);
-// splitting it would only scatter the shared `defs`/`universe`/`bound_of` state.
-#[allow(clippy::too_many_lines)]
+/// Build the path-sensitive [`MultiPathModel`] for a **single-latch** natural loop,
+/// or `None` (⇒ abstain / fall back) when it is not in the supported shape.
 fn build_multipath_model(
     func: &AirFunction,
     module: &AirModule,
     cfg: &Cfg,
     li: &LoopInfo,
 ) -> Option<MultiPathModel> {
-    let defs = index_defs(func, &li.body);
+    build_multipath_model_multi(
+        func,
+        module,
+        cfg,
+        li.header,
+        &[li.latch],
+        &li.body,
+        &li.idom,
+    )
+}
+
+/// Build the path-sensitive [`MultiPathModel`] for a natural loop with header
+/// `header` and one *or more* back-edge latches (all `latch → header`), or `None`
+/// (⇒ abstain / fall back) when it is not in the supported path-sensitive shape.
+///
+/// # Multi-latch soundness
+///
+/// A loop with several back-edges into one header (e.g. a `continue`, or the two
+/// exits of a short-circuit `while (a && b)`) returns to the header via *exactly
+/// one* back-edge each iteration. We enumerate every `header → latchᵢ` path across
+/// **all** latches and record one [`Branch`] per (latch × path). A single
+/// lexicographic ranking function found by [`greedy_lex_rank`] that is bounded and
+/// strictly lex-decreasing on *every* branch therefore strictly decreases across
+/// every possible iteration transition — so the loop runs finitely many times.
+/// (This is why per-latch *independent* ranking is unsound but one *common*
+/// ranking over the union is sound.)
+// NOTE: this is one cohesive extraction pipeline (reject-nested → collect phis →
+// enumerate paths across all latches → per-path guards/transitions → classify
+// overflow → assemble); splitting it would only scatter the shared
+// `defs`/`universe`/`bound_of` state.
+#[allow(clippy::too_many_lines)]
+fn build_multipath_model_multi(
+    func: &AirFunction,
+    module: &AirModule,
+    cfg: &Cfg,
+    header: BlockId,
+    latches: &[BlockId],
+    body: &BTreeSet<BlockId>,
+    idom: &BTreeMap<BlockId, BlockId>,
+) -> Option<MultiPathModel> {
+    if latches.is_empty() {
+        return None;
+    }
+    let latch_set: BTreeSet<BlockId> = latches.iter().copied().collect();
+    let defs = index_defs(func, body);
     let block_of = index_block_of(func);
     let signs = infer_signs(func);
 
-    // Reject a **nested inner loop**: the only dominance back-edge inside the body
-    // may be this loop's own `latch → header`. Any other in-body back-edge is an
-    // inner loop whose many iterations path enumeration would miss (unsound) — bail
-    // to the single-transition havoc model, which over-approximates it as havoc.
-    // (The function is reducible — `extract_natural_loops` rejected irreducible
-    // CFGs — so every in-body cycle has a dominance back-edge and is caught here.)
+    // Reject a **nested inner loop**: the only dominance back-edges inside the body
+    // may be this loop's own `latchᵢ → header` edges. Any other in-body back-edge is
+    // an inner loop whose many iterations path enumeration would miss (unsound) —
+    // bail (for single-latch, the caller falls back to the havoc model). (The
+    // function is reducible — the extractor rejected irreducible CFGs — so every
+    // in-body cycle has a dominance back-edge and is caught here.)
     for (&u, succs) in &cfg.successors {
-        if !li.body.contains(&u) {
+        if !body.contains(&u) {
             continue;
         }
         for &v in succs {
-            if li.body.contains(&v)
-                && dominates(v, u, &li.idom)
-                && !(u == li.latch && v == li.header)
+            if body.contains(&v)
+                && dominates(v, u, idom)
+                && !(v == header && latch_set.contains(&u))
             {
                 return None;
             }
         }
     }
 
-    // Header phis and their back-edge (latch) incoming value.
-    let header_block = func.blocks.iter().find(|b| b.id == li.header)?;
-    let mut phi_next: BTreeMap<ValueId, ValueId> = BTreeMap::new();
+    // Header phis (dsts). Each is resolved per latch to its back-edge incoming value.
+    let header_block = func.blocks.iter().find(|b| b.id == header)?;
+    let mut header_phis: BTreeSet<ValueId> = BTreeSet::new();
     for inst in &header_block.instructions {
-        if let Operation::Phi { incoming } = &inst.op {
-            let Some(dst) = inst.dst else { continue };
-            if let Some((_, v)) = incoming.iter().find(|(pred, _)| *pred == li.latch) {
-                phi_next.insert(dst, *v);
+        if let Operation::Phi { .. } = &inst.op {
+            if let Some(dst) = inst.dst {
+                header_phis.insert(dst);
             }
         }
     }
-    if phi_next.is_empty() {
+    if header_phis.is_empty() {
         return None;
     }
-    let header_phis: BTreeSet<ValueId> = phi_next.keys().copied().collect();
 
-    // Enumerate every header→latch path of the (acyclic) body.
-    let paths = enumerate_body_paths(cfg, &li.body, li.header, li.latch)?;
-    let latch_block = func.blocks.iter().find(|b| b.id == li.latch)?;
-
-    // --- Pass 1: per-path guards + raw affine transitions; collect the universe.
-    let mut raws: Vec<RawBranch> = Vec::with_capacity(paths.len());
+    // --- Pass 1: per-(latch × path) guards + raw affine transitions. -----------
+    let mut raws: Vec<RawBranch> = Vec::new();
     let mut universe: BTreeSet<ValueId> = header_phis.clone();
-    for path in &paths {
-        let path_pred = path_pred_map(path);
-        let mut guards: Vec<Constraint> = Vec::new();
-        // Necessary stay-conditions along the path's internal/exit branches …
-        for pair in path.windows(2) {
-            if let Some(block) = func.blocks.iter().find(|b| b.id == pair[0]) {
-                add_path_guards(
-                    &mut guards,
-                    &mut universe,
-                    block,
-                    pair[1],
-                    &defs,
-                    &block_of,
-                    &header_phis,
-                    module,
-                    &path_pred,
-                );
+    for &latch in latches {
+        // This latch's back-edge incoming value for each header phi.
+        let mut phi_next: BTreeMap<ValueId, ValueId> = BTreeMap::new();
+        for inst in &header_block.instructions {
+            if let Operation::Phi { incoming } = &inst.op {
+                let Some(dst) = inst.dst else { continue };
+                if let Some((_, v)) = incoming.iter().find(|(pred, _)| *pred == latch) {
+                    phi_next.insert(dst, *v);
+                }
             }
         }
-        // … plus the back-edge branch itself (`latch → header`): in a `do…while`
-        // the continuing condition lives here.
-        add_path_guards(
-            &mut guards,
-            &mut universe,
-            latch_block,
-            li.header,
-            &defs,
-            &block_of,
-            &header_phis,
-            module,
-            &path_pred,
-        );
+        let latch_block = func.blocks.iter().find(|b| b.id == latch)?;
+        // Enumerate every header→latch path of the (acyclic) body.
+        let paths = enumerate_body_paths(cfg, body, header, latch)?;
+        for path in &paths {
+            let path_pred = path_pred_map(path);
+            let mut guards: Vec<Constraint> = Vec::new();
+            // Necessary stay-conditions along the path's internal/exit branches …
+            for pair in path.windows(2) {
+                if let Some(block) = func.blocks.iter().find(|b| b.id == pair[0]) {
+                    add_path_guards(
+                        &mut guards,
+                        &mut universe,
+                        block,
+                        pair[1],
+                        &defs,
+                        &block_of,
+                        &header_phis,
+                        module,
+                        &path_pred,
+                    );
+                }
+            }
+            // … plus the back-edge branch itself (`latch → header`): in a `do…while`
+            // the continuing condition lives here.
+            add_path_guards(
+                &mut guards,
+                &mut universe,
+                latch_block,
+                header,
+                &defs,
+                &block_of,
+                &header_phis,
+                module,
+                &path_pred,
+            );
 
-        let mut raw_next: BTreeMap<ValueId, Option<Affine>> = BTreeMap::new();
-        for (&phi, &nv) in &phi_next {
-            let a = resolve_affine_path(nv, &defs, &block_of, &header_phis, module, &path_pred, 0);
-            if let Some(ref aff) = a {
-                universe.extend(aff.terms.keys().copied());
+            let mut raw_next: BTreeMap<ValueId, Option<Affine>> = BTreeMap::new();
+            for &phi in &header_phis {
+                // A phi lacking a back-edge value for this latch cannot be modelled;
+                // over-approximate it as an (unresolved) havoc below.
+                let a = phi_next.get(&phi).and_then(|&nv| {
+                    resolve_affine_path(nv, &defs, &block_of, &header_phis, module, &path_pred, 0)
+                });
+                if let Some(ref aff) = a {
+                    universe.extend(aff.terms.keys().copied());
+                }
+                raw_next.insert(phi, a);
             }
-            raw_next.insert(phi, a);
+            raws.push(RawBranch { guards, raw_next });
+            if raws.len() > MAX_PATHS {
+                return None;
+            }
         }
-        raws.push(RawBranch { guards, raw_next });
     }
 
     // Invariant params: leaf symbols that are neither header phis nor defined
@@ -4471,5 +4646,179 @@ mod tests {
         let (m, _) = mutual_pair(BinaryOp::ICmpSgt, 0, -1);
         let solo: BTreeSet<FunctionId> = [m.functions[0].id].into_iter().collect();
         assert!(!mutual_recursion_is_ranked(&m, &solo));
+    }
+
+    // --- multi-latch loops (two back-edges into one header) -----------------
+
+    /// Build `main` containing a single loop whose header has **two** back-edges
+    /// (the `continue` shape):
+    /// ```c
+    /// int i = nondet();
+    /// while (i > 0) {          // header: phi i ; icmp sgt(i,0) ; condbr body/exit
+    ///   if (nondet()) i += step1;   // body → l1 (back-edge)
+    ///   else          i += step2;   // body → l2 (back-edge)
+    /// }
+    /// ```
+    /// Both `l1 → header` and `l2 → header` are dominance back-edges, so the header
+    /// has two latches (the single-latch extractor rejects it). A common ranking
+    /// function `f = i` proves termination iff *both* steps decrease `i`.
+    fn multilatch_loop(step1: i64, step2: i64) -> AirModule {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+
+        let b0 = bid("ml_entry");
+        let h = bid("ml_header");
+        let body = bid("ml_body");
+        let l1 = bid("ml_l1");
+        let l2 = bid("ml_l2");
+        let e = bid("ml_exit");
+
+        let i = vid("ml_i"); // header phi
+        let i1v = vid("ml_i1"); // l1: i + step1
+        let i2v = vid("ml_i2"); // l2: i + step2
+        let i_init = vid("ml_i_init"); // nondet init
+        let cond = vid("ml_cond"); // header guard result
+        let brc = vid("ml_brc"); // body branch nondet
+        let zero = vid("ml_zero");
+        let s1 = vid("ml_step1");
+        let s2 = vid("ml_step2");
+        constants.insert(zero, Constant::Int { value: 0, bits: 32 });
+        constants.insert(
+            s1,
+            Constant::Int {
+                value: step1,
+                bits: 32,
+            },
+        );
+        constants.insert(
+            s2,
+            Constant::Int {
+                value: step2,
+                bits: 32,
+            },
+        );
+
+        let nd_int = FunctionId(make_id("func", b"__VERIFIER_nondet_int"));
+
+        // entry: i_init = nondet(); br header
+        let mut entry = AirBlock::new(b0);
+        entry.instructions.push(vinst(
+            "ml_init",
+            Operation::CallDirect { callee: nd_int },
+            i_init,
+            vec![],
+            i32t,
+        ));
+        entry
+            .instructions
+            .push(term("ml_br_entry", Operation::Br { target: h }, vec![]));
+
+        // header: phi i ; cond = icmp sgt(i,0) ; condbr cond -> body/exit
+        let mut header = AirBlock::new(h);
+        header.instructions.push(vinst(
+            "ml_phi",
+            Operation::Phi {
+                incoming: vec![(b0, i_init), (l1, i1v), (l2, i2v)],
+            },
+            i,
+            vec![],
+            i32t,
+        ));
+        header.instructions.push(vinst(
+            "ml_cmp",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            cond,
+            vec![i, zero],
+            i1t,
+        ));
+        header.instructions.push(term(
+            "ml_condbr",
+            Operation::CondBr {
+                then_target: body,
+                else_target: e,
+            },
+            vec![cond],
+        ));
+
+        // body: brc = nondet(); condbr brc -> l1/l2
+        let mut bodyb = AirBlock::new(body);
+        bodyb.instructions.push(vinst(
+            "ml_brc",
+            Operation::CallDirect { callee: nd_int },
+            brc,
+            vec![],
+            i32t,
+        ));
+        bodyb.instructions.push(term(
+            "ml_bodybr",
+            Operation::CondBr {
+                then_target: l1,
+                else_target: l2,
+            },
+            vec![brc],
+        ));
+
+        // l1: i1 = i + step1 ; br header  (back-edge)
+        let mut lb1 = AirBlock::new(l1);
+        lb1.instructions.push(vinst(
+            "ml_add1",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            i1v,
+            vec![i, s1],
+            i32t,
+        ));
+        lb1.instructions
+            .push(term("ml_br1", Operation::Br { target: h }, vec![]));
+
+        // l2: i2 = i + step2 ; br header  (back-edge)
+        let mut lb2 = AirBlock::new(l2);
+        lb2.instructions.push(vinst(
+            "ml_add2",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            i2v,
+            vec![i, s2],
+            i32t,
+        ));
+        lb2.instructions
+            .push(term("ml_br2", Operation::Br { target: h }, vec![]));
+
+        // exit: ret i
+        let mut exit = AirBlock::new(e);
+        exit.instructions
+            .push(term("ml_ret", Operation::Ret, vec![i]));
+
+        let func = AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![entry, header, bodyb, lb1, lb2, exit],
+            entry_block: Some(b0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        module_of(func, constants)
+    }
+
+    #[test]
+    fn multilatch_both_decrease_is_ranked() {
+        // while (i>0) { if (*) i-=1; else i-=2; }  — both back-edges decrease i,
+        // so f = i ranks the whole loop (single common ranking over two latches).
+        assert!(ranked(&multilatch_loop(-1, -2)));
+    }
+
+    #[test]
+    fn multilatch_one_increases_abstains() {
+        // while (i>0) { if (*) i-=1; else i+=1; }  — the `i+=1` latch can be taken
+        // forever, so no common ranking exists ⇒ abstain (never a wrong `true`).
+        assert!(!ranked(&multilatch_loop(-1, 1)));
     }
 }
