@@ -13,10 +13,12 @@
 # Shared infra built once and reused by bmc-fixed-k/se-interp/bmc-incremental/fuzz-concolic-z3: an
 # AIR→SSA path/program encoder + nondet-model extractor (see reach-mechanisms.md §6 "Shared infrastructure").
 # Prefix a line with # to PARK it. The supervisor skips parked/commented levers.
-# frontend-build-robustness (rank-1 marks-loss fix) was DEPLOYED DIRECTLY on 2026-08-21, NOT run as an arm:
-#   a weak-FUNCTION __VERIFIER_assert stub (was a do/while macro colliding with benchmarks that define it as a
-#   real function -> 'while loop outside a function' on ~1428 unreach tasks) + always -lm + -fbracket-depth=1024
-#   + nondet width declares. Strictly-additive build-input change; verdict path untouched.
+# The rank-1 'build robustness' marks-loss fix was DEPLOYED DIRECTLY on 2026-08-21 (commit 3c47ac2d), NOT an
+#   arm. Real diagnosis (roadmap misdiagnosed it): ingestion already neutralizes the __VERIFIER_assert do/while
+#   macro collision, but the unreach native-replay confirmers (fuzz_confirm_false + replay_confirms_false) did
+#   NOT -> ~931 arithmetic-cluster FALSE never ran. Fix = reuse the neutralizer there + -fsanitize-trap=signed-
+#   integer-overflow so overflow-only reaches abstain (else array-fpi/indp2 signed-overflow UB = -16 FP).
+#   Validated real-scorer FP=0 / zero regression / ~+98 raw FALSE recovered.
 termination-recall	tuning	termination	local	Raise termination-TRUE recall via LINEAR RANKING-FUNCTION synthesis (Podelski–Rybalchenko / Farkas+Motzkin+Z3) for single natural loops: extract the loop from the CFG (back-edge/dominator), build the linear transition relation LOOP(x,x') from AIR, template f=s0+sum(s_i*x_i), require LOOP=>f>=0 and LOOP=>f-f'>=1, eliminate the forall via Motzkin, discharge the exists with Z3 (qe/nlsat), extract coeffs. TRUE iff (loop-free AND acyclic) OR (every natural loop ranked AND acyclic callgraph). A valid ranking function is a COMPLETE proof — no soundness risk; TRUE needs no witness (+2 on the verdict). PRESERVE plan-201 hardening (abstain on llvm.global_ctors/dtors + any reachable block with no terminator). Follow-ons: lexicographic/multiphase (k=2), SCC-decomposition per-loop.
 term-mem2reg-counters	capability	termination	local	Scalar-promote provably non-escaped fixed-size scalar allocas to SSA phis BEFORE ranking, so -O0-spilled loop counters (*i) and recursion params become affine state the existing ranking.rs pipeline can rank. ENABLING lever: today ranking.rs treats Load as opaque, so the whole recursion reservoir (recursive-simple/recursive/recursified_*) + memory-alloca loops capture 0. Fail-closed escape gate (promote only when the alloca is used EXCLUSIVELY as a Load/Store operand, never fed to Gep/Call/store-as-value); abstain on any doubt. TRUE-only, no witness (+2), preserves plan-201 hardening. Mandatory negative test: an address-escaped slot must NOT promote.
 term-diseq-guard	tuning	termination	local	Disjunctive path-split of != / ==-else guards into two convex half-spaces (BOTH must rank) to recover rankable recursions whose lower bound is currently dropped as non-convex. FOLLOW-ON of term-mem2reg-counters (guard operands are opaque Loads until promoted; captures nothing before it). Unconditionally sound (a superset of each real transition; Sat-only Farkas, failure abstains). Negative test: while(x!=5)x+=2 from an even start must abstain.
