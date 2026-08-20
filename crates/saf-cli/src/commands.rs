@@ -1459,25 +1459,42 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
         return None;
     }
 
-    // Compile the shim + original program ONCE (native, no sanitizer).
+    // Compile the shim + original program ONCE. Two knobs vs a plain native compile:
+    // (a) a two-pass __VERIFIER_assert neutralizer (mirrors compile_to_ir) so a benchmark that DEFINES its
+    //     own `void __VERIFIER_assert(int)` compiles instead of hitting the stub's function-like macro
+    //     ("while loop outside of a function"); (b) -fsanitize-trap=signed-integer-overflow so a fuzz input
+    //     that reaches reach_error only via signed-overflow UB TRAPS before the sentinel drops -> not a hit
+    //     -> abstain (SV-COMP labels overflow-only reaches safe, e.g. array-fpi/indp2). Additive on both:
+    //     a program that already compiled + reaches reach_error without overflow is unchanged; a genuine
+    //     failure still returns None (inconclusive), never a wrong verdict.
     let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
-    let compiled = Command::new(ctx.clang)
-        .args(["-O0", "-Wno-everything"])
-        .arg(ctx.data_model.clang_flag())
-        .arg("-include")
-        .arg(ctx.stub)
-        .arg("-I")
-        .arg(srcdir)
-        .arg(ctx.input)
-        .arg(&driver_src)
-        .arg("-o")
-        .arg(&harness)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match compiled {
-        Ok(s) if s.success() => {}
-        _ => return None, // link/compile failure -> inconclusive
+    let build = |neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(ctx.clang);
+        cmd.args(["-O0", "-Wno-everything", "-fsanitize=signed-integer-overflow", "-fsanitize-trap=signed-integer-overflow"])
+            .arg(ctx.data_model.clang_flag())
+            .arg("-include")
+            .arg(ctx.stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include").arg(n);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(ctx.input)
+            .arg(&driver_src)
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    let mut compiled_ok = matches!(build(None).status(), Ok(s) if s.success());
+    if !compiled_ok {
+        if let Ok(n) = write_assert_neutralizer(dir) {
+            compiled_ok = matches!(build(Some(n.as_path())).status(), Ok(s) if s.success());
+        }
+    }
+    if !compiled_ok {
+        return None; // link/compile failure -> inconclusive
     }
 
     // Backward AIR slice from the reach_error criteria (+ __VERIFIER_assume as a
@@ -2163,21 +2180,44 @@ fn replay_confirms_false(
         .with_context(|| "writing replay driver")?;
 
     let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
-    let status = Command::new(clang)
-        .args(["-O0", "-Wno-everything"])
-        .arg(data_model.clang_flag())
-        .arg("-include")
-        .arg(stub)
-        .arg("-I")
-        .arg(srcdir)
-        .arg(input)
-        .arg(&driver_src)
-        .arg("-o")
-        .arg(&harness)
-        .stdout(Stdio::null())
+    // Two knobs vs a plain native compile (see fuzz_confirm_false): (a) a two-pass __VERIFIER_assert
+    // neutralizer so a benchmark that DEFINES its own assert compiles; (b) -fsanitize-trap=signed-integer-
+    // overflow so a candidate whose path reaches reach_error only via signed-overflow UB TRAPS before the
+    // sentinel drops -> Ok(false) (inconclusive), NOT a wrong FALSE. Additive: a program that already
+    // compiled + reaches reach_error without overflow is unchanged; a genuine link/compile failure still
+    // returns Ok(false). stderr suppressed on both passes so the transient pass-1 macro error no longer
+    // leaks into task diagnostics.
+    let build = |neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(clang);
+        cmd.args(["-O0", "-Wno-everything", "-fsanitize=signed-integer-overflow", "-fsanitize-trap=signed-integer-overflow"])
+            .arg(data_model.clang_flag())
+            .arg("-include")
+            .arg(stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include").arg(n);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(input)
+            .arg(&driver_src)
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    let mut ok = build(None)
         .status()
-        .with_context(|| format!("failed to spawn {clang} for native replay"))?;
-    if !status.success() {
+        .with_context(|| format!("failed to spawn {clang} for native replay"))?
+        .success();
+    if !ok {
+        let neutralizer = write_assert_neutralizer(dir)?;
+        ok = build(Some(neutralizer.as_path()))
+            .status()
+            .with_context(|| format!("failed to spawn {clang} for native replay"))?
+            .success();
+    }
+    if !ok {
         // Link/compile failure (e.g. the task inlines its own reach_error) —
         // inconclusive, not a violation.
         return Ok(false);
