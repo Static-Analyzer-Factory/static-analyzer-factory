@@ -57,6 +57,11 @@ STATE_DIR="${SAF_LOOP_STATE:-$REPO_ROOT/.loop-state}"
                                    # KEEP/KEEP_POOL/ACCUMULATE_PLUS — stops polishing an unscoreable
                                    # capability (race-confirmer) instead of running to MAX_LEVER_ARMS
 : "${MAX_LEVER_ARMS:=12}"           # hard cap on total arms per lever (bounds accumulation spend)
+: "${MIN_ATTEMPTS:=1}"              # (plan-205 marks-loss) force-schedule any non-parked lever with fewer
+                                   # than this many attempts BEFORE gen_credit exploit picks, so a never-run
+                                   # capability lever (bmc-fixed-k / conc-seq-m1, attempts=0 gen_credit=0)
+                                   # actually gets tried instead of being permanently out-competed; a
+                                   # capability lineage then CONTINUES via its saved wip.patch (see pick_lever)
 TRAIN_MANIFEST="$REPO_ROOT/tests/benchmarks/svcomp-splits/train.jsonl"
 HOLDOUT_MANIFEST="$REPO_ROOT/tests/benchmarks/svcomp-splits/holdout.jsonl"
 VAL_MANIFEST="$REPO_ROOT/tests/benchmarks/svcomp-splits/val.jsonl"
@@ -254,24 +259,42 @@ pick_lever() {  # prints "id<TAB>mode<TAB>family<TAB>scope<TAB>description"
     { all[NR]=$0; if ($0==last) at=NR }
     END { if (at) { for(i=at+1;i<=NR;i++) print all[i]; for(i=1;i<=at;i++) print all[i] }
           else    { for(i=1;i<=NR;i++)   print all[i] } }')"
-  # WITHIN a family, prefer the highest earned gen_credit (holdout-boosts + generalization KEEPs —
-  # plan 205 §2.5), so a lever that has demonstrably moved NOVEL tasks is tried before one that hasn't;
-  # ties fall back to file (ROI) order via a strict `>`. When every credit is 0 (fresh campaign) this is
-  # byte-identical to "first non-parked lever in file order" — the prior behavior.
-  local fam id line gc best_line best_credit
+  # WITHIN a family, pick in priority order (plan-205 marks-loss 2026-08-21):
+  #   (1) CONTINUE a mid-lineage capability lever that reverted with saved WIP (lever.<id>.wip.patch) — so a
+  #       multi-arm build (e.g. the shared BMC AIR->SSA encoder) proceeds from its patch instead of stalling;
+  #       bounded by the existing revert/accumulate budgets that eventually park it.
+  #   (2) FORCE-SCHEDULE an under-explored lever (attempts < MIN_ATTEMPTS) — so a never-run capability lever
+  #       (bmc-fixed-k / conc-seq-m1, attempts=0 gen_credit=0) actually gets tried instead of being
+  #       permanently out-competed by an already-credited sibling; lowest-attempts first, ties -> file order.
+  #   (3) EXPLOIT the highest earned gen_credit (holdout-boosts + generalization KEEPs, plan 205 §2.5); ties
+  #       fall back to file (ROI) order via strict `>`.
+  # When every counter/patch is absent (fresh campaign, MIN_ATTEMPTS=1) tier (2) selects the first
+  # non-parked lever in file order — byte-identical to the prior fresh-campaign behavior.
+  local fam id line gc at best_line best_credit forced_line forced_at cont_line
   while IFS= read -r fam; do
     [ -z "$fam" ] && continue
-    best_line=""; best_credit=-1
+    best_line=""; best_credit=-1; forced_line=""; forced_at=2147483647; cont_line=""
     while IFS= read -r line; do
       id="$(printf '%s' "$line" | cut -f1)"
       [ -e "$STATE_DIR/lever.$id.parked" ] && continue
+      # (1) mid-lineage continuation: a capability lever that reverted with saved WIP
+      [ -z "$cont_line" ] && [ -s "$STATE_DIR/lever.$id.wip.patch" ] && cont_line="$line"
+      # (2) force-schedule under-explored (lowest attempts wins)
+      at="$(cat "$STATE_DIR/lever.$id.attempts" 2>/dev/null || echo 0)"
+      case "$at" in ''|*[!0-9]*) at=0 ;; esac
+      if [ "$at" -lt "$MIN_ATTEMPTS" ] && [ "$at" -lt "$forced_at" ]; then forced_at="$at"; forced_line="$line"; fi
+      # (3) exploit gen_credit
       gc="$(cat "$STATE_DIR/lever.$id.gen_credit" 2>/dev/null || echo 0)"
       case "$gc" in ''|*[!0-9]*) gc=0 ;; esac
       if [ "$gc" -gt "$best_credit" ]; then best_credit="$gc"; best_line="$line"; fi
     done < <(awk -F'\t' -v f="$fam" 'NF>=5 && $1 !~ /^#/ && $3==f {print}' "$LEVERS_FILE")
-    if [ -n "$best_line" ]; then
+    local chosen=""
+    if   [ -n "$cont_line" ];   then chosen="$cont_line"
+    elif [ -n "$forced_line" ]; then chosen="$forced_line"
+    elif [ -n "$best_line" ];   then chosen="$best_line"; fi
+    if [ -n "$chosen" ]; then
       printf '%s' "$fam" > "$STATE_DIR/family_cursor"
-      printf '%s\n' "$best_line"; return 0
+      printf '%s\n' "$chosen"; return 0
     fi
   done <<< "$ordered"
   return 0
@@ -369,12 +392,13 @@ run_arm() {
     saf_eval "$TRAIN_MANIFEST" "$wk/pool_after.json" $prop_arg --group-weight --per-task "$wk/after.pertask.jsonl"
     gen_delta="$(py -c "import json,os;b=json.load(open('$wk/val_before.json'));a=json.load(open('$wk/val_after.json')) if os.path.exists('$wk/val_after.json') else {};c=a.get('confirmed_score_weighted');print((c-b.get('confirmed_score_weighted',0)) if c is not None else -999999999)")"
     pool_delta="$(py -c "import json,os;b=json.load(open('$wk/pool_before.json'));a=json.load(open('$wk/pool_after.json')) if os.path.exists('$wk/pool_after.json') else {};c=a.get('confirmed_score_weighted');print((c-b.get('confirmed_score_weighted',0)) if c is not None else -999999999)")"
-    # novel_solved must be MEASURED, not just mode==capability. Only a capability arm that actually
-    # ADDED net raw confirmed FALSEs (real solving progress) earns ACCUMULATE_PLUS's park-countdown
-    # immunity; a zero/negative-progress capability arm falls through to ACCUMULATE/REVERT so the lever
-    # parks (fixes race-find never parking over 6 zero-yield ACCUMULATE_PLUS arms). [arm-review 2026-08-19]
-    local rawpd; rawpd="$(py -c "import json,os;b=json.load(open('$wk/pool_before.json'));a=json.load(open('$wk/pool_after.json')) if os.path.exists('$wk/pool_after.json') else {};print(int((a.get('confirmed_score',0) or 0)-(b.get('confirmed_score',0) or 0)))" 2>/dev/null || echo 0)"
-    local novel=0; { [ "$mode" = capability ] && [ "${rawpd:-0}" -gt 0 ]; } 2>/dev/null && novel=1
+    # novel_solved must be MEASURED as DISTINCT-CLUSTER (dedup-weighted) progress, not raw confirmed FALSEs.
+    # The earlier rawpd>0 gate (arm-review 2026-08-19) still let a capability arm that only re-solved
+    # near-duplicate Juliet tasks earn ACCUMULATE_PLUS's park-countdown immunity every arm (the VERIFIED
+    # race-find 7-arm / +0-dedup burn). Require a positive DEDUP-WEIGHTED delta on the val OR pool set — a
+    # genuinely new cluster. A capability arm with no new cluster falls through to ACCUMULATE (accum_stall
+    # increments) and parks on ACCUMULATE_BUDGET like any other unscoreable lineage. [plan-205 marks-loss 2026-08-21]
+    local novel=0; { [ "$mode" = capability ] && { [ "${pool_delta:-0}" -gt 0 ] || [ "${gen_delta:-0}" -gt 0 ]; }; } 2>/dev/null && novel=1
     decision="$(py "$LIB/verify_arm.py" --gen-mode \
         --before "$wk/val_before.json" --after "$wk/val_after.json" \
         --pool-before "$wk/pool_before.json" --pool-after "$wk/pool_after.json" \

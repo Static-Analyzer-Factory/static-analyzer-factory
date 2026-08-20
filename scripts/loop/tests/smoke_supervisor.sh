@@ -290,6 +290,9 @@ gen_credit_priority() {  # §2.5: within a family, pick_lever prefers the highes
   printf 'la\ttuning\tvalid-memsafety\tlocal\tfile-first lever\n'  > "$tmp/levers.tsv"
   printf 'lb\ttuning\tvalid-memsafety\tlocal\thigher gen_credit lever\n' >> "$tmp/levers.tsv"
   echo 5 > "$tmp/state/lever.lb.gen_credit"
+  # both already explored (attempts >= MIN_ATTEMPTS) so the force-schedule tier does not preempt — this test
+  # isolates the gen_credit EXPLOIT tier. (force-schedule of the unexplored case is force_schedule_unexplored.)
+  echo 1 > "$tmp/state/lever.la.attempts"; echo 1 > "$tmp/state/lever.lb.attempts"
   SAF_REPO_ROOT="$tmp" SAF_LOOP_STATE="$tmp/state" SAF_GATE_LIB="$tmp/gate" SAF_LOOP_STUBS="$tmp/stubs.sh" \
     LEVERS_FILE="$tmp/levers.tsv" ARM_PROMPT_FILE="$LOOP_DIR/arm_prompt.md" JOURNAL="$tmp/state/journal.md" \
     LOOP_ENV=/dev/null SMOKE_SCENARIO=tuning_nogain \
@@ -300,6 +303,41 @@ gen_credit_priority() {  # §2.5: within a family, pick_lever prefers the highes
     printf '  ok   %-16s picked=%s (higher gen_credit beats file order)\n' gen_credit_priority "$picked"; pass=$((pass+1))
   else
     printf '  FAIL %-16s picked=%s want=lb\n' gen_credit_priority "$picked"; fail=$((fail+1))
+    tail -20 "$tmp.log" | sed 's/^/       /'
+  fi
+  rm -rf "$tmp" 2>/dev/null || true
+}
+
+force_schedule_unexplored() {  # plan-205 marks-loss: a never-run lever (attempts<MIN_ATTEMPTS) is
+                               # force-scheduled BEFORE a proven, higher-gen_credit sibling — so a
+                               # capability lever like bmc-fixed-k (attempts=0, gen_credit=0) actually runs.
+  local tmp; tmp="$(mktemp -d)"
+  mkdir -p "$tmp/scripts/loop/lib" "$tmp/tests/benchmarks/svcomp-splits" "$tmp/crates/saf-svcomp/src" "$tmp/state"
+  echo SCORER > "$tmp/scripts/svcomp_split_eval.py"
+  cp "$LOOP_DIR"/lib/*.py "$tmp/scripts/loop/lib/"
+  echo '{"t":1}' > "$tmp/tests/benchmarks/svcomp-splits/train.jsonl"
+  echo '{"t":2}' > "$tmp/tests/benchmarks/svcomp-splits/holdout.jsonl"
+  echo 'pub fn foo(){}' > "$tmp/crates/saf-svcomp/src/lib.rs"
+  printf 'state/\n.loop-state/\nlevers.tsv\nstubs.sh\ngate/\n' > "$tmp/.gitignore"
+  git -C "$tmp" init -q
+  git -C "$tmp" -c user.email=a@b -c user.name=t add -A >/dev/null
+  git -C "$tmp" -c user.email=a@b -c user.name=t commit -qm init
+  echo "$STUBS_BODY" > "$tmp/stubs.sh"
+  # lb is file-first, proven (gen_credit=5, already explored); lz is file-second and NEVER run (attempts=0).
+  # Force-schedule must pick lz despite lb's higher credit + earlier file position.
+  printf 'lb\ttuning\tvalid-memsafety\tlocal\tproven, credited lever\n'  > "$tmp/levers.tsv"
+  printf 'lz\tcapability\tvalid-memsafety\tlocal\tnever-run capability lever\n' >> "$tmp/levers.tsv"
+  echo 5 > "$tmp/state/lever.lb.gen_credit"; echo 3 > "$tmp/state/lever.lb.attempts"
+  SAF_REPO_ROOT="$tmp" SAF_LOOP_STATE="$tmp/state" SAF_GATE_LIB="$tmp/gate" SAF_LOOP_STUBS="$tmp/stubs.sh" \
+    LEVERS_FILE="$tmp/levers.tsv" ARM_PROMPT_FILE="$LOOP_DIR/arm_prompt.md" JOURNAL="$tmp/state/journal.md" \
+    LOOP_ENV=/dev/null SMOKE_SCENARIO=tuning_nogain \
+    GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=a@b GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=a@b \
+    bash "$SUP" --once >"$tmp.log" 2>&1
+  local picked; picked="$(awk -F' \\| ' '/^- arm/ {print $2}' "$tmp/state/journal.md" 2>/dev/null | tr -d ' ')"
+  if [ "$picked" = lz ]; then
+    printf '  ok   %-16s picked=%s (unexplored lever force-scheduled over proven gen_credit)\n' force_schedule_unexplored "$picked"; pass=$((pass+1))
+  else
+    printf '  FAIL %-16s picked=%s want=lz\n' force_schedule_unexplored "$picked"; fail=$((fail+1))
     tail -20 "$tmp.log" | sed 's/^/       /'
   fi
   rm -rf "$tmp" 2>/dev/null || true
@@ -362,6 +400,7 @@ accumulate_park                                                   # BUG-4: an AC
 cap_wip_reprime                                                   # BUG-2: reverted capability WIP preserved + next arm primed
 reap_swept                                                        # BUG-3: orphan-container sweep invoked on keep + revert
 gen_credit_priority                                               # §2.5: holdout-boosted lever wins within its family
+force_schedule_unexplored                                         # plan-205: a never-run lever is force-scheduled over a proven sibling
 heldout_brake_park                                                # §1a/§2.4: gen-mode holdout brake parks a non-reproducing lever
 
 echo
