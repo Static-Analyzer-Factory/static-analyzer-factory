@@ -306,25 +306,34 @@ def weighted_confirmed_summary(results: list[dict], cap: int = 1) -> dict:
     number by at most `cap` — while penalties (−16/−32) pass through in FULL (a cluster can never hide a
     false alarm). This is the quantity the loop's generalization gate maximizes on the reasoning `val` set:
     distinct solving power, not pool volume. Returns `confirmed_score_weighted` + per-property
-    `{confirmed_weighted, confirmed_clusters}` + `confirmed_by_cluster`."""
-    by_cluster: dict[str, int] = defaultdict(int)
-    cluster_prop: dict[str, str] = {}
+    `{confirmed_weighted, confirmed_clusters}` + `confirmed_by_cluster`.
+
+    Attribution is keyed by (origin `group`, `property`): one origin cluster (e.g. a single Juliet CWE
+    dir) frequently contains tasks of DIFFERENT properties (a memory bug AND a signed overflow), and each
+    property SAF actually solves in that cluster is DISTINCT solving power. Keying by `group` alone
+    attributed the whole cluster to a single property (last-writer-wins), which silently zeroed e.g.
+    no-overflow's real dedup credit when its clusters overlapped memsafety. Per-(group,property) keeps the
+    anti-Juliet-memorization cap fully intact (still at most `cap` positive points per (cluster,property))
+    while crediting every property a cluster genuinely solves. `confirmed_by_cluster` (display) stays keyed
+    by group total for backward compatibility."""
+    by_cluster: dict[str, int] = defaultdict(int)               # display: per origin-group total (unchanged shape)
+    by_cluster_prop: dict[tuple[str, str], int] = defaultdict(int)  # scoring: per (group, property)
     for r in results:
         g = r.get("group") or r["rel_yml"]
         by_cluster[g] += r["confirmed"]
-        cluster_prop[g] = r["property"]
+        by_cluster_prop[(g, r["property"])] += r["confirmed"]
 
     def capped(c: int) -> int:
-        return min(c, cap) if c > 0 else c   # cap positives per cluster; keep penalties whole
+        return min(c, cap) if c > 0 else c   # cap positives per (cluster,property); keep penalties whole
 
     per: dict[str, dict] = defaultdict(lambda: {"confirmed_weighted": 0, "confirmed_clusters": 0})
     total = 0
-    for g, c in by_cluster.items():
+    for (g, prop), c in by_cluster_prop.items():
         w = capped(c)
         total += w
-        per[cluster_prop[g]]["confirmed_weighted"] += w
+        per[prop]["confirmed_weighted"] += w
         if c > 0:
-            per[cluster_prop[g]]["confirmed_clusters"] += 1
+            per[prop]["confirmed_clusters"] += 1
     return {
         "confirmed_score_weighted": total,
         "per_property_weighted": {p: dict(v) for p, v in per.items()},
