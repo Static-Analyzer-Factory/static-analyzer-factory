@@ -1671,6 +1671,48 @@ fn run_fuzz_harness(
 /// valid concrete input, and `__VERIFIER_assume` prunes infeasible ones.
 const NONDET_CONSTS: &[i64] = &[0, 1, 2, 42, 255, 256, 1024, 65_535, 2_147_483_647, -1];
 
+/// Curated `(split, base, target)` triples for the memsafety threshold sweep
+/// ([`asan_threshold_argv_sweep`]). `split` is how many LEADING scalar-nondet calls
+/// return the in-range `base` (the "setup" phase: satisfy an entry guard, pick an
+/// array size, fill an array); every LATER call returns the out-of-range `target`
+/// (the violation phase: an OOB index, a negative shuffle offset). This reproduces
+/// the multi-nondet class a single shared constant cannot — e.g. `i = nondet()` must
+/// be in `[0,10)` to ENTER `while (i<10 && a[i]>=0) { i = nondet(); a[i]=0; }` but
+/// out of range to index `a[i]` OOB, or `int a[N]` (`N = nondet()` in range) then a
+/// later `nondet()` shuffle index that runs `a[r]` negative. Kept short (the run
+/// count is `|sweep| × |argv|`, all reusing ONE compiled harness) so the pass stays
+/// cheap; each triple is a distinct enter-then-violate shape. Sound: base/target are
+/// ordinary `int` values, so any `ASan` mem-error is a genuine feasible execution and a
+/// safe program faults for none (R1/R2 still gate the report).
+const MEMSAFETY_SPLIT_SWEEP: &[(i64, i64, i64)] = &[
+    (1, 0, 10),
+    (1, 0, -1),
+    (1, 3, -1),
+    (1, 1, 100),
+    (1, 0, 2_147_483_647),
+    (2, 0, 10),
+    (2, 3, -1),
+];
+
+/// Command-line argument vectors the memsafety threshold sweep runs the harness under.
+/// SV-COMP treats `argc`/`argv` as NONDETERMINISTIC inputs (a valid, NUL-terminated
+/// argument vector of some length), so a violation reachable via some command line is a
+/// genuine violation. The empty vector (`argc == 1`) is the committed no-args behaviour;
+/// the two-argument vector (`argc == 3`, argv[1..]=well-formed strings) lets an
+/// `if (argc < 2) return;`-gated body execute. libc guarantees the vector is well-formed
+/// (argc pointers to NUL-terminated strings, `argv[argc] == NULL`), so any fault is the
+/// program's OWN bug — never a malformed-harness artifact — keeping the pass sound.
+const MEMSAFETY_SPLIT_ARGV: &[&[&str]] = &[&[], &["a", "b"]];
+
+/// Whole-pass wall-clock cap (seconds) for the memsafety threshold sweep — a hard
+/// backstop so the pass can never dominate a currently-`unknown` task's budget even if
+/// several runs hit the per-run replay timeout. A genuine confirmation traps fast (well
+/// under the per-run timeout), so a confirming task always resolves long before this cap
+/// bites; it only bounds wasted work on a non-confirming task (whose verdict is `unknown`
+/// either way). Kept small so the added cost on the ~88% of tasks the base sweep already
+/// resolves is ZERO (the pass never runs there) and the cost on the remainder is bounded.
+const MEMSAFETY_SPLIT_WALL_SECS: u64 = 8;
+
 /// `ASAN_OPTIONS` for the memsafety replay: deterministic exit (no `SIGABRT`/coredump),
 /// leaks off (valid-memtrack deferred), printf checks off (SV-COMP does not count
 /// libc `printf` string reads; keeps a benign printf artifact from aborting before a
@@ -2243,9 +2285,27 @@ fn synthesize_asan_driver() -> String {
     // any resulting UBSan trap is a genuine feasible execution (R2/R6); the counter
     // side effect is unobservable when untargeted.
     s.push_str("static long __saf_idx = 0;\n");
+    // SAF_SPLIT_IDX threshold mode (memsafety confirmer's positional/threshold pass):
+    // when set, the FIRST `SAF_SPLIT_IDX` scalar-nondet calls return `SAF_BASE_VAL`
+    // (the in-range "setup" value that satisfies an entry guard / fills an array) and
+    // EVERY LATER call returns `SAF_TARGET_VAL` (the out-of-range value that drives the
+    // violation). This synthesizes the DIFFERENT-value-per-phase inputs a single shared
+    // `SAF_NONDET_CONST` cannot — e.g. `int i = nondet(); ...; while (guard(i)) { i =
+    // nondet(); a[i] = 0; }` needs `i` in range to ENTER the loop but out of range to
+    // index OOB, and `int a[N]` with `N = nondet()` then a later `nondet()` shuffle index.
+    // Checked BEFORE `SAF_TARGET_IDX`, so when `SAF_SPLIT_IDX` is UNSET this is
+    // byte-identical to the committed behaviour (the overflow positional pass and every
+    // other pass never set it). Sound: each returned value is a legal value of the
+    // nondet's type, so any resulting ASan mem-error is a genuine feasible execution
+    // (R1/R2 in `parse_asan_report` still gate), and a safe program faults for none.
     s.push_str(
         "static long __saf_nv(void) {\n\
          \x20 long idx = __saf_idx++;\n\
+         \x20 const char *sp = getenv(\"SAF_SPLIT_IDX\");\n\
+         \x20 if (sp) {\n\
+         \x20   const char *bv = getenv(\"SAF_BASE_VAL\"); const char *tv = getenv(\"SAF_TARGET_VAL\");\n\
+         \x20   return idx < atol(sp) ? (bv ? atol(bv) : 0) : (tv ? atol(tv) : 0);\n\
+         \x20 }\n\
          \x20 const char *ti = getenv(\"SAF_TARGET_IDX\");\n\
          \x20 if (!ti) return __saf_c();\n\
          \x20 if (idx == atol(ti)) { const char *tv = getenv(\"SAF_TARGET_VAL\"); return tv ? atol(tv) : 0; }\n\
@@ -2323,6 +2383,11 @@ fn synthesize_asan_driver() -> String {
 /// uninitialized local reproduces deterministically. Pass 2 is sound-additive — an
 /// uninitialized read is nondeterministic under SV-COMP semantics, so it can only
 /// confirm a violation the program genuinely has.
+// NOTE: a single cohesive replay pipeline — driver synthesis, the compile/link closure
+// (with its assert-macro fallback), the two base sweeps, and the threshold+argv sweep —
+// whose stages share the harness path, candidate list, and timeout; splitting it would
+// scatter that shared setup across helpers and obscure the pass ordering.
+#[allow(clippy::too_many_lines)]
 fn asan_confirm(
     input: &Path,
     data_model: saf_svcomp::DataModel,
@@ -2509,7 +2574,87 @@ fn asan_confirm(
     // pattern-init makes the indeterminate pointer a fixed wild address that SEGVs
     // deterministically, so ASan reproduces the genuine `valid-deref` violation. It
     // can only ADD confirmations, never a false alarm (see the pass-2 rationale above).
-    run_pass(true)
+    if let Some(hit) = run_pass(true)? {
+        return Ok(Some(hit));
+    }
+
+    // Threshold + argv positional sweep (additive; only reached when BOTH base passes
+    // are inconclusive, so it costs nothing on the tasks the simple sweep already
+    // resolves). Reuses the harness the last `run_pass` compiled — a valid ASan binary
+    // whether it is the pass-1 (stack-garbage) or pass-2 (pattern-init) build — so it
+    // adds NO compile cost, only a small, wall-capped set of extra native runs. It
+    // recovers the multi-nondet enter-then-violate class (an early nondet must be
+    // in-range to reach the sink, a later nondet out-of-range to violate) and the
+    // `argc`-gated class (`if (argc < 2) return;`), neither of which the single-shared-
+    // constant sweep can reach. Sound: the threshold values and the well-formed argv are
+    // legal nondet inputs, ASan stays the sole arbiter, and R1/R2 still gate the report.
+    if harness.exists() {
+        return asan_threshold_argv_sweep(&harness, &errpath);
+    }
+    Ok(None)
+}
+
+/// Reuse an already-compiled `ASan` harness to sweep the memsafety threshold cases
+/// ([`MEMSAFETY_SPLIT_SWEEP`]) under each argument vector ([`MEMSAFETY_SPLIT_ARGV`]),
+/// returning the first `(split, base, target, argv)` combination that reproduces a
+/// gated `ASan` mem-error. `Ok(None)` if none does (⇒ the caller keeps `unknown`). The
+/// whole pass is wall-capped by [`MEMSAFETY_SPLIT_WALL_SECS`]; individual runs by
+/// [`replay_timeout`]. Only `SAF_SPLIT_IDX`/`SAF_BASE_VAL`/`SAF_TARGET_VAL` are set
+/// (never `SAF_NONDET_CONST`), so the driver's threshold branch governs every scalar
+/// nondet and `__VERIFIER_nondet_bool` stays `false` (no unbounded bool loop is spun).
+fn asan_threshold_argv_sweep(
+    harness: &Path,
+    errpath: &Path,
+) -> anyhow::Result<Option<saf_svcomp::AsanHit>> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+
+    let per_run = replay_timeout();
+    let pass_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(MEMSAFETY_SPLIT_WALL_SECS);
+
+    for &(split, base, target) in MEMSAFETY_SPLIT_SWEEP {
+        for argv in MEMSAFETY_SPLIT_ARGV {
+            if std::time::Instant::now() >= pass_deadline {
+                return Ok(None); // whole-pass wall cap — bound wasted work on a non-confirming task
+            }
+            let errfile = std::fs::File::create(errpath)
+                .with_context(|| "creating ASan threshold stderr file")?;
+            let mut cmd = Command::new(harness);
+            cmd.args(*argv)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(errfile))
+                .env("ASAN_OPTIONS", ASAN_OPTS)
+                .env("SAF_SPLIT_IDX", split.to_string())
+                .env("SAF_BASE_VAL", base.to_string())
+                .env("SAF_TARGET_VAL", target.to_string());
+            let mut child = harden_replay_spawn(&mut cmd)
+                .spawn()
+                .with_context(|| "spawning ASan threshold harness")?;
+
+            let start = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if start.elapsed() >= per_run {
+                            kill_replay_group(&mut child);
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => return Err(e).context("waiting on ASan threshold harness"),
+                }
+            }
+
+            let report = std::fs::read_to_string(errpath).unwrap_or_default();
+            if let Some(hit) = saf_svcomp::parse_asan_report(&report) {
+                return Ok(Some(hit)); // first threshold/argv combination that reproduces wins
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The `no-overflow` FALSE pipeline (plan 199, R6): confirmer-first, propose-free.
@@ -4394,5 +4539,42 @@ void worker(void) { __VERIFIER_atomic_inc(&g); __VERIFIER_atomic_acquire(); }
         // emitted so the common case is unperturbed.
         assert!(d.contains("__VERIFIER_atomic_begin"));
         assert!(!d.contains("__cyg_profile_func_enter"));
+    }
+
+    #[test]
+    fn asan_driver_emits_split_threshold_branch() {
+        // The memsafety threshold sweep drives the driver through SAF_SPLIT_IDX: the
+        // first `split` scalar-nondet calls return SAF_BASE_VAL, later ones SAF_TARGET_VAL.
+        let d = synthesize_asan_driver();
+        assert!(d.contains("SAF_SPLIT_IDX"), "{d}");
+        // The threshold branch is checked BEFORE the existing single-index targeting so
+        // the committed SAF_TARGET_IDX behaviour is preserved when SAF_SPLIT_IDX is unset.
+        let split_at = d.find("SAF_SPLIT_IDX").expect("split env present");
+        let target_idx_at = d.find("SAF_TARGET_IDX").expect("target-idx env present");
+        assert!(
+            split_at < target_idx_at,
+            "split branch must precede target-idx"
+        );
+        // Deterministic generation.
+        assert_eq!(d, synthesize_asan_driver());
+    }
+
+    #[test]
+    fn memsafety_split_sweep_is_enter_then_violate() {
+        // Every triple sets up with at least one in-range leading call (`split >= 1`) and
+        // then violates: the target is an OOB index/offset (negative, or well past any
+        // small in-range base), never equal to a plausible in-bounds value like the base.
+        assert!(!MEMSAFETY_SPLIT_SWEEP.is_empty());
+        for &(split, base, target) in MEMSAFETY_SPLIT_SWEEP {
+            assert!(split >= 1, "need a setup phase: {split}");
+            assert_ne!(
+                base, target,
+                "base and target must differ to exercise two phases"
+            );
+        }
+        // The no-args vector (committed behaviour) and a well-formed multi-arg vector
+        // (to pass an `argc < 2` gate) are both swept.
+        assert!(MEMSAFETY_SPLIT_ARGV.iter().any(|a| a.is_empty()));
+        assert!(MEMSAFETY_SPLIT_ARGV.iter().any(|a| a.len() >= 2));
     }
 }
