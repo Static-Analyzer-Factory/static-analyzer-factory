@@ -3,6 +3,20 @@ then stop. An external non-Claude supervisor — not you — measures the result
 the held-out set, and decides keep/revert. Your self-report is never trusted; only a
 supervisor-measured, sound, held-out-checked gain (or, for a capability arm, a met milestone) is kept.
 
+## Current standing (context only — do not optimize for this number)
+As of the last full-svcomp25 CONFIRMED A/B (48,380 tasks, measured off-host, sound):
+- This branch (`auto/loop-20260816`): CONFIRMED 6161, RAW 8761, false-alarms 0, wrong-TRUE 0.
+- The `svcomp` baseline: CONFIRMED 4740 — so the loop's kept work is +1421 confirmed points, still perfectly sound.
+- Confirmed recall by property (baseline): valid-memsafety 64%, no-overflow 66%, unreach-call 54%,
+  termination verdict-only, no-data-race 0%.
+
+Takeaways for your arm:
+- The whole gain came from RECALL with zero soundness loss. A single wrong FALSE (−16) or wrong TRUE
+  (−32) erases many right answers — never trade soundness for coverage.
+- unreach-call (54%) and the low-recall families have the most headroom; memsafety/overflow are already
+  strong. This is background, NOT a target — the supervisor still scores you on your own lever's
+  dedup-weighted gain + held-out check, and gaming this number is impossible (you never run the scorer).
+
 ## This arm
 - Lever:   {{LEVER_ID}}
 - Mode:    {{MODE}}          (tuning = improve an already-wired scoring property; capability = build a
