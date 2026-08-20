@@ -1577,7 +1577,7 @@ const MAX_FUZZ_CORPUS: usize = 256;
 /// `Ok(())`; the caller inspects the sentinel/log. A runaway harness is killed.
 /// Harden a native-replay harness spawn so a hung/spinning sanitizer harness can NEVER outlive us
 /// and leak (the 2026-08-19 load runaway that took cd-vm-15 to load 2600+): (a) `PR_SET_PDEATHSIG`
-/// so the harness is SIGKILLed if this `saf verify` dies mid-replay (the eval RSS watchdog / a
+/// so the harness is `SIGKILLed` if this `saf verify` dies mid-replay (the eval RSS watchdog / a
 /// supervisor restart) -- the case that previously orphaned harnesses to init for hours; (b) its own
 /// process group so a timeout kill (`kill_replay_group`) reaches every descendant (symbolizer, forks).
 /// Call immediately before `.spawn()`. Linux-only (SV-COMP runs on Linux).
@@ -1587,7 +1587,13 @@ fn harden_replay_spawn(cmd: &mut std::process::Command) -> &mut std::process::Co
     // libc functions (prctl / getppid / _exit).
     unsafe {
         cmd.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0);
+            libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0,
+                0,
+                0,
+            );
             // Cover the race where the parent already died between fork and prctl.
             if libc::getppid() == 1 {
                 libc::_exit(0);
@@ -1602,9 +1608,12 @@ fn harden_replay_spawn(cmd: &mut std::process::Command) -> &mut std::process::Co
 /// Replaces a bare `child.kill()`, which killed only the direct child and orphaned any grandchildren.
 fn kill_replay_group(child: &mut std::process::Child) {
     // `harden_replay_spawn` put the child in its own group, so its pgid == child.id().
+    // INVARIANT: a Linux pid fits in i32 (default pid_max is 2^22), so the cast never wraps.
+    #[allow(clippy::cast_possible_wrap)]
+    let pgid = child.id() as i32;
     // SAFETY: kill(2) with a negative pid targets the whole process group; a no-op if already gone.
     unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
+        libc::kill(-pgid, libc::SIGKILL);
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -1771,6 +1780,57 @@ const OVERFLOW_MAX_CANDIDATES: usize = 24;
 /// the extra native runs stay bounded even on a TRUE task whose bool-guarded loop
 /// is unbounded-but-safe (each candidate then spins to the per-run replay timeout).
 const OVERFLOW_BOOL_SWEEP: &[i64] = &[0, 1, -1, 2, 1_073_741_824];
+
+/// Max number of leading scalar-nondet call sites the positional overflow pass
+/// targets (see [`ubsan_confirm`]). Bounds the pass to `POS_MAX × |targets| × 2`
+/// native runs; small so a many-nondet TRUE task cannot spend the whole budget here.
+/// Three positions cover the observed idioms (the overflowing variable is among the
+/// first few nondets: a loop bound, an accumulator seed, or a negated operand).
+const OVERFLOW_POS_MAX_INDEX: usize = 3;
+
+/// Baselines the positional pass gives every NON-targeted scalar-int nondet: `0` (the
+/// dominant `precondition sum==0 && i==0` idiom) and `1` (a precondition needing a
+/// small non-zero value, e.g. `n>0 && n<10` with the loop bound as the baseline).
+const OVERFLOW_POS_BASELINES: &[i64] = &[0, 1];
+
+/// Whole-pass wall-clock cap (seconds) for the positional overflow sweep — a hard
+/// backstop so the pass can never dominate a task's budget even if several runs hit
+/// the per-run timeout. The deterministic bound is the run COUNT (positions × targets
+/// × baselines); every run that WOULD confirm traps in well under the per-run timeout,
+/// so a confirming task is always resolved long before this cap bites — the cap only
+/// bounds the wasted work on a non-confirming explosive task (deep recursion / a safe
+/// counted loop whose bound is a boundary value), whose verdict is `unknown` either
+/// way. Kept modest so an explosive TRUE task cannot spend a big slice of its budget
+/// here (the arm-66 cost-regression guard). The typical run is fast: a boundary value
+/// rarely lands on a loop's bound, so almost every run either traps in <100 ms or
+/// exits immediately — only the rare boundary-into-loop-bound run costs a full per-run
+/// timeout. This backstop bounds the pathological all-slow-runs case; a genuine
+/// confirmation (its trapping run is fast) always resolves well under it.
+const OVERFLOW_POS_WALL_SECS: u64 = 6;
+
+/// Per-run timeout for the positional overflow pass. Short by design: the pass pins
+/// `nondet_bool` to 0 so no `while (nondet_bool())` loop is sustained, hence every run
+/// either traps immediately (a direct boundary overflow), overflows a quadratic
+/// accumulator within tens of thousands of iterations (< 100 ms), or exits — only a
+/// boundary value injected into a *safe* counted loop's bound runs long, and this cap
+/// bounds that rare case without masking any real trap (250 ms is >2× the slowest
+/// productive overflow: a quadratic accumulator overflows within ~65 k iterations).
+fn overflow_positional_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(250)
+}
+
+/// Type-boundary values injected into a SINGLE targeted nondet call site by the
+/// positional overflow pass, in try-order (high-yield first). The 32-bit boundaries
+/// always apply; the 64-bit ones are added ONLY under LP64 — under ILP32 the driver's
+/// `atol` parses into a 32-bit `long`, so a 64-bit literal would overflow the parse.
+fn overflow_positional_targets(data_model: saf_svcomp::DataModel) -> Vec<i64> {
+    let mut v = vec![2_147_483_647, -2_147_483_648, -1];
+    if matches!(data_model, saf_svcomp::DataModel::LP64) {
+        v.push(i64::MAX);
+        v.push(i64::MIN);
+    }
+    v
+}
 
 /// Signed-overflow type-BOUNDARY nondet candidates, appended to the overflow
 /// mini-fuzz sweep ONLY when every reachable loop is provably ranked
@@ -2161,6 +2221,27 @@ fn synthesize_asan_driver() -> String {
     s.push_str(
         "static long __saf_c(void) { const char *e = getenv(\"SAF_NONDET_CONST\"); return e ? atol(e) : 0; }\n",
     );
+    // Positional per-call targeting (overflow confirmer's positional pass): a global
+    // call counter lets ONE nondet call site return a distinct `SAF_TARGET_VAL` while
+    // every OTHER scalar-int nondet returns the small `SAF_BASE_VAL` (default 0). This
+    // synthesizes the DIFFERENT-value-per-call inputs a single shared
+    // `SAF_NONDET_CONST` cannot — e.g. a precondition pins `sum==0 && i==0` while the
+    // loop bound `n` must be large to overflow the accumulator. When `SAF_TARGET_IDX`
+    // is UNSET (every existing pass: memsafety, the primary overflow sweep, the bool
+    // pass) `__saf_nv()` returns exactly `__saf_c()`, so committed behaviour is
+    // unchanged. Sound: each returned value is a legal value of the nondet's type, so
+    // any resulting UBSan trap is a genuine feasible execution (R2/R6); the counter
+    // side effect is unobservable when untargeted.
+    s.push_str("static long __saf_idx = 0;\n");
+    s.push_str(
+        "static long __saf_nv(void) {\n\
+         \x20 long idx = __saf_idx++;\n\
+         \x20 const char *ti = getenv(\"SAF_TARGET_IDX\");\n\
+         \x20 if (!ti) return __saf_c();\n\
+         \x20 if (idx == atol(ti)) { const char *tv = getenv(\"SAF_TARGET_VAL\"); return tv ? atol(tv) : 0; }\n\
+         \x20 const char *bv = getenv(\"SAF_BASE_VAL\"); return bv ? atol(bv) : 0;\n\
+         }\n",
+    );
     for (fname, cty) in SCALAR_NONDET {
         if *fname == "__VERIFIER_nondet_bool" {
             // Loop-sustaining bool decoupling (overflow confirmer): when `SAF_BOOL_CONST`
@@ -2171,18 +2252,31 @@ fn synthesize_asan_driver() -> String {
             // { i += ++x; }` needs `i==0` AND the guard true — impossible with one shared
             // constant). Every returned bool is a value `__VERIFIER_nondet_bool` is
             // allowed to return, so a resulting overflow is a genuine feasible execution
-            // and UBSan stays the sole sound arbiter (R2, R6). When `SAF_BOOL_CONST` is
-            // UNSET — the ASan/memsafety path and the primary overflow sweep — this is
-            // byte-identical to the previous `(_Bool)__saf_c()` behaviour.
+            // and UBSan stays the sole sound arbiter (R2, R6). When neither
+            // `SAF_BOOL_CONST` nor `SAF_TARGET_IDX` is set — the ASan/memsafety path and
+            // the primary overflow sweep — this is byte-identical to the previous
+            // `(_Bool)__saf_c()` behaviour. In the positional pass (`SAF_TARGET_IDX`
+            // set) the bool is pinned to 0 unless it IS the targeted call, so no
+            // `while (nondet_bool())` loop is sustained and every positional run
+            // terminates fast. The counter is advanced in every branch so a bool call
+            // occupies its execution-order index (keeping int/bool targeting aligned).
             s.push_str(
-                "_Bool __VERIFIER_nondet_bool(void) { const char *b = getenv(\"SAF_BOOL_CONST\"); return b ? (_Bool)(atoi(b) & 1) : (_Bool)__saf_c(); }\n",
+                "_Bool __VERIFIER_nondet_bool(void) {\n\
+                 \x20 const char *b = getenv(\"SAF_BOOL_CONST\");\n\
+                 \x20 if (b) { __saf_idx++; return (_Bool)(atoi(b) & 1); }\n\
+                 \x20 const char *ti = getenv(\"SAF_TARGET_IDX\");\n\
+                 \x20 if (!ti) { __saf_idx++; return (_Bool)__saf_c(); }\n\
+                 \x20 long idx = __saf_idx++;\n\
+                 \x20 if (idx == atol(ti)) { const char *tv = getenv(\"SAF_TARGET_VAL\"); return (_Bool)((tv ? atol(tv) : 0) & 1); }\n\
+                 \x20 return (_Bool)0;\n\
+                 }\n",
             );
             continue;
         }
         let suffix = fname.trim_start_matches("__VERIFIER_nondet_");
         let _ = writeln!(
             s,
-            "{cty} __VERIFIER_nondet_{suffix}(void) {{ return ({cty})__saf_c(); }}"
+            "{cty} __VERIFIER_nondet_{suffix}(void) {{ return ({cty})__saf_nv(); }}"
         );
     }
     s.push_str("void* __VERIFIER_nondet_pointer(void) { return (void*)0; }\n");
@@ -2986,44 +3080,58 @@ fn ubsan_confirm(
     let candidates = overflow_replay_candidates(module, data_model);
 
     let timeout = replay_timeout();
+    // Run the harness ONCE under the extra environment `env` (added to the fixed
+    // `UBSAN_OPTIONS`), waiting up to `run_timeout`, and parse the captured stderr into
+    // an overflow hit (`None` = no trap / timeout). Shared by every sweep below so the
+    // spawn/wait/parse logic lives in one place.
+    let run_child = |env: &[(&str, String)],
+                     run_timeout: std::time::Duration|
+     -> anyhow::Result<Option<saf_svcomp::OverflowHit>> {
+        let errfile =
+            std::fs::File::create(&errpath).with_context(|| "creating UBSan stderr file")?;
+        let mut cmd = Command::new(&harness);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(errfile))
+            .env("UBSAN_OPTIONS", UBSAN_OPTS);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = harden_replay_spawn(&mut cmd)
+            .spawn()
+            .with_context(|| "spawning UBSan harness")?;
+
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if start.elapsed() >= run_timeout {
+                        kill_replay_group(&mut child);
+                        break; // runaway -> parse whatever exists (likely no report)
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => return Err(e).context("waiting on UBSan harness"),
+            }
+        }
+
+        let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+        Ok(saf_svcomp::parse_ubsan_overflow(&report))
+    };
+
     // Run one mini-fuzz sweep: for each data constant `k` in `sweep`, run the harness
     // with `SAF_NONDET_CONST=k` (and, when `bool_const` is set, `SAF_BOOL_CONST` too),
-    // returning the first constant that reproduces a signed overflow. Factored out so
-    // the primary sweep and the loop-sustaining bool pass share the spawn/wait logic.
+    // returning the first constant that reproduces a signed overflow.
     let run_sweep = |sweep: &[i64],
                      bool_const: Option<&str>|
      -> anyhow::Result<Option<saf_svcomp::OverflowHit>> {
         for &k in sweep {
-            let errfile =
-                std::fs::File::create(&errpath).with_context(|| "creating UBSan stderr file")?;
-            let mut cmd = Command::new(&harness);
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(errfile))
-                .env("UBSAN_OPTIONS", UBSAN_OPTS)
-                .env("SAF_NONDET_CONST", k.to_string());
+            let mut env: Vec<(&str, String)> = vec![("SAF_NONDET_CONST", k.to_string())];
             if let Some(bc) = bool_const {
-                cmd.env("SAF_BOOL_CONST", bc);
+                env.push(("SAF_BOOL_CONST", bc.to_string()));
             }
-            let mut child = harden_replay_spawn(&mut cmd).spawn().with_context(|| "spawning UBSan harness")?;
-
-            let start = std::time::Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if start.elapsed() >= timeout {
-                            kill_replay_group(&mut child);
-                            break; // runaway -> parse whatever exists (likely no report)
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(e) => return Err(e).context("waiting on UBSan harness"),
-                }
-            }
-
-            let report = std::fs::read_to_string(&errpath).unwrap_or_default();
-            if let Some(hit) = saf_svcomp::parse_ubsan_overflow(&report) {
+            if let Some(hit) = run_child(&env, timeout)? {
                 return Ok(Some(hit)); // first constant that reproduces an overflow wins
             }
         }
@@ -3046,6 +3154,46 @@ fn ubsan_confirm(
     if saf_svcomp::fuzz::references_nondet_bool(module) {
         if let Some(hit) = run_sweep(OVERFLOW_BOOL_SWEEP, Some("1"))? {
             return Ok(Some(hit));
+        }
+    }
+
+    // Positional boundary injection (multi-nondet loop class): the uniform sweeps above
+    // give EVERY scalar nondet the same value, so they cannot satisfy a program whose
+    // precondition pins some nondets (`sum==0 && i==0`, `x!=y`) while a DIFFERENT nondet
+    // must be large/specific to overflow (the loop bound `n`, an accumulator seed near
+    // INT_MAX, a negated `y=-1`). This pass gives ONE targeted nondet call site a
+    // type-boundary value (`SAF_TARGET_IDX`/`SAF_TARGET_VAL`) while every other
+    // scalar-int nondet takes a small baseline (`SAF_BASE_VAL` ∈ {0,1}); `nondet_bool`
+    // is pinned to 0 so no `while (nondet_bool())` loop is sustained, keeping every run
+    // fast. Sweep the target position × boundary value × baseline, returning on the
+    // first UBSan trap. Sound: every combination is a concrete feasible execution
+    // (UBSan sole arbiter R2, re-triggered on the original program R6; `__VERIFIER_assume`
+    // still prunes infeasible paths R4). Gated on ≥2 scalar-nondet call sites — with a
+    // single site the positional value equals the uniform sweep already tried — and
+    // bounded by a per-run timeout, a leading-position cap, and a whole-pass wall clock.
+    let nondet_sites = saf_svcomp::fuzz::count_scalar_nondet_call_sites(module);
+    if nondet_sites >= 2 {
+        let positions = nondet_sites.min(OVERFLOW_POS_MAX_INDEX);
+        let targets = overflow_positional_targets(data_model);
+        let pos_timeout = overflow_positional_timeout();
+        let pos_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(OVERFLOW_POS_WALL_SECS);
+        for &val in &targets {
+            for idx in 0..positions {
+                for &base in OVERFLOW_POS_BASELINES {
+                    if std::time::Instant::now() >= pos_deadline {
+                        return Ok(None); // whole-pass wall cap -> inconclusive
+                    }
+                    let env = [
+                        ("SAF_TARGET_IDX", idx.to_string()),
+                        ("SAF_TARGET_VAL", val.to_string()),
+                        ("SAF_BASE_VAL", base.to_string()),
+                    ];
+                    if let Some(hit) = run_child(&env, pos_timeout)? {
+                        return Ok(Some(hit));
+                    }
+                }
+            }
         }
     }
     Ok(None)
@@ -4032,6 +4180,21 @@ mod verify_tests {
         module.functions.push(main);
         module.constants = constants;
         module
+    }
+
+    #[test]
+    fn overflow_positional_targets_are_width_specific() {
+        let ilp32 = overflow_positional_targets(saf_svcomp::DataModel::ILP32);
+        let lp64 = overflow_positional_targets(saf_svcomp::DataModel::LP64);
+        // 32-bit boundaries + the negated-value probe present under both models.
+        assert!(ilp32.contains(&2_147_483_647), "INT_MAX under ILP32");
+        assert!(ilp32.contains(&-1), "-1 (negation seed) under ILP32");
+        // ILP32 must NOT carry a 64-bit literal (the driver's atol would overflow).
+        assert!(!ilp32.contains(&i64::MAX));
+        // LP64 adds the 64-bit boundaries on top.
+        assert!(lp64.contains(&i64::MAX), "LONG_MAX under LP64");
+        assert!(lp64.contains(&i64::MIN), "LONG_MIN under LP64");
+        assert!(lp64.len() > ilp32.len());
     }
 
     #[test]

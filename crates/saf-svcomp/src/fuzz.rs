@@ -99,6 +99,37 @@ pub fn references_scalar_nondet(module: &AirModule) -> bool {
         .any(|f| SCALAR_NONDET.iter().any(|(name, _)| *name == f.name))
 }
 
+/// Number of scalar-integer `__VERIFIER_nondet_*` CALL SITES in the module's
+/// defined functions (each direct call counted once, in no particular order).
+///
+/// The overflow confirmer's positional pass uses this to decide whether giving
+/// distinct per-call values can help: with fewer than two call sites a positional
+/// value equals the uniform `SAF_NONDET_CONST` sweep already tried, so the pass would
+/// add nothing. A cheap over-approximation (whole-module, not reachability-scoped) —
+/// over-counting only risks a few extra fast native runs, never a missed gate.
+#[must_use]
+pub fn count_scalar_nondet_call_sites(module: &AirModule) -> usize {
+    use saf_core::air::Operation;
+    let mut count = 0usize;
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Operation::CallDirect { callee, .. } = &inst.op {
+                    if let Some(target) = module.function(*callee) {
+                        if SCALAR_NONDET.iter().any(|(name, _)| *name == target.name) {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
 /// True iff the program references `__VERIFIER_nondet_bool` (declared or defined).
 ///
 /// Used by the overflow confirmer to decide whether the loop-sustaining bool-decoupling
@@ -533,6 +564,59 @@ mod tests {
             block_index: BTreeMap::new(),
         });
         assert!(references_scalar_nondet(&m));
+    }
+
+    #[test]
+    fn count_scalar_nondet_call_sites_counts_direct_calls() {
+        use saf_core::air::{AirBlock, AirFunction, Instruction, Operation};
+        use saf_core::ids::{BlockId, FunctionId, InstId};
+        use std::collections::BTreeMap;
+
+        // A `__VERIFIER_nondet_int` declaration + a `main` that calls it twice.
+        let nondet = AirFunction {
+            id: FunctionId::new(1),
+            name: "__VERIFIER_nondet_int".to_string(),
+            params: vec![],
+            blocks: vec![],
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let mut block = AirBlock::new(BlockId::new(10));
+        for i in 0..2u128 {
+            block.instructions.push(Instruction {
+                id: InstId::new(100 + i),
+                op: Operation::CallDirect {
+                    callee: FunctionId::new(1),
+                },
+                operands: vec![],
+                dst: None,
+                span: None,
+                symbol: None,
+                result_type: None,
+                extensions: BTreeMap::new(),
+            });
+        }
+        let main = AirFunction {
+            id: FunctionId::new(2),
+            name: "main".to_string(),
+            params: vec![],
+            blocks: vec![block],
+            entry_block: None,
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let mut m = AirModule::new(ModuleId::new(1));
+        // No call sites yet (empty module).
+        assert_eq!(count_scalar_nondet_call_sites(&m), 0);
+        m.functions.push(nondet);
+        m.functions.push(main);
+        // Two direct calls to a scalar nondet -> gate (>=2) is met.
+        assert_eq!(count_scalar_nondet_call_sites(&m), 2);
     }
 
     #[test]
