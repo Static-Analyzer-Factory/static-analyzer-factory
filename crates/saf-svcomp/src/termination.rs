@@ -135,6 +135,17 @@ pub fn program_structurally_terminates(module: &AirModule) -> bool {
         return false;
     }
 
+    // Scalar-alloca → SSA promotion (a self-contained `mem2reg`) exposes
+    // `-O0`-spilled loop counters and recursion parameters as affine SSA state to
+    // the ranking synthesizer below. It is semantics-preserving and preserves the
+    // CFG and call graph exactly (phis inserted at block heads; only non-escaped
+    // integer scalar loads/stores/allocas removed), so every structural check
+    // (I/E/A) and the reachability set are unchanged — it can only turn a ranking
+    // abstention into a sound `true`, never introduce a wrong verdict. When no slot
+    // is eligible the module is returned structurally unchanged (no regression).
+    let promoted = crate::promote::promote_module(module);
+    let module = &promoted;
+
     let cg = CallGraph::build(module);
 
     // Node-level reachability from `main` (so `External` and `IndirectPlaceholder`

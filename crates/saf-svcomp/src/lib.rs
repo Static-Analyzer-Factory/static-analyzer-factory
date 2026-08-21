@@ -17,6 +17,7 @@ pub mod fast_paths;
 pub mod fuzz;
 pub mod memsafety;
 pub mod overflow;
+pub mod promote;
 pub mod property;
 pub mod property_kind;
 pub mod race;

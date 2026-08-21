@@ -1470,10 +1470,15 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
     let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
     let build = |neutralizer: Option<&Path>| {
         let mut cmd = Command::new(ctx.clang);
-        cmd.args(["-O0", "-Wno-everything", "-fsanitize=signed-integer-overflow", "-fsanitize-trap=signed-integer-overflow"])
-            .arg(ctx.data_model.clang_flag())
-            .arg("-include")
-            .arg(ctx.stub);
+        cmd.args([
+            "-O0",
+            "-Wno-everything",
+            "-fsanitize=signed-integer-overflow",
+            "-fsanitize-trap=signed-integer-overflow",
+        ])
+        .arg(ctx.data_model.clang_flag())
+        .arg("-include")
+        .arg(ctx.stub);
         if let Some(n) = neutralizer {
             cmd.arg("-include").arg(n);
         }
@@ -2189,10 +2194,15 @@ fn replay_confirms_false(
     // leaks into task diagnostics.
     let build = |neutralizer: Option<&Path>| {
         let mut cmd = Command::new(clang);
-        cmd.args(["-O0", "-Wno-everything", "-fsanitize=signed-integer-overflow", "-fsanitize-trap=signed-integer-overflow"])
-            .arg(data_model.clang_flag())
-            .arg("-include")
-            .arg(stub);
+        cmd.args([
+            "-O0",
+            "-Wno-everything",
+            "-fsanitize=signed-integer-overflow",
+            "-fsanitize-trap=signed-integer-overflow",
+        ])
+        .arg(data_model.clang_flag())
+        .arg("-include")
+        .arg(stub);
         if let Some(n) = neutralizer {
             cmd.arg("-include").arg(n);
         }
