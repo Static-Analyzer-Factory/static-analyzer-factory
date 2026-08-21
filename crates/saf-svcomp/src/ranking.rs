@@ -2030,12 +2030,31 @@ fn build_multipath_model_multi(
         }
     }
 
+    // Function parameters carry their declared type on [`AirParam`], not on any
+    // instruction [`Def`], so [`type_bounds`] (which reads `defs`) misses them. Index
+    // each param's `TypeId` so a param used as a loop bound (`while (x > z)` with `z`
+    // a parameter) or a param-initialized counter still gets its type range in the
+    // *path-sensitive* model — without it a loop whose guard/counter operands are
+    // spilled-then-promoted parameters (the `-O0` recursion/argument reservoir) has
+    // no bound on those leaves, the overflow-freedom check cannot bound the counter's
+    // `next`, and the (otherwise trivially ranked) loop abstains. This mirrors the
+    // fallback in [`build_loop_model`] (the havoc model already had it).
+    let param_types: BTreeMap<ValueId, TypeId> = func
+        .params
+        .iter()
+        .filter_map(|p| p.param_type.map(|t| (p.id, t)))
+        .collect();
+
     // Type bounds for every integer leaf with a known signedness/width — true facts
     // about the real state, shared by every branch region.
     let mut base_bounds: Vec<Constraint> = Vec::new();
     let mut bound_of: BTreeMap<ValueId, (i128, i128)> = BTreeMap::new();
     for &sym in &universe {
-        if let Some((lo, hi)) = type_bounds(sym, &defs, &signs, module) {
+        if let Some((lo, hi)) = type_bounds(sym, &defs, &signs, module).or_else(|| {
+            param_types
+                .get(&sym)
+                .and_then(|&t| bounds_from_type(sym, t, &signs, module))
+        }) {
             bound_of.insert(sym, (lo, hi));
             base_bounds.push(Constraint {
                 coeffs: BTreeMap::from([(sym, 1)]),
@@ -2942,6 +2961,213 @@ mod tests {
         // while (i > 5) i--  (signed)  →  f = i - 5.
         let m = counter_loop(BinaryOp::ICmpSgt, Bound::Const(5), -1);
         assert!(ranked(&m));
+    }
+
+    /// Build `f(int x, int y, int z) { while (x > z && y > z) { x += step; y += step; } }`
+    /// as a module. Both counters `x`,`y` are header phis whose preheader value is a
+    /// **function parameter**, and the invariant lower bound `z` is a parameter too.
+    /// The short-circuit `&&` splits the guard across two blocks (header + check2), so
+    /// this is the path-sensitive multipath model's shape, NOT the single-guard havoc
+    /// model. `z`'s type range lives only on `AirParam`, so without the param-table
+    /// fallback in [`build_multipath_model_multi`] the overflow-freedom check cannot
+    /// bound the decrement and the loop abstains.
+    #[allow(clippy::too_many_lines)]
+    fn compound_param_loop(step: i64) -> AirModule {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut types = BTreeMap::new();
+        types.insert(i32t, AirType::Integer { bits: 32 });
+        types.insert(i1t, AirType::Integer { bits: 1 });
+        let mut constants = BTreeMap::new();
+        let step_v = vid("step");
+        constants.insert(
+            step_v,
+            Constant::Int {
+                value: step,
+                bits: 32,
+            },
+        );
+
+        let b0 = bid("entry");
+        let h = bid("header");
+        let ch2 = bid("check2");
+        let body = bid("body");
+        let e = bid("exit");
+
+        // Parameters (leaves with a type on `AirParam`, no `Def`).
+        let px = vid("x");
+        let py = vid("y");
+        let pz = vid("z");
+        // Header phis + latch increments + guard results.
+        let xphi = vid("xphi");
+        let yphi = vid("yphi");
+        let xn = vid("xn");
+        let yn = vid("yn");
+        let c1 = vid("c1");
+        let c2 = vid("c2");
+
+        let mut entry = AirBlock::new(b0);
+        entry
+            .instructions
+            .push(term("br_entry", Operation::Br { target: h }, vec![]));
+
+        // header: phi x,y ; c1 = x sgt z ; condbr c1 -> check2/exit
+        let mut header = AirBlock::new(h);
+        header.instructions.push(vinst(
+            "phi_x",
+            Operation::Phi {
+                incoming: vec![(b0, px), (body, xn)],
+            },
+            xphi,
+            vec![],
+            i32t,
+        ));
+        header.instructions.push(vinst(
+            "phi_y",
+            Operation::Phi {
+                incoming: vec![(b0, py), (body, yn)],
+            },
+            yphi,
+            vec![],
+            i32t,
+        ));
+        header.instructions.push(vinst(
+            "cmp1",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            c1,
+            vec![xphi, pz],
+            i1t,
+        ));
+        header.instructions.push(term(
+            "condbr1",
+            Operation::CondBr {
+                then_target: ch2,
+                else_target: e,
+            },
+            vec![c1],
+        ));
+
+        // check2: c2 = y sgt z ; condbr c2 -> body/exit
+        let mut check2 = AirBlock::new(ch2);
+        check2.instructions.push(vinst(
+            "cmp2",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            c2,
+            vec![yphi, pz],
+            i1t,
+        ));
+        check2.instructions.push(term(
+            "condbr2",
+            Operation::CondBr {
+                then_target: body,
+                else_target: e,
+            },
+            vec![c2],
+        ));
+
+        // body: xn = x + step ; yn = y + step ; br header
+        let mut bodyb = AirBlock::new(body);
+        bodyb.instructions.push(vinst(
+            "add_x",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            xn,
+            vec![xphi, step_v],
+            i32t,
+        ));
+        bodyb.instructions.push(vinst(
+            "add_y",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            yn,
+            vec![yphi, step_v],
+            i32t,
+        ));
+        bodyb
+            .instructions
+            .push(term("br_body", Operation::Br { target: h }, vec![]));
+
+        let mut exit = AirBlock::new(e);
+        exit.instructions
+            .push(term("ret", Operation::Ret, vec![xphi]));
+
+        let params = vec![
+            AirParam {
+                id: px,
+                name: None,
+                index: 0,
+                param_type: Some(i32t),
+            },
+            AirParam {
+                id: py,
+                name: None,
+                index: 1,
+                param_type: Some(i32t),
+            },
+            AirParam {
+                id: pz,
+                name: None,
+                index: 2,
+                param_type: Some(i32t),
+            },
+        ];
+
+        let func = AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params,
+            blocks: vec![entry, header, check2, bodyb, exit],
+            entry_block: Some(b0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+
+        AirModule {
+            id: ModuleId(make_id("module", b"t")),
+            name: Some("t".to_string()),
+            functions: vec![func],
+            globals: Vec::new(),
+            source_files: Vec::new(),
+            type_hierarchy: Vec::new(),
+            constants,
+            types,
+            target_pointer_width: 8,
+            function_index: BTreeMap::new(),
+            name_index: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn compound_guard_param_bound_decreasing_is_ranked() {
+        // while (x > z && y > z) { x--; y--; } with x,y,z FUNCTION PARAMETERS.
+        // The short-circuit `&&` puts this on the path-sensitive multipath model,
+        // which (before the param-table fallback) had no type range for the `z`
+        // parameter and abstained despite the trivial rank `f = x - z`.
+        let m = compound_param_loop(-1);
+        assert!(
+            ranked(&m),
+            "param-bounded decreasing compound loop must rank"
+        );
+    }
+
+    #[test]
+    fn compound_guard_param_bound_increasing_not_ranked() {
+        // while (x > z && y > z) { x++; y++; } — both counters move AWAY from the
+        // lower bound `z`; the loop can run forever, so it must NOT rank (soundness:
+        // the param bound must not manufacture a wrong `true`).
+        let m = compound_param_loop(1);
+        assert!(
+            !ranked(&m),
+            "increasing compound loop is non-terminating and must abstain"
+        );
     }
 
     #[test]
