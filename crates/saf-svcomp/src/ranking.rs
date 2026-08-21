@@ -833,9 +833,51 @@ fn comparison_constraints(
         ICmpSgt | ICmpUgt => Some(vec![cons(rhs, lhs, -1)?]), // a - b - 1 ≥ 0
         ICmpSge | ICmpUge => Some(vec![cons(rhs, lhs, 0)?]),  // a - b ≥ 0
         ICmpEq => Some(vec![cons(lhs, rhs, 0)?, cons(rhs, lhs, 0)?]), // a = b
-        // `!=` is not convex; drop it (sound — weaker guard).
+        // `!=` is not convex; drop it here (sound — weaker guard). The disjunctive
+        // path-split ([`ne_split`]) recovers it precisely for the path-sensitive
+        // models by forking the branch into the two convex half-spaces.
         _ => Some(vec![]),
     }
+}
+
+/// If the comparison `lhs <pred> rhs`, taken in the `taken_true` polarity, is
+/// effectively **`!=`** (a `!=` taken true, or an `==` taken *false*), return the
+/// two convex half-spaces `lhs ≥ rhs + 1` and `lhs ≤ rhs − 1` whose **union** is
+/// the guard region `lhs ≠ rhs`. Returns `None` for every other predicate (those
+/// are already a single convex half-space handled by [`comparison_constraints`]).
+///
+/// The path-sensitive model forks the branch into two branches — one per
+/// half-space — and requires the ranking to hold on **both** (a disjunctive
+/// termination argument). This is sound: the union of the two half-spaces is still
+/// a superset of the real continuing states on this path (which do satisfy
+/// `lhs ≠ rhs`), and requiring a common lexicographic ranking over both covers that
+/// union. It is strictly *more precise* than dropping the guard — each half-space
+/// contributes the lower/upper bound `!=` alone cannot, which is exactly what makes
+/// an otherwise-`havoc` transition (e.g. `n − 1` under `n ≠ 0` with `n` unsigned,
+/// where `n ≥ 1` proves no underflow) affine-stable and hence rankable. The `∞`
+/// (both-halves-feasible, one-side-diverging) cases still abstain because the
+/// diverging half cannot be ranked.
+fn ne_split(
+    kind: BinaryOp,
+    lhs: &Affine,
+    rhs: &Affine,
+    taken_true: bool,
+) -> Option<[Constraint; 2]> {
+    use BinaryOp::{ICmpEq, ICmpNe};
+    if !matches!((kind, taken_true), (ICmpNe, true) | (ICmpEq, false)) {
+        return None;
+    }
+    // `cons(a, b, m)` builds `b − a + m ≥ 0` (mirrors [`comparison_constraints`]).
+    let cons = |a: &Affine, b: &Affine, minus: i128| -> Option<Constraint> {
+        let e = b.sub(a)?.add(&Affine::constant(minus))?;
+        Some(Constraint {
+            coeffs: e.terms,
+            constant: e.constant,
+        })
+    };
+    // Half A: `lhs > rhs` ⇒ `lhs − rhs − 1 ≥ 0`. Half B: `lhs < rhs` ⇒
+    // `rhs − lhs − 1 ≥ 0`. (Same forms as the strict `>`/`<` arms above.)
+    Some([cons(rhs, lhs, -1)?, cons(lhs, rhs, -1)?])
 }
 
 /// Infer each integer value's signedness from the operations that consume it.
@@ -1210,6 +1252,11 @@ fn i128_to_i64(v: i128) -> Option<i64> {
 /// classification and universe/type-bound assembly (a build-time intermediate).
 struct RawBranch {
     guards: Vec<Constraint>,
+    /// Disjunctive `!=` / `==`-else half-space splits collected along this path
+    /// (each entry: the two convex half-spaces whose union is the guard region).
+    /// [`assemble_branches`] forks the branch into the cartesian product of
+    /// half-space choices, requiring the ranking to hold on every one.
+    splits: Vec<[Constraint; 2]>,
     raw_next: BTreeMap<ValueId, Option<Affine>>,
 }
 
@@ -1397,11 +1444,13 @@ fn build_recursion_model(
         for path in &paths {
             let path_pred = path_pred_map(path);
             let mut guards: Vec<Constraint> = Vec::new();
+            let mut splits: Vec<[Constraint; 2]> = Vec::new();
             // Necessary stay-conditions of the branches entering the call block.
             for pair in path.windows(2) {
                 if let Some(block) = func.blocks.iter().find(|b| b.id == pair[0]) {
                     add_path_guards(
                         &mut guards,
+                        &mut splits,
                         &mut universe,
                         block,
                         pair[1],
@@ -1427,7 +1476,11 @@ fn build_recursion_model(
                 }
                 raw_next.insert(p.id, a);
             }
-            raws.push(RawBranch { guards, raw_next });
+            raws.push(RawBranch {
+                guards,
+                splits,
+                raw_next,
+            });
         }
     }
     if raws.is_empty() {
@@ -1466,52 +1519,9 @@ fn build_recursion_model(
         }
     }
 
-    // --- Pass 2: classify each argument transition (affine-stable vs havoc). ----
-    let mut fresh_syms: BTreeSet<ValueId> = BTreeSet::new();
-    let mut branches: Vec<Branch> = Vec::with_capacity(raws.len());
-    for (bi, raw) in raws.into_iter().enumerate() {
-        let mut check_region = raw.guards;
-        check_region.extend(base_bounds.iter().cloned());
-
-        let mut next: BTreeMap<ValueId, Affine> = BTreeMap::new();
-        let mut fresh_bounds: Vec<Constraint> = Vec::new();
-        for (&param, cand) in &raw.raw_next {
-            // Stable iff the affine argument provably never wraps its type range on
-            // the region (⇒ affine model == machine value). Otherwise havoc: a
-            // fresh type-bounded free symbol (ranking must hold for every value).
-            let stable = match (cand, bound_of.get(&param)) {
-                (Some(a), Some(&(lo, hi)))
-                    if next_never_overflows(a, lo, hi, &check_region, &universe) =>
-                {
-                    Some(a.clone())
-                }
-                _ => None,
-            };
-            if let Some(a) = stable {
-                next.insert(param, a);
-            } else {
-                let fresh = havoc_id(param, bi);
-                fresh_syms.insert(fresh);
-                if let Some(&(lo, hi)) = bound_of.get(&param) {
-                    fresh_bounds.push(Constraint {
-                        coeffs: BTreeMap::from([(fresh, 1)]),
-                        constant: -lo,
-                    });
-                    fresh_bounds.push(Constraint {
-                        coeffs: BTreeMap::from([(fresh, -1)]),
-                        constant: hi,
-                    });
-                }
-                next.insert(param, Affine::symbol(fresh));
-            }
-        }
-        check_region.extend(fresh_bounds);
-        branches.push(Branch {
-            region: check_region,
-            next,
-        });
-    }
-    universe.extend(fresh_syms);
+    // --- Pass 2: expand disjunctive splits, classify each argument transition
+    // (affine-stable vs havoc), and assemble the final per-branch regions.
+    let branches = assemble_branches(raws, &base_bounds, &bound_of, &mut universe);
 
     let template: BTreeSet<ValueId> = param_ids.iter().chain(invariants.iter()).copied().collect();
     Some(MultiPathModel {
@@ -1745,11 +1755,13 @@ fn build_mutual_recursion_model(
             for path in &paths {
                 let path_pred = path_pred_map(path);
                 let mut guards_local: Vec<Constraint> = Vec::new();
+                let mut splits_local: Vec<[Constraint; 2]> = Vec::new();
                 let mut local_universe: BTreeSet<ValueId> = BTreeSet::new();
                 for pair in path.windows(2) {
                     if let Some(block) = f.blocks.iter().find(|b| b.id == pair[0]) {
                         add_path_guards(
                             &mut guards_local,
+                            &mut splits_local,
                             &mut local_universe,
                             block,
                             pair[1],
@@ -1792,7 +1804,20 @@ fn build_mutual_recursion_model(
                 for c in &guards {
                     universe.extend(c.coeffs.keys().copied());
                 }
-                raws.push(RawBranch { guards, raw_next });
+                // Remap each `!=` split's two half-spaces into the shared vocabulary.
+                let splits: Vec<[Constraint; 2]> = splits_local
+                    .iter()
+                    .map(|[a, b]| [remap_constraint(a, remap), remap_constraint(b, remap)])
+                    .collect();
+                for [a, b] in &splits {
+                    universe.extend(a.coeffs.keys().copied());
+                    universe.extend(b.coeffs.keys().copied());
+                }
+                raws.push(RawBranch {
+                    guards,
+                    splits,
+                    raw_next,
+                });
             }
         }
     }
@@ -1818,49 +1843,9 @@ fn build_mutual_recursion_model(
         }
     }
 
-    // --- Pass 2: classify each argument transition (affine-stable vs havoc). ----
-    let mut fresh_syms: BTreeSet<ValueId> = BTreeSet::new();
-    let mut branches: Vec<Branch> = Vec::with_capacity(raws.len());
-    for (bi, raw) in raws.into_iter().enumerate() {
-        let mut check_region = raw.guards;
-        check_region.extend(base_bounds.iter().cloned());
-
-        let mut next: BTreeMap<ValueId, Affine> = BTreeMap::new();
-        let mut fresh_bounds: Vec<Constraint> = Vec::new();
-        for (&param, cand) in &raw.raw_next {
-            let stable = match (cand, bound_of.get(&param)) {
-                (Some(a), Some(&(lo, hi)))
-                    if next_never_overflows(a, lo, hi, &check_region, &universe) =>
-                {
-                    Some(a.clone())
-                }
-                _ => None,
-            };
-            if let Some(a) = stable {
-                next.insert(param, a);
-            } else {
-                let fresh = havoc_id(param, bi);
-                fresh_syms.insert(fresh);
-                if let Some(&(lo, hi)) = bound_of.get(&param) {
-                    fresh_bounds.push(Constraint {
-                        coeffs: BTreeMap::from([(fresh, 1)]),
-                        constant: -lo,
-                    });
-                    fresh_bounds.push(Constraint {
-                        coeffs: BTreeMap::from([(fresh, -1)]),
-                        constant: hi,
-                    });
-                }
-                next.insert(param, Affine::symbol(fresh));
-            }
-        }
-        check_region.extend(fresh_bounds);
-        branches.push(Branch {
-            region: check_region,
-            next,
-        });
-    }
-    universe.extend(fresh_syms);
+    // --- Pass 2: expand disjunctive splits, classify each argument transition
+    // (affine-stable vs havoc), and assemble the final per-branch regions.
+    let branches = assemble_branches(raws, &base_bounds, &bound_of, &mut universe);
 
     Some(MultiPathModel {
         template: param_ids,
@@ -1979,11 +1964,13 @@ fn build_multipath_model_multi(
         for path in &paths {
             let path_pred = path_pred_map(path);
             let mut guards: Vec<Constraint> = Vec::new();
+            let mut splits: Vec<[Constraint; 2]> = Vec::new();
             // Necessary stay-conditions along the path's internal/exit branches …
             for pair in path.windows(2) {
                 if let Some(block) = func.blocks.iter().find(|b| b.id == pair[0]) {
                     add_path_guards(
                         &mut guards,
+                        &mut splits,
                         &mut universe,
                         block,
                         pair[1],
@@ -1999,6 +1986,7 @@ fn build_multipath_model_multi(
             // the continuing condition lives here.
             add_path_guards(
                 &mut guards,
+                &mut splits,
                 &mut universe,
                 latch_block,
                 header,
@@ -2021,7 +2009,11 @@ fn build_multipath_model_multi(
                 }
                 raw_next.insert(phi, a);
             }
-            raws.push(RawBranch { guards, raw_next });
+            raws.push(RawBranch {
+                guards,
+                splits,
+                raw_next,
+            });
             if raws.len() > MAX_PATHS {
                 return None;
             }
@@ -2056,55 +2048,9 @@ fn build_multipath_model_multi(
         }
     }
 
-    // --- Pass 2: classify each transition (affine-stable vs havoc) and assemble
-    // the final per-branch regions.
-    let mut fresh_syms: BTreeSet<ValueId> = BTreeSet::new();
-    let mut branches: Vec<Branch> = Vec::with_capacity(raws.len());
-    for (bi, raw) in raws.into_iter().enumerate() {
-        // Region used to *check* overflow-freedom (guards + type bounds only).
-        let mut check_region = raw.guards;
-        check_region.extend(base_bounds.iter().cloned());
-
-        let mut next: BTreeMap<ValueId, Affine> = BTreeMap::new();
-        let mut fresh_bounds: Vec<Constraint> = Vec::new();
-        for (&phi, cand) in &raw.raw_next {
-            // A phi is stable on this path iff its affine `next` provably never
-            // wraps its type range on the path region (⇒ affine model == machine
-            // update). Otherwise it is havoc: a fresh free symbol, type-bounded, so
-            // the ranking must hold for *every* in-range successor value.
-            let stable = match (cand, bound_of.get(&phi)) {
-                (Some(a), Some(&(lo, hi)))
-                    if next_never_overflows(a, lo, hi, &check_region, &universe) =>
-                {
-                    Some(a.clone())
-                }
-                _ => None,
-            };
-            if let Some(a) = stable {
-                next.insert(phi, a);
-            } else {
-                let fresh = havoc_id(phi, bi);
-                fresh_syms.insert(fresh);
-                if let Some(&(lo, hi)) = bound_of.get(&phi) {
-                    fresh_bounds.push(Constraint {
-                        coeffs: BTreeMap::from([(fresh, 1)]),
-                        constant: -lo,
-                    });
-                    fresh_bounds.push(Constraint {
-                        coeffs: BTreeMap::from([(fresh, -1)]),
-                        constant: hi,
-                    });
-                }
-                next.insert(phi, Affine::symbol(fresh));
-            }
-        }
-        check_region.extend(fresh_bounds);
-        branches.push(Branch {
-            region: check_region,
-            next,
-        });
-    }
-    universe.extend(fresh_syms);
+    // --- Pass 2: expand disjunctive splits, classify each transition
+    // (affine-stable vs havoc), and assemble the final per-branch regions.
+    let branches = assemble_branches(raws, &base_bounds, &bound_of, &mut universe);
 
     let template: BTreeSet<ValueId> = header_phis
         .iter()
@@ -2131,12 +2077,114 @@ fn index_block_of(func: &AirFunction) -> BTreeMap<ValueId, BlockId> {
     out
 }
 
-/// A deterministic fresh **havoc** symbol for header phi `phi` on branch `bi`
-/// (used when the phi's `next` on that path is non-affine or may overflow).
-fn havoc_id(phi: ValueId, bi: usize) -> ValueId {
+/// A deterministic fresh **havoc** symbol for header phi `phi` on raw branch `bi`,
+/// half-space-choice `si` (used when the phi's `next` on that path is non-affine or
+/// may overflow). `si` keeps the two disjunctive sub-branches of one raw branch
+/// from sharing a havoc symbol (each sub-branch havocs independently).
+fn havoc_id(phi: ValueId, bi: usize, si: usize) -> ValueId {
     let mut bytes = format!("{phi:?}").into_bytes();
     bytes.extend_from_slice(&bi.to_le_bytes());
+    bytes.extend_from_slice(&si.to_le_bytes());
     ValueId(make_id("ranking_havoc", &bytes))
+}
+
+/// Maximum disjunctive `!=` / `==`-else splits expanded per raw branch. Each split
+/// forks the branch into two half-space branches (both must rank), so the branch
+/// count grows by `2^(#splits)`; the cap bounds the Farkas work. Above it, the
+/// splits are dropped (a sound weakening — the guard is simply not used).
+const MAX_NE_SPLITS: usize = 3;
+
+/// Expand a raw branch's disjunctive splits into the cartesian product of
+/// half-space choices: one `Vec<Constraint>` of extra region constraints per
+/// combination (`[Vec::new()]` when there are no splits). Deterministic order.
+fn split_half_space_choices(splits: &[[Constraint; 2]]) -> Vec<Vec<Constraint>> {
+    let mut out: Vec<Vec<Constraint>> = vec![Vec::new()];
+    for pair in splits {
+        let mut next: Vec<Vec<Constraint>> = Vec::with_capacity(out.len() * 2);
+        for base in &out {
+            for half in pair {
+                let mut v = base.clone();
+                v.push(half.clone());
+                next.push(v);
+            }
+        }
+        out = next;
+    }
+    out
+}
+
+/// Assemble the final [`Branch`] list from the raw per-path transitions, shared by
+/// all three [`MultiPathModel`] builders (single/multi-latch loops, self-recursion,
+/// mutual recursion).
+///
+/// For each raw branch it (1) expands the disjunctive `!=` / `==`-else splits into
+/// the cartesian product of convex half-space choices — **both/every** resulting
+/// sub-branch becomes a branch the ranking must cover, which is sound because their
+/// union is a superset of the real continuing states on the path — then (2)
+/// classifies every phi/param transition as affine-**stable** (its affine `next`
+/// provably never wraps its type range on that sub-branch's region ⇒ affine model
+/// == machine update) or **havoc** (a fresh type-bounded free symbol). Running the
+/// overflow classification *per half-space* is the point: a half-space bound (e.g.
+/// `n ≥ 1` from `n ≠ 0`) can prove a `next` (`n − 1`) overflow-free that is unstable
+/// on the un-split region, recovering an otherwise-dropped ranking.
+fn assemble_branches(
+    raws: Vec<RawBranch>,
+    base_bounds: &[Constraint],
+    bound_of: &BTreeMap<ValueId, (i128, i128)>,
+    universe: &mut BTreeSet<ValueId>,
+) -> Vec<Branch> {
+    let mut fresh_syms: BTreeSet<ValueId> = BTreeSet::new();
+    let mut branches: Vec<Branch> = Vec::with_capacity(raws.len());
+    for (bi, raw) in raws.into_iter().enumerate() {
+        // Over the cap, drop the splits (sound weakening) rather than blow up.
+        let choices = if raw.splits.len() <= MAX_NE_SPLITS {
+            split_half_space_choices(&raw.splits)
+        } else {
+            vec![Vec::new()]
+        };
+        for (si, extra) in choices.into_iter().enumerate() {
+            let mut check_region = raw.guards.clone();
+            check_region.extend(base_bounds.iter().cloned());
+            check_region.extend(extra);
+
+            let mut next: BTreeMap<ValueId, Affine> = BTreeMap::new();
+            let mut fresh_bounds: Vec<Constraint> = Vec::new();
+            for (&sym, cand) in &raw.raw_next {
+                let stable = match (cand, bound_of.get(&sym)) {
+                    (Some(a), Some(&(lo, hi)))
+                        if next_never_overflows(a, lo, hi, &check_region, universe) =>
+                    {
+                        Some(a.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(a) = stable {
+                    next.insert(sym, a);
+                } else {
+                    let fresh = havoc_id(sym, bi, si);
+                    fresh_syms.insert(fresh);
+                    if let Some(&(lo, hi)) = bound_of.get(&sym) {
+                        fresh_bounds.push(Constraint {
+                            coeffs: BTreeMap::from([(fresh, 1)]),
+                            constant: -lo,
+                        });
+                        fresh_bounds.push(Constraint {
+                            coeffs: BTreeMap::from([(fresh, -1)]),
+                            constant: hi,
+                        });
+                    }
+                    next.insert(sym, Affine::symbol(fresh));
+                }
+            }
+            check_region.extend(fresh_bounds);
+            branches.push(Branch {
+                region: check_region,
+                next,
+            });
+        }
+    }
+    universe.extend(fresh_syms);
+    branches
 }
 
 /// `block ↦ its predecessor on this path` (the header, at index 0, has none).
@@ -2213,6 +2261,7 @@ fn dfs_body_paths(
 #[allow(clippy::too_many_arguments)]
 fn add_path_guards(
     region: &mut Vec<Constraint>,
+    splits: &mut Vec<[Constraint; 2]>,
     universe: &mut BTreeSet<ValueId>,
     block: &saf_core::air::AirBlock,
     next_block: BlockId,
@@ -2244,6 +2293,7 @@ fn add_path_guards(
     };
     resolve_bool_guard(
         region,
+        splits,
         universe,
         cond,
         taken_true,
@@ -2289,6 +2339,7 @@ fn add_path_guards(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn resolve_bool_guard(
     region: &mut Vec<Constraint>,
+    splits: &mut Vec<[Constraint; 2]>,
     universe: &mut BTreeSet<ValueId>,
     cond: ValueId,
     want_true: bool,
@@ -2316,21 +2367,25 @@ fn resolve_bool_guard(
     let Some(def) = defs.get(&cond) else {
         return; // opaque leaf (param / nondet / global) ⇒ no usable constraint.
     };
-    let recurse =
-        |region: &mut Vec<Constraint>, universe: &mut BTreeSet<ValueId>, v: ValueId, want: bool| {
-            resolve_bool_guard(
-                region,
-                universe,
-                v,
-                want,
-                defs,
-                block_of,
-                header_phis,
-                module,
-                path_pred,
-                depth + 1,
-            );
-        };
+    let recurse = |region: &mut Vec<Constraint>,
+                   splits: &mut Vec<[Constraint; 2]>,
+                   universe: &mut BTreeSet<ValueId>,
+                   v: ValueId,
+                   want: bool| {
+        resolve_bool_guard(
+            region,
+            splits,
+            universe,
+            v,
+            want,
+            defs,
+            block_of,
+            header_phis,
+            module,
+            path_pred,
+            depth + 1,
+        );
+    };
     match &def.op {
         // Direct integer comparison — the base case.
         Operation::BinaryOp { kind } if is_int_comparison(*kind) => {
@@ -2349,6 +2404,14 @@ fn resolve_bool_guard(
                     region.push(c);
                 }
             }
+            // A `!=` / `==`-else guard is non-convex: record its two convex
+            // half-spaces for disjunctive expansion in `assemble_branches`.
+            if let Some(pair) = ne_split(*kind, &lhs, &rhs, want_true) {
+                for c in &pair {
+                    universe.extend(c.coeffs.keys().copied());
+                }
+                splits.push(pair);
+            }
         }
         // `i1` short-circuit phi (the `&&` / `||` lowering): resolve to the value
         // incoming from this path's predecessor of the phi's block, same polarity.
@@ -2360,7 +2423,7 @@ fn resolve_bool_guard(
                 return;
             };
             if let Some((_, val)) = incoming.iter().find(|(p, _)| p == pred) {
-                recurse(region, universe, *val, want_true);
+                recurse(region, splits, universe, *val, want_true);
             }
         }
         // Logical `and` taken true ⇒ both conjuncts true; logical `or` taken false
@@ -2369,12 +2432,12 @@ fn resolve_bool_guard(
             kind: BinaryOp::And,
         } if want_true => {
             for &op in def.operands.iter().take(2) {
-                recurse(region, universe, op, true);
+                recurse(region, splits, universe, op, true);
             }
         }
         Operation::BinaryOp { kind: BinaryOp::Or } if !want_true => {
             for &op in def.operands.iter().take(2) {
-                recurse(region, universe, op, false);
+                recurse(region, splits, universe, op, false);
             }
         }
         // `xor v, 1` is `!v` on an `i1`; recurse on `v` with flipped polarity.
@@ -2393,12 +2456,12 @@ fn resolve_bool_guard(
                 // `xor v, true` ⇒ negate `v`; `xor v, false` ⇒ passthrough.
                 (Some(bit), _) => {
                     if let Some(v) = b {
-                        recurse(region, universe, v, want_true ^ bit);
+                        recurse(region, splits, universe, v, want_true ^ bit);
                     }
                 }
                 (_, Some(bit)) => {
                     if let Some(v) = a {
-                        recurse(region, universe, v, want_true ^ bit);
+                        recurse(region, splits, universe, v, want_true ^ bit);
                     }
                 }
                 _ => {}
@@ -2412,7 +2475,7 @@ fn resolve_bool_guard(
             ..
         } => {
             if let Some(&src) = def.operands.first() {
-                recurse(region, universe, src, want_true);
+                recurse(region, splits, universe, src, want_true);
             }
         }
         _ => {}
@@ -2908,6 +2971,153 @@ mod tests {
         // while (i != n) i++ : `!=` is not a convex half-space; with only a type
         // bound the increment can overflow ⇒ abstain (sound).
         let m = counter_loop(BinaryOp::ICmpNe, Bound::Nondet, 1);
+        assert!(!ranked(&m));
+    }
+
+    /// Build `while (x != bound) x += step;` with `x` typed `i32`, plus a dead
+    /// `x / one` op that hints `x`'s signedness (`unsigned` ⇒ `udiv`, else `sdiv`)
+    /// so the loop var carries a concrete type range. Exercises the disjunctive
+    /// `!=` half-space split.
+    #[allow(clippy::too_many_lines)]
+    fn ne_counter_loop(bound: i64, step: i64, unsigned: bool) -> AirModule {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let b0 = bid("entry");
+        let h = bid("header");
+        let l = bid("latch");
+        let e = bid("exit");
+
+        let x = vid("x");
+        let xn = vid("xn");
+        let cval = vid("c");
+        let dead = vid("dead");
+        let x_init = vid("x_init");
+        let step_v = vid("step");
+        let bound_v = vid("bound_const");
+        let one = vid("one");
+        let mut constants = BTreeMap::new();
+        constants.insert(x_init, Constant::Int { value: 0, bits: 32 });
+        constants.insert(
+            step_v,
+            Constant::Int {
+                value: step,
+                bits: 32,
+            },
+        );
+        constants.insert(
+            bound_v,
+            Constant::Int {
+                value: bound,
+                bits: 32,
+            },
+        );
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+
+        let mut entry = AirBlock::new(b0);
+        entry
+            .instructions
+            .push(term("br_entry", Operation::Br { target: h }, vec![]));
+
+        let mut header = AirBlock::new(h);
+        header.instructions.push(vinst(
+            "phi_x",
+            Operation::Phi {
+                incoming: vec![(b0, x_init), (l, xn)],
+            },
+            x,
+            vec![],
+            i32t,
+        ));
+        // Signedness hint: `udiv`/`sdiv` marks `x` unsigned/signed for `infer_signs`.
+        header.instructions.push(vinst(
+            "hint",
+            Operation::BinaryOp {
+                kind: if unsigned {
+                    BinaryOp::UDiv
+                } else {
+                    BinaryOp::SDiv
+                },
+            },
+            dead,
+            vec![x, one],
+            i32t,
+        ));
+        header.instructions.push(vinst(
+            "cmp",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpNe,
+            },
+            cval,
+            vec![x, bound_v],
+            i1t,
+        ));
+        header.instructions.push(term(
+            "condbr",
+            Operation::CondBr {
+                then_target: l,
+                else_target: e,
+            },
+            vec![cval],
+        ));
+
+        let mut latch = AirBlock::new(l);
+        latch.instructions.push(vinst(
+            "add",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            xn,
+            vec![x, step_v],
+            i32t,
+        ));
+        latch
+            .instructions
+            .push(term("br_latch", Operation::Br { target: h }, vec![]));
+
+        let mut exit = AirBlock::new(e);
+        exit.instructions.push(term("ret", Operation::Ret, vec![x]));
+
+        let func = AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![entry, header, latch, exit],
+            entry_block: Some(b0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        module_of(func, constants)
+    }
+
+    #[test]
+    fn ne_zero_unsigned_countdown_ranked() {
+        // while (x != 0) x -= 1;  with `x` unsigned. The `!=` split forks into the
+        // half-space `x ≥ 1` (where `x − 1` never underflows ⇒ `f = x` ranks) and
+        // `x ≤ -1` (infeasible under `x ≥ 0` ⇒ vacuously ranked). Both rank ⇒ TRUE.
+        // Was abstained before the split: on the un-split region `x ≥ 0` the `x − 1`
+        // step underflows at `x = 0` ⇒ havoc ⇒ unranked.
+        let m = ne_counter_loop(0, -1, true);
+        assert!(ranked(&m));
+    }
+
+    #[test]
+    fn ne_five_step_two_diverging_half_abstains() {
+        // while (x != 5) x += 2;  with `x` signed. The task's negative: from an even
+        // start the loop never hits 5. The `!=` split's `x ≥ 6` half diverges
+        // (`x += 2` grows, unbounded / overflows near INT_MAX) ⇒ that half cannot be
+        // ranked ⇒ abstain. (The `x ≤ 4` half ranks, but BOTH are required.)
+        let m = ne_counter_loop(5, 2, false);
+        assert!(!ranked(&m));
+    }
+
+    #[test]
+    fn ne_zero_signed_countdown_abstains() {
+        // while (x != 0) x -= 1;  with `x` *signed*: the `x ≤ -1` half is feasible
+        // and `x -= 1` diverges toward INT_MIN (underflow) ⇒ that half cannot be
+        // ranked ⇒ abstain (sound: signed `x < 0` does not terminate here).
+        let m = ne_counter_loop(0, -1, false);
         assert!(!ranked(&m));
     }
 
@@ -4380,6 +4590,113 @@ mod tests {
         // bound the argument can decrease past INT_MIN ⇒ abstain (sound: this is
         // non-terminating for a negative signed `n`).
         assert!(!rec_ranked(&self_rec(BinaryOp::ICmpNe, 0, -1)));
+    }
+
+    /// `unsigned f(n){ t = n / 1; if (n != 0) f(n - 1); }` — the `udiv` hints `n`
+    /// unsigned so it carries the range `[0, 2^32-1]`. Exercises the disjunctive
+    /// `!=` split on the recursion model.
+    fn self_rec_unsigned_ne_zero() -> AirModule {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let zero = vid("zero");
+        let one = vid("one");
+        let negone = vid("negone");
+        constants.insert(zero, Constant::Int { value: 0, bits: 32 });
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+        constants.insert(
+            negone,
+            Constant::Int {
+                value: -1,
+                bits: 32,
+            },
+        );
+
+        let f_id = FunctionId(make_id("func", b"f"));
+        let n = vid("n");
+        let dead = vid("dead");
+        let c = vid("c");
+        let na = vid("na");
+        let entry = bid("f_entry");
+        let rec = bid("f_rec");
+        let base = bid("f_base");
+
+        let mut eb = AirBlock::new(entry);
+        // Unsigned hint: `n u/ 1` marks `n` unsigned for `infer_signs`.
+        eb.instructions.push(vinst(
+            "hint",
+            Operation::BinaryOp {
+                kind: BinaryOp::UDiv,
+            },
+            dead,
+            vec![n, one],
+            i32t,
+        ));
+        eb.instructions.push(vinst(
+            "cmp",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpNe,
+            },
+            c,
+            vec![n, zero],
+            i1t,
+        ));
+        eb.instructions.push(term(
+            "condbr",
+            Operation::CondBr {
+                then_target: rec,
+                else_target: base,
+            },
+            vec![c],
+        ));
+
+        let mut rb = AirBlock::new(rec);
+        rb.instructions.push(vinst(
+            "add",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            na,
+            vec![n, negone],
+            i32t,
+        ));
+        rb.instructions.push(term(
+            "call",
+            Operation::CallDirect { callee: f_id },
+            vec![na],
+        ));
+        rb.instructions
+            .push(term("br_rec", Operation::Br { target: base }, vec![]));
+
+        let mut bb = AirBlock::new(base);
+        bb.instructions.push(term("ret", Operation::Ret, vec![]));
+
+        let func = AirFunction {
+            id: f_id,
+            name: "f".to_string(),
+            params: vec![AirParam {
+                id: n,
+                name: None,
+                index: 0,
+                param_type: Some(i32t),
+            }],
+            blocks: vec![eb, rb, bb],
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        module_of(func, constants)
+    }
+
+    #[test]
+    fn ne_zero_unsigned_recursion_is_ranked() {
+        // f(unsigned n){ if (n != 0) f(n - 1); }  — the `!=` split gives `n ≥ 1`
+        // (where `n - 1` never underflows ⇒ f = n ranks) and `n ≤ -1` (infeasible
+        // under `n ≥ 0` ⇒ vacuous). Both rank ⇒ TRUE (was abstained: on `n ≥ 0` the
+        // `n - 1` step underflows at n = 0 ⇒ havoc ⇒ unranked).
+        assert!(rec_ranked(&self_rec_unsigned_ne_zero()));
     }
 
     #[test]
