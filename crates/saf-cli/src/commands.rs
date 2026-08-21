@@ -1398,14 +1398,25 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     }
 }
 
-/// Internal cap on blind-fuzz iterations (mutation trials), overridable via
-/// `$SAF_FUZZ_ITERS`. Bounds worst-case native run time; a dictionary-steered
-/// guard is usually hit in the seed corpus or the first handful of trials.
-fn fuzz_iters() -> usize {
-    std::env::var("SAF_FUZZ_ITERS")
+/// Deterministic cap on blind-fuzz iterations (mutation trials), overridable via
+/// `$SAF_FUZZ_ITERS`. This — NOT the wall-clock deadline — is the primary bound, so
+/// the search (and therefore the verdict) is reproducible across machines; the
+/// deadline is only a pathological-slowness safety valve.
+///
+/// With `SanitizerCoverage` feedback each exec is far more valuable (a new-edge input
+/// is kept and its frontier mutated), so the coverage path is given a larger budget
+/// to let the incremental frontier-building actually pay off; the blind path keeps
+/// the original small budget (a dictionary-steered guard is usually hit in the seed
+/// corpus or the first handful of trials). The sv-benchmarks reach tasks are tiny
+/// (µs-scale execs), so even the larger budget finishes well inside the deadline.
+fn fuzz_iters(cov_enabled: bool) -> usize {
+    if let Some(n) = std::env::var("SAF_FUZZ_ITERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(600)
+    {
+        return n;
+    }
+    if cov_enabled { 6000 } else { 600 }
 }
 
 /// Wall-clock safety cap on the whole blind-fuzz stage (seconds), overridable via
@@ -1449,6 +1460,9 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
     let harness = dir.join("saf_fuzz_harness");
     let input_path = dir.join("saf_fuzz.input");
     let log_path = dir.join("saf_fuzz.log");
+    let cov_path = dir.join("saf_fuzz.cov");
+    let cmplog_path = dir.join("saf_fuzz.cmplog");
+    let i2s_path = dir.join("saf_fuzz.i2s");
 
     if std::fs::write(
         &driver_src,
@@ -1468,17 +1482,24 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
     //     a program that already compiled + reaches reach_error without overflow is unchanged; a genuine
     //     failure still returns None (inconclusive), never a wrong verdict.
     let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
-    let build = |neutralizer: Option<&Path>| {
+    let build = |neutralizer: Option<&Path>, cov: bool| {
         let mut cmd = Command::new(ctx.clang);
         cmd.args([
             "-O0",
             "-Wno-everything",
             "-fsanitize=signed-integer-overflow",
             "-fsanitize-trap=signed-integer-overflow",
-        ])
-        .arg(ctx.data_model.clang_flag())
-        .arg("-include")
-        .arg(ctx.stub);
+        ]);
+        if cov {
+            // Standalone SanitizerCoverage: 8-bit edge counters (coverage map) + a PC
+            // table (waypoints) + trace-cmp (CmpLog operands). The driver defines the
+            // required callbacks; no sanitizer runtime is linked. Purely a search
+            // signal — see `fuzz::CoverageMap` / `fuzz::merge_cmplog`.
+            cmd.arg("-fsanitize-coverage=inline-8bit-counters,pc-table,trace-cmp");
+        }
+        cmd.arg(ctx.data_model.clang_flag())
+            .arg("-include")
+            .arg(ctx.stub);
         if let Some(n) = neutralizer {
             cmd.arg("-include").arg(n);
         }
@@ -1492,14 +1513,25 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
             .stderr(Stdio::null());
         cmd
     };
-    let mut compiled_ok = matches!(build(None).status(), Ok(s) if s.success());
-    if !compiled_ok {
-        if let Ok(n) = write_assert_neutralizer(dir) {
-            compiled_ok = matches!(build(Some(n.as_path())).status(), Ok(s) if s.success());
+    // Try the coverage-instrumented build first (greybox feedback). If that fails on
+    // this toolchain — for any reason — fall back to the plain build so the fuzzer
+    // still runs blind: zero regression, coverage feedback is a strict bonus.
+    let neutralizer = write_assert_neutralizer(dir).ok();
+    let attempt = |cov: bool| {
+        if matches!(build(None, cov).status(), Ok(s) if s.success()) {
+            return true;
         }
-    }
-    if !compiled_ok {
+        if let Some(n) = neutralizer.as_ref() {
+            return matches!(build(Some(n.as_path()), cov).status(), Ok(s) if s.success());
+        }
+        false
+    };
+    let cov_enabled = attempt(true);
+    if !cov_enabled && !attempt(false) {
         return None; // link/compile failure -> inconclusive
+    }
+    if cov_enabled {
+        eprintln!("saf verify: blind fuzz using SanitizerCoverage feedback (edge map + CmpLog)");
     }
 
     // Backward AIR slice from the reach_error criteria (+ __VERIFIER_assume as a
@@ -1511,15 +1543,25 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
     // slice yields a dictionary byte-identical to the plain harvest and no sequence
     // seeds, so this never regresses.
     let slice = saf_svcomp::slicing::backward_slice(ctx.module);
-    let dict = saf_svcomp::slicing::slice_directed_dictionary(ctx.module, &slice);
+    let mut dict = saf_svcomp::slicing::slice_directed_dictionary(ctx.module, &slice);
     let mut corpus = fuzz::seed_corpus(&dict);
     corpus.extend(saf_svcomp::slicing::sequence_seeds(&slice.guard_constants));
     // Fixed seed -> the whole search (and therefore the verdict) is reproducible.
     let mut rng = fuzz::XorShift64::new(0x5AF3_C0DE);
     let per_run = replay_timeout();
-    let iters = fuzz_iters();
+    let iters = fuzz_iters(cov_enabled);
     let deadline = std::time::Instant::now() + fuzz_time_budget();
     let mut max_depth = 0usize;
+    // Greybox feedback state. `cov` accumulates the AFL-bucketed 8-bit edge map; an
+    // input that lights a new bucket is kept as a mutation base. The CmpLog dump is
+    // folded back into `dict` so comparison operands become steering constants. Both
+    // are pure search heuristics — the verdict is still native replay (R6).
+    let mut cov = fuzz::CoverageMap::new();
+    // Redqueen input-to-state queue: candidates produced by patching an input byte
+    // window to a value the program compared it against. Drained BEFORE havoc — a
+    // single I2S step often clears a magic-value / state-machine guard that blind
+    // mutation would need millions of execs to hit.
+    let mut i2s_pending: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
 
     // Trial 0..N: the seed corpus first (its entries are tried verbatim before any
     // mutation), then mutations of corpus entries. A run that consumes MORE nondet
@@ -1532,8 +1574,16 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
         }
         let input: Vec<u8> = if i < corpus.len() {
             corpus[i].clone()
+        } else if let Some(cand) = i2s_pending.pop_back() {
+            // Input-to-state candidates take priority over blind mutation. LIFO
+            // (depth-first) so a freshly-cracked stage's follow-up candidates are
+            // tried immediately — this chains through multi-stage guards in a handful
+            // of execs instead of draining a huge FIFO of stale candidates first.
+            cand
         } else {
-            let base = &corpus[rng.below(corpus.len())];
+            // Frontier-biased energy: favour the most-recently-added (deepest /
+            // newest-coverage) corpus entries as mutation bases.
+            let base = &corpus[rng.below_biased_high(corpus.len())];
             fuzz::mutate(&mut rng, base, &dict)
         };
 
@@ -1542,8 +1592,21 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
         }
         let _ = std::fs::remove_file(&sentinel);
         let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_file(&cov_path);
+        let _ = std::fs::remove_file(&cmplog_path);
+        let _ = std::fs::remove_file(&i2s_path);
 
-        if run_fuzz_harness(&harness, &input_path, &log_path, per_run).is_err() {
+        if run_fuzz_harness(
+            &harness,
+            &input_path,
+            &log_path,
+            &cov_path,
+            &cmplog_path,
+            &i2s_path,
+            per_run,
+        )
+        .is_err()
+        {
             continue;
         }
 
@@ -1584,14 +1647,48 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
                 }
                 Err(e) => eprintln!("saf verify: fuzz re-confirm errored: {e:#} -> continue"),
             }
-        } else if i >= corpus.len() {
-            // Greybox corpus feedback: keep inputs that reached deeper.
-            let depth = std::fs::read_to_string(&log_path)
-                .map(|l| l.lines().count())
-                .unwrap_or(0);
-            if depth > max_depth && corpus.len() < MAX_FUZZ_CORPUS {
-                max_depth = depth;
-                corpus.push(input);
+        } else {
+            // Greybox corpus feedback (runs that did NOT hit the sentinel).
+            //
+            // With coverage instrumentation: fold this run's edge map; an input that
+            // lit a NEW bucket is a coverage frontier and is kept as a mutation base.
+            // Merge the CmpLog operands into the dictionary regardless (they steer
+            // future mutations past magic-value guards). Without instrumentation, fall
+            // back to the original depth (nondet-log-line-count) heuristic.
+            if cov_enabled {
+                if let Ok(cl) = std::fs::read_to_string(&cmplog_path) {
+                    fuzz::merge_cmplog(&mut dict, &cl, MAX_MERGED_DICT);
+                }
+                let novel = std::fs::read(&cov_path).is_ok_and(|raw| cov.fold(&raw));
+                // Only EXPAND the search from inputs that reached somewhere new: keep
+                // them as mutation bases, and grow the Redqueen frontier from them
+                // (patch input windows to the values just compared against). Gating on
+                // novelty keeps the queue tight and walks the fill frontier stage by
+                // stage instead of flooding it with redundant candidates.
+                if novel {
+                    if i >= corpus.len() && corpus.len() < MAX_FUZZ_CORPUS {
+                        corpus.push(input.clone());
+                    }
+                    if let Ok(dump) = std::fs::read_to_string(&i2s_path) {
+                        let pairs = fuzz::parse_i2s(&dump);
+                        for cand in
+                            fuzz::i2s_candidates(&input, &pairs, MAX_I2S_PER_RUN, I2S_PER_PAIR)
+                        {
+                            if i2s_pending.len() >= MAX_I2S_PENDING {
+                                i2s_pending.pop_front(); // bounded: drop the oldest
+                            }
+                            i2s_pending.push_back(cand);
+                        }
+                    }
+                }
+            } else if i >= corpus.len() {
+                let depth = std::fs::read_to_string(&log_path)
+                    .map(|l| l.lines().count())
+                    .unwrap_or(0);
+                if depth > max_depth && corpus.len() < MAX_FUZZ_CORPUS {
+                    max_depth = depth;
+                    corpus.push(input);
+                }
             }
         }
     }
@@ -1603,6 +1700,25 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
 /// Corpus size cap for the greybox feedback loop — bounds memory and keeps the
 /// mutation base-selection distribution stable.
 const MAX_FUZZ_CORPUS: usize = 256;
+
+/// Cap on the CmpLog-extended mutation dictionary — bounds the mutation cost while
+/// leaving ample room above the static harvest ([`fuzz::MAX_DICT_ENTRIES`]) for
+/// dynamically-discovered comparison operands.
+const MAX_MERGED_DICT: usize = 1024;
+
+/// Bound on the outstanding Redqueen input-to-state queue (candidates awaiting a
+/// run). Keeps the extra execs — and memory — in check on comparison-heavy programs.
+const MAX_I2S_PENDING: usize = 4096;
+
+/// Bound on input-to-state candidates harvested from a SINGLE run, so one input that
+/// matches many comparison sites cannot monopolise the queue. Sized well above
+/// `I2S_PER_PAIR * (typical distinct pairs)` so no comparison site is clipped.
+const MAX_I2S_PER_RUN: usize = 256;
+
+/// Per-pair cap on input-to-state match sites (see [`fuzz::i2s_candidates`]): the
+/// earliest few matches walk the left-to-right byte-stream fill frontier without a
+/// high-multiplicity noise pair crowding out the load-bearing magic-value pair.
+const I2S_PER_PAIR: usize = 3;
 
 /// Run the byte-stream fuzz harness on one input under a short timeout, feeding
 /// `$SAF_FUZZ_INPUT` / `$SAF_FUZZ_LOG`. Success/normal-exit/timeout all return
@@ -1655,6 +1771,9 @@ fn run_fuzz_harness(
     harness: &Path,
     input_path: &Path,
     log_path: &Path,
+    cov_path: &Path,
+    cmplog_path: &Path,
+    i2s_path: &Path,
     timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
@@ -1665,7 +1784,12 @@ fn run_fuzz_harness(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .env("SAF_FUZZ_INPUT", input_path)
-        .env("SAF_FUZZ_LOG", log_path);
+        .env("SAF_FUZZ_LOG", log_path)
+        // Coverage / CmpLog / I2S feedback channels. Harmless when the harness was
+        // built without instrumentation (the dumper writes nothing).
+        .env("SAF_FUZZ_COV", cov_path)
+        .env("SAF_FUZZ_CMPLOG", cmplog_path)
+        .env("SAF_FUZZ_I2S", i2s_path);
     let mut child = harden_replay_spawn(&mut cmd)
         .spawn()
         .with_context(|| "spawning fuzz harness")?;

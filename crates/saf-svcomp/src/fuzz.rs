@@ -178,6 +178,86 @@ pub const MAX_DICT_ENTRIES: usize = 256;
 /// a CONSTANT length keeps mutation allocation-free and the search deterministic.
 pub const INPUT_LEN: usize = 256;
 
+/// Standalone-SanitizerCoverage feedback block appended to the byte-stream driver.
+///
+/// Defines the callbacks the `inline-8bit-counters`, `pc-table` and `trace-cmp`
+/// instrumentation kinds require (no sanitizer runtime is linked, so we own them),
+/// and a `constructor`/`atexit` pair that dumps the coverage map + harvested
+/// comparison operands on normal exit. The whole block is INERT when the harness is
+/// compiled without `-fsanitize-coverage`: the init callbacks are simply never
+/// invoked, the captured pointers stay null, and the dump writes nothing.
+///
+/// The CmpLog table is a fixed-size open-addressed hash (O(1) per comparison — no
+/// linear scan in hot loops); collisions merely lose a candidate value, which only
+/// costs recall, never soundness.
+const COVERAGE_FEEDBACK_C: &str = "\
+/* --- SAF SanitizerCoverage feedback (inert without -fsanitize-coverage) --- */\n\
+/* CRITICAL: every callback/helper below is compiled in the SAME TU as the program\n\
+ * under -fsanitize-coverage, so its OWN comparisons would be instrumented and\n\
+ * re-enter the trace-cmp callbacks -> infinite recursion / stack overflow. Exclude\n\
+ * them from instrumentation (matches how the real sanitizer runtime is built). */\n\
+#define __SAF_NOCOV __attribute__((no_sanitize(\"coverage\")))\n\
+static unsigned char* __saf_cov_start = 0;\n\
+static unsigned char* __saf_cov_stop = 0;\n\
+__SAF_NOCOV void __sanitizer_cov_8bit_counters_init(unsigned char* s, unsigned char* e) { __saf_cov_start = s; __saf_cov_stop = e; }\n\
+static const void* __saf_pcs_beg = 0;\n\
+static const void* __saf_pcs_end = 0;\n\
+__SAF_NOCOV void __sanitizer_cov_pcs_init(const void* b, const void* e) { __saf_pcs_beg = b; __saf_pcs_end = e; }\n\
+#define __SAF_CMP_SLOTS 512\n\
+static unsigned long long __saf_cmp_tab[__SAF_CMP_SLOTS];\n\
+__SAF_NOCOV static void __saf_cmp_note(unsigned long long v) {\n\
+  if (v <= 1ULL) return;\n\
+  unsigned long long h = (v * 0x9E3779B97F4A7C15ULL) >> 55;\n\
+  __saf_cmp_tab[h & (__SAF_CMP_SLOTS - 1)] = v;\n\
+}\n\
+/* Redqueen-style input-to-state table: distinct (from,to,width) operand pairs so\n\
+ * the fuzz loop can locate `from` in the input bytes and patch it to `to`. */\n\
+#define __SAF_I2S_SLOTS 1024\n\
+static unsigned long long __saf_i2s_a[__SAF_I2S_SLOTS];\n\
+static unsigned long long __saf_i2s_b[__SAF_I2S_SLOTS];\n\
+static unsigned char __saf_i2s_w[__SAF_I2S_SLOTS];\n\
+__SAF_NOCOV static void __saf_i2s_note(unsigned long long a, unsigned long long b, unsigned char w) {\n\
+  if (a == b) return;\n\
+  unsigned long long h = (a * 0x9E3779B97F4A7C15ULL) ^ (b * 0xC2B2AE3D27D4EB4FULL);\n\
+  unsigned idx = (unsigned)((h >> 54) & (__SAF_I2S_SLOTS - 1));\n\
+  __saf_i2s_a[idx] = a; __saf_i2s_b[idx] = b; __saf_i2s_w[idx] = w;\n\
+}\n\
+__SAF_NOCOV static void __saf_cmp(unsigned long long a, unsigned long long b, unsigned char w) {\n\
+  __saf_cmp_note(a); __saf_cmp_note(b);\n\
+  __saf_i2s_note(a, b, w); __saf_i2s_note(b, a, w);\n\
+}\n\
+__SAF_NOCOV void __sanitizer_cov_trace_cmp1(unsigned char a, unsigned char b) { __saf_cmp(a, b, 1); }\n\
+__SAF_NOCOV void __sanitizer_cov_trace_cmp2(unsigned short a, unsigned short b) { __saf_cmp(a, b, 2); }\n\
+__SAF_NOCOV void __sanitizer_cov_trace_cmp4(unsigned int a, unsigned int b) { __saf_cmp(a, b, 4); }\n\
+__SAF_NOCOV void __sanitizer_cov_trace_cmp8(unsigned long long a, unsigned long long b) { __saf_cmp(a, b, 8); }\n\
+__SAF_NOCOV void __sanitizer_cov_trace_const_cmp1(unsigned char a, unsigned char b) { __saf_cmp(a, b, 1); }\n\
+__SAF_NOCOV void __sanitizer_cov_trace_const_cmp2(unsigned short a, unsigned short b) { __saf_cmp(a, b, 2); }\n\
+__SAF_NOCOV void __sanitizer_cov_trace_const_cmp4(unsigned int a, unsigned int b) { __saf_cmp(a, b, 4); }\n\
+__SAF_NOCOV void __sanitizer_cov_trace_const_cmp8(unsigned long long a, unsigned long long b) { __saf_cmp(a, b, 8); }\n\
+__SAF_NOCOV void __sanitizer_cov_trace_switch(unsigned long long val, unsigned long long* cases) {\n\
+  unsigned long long n = cases[0]; unsigned long long bw = cases[1] / 8; unsigned long long i;\n\
+  unsigned char w = (bw == 1 || bw == 2 || bw == 4 || bw == 8) ? (unsigned char)bw : 8;\n\
+  for (i = 0; i < n; i++) __saf_cmp(val, cases[2 + i], w);\n\
+}\n\
+__SAF_NOCOV static void __saf_cov_dump(void) {\n\
+  const char* cp = getenv(\"SAF_FUZZ_COV\");\n\
+  if (cp && __saf_cov_start && __saf_cov_stop && __saf_cov_stop > __saf_cov_start) {\n\
+    FILE* f = fopen(cp, \"wb\");\n\
+    if (f) { fwrite(__saf_cov_start, 1, (size_t)(__saf_cov_stop - __saf_cov_start), f); fclose(f); }\n\
+  }\n\
+  const char* mp = getenv(\"SAF_FUZZ_CMPLOG\");\n\
+  if (mp) {\n\
+    FILE* f = fopen(mp, \"w\");\n\
+    if (f) { int i; for (i = 0; i < __SAF_CMP_SLOTS; i++) { if (__saf_cmp_tab[i]) fprintf(f, \"%llu\\n\", __saf_cmp_tab[i]); } fclose(f); }\n\
+  }\n\
+  const char* ip = getenv(\"SAF_FUZZ_I2S\");\n\
+  if (ip) {\n\
+    FILE* f = fopen(ip, \"w\");\n\
+    if (f) { int i; for (i = 0; i < __SAF_I2S_SLOTS; i++) { if (__saf_i2s_w[i]) fprintf(f, \"%u %llu %llu\\n\", (unsigned)__saf_i2s_w[i], __saf_i2s_a[i], __saf_i2s_b[i]); } fclose(f); }\n\
+  }\n\
+}\n\
+__attribute__((constructor)) static void __saf_cov_ctor(void) { atexit(__saf_cov_dump); }\n";
+
 /// Generate the C source of the byte-stream nondet shim + error sentinel driver.
 ///
 /// Each scalar-integer `__VERIFIER_nondet_T()` consumes `sizeof(T)` little-endian
@@ -245,6 +325,21 @@ pub fn synthesize_bytestream_driver(sentinel_c_literal: &str) -> String {
             "{cty} {fname}(void) {{ {cty} v; unsigned long long r = __saf_take(sizeof({cty})); memcpy(&v, &r, sizeof({cty})); __saf_note(\"{fname}\", (long long)v); return v; }}"
         );
     }
+
+    // SanitizerCoverage feedback (INERT unless the harness is compiled with
+    // `-fsanitize-coverage=...`). We define the standalone-sancov callbacks the
+    // instrumentation requires — no sanitizer runtime is linked, so the compiler
+    // expects us to provide them:
+    //   * inline-8bit-counters -> `__sanitizer_cov_8bit_counters_init(start, stop)`
+    //   * pc-table             -> `__sanitizer_cov_pcs_init(beg, end)`
+    //   * trace-cmp            -> the `__sanitizer_cov_trace_cmp*` family
+    // At normal exit we dump the raw counter array to `$SAF_FUZZ_COV` (the fuzz loop
+    // buckets it AFL-style for new-edge seed keeping) and the harvested comparison
+    // operands to `$SAF_FUZZ_CMPLOG` (a CmpLog dynamic dictionary that cracks
+    // magic-value guards the static dictionary misses). This ONLY steers the search
+    // — the verdict is still produced by deterministic native replay (R6), so
+    // coverage feedback can never manufacture a wrong FALSE.
+    s.push_str(COVERAGE_FEEDBACK_C);
 
     // Non-integer / pointer nondet: same legal defaults the replay driver uses, so
     // the fuzz path and the re-confirm path stay behaviourally equivalent.
@@ -342,6 +437,117 @@ impl XorShift64 {
             usize::try_from(self.next_u64() % n as u64).unwrap_or(0)
         }
     }
+
+    /// A value in `0..n` biased toward the HIGH end (the max of two uniform draws —
+    /// a triangular distribution). Used to pick a mutation base that favours the
+    /// most-recently-added corpus entries, which are the coverage frontier
+    /// (AFLFast-style energy: spend more on the newest, deepest inputs).
+    pub fn below_biased_high(&mut self, n: usize) -> usize {
+        let a = self.below(n);
+        let b = self.below(n);
+        a.max(b)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Edge-coverage feedback (SanitizerCoverage inline-8bit-counters).
+// ---------------------------------------------------------------------------
+
+/// AFL-style hit-count bucketing: fold a raw 8-bit edge counter into a single
+/// one-hot *bucket bit* so near-identical hit counts (e.g. 8 vs 9) collapse to one
+/// coverage class while 1 vs 2 vs 3 stay distinct. `0` hits map to `0` (no bit).
+#[must_use]
+pub fn classify_counter(c: u8) -> u8 {
+    match c {
+        0 => 0,
+        1 => 1,
+        2 => 1 << 1,
+        3 => 1 << 2,
+        4..=7 => 1 << 3,
+        8..=15 => 1 << 4,
+        16..=31 => 1 << 5,
+        32..=127 => 1 << 6,
+        _ => 1 << 7,
+    }
+}
+
+/// Accumulated edge-coverage map: the running OR of every bucket bit seen across all
+/// fuzz runs so far. A run reveals *new coverage* iff it sets a bucket bit not
+/// previously accumulated — the classic greybox "keep the input that reached
+/// somewhere new" signal, far stronger than the depth (log-line-count) heuristic it
+/// replaces. Purely a search heuristic: it never influences the verdict.
+#[derive(Debug, Default, Clone)]
+pub struct CoverageMap {
+    seen: Vec<u8>,
+}
+
+impl CoverageMap {
+    /// A fresh, empty map.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { seen: Vec::new() }
+    }
+
+    /// Fold one raw counter snapshot (`raw[i]` = hit count of edge `i`) into the
+    /// accumulated map. Returns `true` iff it contributed at least one previously
+    /// unseen bucket bit. Grows the map to `raw.len()` on first sight of a larger
+    /// snapshot (module load order is stable, so this is deterministic).
+    pub fn fold(&mut self, raw: &[u8]) -> bool {
+        if raw.len() > self.seen.len() {
+            self.seen.resize(raw.len(), 0);
+        }
+        let mut novel = false;
+        for (i, &c) in raw.iter().enumerate() {
+            let bucket = classify_counter(c);
+            let acc = &mut self.seen[i];
+            if bucket & !*acc != 0 {
+                *acc |= bucket;
+                novel = true;
+            }
+        }
+        novel
+    }
+
+    /// True iff no coverage has been accumulated yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.seen.iter().all(|&b| b == 0)
+    }
+}
+
+/// Merge a CmpLog dump — one unsigned-decimal comparison operand per line, as the
+/// instrumented harness wrote them — into the live mutation `dict`. Each value's
+/// 64-bit pattern is reinterpreted as `i64` (so a large unsigned magic constant maps
+/// to the same little-endian window bytes the guard compares against). The dictionary
+/// is re-deduplicated, kept in deterministic sorted order, and capped at `cap`.
+/// Returns the number of NEW distinct values added.
+///
+/// This is the dynamic-dictionary half of CmpLog: comparison operands that never
+/// appear as IR literals (computed magic values, multi-byte tokens of a state
+/// machine) become steering constants for subsequent mutations, cracking guards the
+/// static harvest cannot.
+pub fn merge_cmplog(dict: &mut Vec<i64>, cmplog: &str, cap: usize) -> usize {
+    let mut set: BTreeSet<i64> = dict.iter().copied().collect();
+    let before = set.len();
+    for line in cmplog.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        if let Ok(u) = t.parse::<u64>() {
+            set.insert(u as i64);
+        } else if let Ok(v) = t.parse::<i64>() {
+            set.insert(v);
+        }
+    }
+    let added = set.len().saturating_sub(before);
+    let mut v: Vec<i64> = set.into_iter().collect();
+    if v.len() > cap {
+        v.truncate(cap);
+    }
+    *dict = v;
+    added
 }
 
 /// Produce a mutated copy of `input` (length preserved) by applying a random stack
@@ -438,6 +644,112 @@ pub fn seed_corpus(dict: &[i64]) -> Vec<Vec<u8>> {
         corpus.push(buf);
     }
     corpus
+}
+
+// ---------------------------------------------------------------------------
+// Redqueen-style input-to-state (I2S) replacement.
+// ---------------------------------------------------------------------------
+
+/// A comparison operand pair observed by the instrumented harness: at some point the
+/// program compared a `width`-byte value equal to `from`. If `from` appears verbatim
+/// in the fuzz input, overwriting it with `to` is very likely to flip the guard —
+/// the mechanism that cracks magic-value and multi-stage guards in a handful of execs
+/// (Redqueen / `AFL++` CmpLog "input-to-state"), without blind brute force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct I2sPair {
+    /// Operand byte width (1, 2, 4 or 8).
+    pub width: u8,
+    /// The value seen in the comparison (candidate to locate in the input).
+    pub from: u64,
+    /// The value to write in its place (the other operand — what the guard wants).
+    pub to: u64,
+}
+
+/// Parse an I2S dump (`"<width> <from> <to>"` per line, unsigned decimals) into
+/// pairs. Malformed lines and non-`{1,2,4,8}` widths are skipped; identity pairs are
+/// dropped. Deterministic (input-order preserving).
+#[must_use]
+pub fn parse_i2s(dump: &str) -> Vec<I2sPair> {
+    let mut out = Vec::new();
+    for line in dump.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(w), Some(a), Some(b)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(width), Ok(from), Ok(to)) = (w.parse::<u8>(), a.parse::<u64>(), b.parse::<u64>())
+        else {
+            continue;
+        };
+        if !matches!(width, 1 | 2 | 4 | 8) || from == to {
+            continue;
+        }
+        out.push(I2sPair { width, from, to });
+    }
+    out
+}
+
+/// Read a `width`-byte little-endian window of `buf` at `off` as a `u64`.
+fn read_le(buf: &[u8], off: usize, width: usize) -> u64 {
+    let mut v = 0u64;
+    for i in 0..width {
+        v |= u64::from(buf[off + i]) << (8 * i);
+    }
+    v
+}
+
+/// Generate input-to-state candidate inputs from `input` and the observed `pairs`:
+/// for every pair, the little-endian windows of `input` whose bytes equal `from` are
+/// rewritten to `to`, yielding one candidate per match site. To follow the
+/// left-to-right byte-stream fill frontier — and to stop a high-multiplicity noise
+/// pair (e.g. `0 -> 1`) from crowding out the load-bearing `0 -> magic` pair — at most
+/// `per_pair` EARLIEST match sites are taken per pair; the total is capped at `max`.
+/// Candidates are deduplicated, never equal the original, and preserve length.
+/// Deterministic: pairs scanned in order, offsets ascending.
+#[must_use]
+pub fn i2s_candidates(
+    input: &[u8],
+    pairs: &[I2sPair],
+    max: usize,
+    per_pair: usize,
+) -> Vec<Vec<u8>> {
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for p in pairs {
+        let w = p.width as usize;
+        if w == 0 || w > input.len() {
+            continue;
+        }
+        let mask = if w == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * w)) - 1
+        };
+        let from = p.from & mask;
+        let to = p.to & mask;
+        let mut taken = 0usize;
+        for off in 0..=(input.len() - w) {
+            if read_le(input, off, w) != from {
+                continue;
+            }
+            let mut cand = input.to_vec();
+            for i in 0..w {
+                #[allow(clippy::cast_possible_truncation)]
+                let b = (to >> (8 * i)) as u8;
+                cand[off + i] = b;
+            }
+            if cand.as_slice() != input && seen.insert(cand.clone()) {
+                out.push(cand);
+                if out.len() >= max {
+                    return out;
+                }
+                taken += 1;
+                if taken >= per_pair {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -617,6 +929,203 @@ mod tests {
         m.functions.push(main);
         // Two direct calls to a scalar nondet -> gate (>=2) is met.
         assert_eq!(count_scalar_nondet_call_sites(&m), 2);
+    }
+
+    #[test]
+    fn driver_defines_sancov_callbacks_and_dumper() {
+        let src = synthesize_bytestream_driver("/tmp/s.sentinel");
+        // All instrumentation-required callbacks are defined (else the coverage
+        // build would fail to link).
+        for cb in [
+            "__sanitizer_cov_8bit_counters_init",
+            "__sanitizer_cov_pcs_init",
+            "__sanitizer_cov_trace_cmp1",
+            "__sanitizer_cov_trace_cmp2",
+            "__sanitizer_cov_trace_cmp4",
+            "__sanitizer_cov_trace_cmp8",
+            "__sanitizer_cov_trace_const_cmp1",
+            "__sanitizer_cov_trace_const_cmp8",
+            "__sanitizer_cov_trace_switch",
+        ] {
+            assert!(src.contains(cb), "missing sancov callback {cb}");
+        }
+        // The dump reads the two feedback channels.
+        assert!(src.contains("SAF_FUZZ_COV"));
+        assert!(src.contains("SAF_FUZZ_CMPLOG"));
+        assert!(src.contains("atexit"));
+    }
+
+    #[test]
+    fn classify_counter_buckets_hit_counts() {
+        assert_eq!(classify_counter(0), 0);
+        assert_eq!(classify_counter(1), 1);
+        assert_eq!(classify_counter(2), 1 << 1);
+        assert_eq!(classify_counter(3), 1 << 2);
+        // Same bucket for 4..=7.
+        assert_eq!(classify_counter(4), classify_counter(7));
+        assert_ne!(classify_counter(3), classify_counter(4));
+        assert_eq!(classify_counter(200), 1 << 7);
+    }
+
+    #[test]
+    fn coverage_map_reports_only_new_edges() {
+        let mut cov = CoverageMap::new();
+        assert!(cov.is_empty());
+        // First non-zero snapshot is entirely novel.
+        assert!(cov.fold(&[0, 1, 0, 5]));
+        assert!(!cov.is_empty());
+        // Identical snapshot -> nothing new.
+        assert!(!cov.fold(&[0, 1, 0, 5]));
+        // Same edges but a DIFFERENT hit-count bucket on edge 1 -> novel.
+        assert!(cov.fold(&[0, 2, 0, 5]));
+        // A brand-new edge index (grows the map) -> novel.
+        assert!(cov.fold(&[0, 0, 0, 0, 9]));
+        // An all-zero snapshot never counts as new.
+        assert!(!cov.fold(&[0, 0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn merge_cmplog_extends_dictionary_deterministically() {
+        let mut dict = vec![0i64, 1, 42];
+        let added = merge_cmplog(&mut dict, "3735928559\n42\n1000\n", 256);
+        // 3735928559 == 0xDEADBEEF and 1000 are new; 42 already present.
+        assert_eq!(added, 2);
+        assert!(dict.contains(&3_735_928_559));
+        assert!(dict.contains(&1000));
+        // Sorted, deduped (deterministic).
+        let mut sorted = dict.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(dict, sorted);
+        // Idempotent: re-merging the same log adds nothing.
+        assert_eq!(merge_cmplog(&mut dict, "42\n1000\n", 256), 0);
+    }
+
+    #[test]
+    fn merge_cmplog_respects_cap() {
+        let mut dict: Vec<i64> = Vec::new();
+        let log: String = (0..1000).map(|n| format!("{n}\n")).collect();
+        merge_cmplog(&mut dict, &log, 100);
+        assert_eq!(dict.len(), 100);
+    }
+
+    #[test]
+    fn driver_defines_i2s_channel() {
+        let src = synthesize_bytestream_driver("/tmp/s.sentinel");
+        assert!(src.contains("SAF_FUZZ_I2S"));
+        assert!(src.contains("__saf_i2s_note"));
+    }
+
+    #[test]
+    fn parse_i2s_skips_malformed_and_identity() {
+        let pairs = parse_i2s("4 0 305419896\n2 7 7\n8 1 2\nbad line\n3 5 6\n");
+        // width 4 (0->0x12345678) and width 8 (1->2) kept; identity (7->7) and
+        // invalid width 3 dropped.
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(
+            pairs[0],
+            I2sPair {
+                width: 4,
+                from: 0,
+                to: 305_419_896
+            }
+        );
+        assert_eq!(
+            pairs[1],
+            I2sPair {
+                width: 8,
+                from: 1,
+                to: 2
+            }
+        );
+    }
+
+    #[test]
+    fn i2s_patches_the_matching_window() {
+        // Input has 0 in bytes 0..4; a (from=0, to=0x12345678, w=4) pair should
+        // rewrite offset 0 (and every other all-zero 4-window) to the magic value.
+        let input = vec![0u8; 8];
+        let pairs = vec![I2sPair {
+            width: 4,
+            from: 0,
+            to: 0x1234_5678,
+        }];
+        let cands = i2s_candidates(&input, &pairs, 16, 8);
+        assert!(!cands.is_empty());
+        // The EARLIEST match (offset 0) is produced first — the fill frontier.
+        assert_eq!(
+            u32::from_le_bytes([cands[0][0], cands[0][1], cands[0][2], cands[0][3]]),
+            0x1234_5678
+        );
+        // Length preserved; none equals the original.
+        assert!(cands.iter().all(|c| c.len() == input.len() && c != &input));
+    }
+
+    #[test]
+    fn i2s_per_pair_cap_leaves_room_for_later_pairs() {
+        // A high-multiplicity noise pair (0 -> 1) precedes the load-bearing pair
+        // (0 -> magic). With per_pair small, the noise pair cannot exhaust the budget
+        // before the magic pair is reached.
+        let input = vec![0u8; 64];
+        let pairs = vec![
+            I2sPair {
+                width: 4,
+                from: 0,
+                to: 1,
+            },
+            I2sPair {
+                width: 4,
+                from: 0,
+                to: 0xCAFE_BABE,
+            },
+        ];
+        let cands = i2s_candidates(&input, &pairs, 64, 2);
+        assert!(
+            cands
+                .iter()
+                .any(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) == 0xCAFE_BABE),
+            "magic pair must still get a candidate"
+        );
+    }
+
+    #[test]
+    fn i2s_finds_a_nonzero_value_and_respects_cap() {
+        // 42 (LE, width 4) sits at offset 2.
+        let mut input = vec![0u8; 12];
+        input[2..6].copy_from_slice(&42u32.to_le_bytes());
+        let pairs = vec![I2sPair {
+            width: 4,
+            from: 42,
+            to: 99,
+        }];
+        let cands = i2s_candidates(&input, &pairs, 16, 8);
+        // The offset-2 window becomes 99.
+        assert!(
+            cands
+                .iter()
+                .any(|c| { u32::from_le_bytes([c[2], c[3], c[4], c[5]]) == 99 })
+        );
+        // Cap is honoured.
+        let capped = i2s_candidates(&vec![0u8; 64], &pairs, 3, 8);
+        assert!(capped.len() <= 3);
+    }
+
+    #[test]
+    fn biased_high_favours_the_frontier() {
+        let mut rng = XorShift64::new(99);
+        let n = 10;
+        let mut high = 0usize;
+        let mut plain = 0usize;
+        for _ in 0..2000 {
+            if rng.below_biased_high(n) >= n / 2 {
+                high += 1;
+            }
+            if rng.below(n) >= n / 2 {
+                plain += 1;
+            }
+        }
+        // The biased draw lands in the top half markedly more often than uniform.
+        assert!(high > plain, "biased={high} uniform={plain}");
     }
 
     #[test]
