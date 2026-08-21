@@ -1430,6 +1430,33 @@ fn fuzz_time_budget() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Iteration cap for the memsafety byte-stream `ASan` mini-fuzz (pass 3), overridable
+/// via `$SAF_MEM_FUZZ_ITERS`. Deliberately small: pass 3 runs only on the residue the
+/// uniform/split passes leave `unknown` AND that has ≥2 scalar nondet call sites, and a
+/// multi-nondet OOB/UAF is either hit within the seed corpus / the first hundreds of
+/// dictionary-steered trials or not at all. A tight cap bounds the aggregate added cost
+/// (a bloated per-task budget is what regressed the earlier full-fat version of this
+/// pass — it timed OTHER tasks out past the eval budget).
+fn mem_fuzz_iters() -> usize {
+    std::env::var("SAF_MEM_FUZZ_ITERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(600)
+}
+
+/// Wall-clock cap (seconds) for the memsafety byte-stream `ASan` mini-fuzz (pass 3),
+/// overridable via `$SAF_MEM_FUZZ_TIME`. Kept small to bound the added per-task cost on
+/// the (≥2-nondet) tasks the earlier passes did not resolve — a confirming fault traps
+/// fast, well under this, and a longer budget only slows the eval for tasks it will not
+/// crack anyway.
+fn mem_fuzz_time_budget() -> std::time::Duration {
+    let secs = std::env::var("SAF_MEM_FUZZ_TIME")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(3);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Blind byte-stream fuzz confirmer for `unreach-call` (Stage 5).
 ///
 /// Compiles the ORIGINAL program with the byte-stream nondet shim ONCE, runs an
@@ -2763,8 +2790,230 @@ fn asan_confirm(
     // constant sweep can reach. Sound: the threshold values and the well-formed argv are
     // legal nondet inputs, ASan stays the sole arbiter, and R1/R2 still gate the report.
     if harness.exists() {
-        return asan_threshold_argv_sweep(&harness, &errpath);
+        if let Some(hit) = asan_threshold_argv_sweep(&harness, &errpath)? {
+            return Ok(Some(hit));
+        }
     }
+
+    // Pass 3 (byte-stream coverage-guided greybox mini-fuzz; additive, only reached when
+    // every earlier pass is inconclusive). The uniform/positional-split passes give every
+    // scalar nondet call the SAME value (or one leading/trailing split), so a violation
+    // gated behind two-or-more INDEPENDENTLY-valued nondet inputs (`n=nondet()` sizes an
+    // array; a LATER `idx=nondet()` indexes it OOB) stays unreached. Pass 3 compiles a
+    // separate ASan harness with a byte-stream nondet shim (each call draws its own bytes
+    // from an AFL-mutated buffer) and runs a deterministic mutation loop; the FIRST input
+    // that makes ASan trap in the program's own code — through the SAME unmodified R1/R2
+    // `parse_asan_report` gate — is the confirmed FALSE. Sound: ASan is the sole arbiter,
+    // the byte-stream runs the ORIGINAL program, and the hit is re-triggered on the same
+    // input before emitting (R6). It costs one extra compile + a wall-capped set of native
+    // runs, borne only by tasks the cheaper passes already left `unknown`.
+    asan_fuzz_pass(input, data_model, module, stub, dir, clang)
+}
+
+/// Byte-stream depth-guided greybox `ASan` mini-fuzz (memsafety pass 3, lever
+/// `mem-fuzz-covguided`). Compiles the ORIGINAL program with the
+/// [`saf_svcomp::fuzz::synthesize_bytestream_asan_shim`] driver ONCE, then runs a
+/// deterministic AFL-style mutation loop (dictionary = harvested IR constants + AFL
+/// "interesting" values; seed corpus tiles each). Each input is fed via `$SAF_FUZZ_INPUT`;
+/// the harness's `ASan` stderr is parsed by the UNMODIFIED [`saf_svcomp::parse_asan_report`]
+/// R1/R2 gate. On the first gated hit the SAME input is replayed and required to reproduce
+/// the identical hit (R6) before returning `Ok(Some(hit))`; otherwise `Ok(None)` (abstain).
+///
+/// Gate: skip unless the program has **≥2 scalar `__VERIFIER_nondet_*` call sites**.
+/// That is precisely the class the cheaper passes cannot reach — the uniform sweep gives
+/// every call the same shared constant and the threshold pass one leading/trailing split,
+/// so a violation needing two or more call sites to each take a DISTINCT value stays
+/// unreached. With fewer than two sites the byte stream can only reproduce the single
+/// value the earlier passes already swept, so pass 3 adds nothing; skipping there also
+/// keeps its (one extra compile + wall-capped native runs) cost off the large majority of
+/// memsafety tasks — the aggregate-cost blowup that must be avoided.
+///
+/// Sound & fail-closed: `ASan` is the sole FALSE arbiter (the shim installs no sentinel
+/// sink — an assertion failure is not a memory-safety violation), every byte-stream value
+/// is a legal input of its nondet type (R5), `__VERIFIER_assume` hard-rejects infeasible
+/// paths (R4), the compile honours the task's data model (R3), and the search is fully
+/// deterministic (fixed `XorShift64` seed) so the verdict is reproducible.
+// NOTE: the compile-once / seed / mutate / confirm loop is one cohesive fail-closed unit,
+// mirroring `fuzz_confirm_false`; splitting it would scatter the shared harness setup.
+#[allow(clippy::too_many_lines)]
+fn asan_fuzz_pass(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    module: &saf_core::air::AirModule,
+    stub: &Path,
+    dir: &Path,
+    clang: &str,
+) -> anyhow::Result<Option<saf_svcomp::AsanHit>> {
+    use anyhow::Context;
+    use saf_svcomp::fuzz;
+    use std::process::{Command, Stdio};
+
+    // Gate: pass 3 targets ONLY the multi-independent-nondet class. With fewer than two
+    // scalar nondet call sites the byte stream reproduces the same single value the
+    // uniform / threshold passes already swept, so it can add nothing — and skipping keeps
+    // its extra compile + native-run cost off the memsafety majority (see the fn doc).
+    if fuzz::count_scalar_nondet_call_sites(module) < 2 {
+        return Ok(None);
+    }
+
+    let driver_src = dir.join("saf_asan_fuzz_driver.c");
+    let harness = dir.join("saf_asan_fuzz_harness");
+    let errpath = dir.join("saf_asan_fuzz_stderr.txt");
+    let input_path = dir.join("saf_asan_fuzz.input");
+    let log_path = dir.join("saf_asan_fuzz.log");
+
+    std::fs::write(&driver_src, fuzz::synthesize_bytestream_asan_shim())
+        .with_context(|| "writing ASan byte-stream fuzz driver")?;
+
+    let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
+
+    // Compile the shim + original program ONCE with PLAIN ASan — NO SanitizerCoverage.
+    // The instrumented double-compile + slower instrumented binary is exactly the
+    // aggregate-cost blowup that regressed the earlier full-fat version of this pass; the
+    // slice-directed dictionary + execution-depth-proxy corpus feedback steer the search
+    // adequately without it. Mirrors `asan_confirm`'s flags (data model per R3, rand/srand
+    // linker-wrap for determinism) plus the two-pass `__VERIFIER_assert`-macro neutralizer
+    // fallback so own-assert programs still link.
+    let build = |neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(clang);
+        cmd.args([
+            "-O0",
+            "-g",
+            "-fsanitize=address",
+            "-fno-sanitize-recover=address",
+            "-Wno-everything",
+            "-Wl,--wrap=rand",
+            "-Wl,--wrap=srand",
+        ]);
+        cmd.arg(data_model.clang_flag()).arg("-include").arg(stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include").arg(n);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(input)
+            .arg(&driver_src)
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    let mut linked = matches!(build(None).status(), Ok(s) if s.success());
+    if !linked {
+        if let Ok(n) = write_assert_neutralizer(dir) {
+            linked = matches!(build(Some(&n)).status(), Ok(s) if s.success());
+        }
+    }
+    if !linked {
+        return Ok(None); // link/compile failure -> inconclusive
+    }
+
+    // Slice-directed steering (identical to the unreach fuzzer): the backward slice from
+    // the `__VERIFIER_assume` guards front-loads their constants into the dictionary and
+    // lays multi-guard chains as sequence seeds — so a multi-nondet OOB gated behind
+    // distinct-valued guards (`assume(i>=40); assume(n<=15); a[i]=…`) is steered toward,
+    // which single-value tiling cannot reach. An empty slice reduces to the plain harvest.
+    let slice = saf_svcomp::slicing::backward_slice(module);
+    let dict = saf_svcomp::slicing::slice_directed_dictionary(module, &slice);
+    let mut corpus = fuzz::seed_corpus(&dict);
+    corpus.extend(saf_svcomp::slicing::sequence_seeds(&slice.guard_constants));
+    // Fixed seed -> the whole search (and therefore the verdict) is reproducible.
+    let mut rng = fuzz::XorShift64::new(0x5AF3_C0DE);
+    let per_run = replay_timeout();
+    let iters = mem_fuzz_iters();
+    let deadline = std::time::Instant::now() + mem_fuzz_time_budget();
+    let mut max_depth = 0usize;
+
+    // A one-shot ASan run of `input` capturing stderr to `errpath` (and the depth-proxy
+    // log), returning the gated hit (if any). Reused for the trial and the R6 re-confirm
+    // so both go through the identical run + parse path.
+    let run_once = |the_input: &[u8]| -> anyhow::Result<Option<saf_svcomp::AsanHit>> {
+        std::fs::write(&input_path, the_input).with_context(|| "writing ASan fuzz input")?;
+        let errfile =
+            std::fs::File::create(&errpath).with_context(|| "creating ASan fuzz stderr file")?;
+        let mut cmd = Command::new(&harness);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(errfile))
+            .env("ASAN_OPTIONS", ASAN_OPTS)
+            .env("SAF_FUZZ_INPUT", &input_path)
+            .env("SAF_FUZZ_LOG", &log_path);
+        let mut child = harden_replay_spawn(&mut cmd)
+            .spawn()
+            .with_context(|| "spawning ASan fuzz harness")?;
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if start.elapsed() >= per_run {
+                        kill_replay_group(&mut child);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(e) => return Err(e).context("waiting on ASan fuzz harness"),
+            }
+        }
+        let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+        Ok(saf_svcomp::parse_asan_report(&report))
+    };
+
+    // Trials: the seed corpus verbatim first, then dictionary-steered mutations.
+    let total = iters + corpus.len();
+    for i in 0..total {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let the_input: Vec<u8> = if i < corpus.len() {
+            corpus[i].clone()
+        } else {
+            // Frontier-biased energy: favour the newest (deepest) corpus bases.
+            let base = &corpus[rng.below_biased_high(corpus.len())];
+            fuzz::mutate(&mut rng, base, &dict)
+        };
+        let _ = std::fs::remove_file(&log_path);
+
+        let Ok(hit) = run_once(&the_input) else {
+            continue;
+        };
+        let Some(hit) = hit else {
+            // Greybox corpus feedback without instrumentation: keep inputs that drove the
+            // program DEEPER (consumed more nondet bytes), a lightweight execution-depth
+            // proxy that biases mutation toward the deep multi-nondet violation states.
+            if i >= corpus.len() && corpus.len() < MAX_FUZZ_CORPUS {
+                let depth = std::fs::read_to_string(&log_path)
+                    .map(|l| l.lines().count())
+                    .unwrap_or(0);
+                if depth > max_depth {
+                    max_depth = depth;
+                    corpus.push(the_input);
+                }
+            }
+            continue;
+        };
+
+        // R6: re-trigger the violation deterministically on the SAME input before
+        // emitting. A genuine memory bug reproduces byte-identically (same sub-property,
+        // file, and line); anything that does not is treated as flaky and abstained.
+        match run_once(&the_input) {
+            Ok(Some(hit2)) if hit2 == hit => {
+                eprintln!(
+                    "saf verify: byte-stream ASan fuzz reproduced {} (trial {i}); re-confirmed -> false",
+                    hit.subproperty
+                );
+                return Ok(Some(hit));
+            }
+            _ => {
+                eprintln!(
+                    "saf verify: ASan fuzz hit at trial {i} did not re-confirm deterministically -> continue"
+                );
+            }
+        }
+    }
+
+    eprintln!("saf verify: byte-stream ASan fuzz exhausted (no confirmed violation) -> unknown");
     Ok(None)
 }
 

@@ -368,6 +368,142 @@ pub fn synthesize_bytestream_driver(sentinel_c_literal: &str) -> String {
     s
 }
 
+/// Generate the C source of a byte-stream nondet shim for the **`valid-memsafety`
+/// ASan confirmer** (lever `mem-fuzz-covguided`).
+///
+/// This is the byte-stream analogue of `synthesize_asan_driver` in `saf-cli`: the
+/// uniform / positional-split ASan passes give every scalar nondet call the SAME
+/// value (or a single leading/trailing split), which cannot reach a memory violation
+/// gated behind two or more *independently-valued* nondet inputs (e.g. `n = nondet()`
+/// picks an array size, then a LATER `idx = nondet()` must be a different in-range-then-
+/// OOB value). Here each `__VERIFIER_nondet_T()` instead consumes `sizeof(T)`
+/// little-endian bytes from the AFL-mutated input buffer, so a single run can supply a
+/// distinct value to every call — exactly what a coverage-guided greybox search over
+/// the SAME ASan harness needs.
+///
+/// # Why this is sound (ASan is the sole arbiter — a wrong FALSE is impossible)
+///
+/// Unlike [`synthesize_bytestream_driver`], this shim installs **no** `reach_error` /
+/// `__VERIFIER_error` / `__assert_fail` sentinel sinks: it never itself decides a
+/// verdict. AddressSanitizer intercepts `malloc`/`free`/loads/stores, and a genuine
+/// memory-safety fault is intrinsic to the ORIGINAL program under whatever concrete
+/// nondet values the byte stream supplies. The `saf-cli` driver captures ASan's stderr
+/// and hands it to the UNMODIFIED [`crate::parse_asan_report`] R1/R2 gate; only a
+/// high-fidelity, program-frame ASan mem-error yields `false(<sub-property>)`. The
+/// fuzzer can therefore only ever *propose* a concrete input — it cannot manufacture a
+/// wrong FALSE, and a safe program faults for none of them.
+///
+/// Contract compliance (`scripts/loop/confirmer_contract.md`):
+/// - **R1** — confirmation is ONLY an ASan mem-error in the program's own code (the
+///   parse gate rejects harness/interceptor frames); no catch-all trap confirms.
+/// - **R4** — `__VERIFIER_assume(c)` hard-`_exit`s the run when `c` is false, so an
+///   assume-pruned path can never fault-confirm.
+/// - **R5** — each scalar nondet returns `sizeof(T)` reinterpreted bytes, an in-range
+///   value of `T` (two's-complement, no trap reps); `_Bool` is normalised to `0`/`1`.
+/// - **R6** — the byte-stream runs the ORIGINAL (unsliced) program, so the confirming
+///   run *is* the reproduction; `saf-cli` additionally re-runs the same input to require
+///   the identical ASan hit before emitting.
+///
+/// `rand`/`srand` are linker-`--wrap`ped (see the `-Wl,--wrap=rand/srand` compile
+/// flags): `__wrap_rand` draws from the SAME byte stream (so Juliet `*_rand_*` variants
+/// are driven deterministically, not by a wall-clock seed), and `__wrap_srand` is a
+/// no-op. Pointer/float/double nondet return `0`/`NULL`, matching the uniform driver.
+///
+/// The runtime log (`$SAF_FUZZ_LOG`, `"<name> <value>\n"` per consumed nondet call)
+/// is a lightweight, instrumentation-free execution-depth proxy: an input that drives
+/// the program to consume MORE nondet inputs reached deeper into the (multi-nondet)
+/// state machine, so the fuzz loop keeps it as a corpus seed — the greybox feedback
+/// that steers the search toward the deep violation states without needing a linked
+/// sanitizer-coverage runtime (which would clash with ASan's).
+#[must_use]
+pub fn synthesize_bytestream_asan_shim() -> String {
+    use std::fmt::Write as _;
+
+    let mut s = String::new();
+    s.push_str("/* SAF byte-stream ASan mini-fuzz shim (generated) */\n");
+    s.push_str("#include <stddef.h>\n");
+    s.push_str("#include <stdio.h>\n");
+    s.push_str("#include <stdlib.h>\n");
+    s.push_str("#include <string.h>\n");
+    s.push_str("extern void _exit(int) __attribute__((noreturn));\n");
+    let _ = writeln!(s, "static unsigned char __saf_buf[{INPUT_LEN}];");
+    s.push_str("static size_t __saf_len = 0;\n");
+    s.push_str("static size_t __saf_pos = 0;\n");
+    s.push_str("static FILE* __saf_log = 0;\n");
+    s.push_str("static int __saf_ready = 0;\n");
+    s.push_str(
+        "static void __saf_init(void) {\n\
+         \x20 if (__saf_ready) return;\n\
+         \x20 __saf_ready = 1;\n\
+         \x20 const char* ip = getenv(\"SAF_FUZZ_INPUT\");\n\
+         \x20 if (ip) { FILE* f = fopen(ip, \"rb\"); if (f) { __saf_len = fread(__saf_buf, 1, sizeof(__saf_buf), f); fclose(f); } }\n\
+         \x20 const char* lp = getenv(\"SAF_FUZZ_LOG\");\n\
+         \x20 if (lp) __saf_log = fopen(lp, \"w\");\n\
+         }\n",
+    );
+    s.push_str(
+        "static unsigned long long __saf_take(size_t n) {\n\
+         \x20 __saf_init();\n\
+         \x20 unsigned long long v = 0; size_t i;\n\
+         \x20 for (i = 0; i < n; i++) { unsigned char b = (__saf_pos < __saf_len) ? __saf_buf[__saf_pos] : 0; __saf_pos++; v |= ((unsigned long long)b) << (8 * i); }\n\
+         \x20 return v;\n\
+         }\n",
+    );
+    s.push_str(
+        "static void __saf_note(const char* name, long long val) {\n\
+         \x20 if (__saf_log) { fprintf(__saf_log, \"%s %lld\\n\", name, val); fflush(__saf_log); }\n\
+         }\n",
+    );
+
+    for (fname, cty) in SCALAR_NONDET {
+        if *fname == "__VERIFIER_nondet_bool" {
+            let _ = writeln!(
+                s,
+                "_Bool {fname}(void) {{ unsigned long long r = __saf_take(1); _Bool v = (_Bool)(r & 1ULL); __saf_note(\"{fname}\", (long long)v); return v; }}"
+            );
+            continue;
+        }
+        let _ = writeln!(
+            s,
+            "{cty} {fname}(void) {{ {cty} v; unsigned long long r = __saf_take(sizeof({cty})); memcpy(&v, &r, sizeof({cty})); __saf_note(\"{fname}\", (long long)v); return v; }}"
+        );
+    }
+
+    // SanitizerCoverage feedback (INERT unless the harness is compiled with
+    // `-fsanitize-coverage=...`), identical to the unreach byte-stream driver. It
+    // dumps the 8-bit edge map (`$SAF_FUZZ_COV`), the harvested comparison operands
+    // (`$SAF_FUZZ_CMPLOG`) and the Redqueen input-to-state pairs (`$SAF_FUZZ_I2S`) on
+    // normal exit. This ONLY steers the search — ASan is still the sole FALSE arbiter
+    // (R1), so coverage feedback can never manufacture a wrong FALSE. Coexists with
+    // `-fsanitize=address`: the `__SAF_NOCOV` callbacks are our own symbols (ASan's
+    // runtime does not define them), so there is no duplicate-symbol clash.
+    s.push_str(COVERAGE_FEEDBACK_C);
+
+    // Non-integer / pointer nondet: the same legal defaults the uniform ASan driver uses.
+    s.push_str("void* __VERIFIER_nondet_pointer(void) { return (void*)0; }\n");
+    s.push_str("float __VERIFIER_nondet_float(void) { return 0.0f; }\n");
+    s.push_str("double __VERIFIER_nondet_double(void) { return 0.0; }\n");
+    s.push_str("void __VERIFIER_atomic_begin(void) { }\n");
+    s.push_str("void __VERIFIER_atomic_end(void) { }\n");
+
+    // R4: honour assumptions at runtime (hard reject).
+    s.push_str("void __VERIFIER_assume(int c) { if (!c) _exit(0); }\n");
+
+    // Determinism for Juliet `*_rand_*` variants: `rand()` draws from the byte stream
+    // (masked non-negative, as libc's `rand` returns `[0, RAND_MAX]`), `srand()` is a
+    // no-op. Requires `-Wl,--wrap=rand -Wl,--wrap=srand` at link (as the uniform driver).
+    s.push_str(
+        "int __wrap_rand(void) { unsigned long long r = __saf_take(sizeof(int)); return (int)(r & 0x7fffffffULL); }\n",
+    );
+    s.push_str("void __wrap_srand(unsigned s) { (void)s; }\n");
+
+    // NOTE: deliberately NO reach_error/__VERIFIER_error/__assert_fail sentinel sinks —
+    // ASan is the sole FALSE arbiter for valid-memsafety (an assertion failure is NOT a
+    // memory-safety violation). The stub / program's own definitions link normally.
+
+    s
+}
+
 /// Parse the shim's runtime log (`"<name> <value>\n"` per consumed nondet call)
 /// into a [`NondetCall`] sequence in execution order. Malformed lines are skipped.
 /// The result feeds a [`crate::FalseCandidate`] whose deterministic sequence-replay
@@ -773,6 +909,39 @@ mod tests {
         assert!(src.contains("/tmp/s.sentinel"));
         // Bool is normalised, not memcpy'd.
         assert!(src.contains("(_Bool)(r & 1ULL)"));
+    }
+
+    #[test]
+    fn asan_shim_defines_nondet_family_no_sentinel_and_rand_wraps() {
+        let src = synthesize_bytestream_asan_shim();
+        // Byte-stream scalar nondet family present.
+        for (fname, _) in SCALAR_NONDET {
+            assert!(src.contains(fname), "missing {fname}");
+        }
+        // R4 assume hard-reject present.
+        assert!(src.contains("__VERIFIER_assume"));
+        assert!(src.contains("_exit(0)"));
+        // Bool is normalised, not memcpy'd.
+        assert!(src.contains("(_Bool)(r & 1ULL)"));
+        // Deterministic rand: byte-stream draw + no-op srand (linker --wrap).
+        assert!(src.contains("__wrap_rand"));
+        assert!(src.contains("__wrap_srand"));
+        // CRITICAL soundness: ASan is the sole arbiter — NO error/assert sentinel sinks
+        // (an assertion failure is not a memory-safety violation).
+        assert!(
+            !src.contains("reach_error"),
+            "must not define a reach_error sink"
+        );
+        assert!(
+            !src.contains("__VERIFIER_error"),
+            "must not define a __VERIFIER_error sink"
+        );
+        assert!(
+            !src.contains("__assert_fail"),
+            "must not override __assert_fail"
+        );
+        // Reads the AFL-mutated input buffer.
+        assert!(src.contains("SAF_FUZZ_INPUT"));
     }
 
     #[test]
