@@ -13,6 +13,7 @@
 //! (see plan 192).
 #![allow(clippy::doc_markdown)]
 
+pub mod bmc;
 pub mod fast_paths;
 pub mod fuzz;
 pub mod memsafety;
@@ -28,6 +29,7 @@ pub mod termination;
 pub mod witness_lower;
 pub mod witness_yaml;
 
+pub use bmc::enumerate_bmc_candidates;
 pub use memsafety::{
     AsanHit, asan_class_to_subproperty, lower_memsafety_hit, memsafety_verdict, parse_asan_report,
 };

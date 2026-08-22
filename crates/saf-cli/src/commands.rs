@@ -1354,7 +1354,56 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         }
     }
 
-    let total = candidates.len() + interproc.len();
+    // Stage 4b (BMC base case, fixed-k): the Z3 path stages above model each guard
+    // operand as a fresh unconstrained variable, so a guard defined by ARITHMETIC of
+    // the nondet inputs (`y = x*3+7; if (y==100)`) is proposed with the guard operand
+    // pinned but the INPUT `x` left free — the replay then fails. The BMC engine
+    // instead symbolically executes from `main` with every value modelled as a
+    // bitvector of its width (loops unwound to a fixed bound, callees inlined to a
+    // bounded depth), so the Z3 model gives the actual nondet INPUT vector that makes
+    // the arithmetic guard true. Candidates go through the SAME native-replay gate
+    // (the sole arbiter), so a spurious/imprecise model can only ever yield `unknown`.
+    // Runs before the blind fuzzer because it cracks arithmetic guards the fuzzer's
+    // blind/CmpLog search cannot (the input is a preimage of the compared value).
+    let bmc = saf_svcomp::enumerate_bmc_candidates(ctx.module, &config, ctx.data_model);
+    if !bmc.is_empty() {
+        eprintln!(
+            "saf verify: BMC enumerated {} candidate(s) (fixed-k)",
+            bmc.len()
+        );
+    }
+    for (idx, candidate) in bmc.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
+        match replay_confirms_false(
+            ctx.input,
+            ctx.data_model,
+            ctx.stub,
+            ctx.tempdir,
+            ctx.clang,
+            2 * MAX_REPLAY_CANDIDATES + idx,
+            candidate,
+        ) {
+            Ok(true) => {
+                let witness =
+                    build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, candidate));
+                if witness.is_none() {
+                    eprintln!(
+                        "saf verify: FALSE (BMC replay-confirmed) but witness unconstructible -> emitting false without a witness"
+                    );
+                }
+                return VerdictOutcome {
+                    verdict: format!("false({})", Property::UnreachCall.name()),
+                    witness,
+                    graphml: None,
+                };
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("saf verify: BMC replay of candidate {idx} errored: {e:#} -> continue");
+            }
+        }
+    }
+
+    let total = candidates.len() + interproc.len() + bmc.len();
     if total == 0 {
         eprintln!(
             "saf verify: no FALSE candidate proposed (reach_error not proven reachable) -> unknown"
@@ -1363,9 +1412,10 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         // Candidates were over-approximated as FALSE but did not reproduce under
         // concrete replay — the soundness filter that keeps false alarms out.
         eprintln!(
-            "saf verify: {total} candidate(s) enumerated ({} intraproc + {} interproc); none reproduced reach_error at runtime -> unknown",
+            "saf verify: {total} candidate(s) enumerated ({} intraproc + {} interproc + {} bmc); none reproduced reach_error at runtime -> unknown",
             candidates.len(),
-            interproc.len()
+            interproc.len(),
+            bmc.len()
         );
     }
 

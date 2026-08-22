@@ -1882,7 +1882,7 @@ pub struct FalseCandidate {
 /// a program using them still runs (the driver returns `0`/`NULL`), but their
 /// values are not model-pinned, so an error gated on them simply does not
 /// reproduce → `unknown` (sound).
-fn is_scalar_integer_nondet(name: &str) -> bool {
+pub(crate) fn is_scalar_integer_nondet(name: &str) -> bool {
     matches!(
         name,
         "__VERIFIER_nondet_int"
@@ -2232,7 +2232,7 @@ fn resolve_nondet_sequence_interproc(
 /// Collect the scalar-integer nondet calls executed along `block_path` (in
 /// program order) within a single `func_id` — the single-frame case of
 /// [`resolve_nondet_sequence_interproc`].
-fn resolve_nondet_sequence(
+pub(crate) fn resolve_nondet_sequence(
     module: &AirModule,
     func_id: FunctionId,
     block_path: &[BlockId],
