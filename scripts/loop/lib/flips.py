@@ -51,23 +51,28 @@ def flips(before_jsonl: str, after_jsonl: str) -> dict[str, list[str]]:
       * gained_confirmed  — became a confirmed FALSE and was not one before (a NEW solve)
       * lost_confirmed    — was a confirmed FALSE before and is no longer (a regression)
       * new_false_alarms  — became a FalseIncorrect (correct-TRUE task called FALSE) and was not before
+      * new_wrong_true    — became a TrueIncorrect (expected-FALSE task called TRUE) and was not before
 
-    All three lists are sorted for determinism. Cross-referencing `gained_confirmed` on a TRAIN arm
-    against the holdout's misses is the concrete memorization-vs-generalization test.
+    `new_false_alarms` (-16) and `new_wrong_true` (-32) are the two soundness blockers that trip the hard
+    KEEP gate. Surfacing their exact task ids (lever_outcome_digest) is what lets the next arm ABSTAIN on
+    them instead of re-deriving the same too-permissive gate blind. All lists are sorted for determinism.
     """
     b, a = _index(before_jsonl), _index(after_jsonl)
     if not a:
         # No post-arm evidence at all (a broken-build arm never writes an `after` dump, and the scorer
         # only writes one when --per-task is passed). Report NOTHING rather than flagging every
         # previously-confirmed task as "lost" — that would fabricate a full mass regression signal.
-        return {"gained_confirmed": [], "lost_confirmed": [], "new_false_alarms": []}
+        return {"gained_confirmed": [], "lost_confirmed": [], "new_false_alarms": [], "new_wrong_true": []}
     gained = [k for k, r in a.items() if _is_confirmed(r) and not _is_confirmed(b.get(k, {}))]
     lost = [k for k, r in b.items() if _is_confirmed(r) and not _is_confirmed(a.get(k, {}))]
     new_fp = [k for k, r in a.items()
               if r.get("outcome") == "FalseIncorrect" and b.get(k, {}).get("outcome") != "FalseIncorrect"]
+    new_wt = [k for k, r in a.items()
+              if r.get("outcome") == "TrueIncorrect" and b.get(k, {}).get("outcome") != "TrueIncorrect"]
     return {"gained_confirmed": sorted(gained),
             "lost_confirmed": sorted(lost),
-            "new_false_alarms": sorted(new_fp)}
+            "new_false_alarms": sorted(new_fp),
+            "new_wrong_true": sorted(new_wt)}
 
 
 if __name__ == "__main__":

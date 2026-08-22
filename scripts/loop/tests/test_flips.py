@@ -32,17 +32,20 @@ def test_flips_gained_lost_and_new_fp():
             _row("t/regress.yml", "FalseCorrect", "CONFIRMED"),  # confirmed before, lost after
             _row("t/miss.yml", "unknown"),                        # never solved
             _row("t/becomes_fp.yml", "unknown"),                  # will become a false alarm
+            _row("t/becomes_wt.yml", "unknown"),                  # will become a wrong-TRUE
         ])
         after = _write(d / "a.jsonl", [
             _row("t/already.yml", "FalseCorrect", "CONFIRMED"),  # unchanged
             _row("t/regress.yml", "unknown"),                     # LOST its confirmation
             _row("t/miss.yml", "FalseCorrect", "CONFIRMED"),      # GAINED (new solve)
             _row("t/becomes_fp.yml", "FalseIncorrect"),           # NEW false alarm
+            _row("t/becomes_wt.yml", "TrueIncorrect"),            # NEW wrong-TRUE (-32, KEEP-blocker)
         ])
         out = F.flips(before, after)
         assert out["gained_confirmed"] == ["t/miss.yml"], out
         assert out["lost_confirmed"] == ["t/regress.yml"], out
         assert out["new_false_alarms"] == ["t/becomes_fp.yml"], out
+        assert out["new_wrong_true"] == ["t/becomes_wt.yml"], out
 
 
 def test_flips_raw_correct_but_unconfirmed_is_not_a_gain():
@@ -56,6 +59,22 @@ def test_flips_raw_correct_but_unconfirmed_is_not_a_gain():
         assert out["gained_confirmed"] == [], out
         assert out["lost_confirmed"] == [], out
         assert out["new_false_alarms"] == [], out
+        assert out["new_wrong_true"] == [], out
+
+
+def test_flips_new_wrong_true_only_newly_introduced():
+    # A task that becomes TrueIncorrect (a TRUE verdict on an expected-FALSE task = wrong-TRUE, -32 and a
+    # hard KEEP-blocker) is reported in new_wrong_true — the digest names these so the next arm abstains.
+    # A task already TrueIncorrect BEFORE and after is NOT new (this arm did not introduce it).
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        before = _write(d / "b.jsonl", [_row("t/fresh.yml", "unknown"),
+                                        _row("t/preexisting.yml", "TrueIncorrect")])
+        after = _write(d / "a.jsonl", [_row("t/fresh.yml", "TrueIncorrect"),
+                                       _row("t/preexisting.yml", "TrueIncorrect")])
+        out = F.flips(before, after)
+        assert out["new_wrong_true"] == ["t/fresh.yml"], out
+        assert out["gained_confirmed"] == [] and out["new_false_alarms"] == [], out
 
 
 def test_flips_missing_after_reports_nothing_not_mass_regression():
@@ -67,10 +86,10 @@ def test_flips_missing_after_reports_nothing_not_mass_regression():
         before = _write(d / "b.jsonl", [_row("t/x.yml", "FalseCorrect", "CONFIRMED"),
                                         _row("t/y.yml", "FalseCorrect", "CONFIRMED")])
         out = F.flips(before, str(d / "does_not_exist.jsonl"))
-        assert out == {"gained_confirmed": [], "lost_confirmed": [], "new_false_alarms": []}, out
+        assert out == {"gained_confirmed": [], "lost_confirmed": [], "new_false_alarms": [], "new_wrong_true": []}, out
         # both missing -> all empty, no crash
         out2 = F.flips(str(d / "nope1.jsonl"), str(d / "nope2.jsonl"))
-        assert out2 == {"gained_confirmed": [], "lost_confirmed": [], "new_false_alarms": []}, out2
+        assert out2 == {"gained_confirmed": [], "lost_confirmed": [], "new_false_alarms": [], "new_wrong_true": []}, out2
 
 
 def test_flips_sorted_and_deterministic():

@@ -130,7 +130,7 @@ def build(*, n, lever, mode, family, scope, decision, delta, progressed,
             "api_retries": result.get("api_retries"),
         },
         # which individual tasks flipped (§5a) — the memorization-vs-generalization instrument
-        "flips": flips or {"gained_confirmed": [], "lost_confirmed": [], "new_false_alarms": []},
+        "flips": flips or {"gained_confirmed": [], "lost_confirmed": [], "new_false_alarms": [], "new_wrong_true": []},
         # what the worker actually did (§5b) — advisory
         "fingerprint": fingerprint or {"edits": 0, "writes": 0, "bash": 0,
                                        "ran_tests": False, "ran_clippy": False, "files": []},

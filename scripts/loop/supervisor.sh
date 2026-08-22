@@ -662,10 +662,19 @@ manage_capability_wip() {
     KEEP|KEEP_POOL|ACCUMULATE|ACCUMULATE_PLUS) rm -f "$patch" 2>/dev/null || true ;;
     REVERT|WORKER_FAIL)
       [ "$mode" = capability ] || return 0
+      # Capture the worker's crates diff INCLUDING untracked NEW files. A capability arm typically writes
+      # a brand-new engine (e.g. race_true.rs / bmc.rs, ~900 lines) that it never `git add`ed; plain
+      # `git diff <base>` omits untracked files, so that engine was silently dropped from the WIP patch and
+      # RE-DERIVED from scratch every arm. `git add -N -- crates` marks untracked files intent-to-add so the
+      # working-tree diff below emits a proper "new file" hunk for them (tracked mods + deletions are already
+      # in the diff); then unstage to restore the index (revert_arm resets the branch next anyway). Only the
+      # `crates` pathspec is staged (it always exists) so a missing Cargo.lock can't abort the capture.
+      git_here add -N -- crates >/dev/null 2>&1 || true
       local d; d="$(git_here diff "$base" -- crates Cargo.toml Cargo.lock 2>/dev/null || true)"
+      git_here reset -q -- crates >/dev/null 2>&1 || true
       if [ -n "$d" ]; then
         printf '%s\n' "$d" > "$patch" 2>/dev/null || return 0
-        log "capability WIP preserved for lever $id -> $patch ($(printf '%s\n' "$d" | wc -l | tr -d ' ') lines); next arm continues from it"
+        log "capability WIP preserved for lever $id -> $patch ($(printf '%s\n' "$d" | wc -l | tr -d ' ') lines, incl. untracked new files); next arm continues from it"
       fi ;;
   esac
 }

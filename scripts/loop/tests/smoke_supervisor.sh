@@ -55,6 +55,8 @@ saf_worker() {
     holdout)       : ;;
     *)             echo "// arm $SMOKE_SCENARIO" >> "$REPO_ROOT/crates/saf-svcomp/src/lib.rs" ;;
   esac
+  # optional: also create a brand-new UNTRACKED engine file, to prove manage_capability_wip captures it
+  [ -n "${SMOKE_WORKER_NEWFILE:-}" ] && printf "pub fn capnew() {}\n" > "$REPO_ROOT/crates/saf-svcomp/src/capnew.rs"
   if [ "$SMOKE_SCENARIO" = holdout ]; then
     printf "%s\n" "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"file_path\":\"tests/benchmarks/svcomp-splits/holdout.jsonl\"}}]}}" > "$transcript"
   else
@@ -226,16 +228,18 @@ cap_wip_reprime() {  # BUG-2: a reverted capability arm's crates diff is preserv
   printf 'capwip\tcapability\tvalid-memsafety\tlocal\tmulti-arm capability that reverts then continues\n' > "$tmp/levers.tsv"
   SAF_REPO_ROOT="$tmp" SAF_LOOP_STATE="$tmp/state" SAF_GATE_LIB="$tmp/gate" SAF_LOOP_STUBS="$tmp/stubs.sh" \
     LEVERS_FILE="$tmp/levers.tsv" ARM_PROMPT_FILE="$LOOP_DIR/arm_prompt.md" JOURNAL="$tmp/state/journal.md" \
-    LOOP_ENV=/dev/null SMOKE_SCENARIO=tuning_nogain MAX_ARMS=2 LEVER_BUDGET=9 \
+    LOOP_ENV=/dev/null SMOKE_SCENARIO=tuning_nogain MAX_ARMS=2 LEVER_BUDGET=9 SMOKE_WORKER_NEWFILE=1 \
     GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=a@b GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=a@b \
     bash "$SUP" --loop >"$tmp.log" 2>&1
-  local saved primed
+  local saved primed untracked
   [ -s "$tmp/state/lever.capwip.wip.patch" ] && saved=yes || saved=no
   grep -q 'lever.capwip.wip.patch' "$tmp/state/arm-2/arm_prompt.rendered.md" 2>/dev/null && primed=yes || primed=no
-  if [ "$saved" = yes ] && [ "$primed" = yes ]; then
-    printf '  ok   %-16s wip-saved=%s arm2-primed=%s (capability continues, not re-derives)\n' cap_wip_reprime "$saved" "$primed"; pass=$((pass+1))
+  # the untracked new engine file the worker created (capnew.rs) MUST appear in the preserved patch
+  grep -q 'capnew.rs' "$tmp/state/lever.capwip.wip.patch" 2>/dev/null && untracked=yes || untracked=no
+  if [ "$saved" = yes ] && [ "$primed" = yes ] && [ "$untracked" = yes ]; then
+    printf '  ok   %-16s wip-saved=%s arm2-primed=%s untracked-captured=%s (capability continues, not re-derives)\n' cap_wip_reprime "$saved" "$primed" "$untracked"; pass=$((pass+1))
   else
-    printf '  FAIL %-16s wip-saved=%s arm2-primed=%s\n' cap_wip_reprime "$saved" "$primed"; fail=$((fail+1))
+    printf '  FAIL %-16s wip-saved=%s arm2-primed=%s untracked-captured=%s\n' cap_wip_reprime "$saved" "$primed" "$untracked"; fail=$((fail+1))
     tail -20 "$tmp.log" | sed 's/^/       /'
   fi
   rm -rf "$tmp" 2>/dev/null || true
