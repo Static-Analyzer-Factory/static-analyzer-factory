@@ -22,6 +22,7 @@ pub mod promote;
 pub mod property;
 pub mod property_kind;
 pub mod race;
+pub mod race_true;
 pub mod ranking;
 pub mod slicing;
 pub mod summaries;
@@ -42,6 +43,9 @@ pub use property::{
 pub use property_kind::{DataModel, Language, Property};
 pub use race::{
     RaceCandidate, RaceHit, find_race_candidates, parse_tsan_report, race_graphml_witness,
+};
+pub use race_true::{
+    is_race_inert_external, program_is_race_free, race_true_verdict, resolve_direct_thread_fn,
 };
 pub use termination::{
     is_known_returning_external, program_structurally_terminates, termination_verdict,

@@ -3210,34 +3210,72 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
 /// by the parsed report, not the exit code).
 const TSAN_OPTS: &str = "halt_on_error=1:abort_on_error=0:exitcode=66";
 
-/// The `no-data-race` FALSE pipeline (lever `race-find`): finder-gated,
-/// `ThreadSanitizer`-confirmed, `GraphML`-witnessed.
+/// The `no-data-race` strategy: attempt a sound structural **TRUE** proof first
+/// (lever `race-free-true-prover`, verdict-only, no witness) and — if that
+/// abstains — fall back to the concrete FALSE confirmation pipeline (finder-gated,
+/// `ThreadSanitizer`-confirmed, `GraphML`-witnessed via [`try_no_data_race_false`]).
 ///
-/// 1. Gate: require an actually-reachable thread spawn (else the program is
-///    sequential — no race possible — and we abstain; SAF is FALSE-only).
-/// 2. R7 scope gate: abstain on `OpenMP` / relaxed-memory / custom
-///    `__VERIFIER_atomic_*` sections a native x86 (TSO/SC) `TSan` replay cannot
-///    soundly arbitrate.
-/// 3. Propose: run the over-approximate lockset+MHP finder
-///    ([`saf_svcomp::find_race_candidates`]). No candidate ⇒ abstain.
-/// 4. Confirm: compile the ORIGINAL program with `-fsanitize=thread` and run it
-///    under the nondet driver; emit `false(no-data-race)` IFF `TSan` concretely
-///    observes a genuine data race (R1). `TSan` is the sole soundness arbiter; the
-///    witness is `GraphML` 1.0 (R7).
+/// TRUE is tried first **for cost**, not because it is less careful: the prover
+/// ([`saf_svcomp::program_is_race_free`]) fails **closed** behind a cheap
+/// structural gate (unresolved spawns / reachable indirect calls / un-modelled
+/// externals) that abstains *before* it pays for pointer analysis — so on the
+/// large CIL-expanded driver tasks it costs almost nothing. When it *does* prove a
+/// program race-free it short-circuits the whole (expensive) finder + `TSan`
+/// replay, which the prior FALSE-first ordering ran on every race-free task; that
+/// duplicated analysis is exactly what timed sibling tasks out. The prover is
+/// sound and over-approximate (maximal concurrency, sound may-alias,
+/// under-approximate locks), so it only ever emits `true` when no unprotected
+/// conflicting access pair can exist — a wrong TRUE (−32) cannot arise from an
+/// over-approximate finding.
 fn no_data_race_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
+    let source = std::fs::read_to_string(ctx.input).unwrap_or_default();
+
+    // TRUE prover first (cheap-gated). Gate on the same out-of-scope source
+    // features (OpenMP / relaxed-memory) plus inline asm, since those can hide
+    // concurrency or memory effects the AIR-level proof would not see (a wrong TRUE).
+    if race_true_out_of_scope(&source).is_none() && saf_svcomp::program_is_race_free(ctx.module) {
+        eprintln!("saf verify: no-data-race structurally proven race-free -> true");
+        return VerdictOutcome {
+            verdict: saf_svcomp::race_true_verdict().to_string(),
+            witness: None,
+            graphml: None,
+        };
+    }
+
+    // FALSE pipeline (concrete TSan confirmation).
+    if let Some(outcome) = try_no_data_race_false(ctx, &source) {
+        return outcome;
+    }
+
+    eprintln!("saf verify: no-data-race neither proven TRUE nor confirmed FALSE -> unknown");
+    unknown_outcome()
+}
+
+/// The FALSE half of [`no_data_race_strategy`] (lever `race-find`). Returns
+/// `Some(false-outcome)` iff `ThreadSanitizer` concretely observes a genuine data
+/// race; `None` (abstain from FALSE) otherwise, letting the caller attempt the TRUE
+/// proof.
+///
+/// 1. Gate: require an actually-reachable thread spawn (else sequential — no race).
+/// 2. R7 scope gate: abstain on `OpenMP` / relaxed-memory a native x86 (TSO/SC)
+///    `TSan` replay cannot soundly arbitrate.
+/// 3. Propose: the over-approximate lockset+MHP finder must yield ≥1 candidate.
+/// 4. Confirm: compile the ORIGINAL program with `-fsanitize=thread`; emit
+///    `false(no-data-race)` IFF `TSan` observes a genuine race (R1). `TSan` is the
+///    sole soundness arbiter; the witness is `GraphML` 1.0 (R7).
+fn try_no_data_race_false(ctx: &VerifyCtx, source: &str) -> Option<VerdictOutcome> {
     // Gate 1: a race needs a real second thread reachable from main.
     let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
     if !saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
         eprintln!("saf verify: no reachable thread spawn (sequential -> no race) -> unknown");
-        return unknown_outcome();
+        return None;
     }
 
     // Gate 2 (R7): out-of-scope concurrency features TSan-on-x86 cannot soundly
-    // arbitrate. Read the source once (also used for the witness hash upstream).
-    let source = std::fs::read_to_string(ctx.input).unwrap_or_default();
-    if let Some(reason) = tsan_out_of_scope(&source) {
-        eprintln!("saf verify: no-data-race out of scope ({reason}) -> unknown");
-        return unknown_outcome();
+    // arbitrate.
+    if let Some(reason) = tsan_out_of_scope(source) {
+        eprintln!("saf verify: no-data-race FALSE out of scope ({reason}) -> unknown");
+        return None;
     }
 
     // Gate 3: the finder must PROPOSE at least one candidate racing pair. An
@@ -3246,7 +3284,7 @@ fn no_data_race_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     let candidates = saf_svcomp::find_race_candidates(ctx.module);
     if candidates.is_empty() {
         eprintln!("saf verify: lockset+MHP finder found no race candidate -> unknown");
-        return unknown_outcome();
+        return None;
     }
     eprintln!(
         "saf verify: finder proposed {} race candidate(s); attempting TSan confirmation",
@@ -3273,21 +3311,42 @@ fn no_data_race_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
                 architecture,
                 &hit,
             );
-            VerdictOutcome {
+            Some(VerdictOutcome {
                 verdict: format!("false({})", saf_svcomp::Property::NoDataRace.name()),
                 witness: None,
                 graphml: Some(graphml),
-            }
+            })
         }
         Ok(None) => {
             eprintln!("saf verify: TSan replay observed no data race -> unknown");
-            unknown_outcome()
+            None
         }
         Err(e) => {
             eprintln!("saf verify: TSan replay errored: {e:#} -> unknown");
-            unknown_outcome()
+            None
         }
     }
+}
+
+/// Source-level out-of-scope gate for the structural `no-data-race` **TRUE** proof.
+/// Returns `Some(reason)` for features that could hide concurrency or memory effects
+/// the AIR-level analysis cannot see — an unsound `true` risk:
+///
+/// - everything [`tsan_out_of_scope`] rejects (`OpenMP` pragmas, whose parallel
+///   regions the frontend drops; relaxed-memory atomics), and
+/// - inline assembly, whose memory effects the frontend may drop entirely.
+fn race_true_out_of_scope(source: &str) -> Option<&'static str> {
+    if let Some(reason) = tsan_out_of_scope(source) {
+        return Some(reason);
+    }
+    if source.contains("__asm__")
+        || source.contains("__asm ")
+        || source.contains("asm volatile")
+        || source.contains("asm goto")
+    {
+        return Some("inline asm");
+    }
+    None
 }
 
 /// R7 scope gate for `no-data-race`: returns `Some(reason)` when the program
@@ -4984,6 +5043,28 @@ void worker(void) { __VERIFIER_atomic_inc(&g); __VERIFIER_atomic_acquire(); }
         assert_eq!(
             tsan_out_of_scope("atomic_load_explicit(&x, memory_order_acquire)"),
             Some("relaxed-memory atomics")
+        );
+    }
+
+    #[test]
+    fn race_true_out_of_scope_gates_omp_relaxed_and_asm() {
+        // The TRUE prover inherits the FALSE scope gate plus inline-asm rejection.
+        assert_eq!(race_true_out_of_scope("int main(){return 0;}"), None);
+        assert_eq!(
+            race_true_out_of_scope("#pragma omp parallel"),
+            Some("OpenMP")
+        );
+        assert_eq!(
+            race_true_out_of_scope("atomic_load_explicit(&x, memory_order_acquire)"),
+            Some("relaxed-memory atomics")
+        );
+        assert_eq!(
+            race_true_out_of_scope("__asm__ volatile(\"mfence\")"),
+            Some("inline asm")
+        );
+        assert_eq!(
+            race_true_out_of_scope("asm volatile(\"nop\")"),
+            Some("inline asm")
         );
     }
 
