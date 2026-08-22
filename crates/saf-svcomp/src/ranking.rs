@@ -942,6 +942,138 @@ fn infer_signs(func: &AirFunction) -> BTreeMap<ValueId, Sign> {
     out
 }
 
+/// SV-COMP `__VERIFIER_nondet_*` sources that return a **non-negative** value
+/// (an unsigned integer or a boolean). A call to one of these is a sound witness
+/// that its result — and hence anything it is directly assigned to — lies in the
+/// unsigned range `[0, 2^w−1]`, never a negative two's-complement value.
+fn is_unsigned_nondet(name: &str) -> bool {
+    matches!(
+        name,
+        "__VERIFIER_nondet_uint"
+            | "__VERIFIER_nondet_unsigned"
+            | "__VERIFIER_nondet_uchar"
+            | "__VERIFIER_nondet_ushort"
+            | "__VERIFIER_nondet_ulong"
+            | "__VERIFIER_nondet_ulonglong"
+            | "__VERIFIER_nondet_u8"
+            | "__VERIFIER_nondet_u16"
+            | "__VERIFIER_nondet_u32"
+            | "__VERIFIER_nondet_u64"
+            | "__VERIFIER_nondet_size_t"
+            | "__VERIFIER_nondet_bool"
+            | "__VERIFIER_nondet_pchar"
+    )
+}
+
+/// Is call argument `arg` (evaluated in `caller`) provably a **non-negative**
+/// integer, using only `caller`-local facts? A non-negative value is one whose
+/// two's-complement bit pattern is a genuine `[0, 2^w−1]` unsigned magnitude —
+/// so treating the callee parameter it feeds as unsigned is sound. Recognized
+/// sources (each unambiguously non-negative regardless of any wider signed
+/// interpretation):
+///
+/// - a non-negative integer constant (`Int`/`ZeroInit`);
+/// - the result of an unsigned nondet source ([`is_unsigned_nondet`]);
+/// - a zero-extension (`ZExt`) — its high bits are all `0`, so the value is
+///   non-negative in both the source and destination widths.
+///
+/// Anything else (a passed-through parameter, a signed nondet, an arbitrary
+/// arithmetic result, `Undef`/`BigInt`) fails closed ⇒ the position is *not*
+/// treated as unsigned (only recall is lost, never soundness).
+fn arg_is_nonneg(arg: ValueId, caller: &AirFunction, module: &AirModule) -> bool {
+    if let Some(c) = module.constants.get(&arg) {
+        return match c {
+            Constant::Int { value, .. } => *value >= 0,
+            Constant::ZeroInit => true,
+            _ => false,
+        };
+    }
+    for block in &caller.blocks {
+        for inst in &block.instructions {
+            if inst.dst != Some(arg) {
+                continue;
+            }
+            return match &inst.op {
+                Operation::CallDirect { callee } => module
+                    .functions
+                    .iter()
+                    .find(|f| f.id == *callee)
+                    .is_some_and(|f| is_unsigned_nondet(&f.name)),
+                Operation::Cast {
+                    kind: CastKind::ZExt,
+                    ..
+                } => true,
+                _ => false,
+            };
+        }
+    }
+    false
+}
+
+/// Parameter **positions** of a recursion SCC that are provably fed only
+/// non-negative unsigned values at every call site **from outside the SCC** (the
+/// base case of the recursion). Used to give an otherwise sign-`Unknown`
+/// recursion parameter the sound unsigned range `[0, 2^w−1]`, which the existing
+/// `!=`-split + overflow-check machinery needs to rank a `-O0`/unsigned counter
+/// such as `id(unsigned x){ if(x==0) return; return id(x-1); }` (its `x` carries
+/// no local signedness hint, so `infer_signs` leaves it `Unknown`).
+///
+/// # Soundness
+///
+/// A position `i` is returned only when **every** external (non-SCC) call site to
+/// **any** SCC member passes a provably-non-negative argument ([`arg_is_nonneg`])
+/// at position `i` — establishing the invariant "position `i` is a non-negative
+/// unsigned value" at the base (entry) of the recursion. That the invariant is
+/// *preserved* across recursive frames is a tautology: position `i` is a `w`-bit
+/// register, so its unsigned interpretation is *always* in `[0, 2^w−1]`; the
+/// caller only marks such positions `Unsigned` (never `Signed`), and the ranking
+/// model's guards on them are sign-agnostic (`==`/`!=`; a signed comparison would
+/// have made `infer_signs` return `Signed`, which the caller preserves). The
+/// affine transitions are overflow-checked against `[0, 2^w−1]` and demoted to a
+/// free in-range havoc on any wrap, so the model over-approximates the unsigned
+/// machine semantics — a ranking of it is a sound termination proof. The unsigned
+/// *source* requirement (rather than merely "≥ 0 at entry") additionally rules
+/// out a negative signed entry whose defined-wrap decrement would rest on signed
+/// overflow (UB). With **no** external call site the base case is unestablished,
+/// so the empty set is returned (fail-closed).
+fn scc_positions_unsigned_by_entry(
+    module: &AirModule,
+    scc: &BTreeSet<FunctionId>,
+) -> BTreeSet<u32> {
+    let mut sites: Vec<(&AirFunction, &Vec<ValueId>)> = Vec::new();
+    for caller in &module.functions {
+        if scc.contains(&caller.id) {
+            continue; // an intra-SCC (recursive) call is the inductive step, not a base entry
+        }
+        for block in &caller.blocks {
+            for inst in &block.instructions {
+                if let Operation::CallDirect { callee } = &inst.op {
+                    if scc.contains(callee) {
+                        sites.push((caller, &inst.operands));
+                    }
+                }
+            }
+        }
+    }
+    if sites.is_empty() {
+        return BTreeSet::new();
+    }
+    let max_len = sites.iter().map(|(_, a)| a.len()).max().unwrap_or(0);
+    let mut out = BTreeSet::new();
+    for i in 0..max_len {
+        let all_nonneg = sites.iter().all(|(caller, args)| {
+            args.get(i)
+                .is_some_and(|&a| arg_is_nonneg(a, caller, module))
+        });
+        if all_nonneg {
+            // INVARIANT: LLVM caps a call's positional argument count well below 2^32.
+            #[allow(clippy::cast_possible_truncation)]
+            out.insert(i as u32);
+        }
+    }
+    out
+}
+
 /// Integer type range `[lo, hi]` for `sym`, if its width is known (≤ 64 bits) and
 /// its signedness is unambiguous. Returns `None` when the bounds cannot be
 /// represented (⇒ no bound is asserted; the symbol stays free — sound).
@@ -1387,7 +1519,24 @@ fn build_recursion_model(
         return None;
     }
 
-    let signs = infer_signs(func);
+    let mut signs = infer_signs(func);
+
+    // Interprocedural non-negativity: a self-recursive parameter with no local
+    // signedness hint (`Unknown`) — e.g. an unsigned `-O0` counter such as
+    // `id(unsigned x){ if(x==0) return; return id(x-1); }` — is given the sound
+    // unsigned range `[0, 2^w−1]` when every external call site feeds it a
+    // provably-non-negative unsigned value. This is exactly the fact the
+    // `!=`-split needs to prove `x − 1` never underflows so `f = x` ranks. Only
+    // `Unknown` positions are lifted; a `Signed` inference is preserved (never
+    // overridden) to keep signed guards interpreted consistently.
+    let self_scc: BTreeSet<FunctionId> = BTreeSet::from([func.id]);
+    let unsigned_positions = scc_positions_unsigned_by_entry(module, &self_scc);
+    for p in &func.params {
+        if unsigned_positions.contains(&p.index) && !matches!(signs.get(&p.id), Some(Sign::Signed))
+        {
+            signs.insert(p.id, Sign::Unsigned);
+        }
+    }
 
     // Ranking state = the function's integer parameters (their `TypeId` lives on
     // `AirParam`, not on any instruction). Non-integer params (pointers, floats)
@@ -1722,6 +1871,23 @@ fn build_mutual_recursion_model(
     }
     for c in &sign_conflict {
         signs.remove(c);
+    }
+
+    // Interprocedural non-negativity over the shared positional symbols: a
+    // position with no local signedness hint (and no conflicting hint above) is
+    // given the sound unsigned range `[0, 2^w−1]` when every call site entering
+    // the SCC from outside feeds it a provably-non-negative unsigned value —
+    // unlocking mutually-recursive unsigned counters (`id`/`id2`). A `Signed`
+    // inference is preserved, never overridden.
+    let unsigned_positions = scc_positions_unsigned_by_entry(module, scc);
+    for p in &canon_params {
+        if let Some(&shared) = shared_of_index.get(&p.index) {
+            if unsigned_positions.contains(&p.index)
+                && !matches!(signs.get(&shared), Some(Sign::Signed))
+            {
+                signs.insert(shared, Sign::Unsigned);
+            }
+        }
     }
 
     // --- Pass 1: one raw transition per (member × call site × entry→site path),
@@ -4784,6 +4950,130 @@ mod tests {
         let func = &m.functions[0];
         let cfg = Cfg::build(func);
         recursion_is_ranked(func, m, &cfg)
+    }
+
+    /// `self_rec` (recursive `f`) plus an external `main` that calls `f(entry)`,
+    /// where `entry` is either the result of the nondet source `nondet_name`
+    /// (a declaration) or, when `nondet_name` is empty, the constant `arg_const`.
+    /// This exercises the interprocedural non-negativity path: `f`'s parameter has
+    /// no local signedness hint, so it is ranked only when the external call site
+    /// proves it unsigned.
+    fn self_rec_called(
+        cmp: BinaryOp,
+        bound: i64,
+        step: i64,
+        nondet_name: &str,
+        arg_const: i64,
+    ) -> AirModule {
+        let mut m = self_rec(cmp, bound, step);
+        let i32t = tid("i32");
+        let f_id = FunctionId(make_id("func", b"f"));
+
+        let inp = vid("main_inp");
+        let mut main_entry = AirBlock::new(bid("main_entry"));
+        let arg = if nondet_name.is_empty() {
+            let cst = vid("main_arg_const");
+            m.constants.insert(
+                cst,
+                Constant::Int {
+                    value: arg_const,
+                    bits: 32,
+                },
+            );
+            cst
+        } else {
+            let nondet_id = FunctionId(make_id("func", nondet_name.as_bytes()));
+            m.functions.push(AirFunction {
+                id: nondet_id,
+                name: nondet_name.to_string(),
+                params: Vec::new(),
+                blocks: Vec::new(),
+                entry_block: None,
+                is_declaration: true,
+                span: None,
+                symbol: None,
+                block_index: BTreeMap::new(),
+            });
+            main_entry.instructions.push(vinst(
+                "main_call_nondet",
+                Operation::CallDirect { callee: nondet_id },
+                inp,
+                vec![],
+                i32t,
+            ));
+            inp
+        };
+        main_entry.instructions.push(term(
+            "main_call_f",
+            Operation::CallDirect { callee: f_id },
+            vec![arg],
+        ));
+        main_entry
+            .instructions
+            .push(term("main_ret", Operation::Ret, vec![]));
+
+        m.functions.push(AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![main_entry],
+            entry_block: Some(bid("main_entry")),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        });
+        m
+    }
+
+    #[test]
+    fn unsigned_nondet_entry_ne_zero_recursion_is_ranked() {
+        // `unsigned f(x){ if (x != 0) f(x - 1); }` called as `f(nondet_uint())`.
+        // The parameter carries no local signedness hint (only `!=` + `add`), so
+        // `infer_signs` leaves it `Unknown`; the unsigned nondet source at the
+        // external call site proves it non-negative ⇒ `[0, 2^32−1]` ⇒ `f = x`
+        // ranks (the mem2reg/`-O0` `id`-family shape).
+        assert!(rec_ranked(&self_rec_called(
+            BinaryOp::ICmpNe,
+            0,
+            -1,
+            "__VERIFIER_nondet_uint",
+            0,
+        )));
+    }
+
+    #[test]
+    fn nonneg_const_entry_ne_zero_recursion_is_ranked() {
+        // Same shape, entered with a non-negative constant `f(7)` — also a sound
+        // witness that the parameter is non-negative at the base.
+        assert!(rec_ranked(&self_rec_called(BinaryOp::ICmpNe, 0, -1, "", 7)));
+    }
+
+    #[test]
+    fn signed_nondet_entry_ne_zero_recursion_not_ranked() {
+        // MANDATORY negative: entered from a SIGNED nondet source, the parameter
+        // may be negative, so `f(x-1)` can decrease past the type minimum — must
+        // NOT be treated as unsigned, must abstain (no wrong `true`).
+        assert!(!rec_ranked(&self_rec_called(
+            BinaryOp::ICmpNe,
+            0,
+            -1,
+            "__VERIFIER_nondet_int",
+            0,
+        )));
+    }
+
+    #[test]
+    fn negative_const_entry_ne_zero_recursion_not_ranked() {
+        // Entered with a NEGATIVE constant `f(-3)`: not provably non-negative ⇒
+        // the position is not treated as unsigned ⇒ abstain.
+        assert!(!rec_ranked(&self_rec_called(
+            BinaryOp::ICmpNe,
+            0,
+            -1,
+            "",
+            -3
+        )));
     }
 
     #[test]
