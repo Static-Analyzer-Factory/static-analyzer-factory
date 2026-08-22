@@ -676,9 +676,9 @@ manage_capability_wip() {
 lever_outcome_digest() {
   local id="$1" af="$STATE_DIR/arms.jsonl"
   [ -s "$af" ] || return 0
-  py - "$af" "$id" <<'PY' 2>/dev/null || true
-import json, sys
-af, lid = sys.argv[1], sys.argv[2]
+  py - "$af" "$id" "$STATE_DIR" <<'PY' 2>/dev/null || true
+import json, os, sys
+af, lid, state = sys.argv[1], sys.argv[2], sys.argv[3]
 rows = []
 for l in open(af):
     l = l.strip()
@@ -693,8 +693,40 @@ for l in open(af):
 if not rows:
     sys.exit(0)
 rows = rows[-6:]
+
+def _pertask_bad(arm):
+    """Read arm-<arm>/after.pertask.jsonl and return (wrong_true_ids, false_alarm_ids) EXACTLY as the
+    authoritative full-pool scorer recorded them. These are the -32 (TrueIncorrect) and -16
+    (FalseIncorrect) tasks that trip the hard KEEP gate. The prior digest THREW THIS AWAY, so every
+    arm re-derived the same too-permissive gate blind. Tolerant of a missing/broken dump -> empty."""
+    wt, fa = set(), set()
+    if arm is None:
+        return wt, fa
+    p = os.path.join(state, "arm-%s" % arm, "after.pertask.jsonl")
+    try:
+        lines = open(p, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return wt, fa
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        rel, oc = rec.get("rel_yml"), rec.get("outcome")
+        if not rel:
+            continue
+        if oc == "TrueIncorrect":
+            wt.add(rel)
+        elif oc == "FalseIncorrect":
+            fa.add(rel)
+    return wt, fa
+
 out = ["## Prior arms on THIS lever — LEARN from them (do NOT repeat a change that already reverted)"]
 nregr = 0
+wt_all, fa_all = set(), set()
 for r in rows:
     dec = r.get("decision", "?"); rr = (r.get("revert_reason") or "")
     if rr == "regression":
@@ -702,16 +734,46 @@ for r in rows:
     cd = r.get("confirmed_delta", "?"); ppd = r.get("per_property_delta", {})
     fl = r.get("flips", {}) or {}
     g = fl.get("gained_confirmed", []) or []; lo = fl.get("lost_confirmed", []) or []
+    wt, fa = _pertask_bad(r.get("arm"))
+    wt_all |= wt; fa_all |= fa
     line = f"- arm {r.get('arm','?')}: {dec}{('/'+rr) if rr else ''} | confirmed_delta={cd} | per_property_delta={ppd}"
     if g:
         fams = sorted({x.split('/')[-2] for x in g if '/' in x})[:4]
         line += f" | added {len(g)} confirmed (clusters {', '.join(fams)} — now dedup-saturated)"
     if lo:
         line += f" | LOST {len(lo)} previously-confirmed (regression)"
+    if wt:
+        line += f" | {len(wt)} WRONG-TRUE (-32 each, KEEP-blocker)"
+    if fa:
+        line += f" | {len(fa)} FALSE-ALARM (-16 each, KEEP-blocker)"
     out.append(line)
+
+if wt_all or fa_all:
+    out.append("")
+    out.append("### SOUNDNESS BLOCKERS — the full-pool scorer counted these EXACT tasks against prior arms on this lever.")
+    out.append("Your own local `saf verify`/audit will likely show ZERO of these — it only covers a subset (the VAL set); the KEEP gate scores the FULL POOL and requires wrong_true=0 AND false_alarms=0 over ALL of it. TRUST THIS LIST over your own audit — a prior arm here self-reported \"WRONG_TRUE=0\" and was still reverted by these tasks.")
+    if wt_all:
+        ids = sorted(wt_all)
+        out.append(f"- WRONG-TRUE ({len(ids)} task(s); you emit TRUE on a genuinely-VIOLATING task, -32 each). Make the verdict ABSTAIN (Unknown) here by making the gate FAIL-CLOSED on whatever imprecision let them pass (e.g. abstain when points-to/alias/analysis is imprecise) — do NOT hard-code these ids, and PRESERVE your correct verdicts:")
+        for t in ids[:40]:
+            out.append(f"    {t}")
+        if len(ids) > 40:
+            out.append(f"    ...(+{len(ids)-40} more)")
+    if fa_all:
+        ids = sorted(fa_all)
+        out.append(f"- FALSE-ALARM ({len(ids)} task(s); you emit FALSE on a correct-TRUE task, -16 each). Tighten the confirmer so it cannot fire on these (they are safe under the benchmark's precondition — your inputs likely leave its assumed domain):")
+        for t in ids[:40]:
+            out.append(f"    {t}")
+        if len(ids) > 40:
+            out.append(f"    ...(+{len(ids)-40} more)")
+
 if nregr:
-    out.append(f"WARNING: {nregr} of the last {len(rows)} arms here REVERTED as REGRESSIONS — the same approach keeps NET-LOSING confirmed FALSEs (a raw recall gain that dedups to ~0 while its added compile/analysis cost times other tasks out past the eval timeout). Do NOT re-apply that change; try a genuinely DIFFERENT mechanism or a lower-cost path, and target reasoning tasks you still miss.")
-out.append("Do not pile more near-duplicate members onto clusters already gained above (they score ~0 under dedup); solve a NEW class.")
+    if wt_all or fa_all:
+        out.append(f"WARNING: {nregr} of the last {len(rows)} arms REVERTED and the proximate cause is the SOUNDNESS BLOCKERS above (wrong-TRUE / false-alarm on specific tasks), NOT dedup saturation. Do NOT 'solve a new class' and do NOT re-derive the same too-permissive gate — make it FAIL-CLOSED so it abstains on those tasks (and their structural class) while PRESERVING the correct verdicts you already produce. Driving those few tasks to abstain is the whole KEEP.")
+    else:
+        out.append(f"WARNING: {nregr} of the last {len(rows)} arms here REVERTED as REGRESSIONS — the same approach keeps NET-LOSING confirmed FALSEs (a raw recall gain that dedups to ~0 while its added compile/analysis cost times other tasks out past the eval timeout). Do NOT re-apply that change; try a genuinely DIFFERENT mechanism or a lower-cost path, and target reasoning tasks you still miss.")
+if not (wt_all or fa_all):
+    out.append("Do not pile more near-duplicate members onto clusters already gained above (they score ~0 under dedup); solve a NEW class.")
 print("\n".join(out))
 PY
 }
