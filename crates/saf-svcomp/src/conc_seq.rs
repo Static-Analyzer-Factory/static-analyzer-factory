@@ -363,6 +363,29 @@ pub fn conc_graphml_witness(
     thread_count: usize,
     schedule: ConcSchedule,
 ) -> String {
+    conc_graphml_witness_labeled(
+        spec,
+        programfile,
+        programhash,
+        architecture,
+        thread_count,
+        schedule.label(),
+    )
+}
+
+/// Like [`conc_graphml_witness`] but takes an arbitrary schedule label string, so
+/// confirmers with their own schedule vocabulary (e.g. the forced-interleaving replay
+/// engine, [`crate::conc_replay`]) can reuse the same GraphML-1.0 emitter without
+/// inventing a [`ConcSchedule`] variant.
+#[must_use]
+pub fn conc_graphml_witness_labeled(
+    spec: &str,
+    programfile: &str,
+    programhash: &str,
+    architecture: &str,
+    thread_count: usize,
+    schedule_label: &str,
+) -> String {
     // Cap the number of modelled threads in the witness so a 10^4-spawn task does not
     // produce a pathologically large witness; one createThread edge is enough to make
     // the witness structurally valid.
@@ -437,7 +460,7 @@ xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n",
     let _ = writeln!(
         s,
         "    <edge source=\"N{modelled}\" target=\"N{vnode}\"><data key=\"threadId\">{}</data></edge>",
-        xml_escape(schedule.label())
+        xml_escape(schedule_label)
     );
     s.push_str("  </graph>\n");
     s.push_str("</graphml>\n");

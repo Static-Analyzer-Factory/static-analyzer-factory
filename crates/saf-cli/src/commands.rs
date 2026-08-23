@@ -1270,6 +1270,16 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         if let Some(outcome) = conc_confirm_false(ctx) {
             return outcome;
         }
+        // Second concurrency confirmer (lever `conc-replay-confirm`): a cooperative
+        // single-token scheduler that forces FINE-GRAINED interleavings (context
+        // switches at `__VERIFIER_atomic` boundaries) on the REAL multithreaded
+        // binary. Catches interleaving-dependent bugs the whole-thread atomic-thread
+        // model above cannot reach (`fib_unsafe`, `triangular`, `reorder`, …). Every
+        // replayed run is a real serialized SC interleaving, so a `reach_error` it hits
+        // is a genuine violation (R1/R6/R7, GraphML witness); any miss ⇒ abstain.
+        if let Some(outcome) = conc_replay_confirm_false(ctx) {
+            return outcome;
+        }
         eprintln!(
             "saf verify: a thread spawn is reachable from main (no atomic-thread schedule confirmed) -> unknown"
         );
@@ -1989,6 +1999,226 @@ fn conc_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     }
 
     eprintln!("saf verify: no atomic-thread schedule reached reach_error -> unknown");
+    None
+}
+
+/// Per-run timeout for one forced-interleaving replay. Short: a gated atomic-only
+/// program that does not reproduce terminates in milliseconds; only a pathological
+/// (schedule-induced) spin hits this, and a timeout just means "this schedule did not
+/// reach the error" → try the next plan / abstain.
+const CONC_REPLAY_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Total wall-clock budget across ALL replay plans for one task. Bounds the per-task
+/// cost even if many plans each spin to their per-run timeout; when exhausted we
+/// abstain (no verdict lost — the schedule is the sole arbiter).
+const CONC_REPLAY_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run the cooperative-scheduler replay harness once under one `(policy, seed)` plan.
+/// Returns `Ok(true)` iff the sentinel dropped (the property's violation event fired).
+/// Timeout / normal exit / crash all return `Ok(false)` — the sentinel is the sole
+/// confirmer. A runaway (spinning) harness is killed with its whole group.
+fn run_conc_replay_plan(
+    harness: &Path,
+    sentinel: &Path,
+    plan: saf_svcomp::ReplayPlan,
+    timeout: std::time::Duration,
+) -> anyhow::Result<bool> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+
+    let _ = std::fs::remove_file(sentinel);
+    let mut cmd = Command::new(harness);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("SAF_REPLAY_POLICY", plan.policy_env())
+        .env("SAF_REPLAY_SEED", plan.seed_env().to_string());
+    let mut child = harden_replay_spawn(&mut cmd)
+        .spawn()
+        .with_context(|| "spawning concurrency replay harness")?;
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    kill_replay_group(&mut child);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) => return Err(e).context("waiting on concurrency replay harness"),
+        }
+    }
+    Ok(sentinel.exists())
+}
+
+/// Fine-grained concurrency `unreach-call` FALSE confirmer (lever `conc-replay-confirm`).
+///
+/// Runs AFTER [`conc_confirm_false`] abstains. Compiles the ORIGINAL program with the
+/// cooperative single-token replay driver ([`saf_svcomp::synthesize_conc_replay_driver`])
+/// ONCE, then replays it under each forced-interleaving plan
+/// ([`saf_svcomp::replay_plans`] — round-robin, then PCT seeds). The FIRST plan that
+/// drops the sentinel (the property's `reach_error` / `__assert_fail` event, R1) is
+/// RE-RUN to require the identical deterministic reproduction (R6) before emitting
+/// `false(unreach-call)` + a GraphML-1.0 violation witness (R7). Returns `None`
+/// (abstain) on any gate miss / compile failure / no reproduction / budget exhaustion —
+/// the schedule is the sole arbiter, so a spurious model can only ever yield `unknown`.
+///
+/// Sound: every replayed run is a real serialized sequentially-consistent interleaving
+/// of the original program executed natively (single token; `__VERIFIER_atomic`
+/// sections held indivisibly), so a sentinel drop is a genuine reachable violation.
+/// [`saf_svcomp::conc_replay_schedulable`] fail-closes on every feature the model
+/// cannot faithfully reproduce (nondet, mutex exclusion, condvars, …).
+// NOTE: compile-once / replay-each-plan / re-confirm is one cohesive fail-closed unit;
+// splitting it would obscure the control flow.
+#[allow(clippy::too_many_lines)]
+fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    use saf_svcomp::Property;
+    use std::process::{Command, Stdio};
+
+    // Gate 0: there must be a reach_error site to reach.
+    if saf_svcomp::reach_error_call_sites(ctx.module).is_empty() {
+        return None;
+    }
+
+    // Gate 1: the program must be amenable to the fine-grained replay model (reachable
+    // spawn, `__VERIFIER_atomic` mid-body scheduling points, no mutex exclusion, no
+    // nondet / condvars / … — see conc_replay_schedulable).
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if !saf_svcomp::conc_replay_schedulable(ctx.module, &callgraph) {
+        return None;
+    }
+
+    // Gate 2 (R7): abstain on OpenMP / relaxed-memory the SC replay cannot arbitrate
+    // (symbol-level gates miss `#pragma omp` — the frontend drops it — so catch it here).
+    let source = std::fs::read_to_string(ctx.input).unwrap_or_default();
+    if let Some(reason) = tsan_out_of_scope(&source) {
+        eprintln!("saf verify: concurrency replay out of scope ({reason}) -> unknown");
+        return None;
+    }
+
+    let dir = ctx.tempdir;
+    let sentinel = dir.join("saf_replay.sentinel");
+    let driver_src = dir.join("saf_replay_driver.c");
+    let harness = dir.join("saf_replay_harness");
+
+    if std::fs::write(
+        &driver_src,
+        saf_svcomp::synthesize_conc_replay_driver(&escape_c_string(&sentinel)),
+    )
+    .is_err()
+    {
+        return None;
+    }
+
+    // Compile the driver + original program ONCE, linking the pthread wrappers. As in
+    // the atomic-thread path: a two-pass __VERIFIER_assert neutralizer handles programs
+    // that DEFINE their own `void __VERIFIER_assert(int)`;
+    // -fsanitize-trap=signed-integer-overflow makes a path that reaches reach_error only
+    // via signed-overflow UB TRAP before the sentinel drops (R1 — the benchmarks are not
+    // UB-free). The three wraps redirect create/join/exit into the driver.
+    let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
+    let build = |neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(ctx.clang);
+        cmd.args([
+            "-O0",
+            "-Wno-everything",
+            "-fsanitize=signed-integer-overflow",
+            "-fsanitize-trap=signed-integer-overflow",
+        ]);
+        cmd.arg(ctx.data_model.clang_flag())
+            .arg("-include")
+            .arg(ctx.stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include").arg(n);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(ctx.input)
+            .arg(&driver_src)
+            .arg("-Wl,--wrap=pthread_create,--wrap=pthread_join,--wrap=pthread_exit")
+            .arg("-lpthread")
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    let neutralizer = write_assert_neutralizer(dir).ok();
+    let compiled = matches!(build(None).status(), Ok(s) if s.success())
+        || neutralizer
+            .as_ref()
+            .is_some_and(|n| matches!(build(Some(n.as_path())).status(), Ok(s) if s.success()));
+    if !compiled {
+        eprintln!("saf verify: concurrency replay harness failed to compile -> unknown");
+        return None;
+    }
+
+    // Replay under each forced-interleaving plan; the first sentinel drop wins, then
+    // re-confirm (R6) before emitting. A total wall-clock budget bounds per-task cost.
+    let budget_start = std::time::Instant::now();
+    for plan in saf_svcomp::replay_plans() {
+        if budget_start.elapsed() >= CONC_REPLAY_TOTAL_BUDGET {
+            eprintln!("saf verify: concurrency replay budget exhausted -> unknown");
+            break;
+        }
+        match run_conc_replay_plan(&harness, &sentinel, plan, CONC_REPLAY_RUN_TIMEOUT) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                eprintln!(
+                    "saf verify: concurrency replay ({}) errored: {e:#} -> continue",
+                    plan.label()
+                );
+                continue;
+            }
+        }
+        // R6: require the identical deterministic reproduction on a second run.
+        if !matches!(
+            run_conc_replay_plan(&harness, &sentinel, plan, CONC_REPLAY_RUN_TIMEOUT),
+            Ok(true)
+        ) {
+            eprintln!(
+                "saf verify: concurrency replay plan {} did not re-confirm deterministically -> continue",
+                plan.label()
+            );
+            continue;
+        }
+        eprintln!(
+            "saf verify: FALSE (concurrency forced-interleaving plan '{}' reached reach_error)",
+            plan.label()
+        );
+        let programfile = ctx.input.file_name().map_or_else(
+            || ctx.input.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let programhash = saf_svcomp::compute_file_hash(ctx.input);
+        let architecture = match ctx.data_model {
+            saf_svcomp::DataModel::ILP32 => "32bit",
+            saf_svcomp::DataModel::LP64 => "64bit",
+        };
+        let thread_count =
+            saf_svcomp::fast_paths::reachable_spawn_call_sites(ctx.module, &callgraph);
+        // Reuse the concurrency GraphML violation-witness emitter; the schedule label
+        // records which forced interleaving reached the violation.
+        let graphml = saf_svcomp::conc_graphml_witness_labeled(
+            ctx.meta.specification.trim(),
+            &programfile,
+            &programhash,
+            architecture,
+            thread_count,
+            &plan.label(),
+        );
+        return Some(VerdictOutcome {
+            verdict: format!("false({})", Property::UnreachCall.name()),
+            witness: None,
+            graphml: Some(graphml),
+        });
+    }
+
+    eprintln!("saf verify: no forced-interleaving plan reached reach_error -> unknown");
     None
 }
 
