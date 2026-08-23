@@ -1254,13 +1254,24 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     // race-free/safe program can be driven to `reach_error` under an arbitrary native
     // schedule (the goblint `race_reach_*_racefree` tasks: `main` spawns 10^4 threads and
     // the assert lives in the thread body). Stage 1 (`must_reach`, sequential
-    // unconditional) is already sound above; the replay-confirmed stages below are not.
-    // Abstain when a thread spawn is reachable from `main`, matching the R5/R6 ASan/UBSan
-    // confirmers' gate (plan 198). Sound over-approximation: never miss a spawn.
+    // unconditional) is already sound above; the sequential replay-confirmed stages
+    // below are not schedule-aware, so they must not run on a threaded program.
     let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
     if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        // Concurrency FALSE finder (lever `conc-seq-m1`): atomic-thread
+        // sequentialization. Instead of ONE arbitrary native schedule, replay the
+        // ORIGINAL program under a small set of explicit NON-PREEMPTIVE schedules
+        // (each thread runs to completion; interleave only at create/join/exit). Every
+        // such schedule is a legal SC interleaving, so a `reach_error` it hits is a
+        // genuine violation (the schedule is the sole arbiter — R1/R6/R7, GraphML
+        // witness). `conc_schedulable` fail-closes on every feature the single-OS-thread
+        // model cannot faithfully reproduce (nondet, TLS, condvars, OpenMP, …), so this
+        // never confirms on the `_racefree` class. Any miss ⇒ abstain (below).
+        if let Some(outcome) = conc_confirm_false(ctx) {
+            return outcome;
+        }
         eprintln!(
-            "saf verify: a thread spawn is reachable from main (unreach replay is schedule-unsound) -> unknown"
+            "saf verify: a thread spawn is reachable from main (no atomic-thread schedule confirmed) -> unknown"
         );
         return unknown_outcome();
     }
@@ -1771,6 +1782,213 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
     }
 
     eprintln!("saf verify: blind fuzz exhausted (no confirmed reach_error) -> unknown");
+    None
+}
+
+/// Per-schedule wall-clock cap for the concurrency atomic-thread replay. Short: the
+/// sv-benchmarks concurrency tasks are µs-scale under a non-preemptive schedule; the
+/// only slow case is a busy-wait spin that never terminates (gated out where we can,
+/// bounded here otherwise) — a timeout just means "this schedule did not reach the
+/// error" → try the next / abstain.
+const CONC_SCHED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Run the atomic-thread sequentialization harness once under one `SAF_SCHED` order.
+/// Returns `Ok(true)` iff the sentinel was dropped (the property's violation event
+/// fired). Timeout / normal exit / crash all return `Ok(false)` — the sentinel is the
+/// sole confirmer. A runaway (spinning) harness is killed with its whole group.
+fn run_conc_schedule(
+    harness: &Path,
+    sentinel: &Path,
+    schedule: saf_svcomp::ConcSchedule,
+    timeout: std::time::Duration,
+) -> anyhow::Result<bool> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+
+    let _ = std::fs::remove_file(sentinel);
+    let mut cmd = Command::new(harness);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("SAF_SCHED", schedule.env_value());
+    let mut child = harden_replay_spawn(&mut cmd)
+        .spawn()
+        .with_context(|| "spawning concurrency harness")?;
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    kill_replay_group(&mut child);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) => return Err(e).context("waiting on concurrency harness"),
+        }
+    }
+    Ok(sentinel.exists())
+}
+
+/// Concurrency `unreach-call` FALSE confirmer (lever `conc-seq-m1`).
+///
+/// Compiles the ORIGINAL program with the atomic-thread sequentialization driver
+/// ([`saf_svcomp::synthesize_conc_driver`]) ONCE, then replays it under each
+/// non-preemptive schedule ([`saf_svcomp::CONC_SCHEDULES`]). The FIRST schedule that
+/// drops the sentinel (the property's `reach_error` / `__assert_fail` event, R1) is
+/// RE-RUN to require the identical deterministic reproduction (R6) before emitting
+/// `false(unreach-call)` + a GraphML-1.0 violation witness (R7). Returns `None`
+/// (abstain) on any gate miss / compile failure / no reproduction — the schedule is
+/// the sole arbiter, so a spurious model can only ever yield `unknown`.
+///
+/// Sound: every replayed schedule is a legal sequentially-consistent interleaving of
+/// the real program executed natively, so a sentinel drop is a genuine reachable
+/// assertion violation. [`saf_svcomp::conc_schedulable`] fail-closes on every feature
+/// the non-preemptive single-OS-thread model cannot faithfully reproduce.
+// NOTE: compile-once / replay-each-schedule / re-confirm is one cohesive fail-closed
+// unit; splitting it would obscure the control flow.
+#[allow(clippy::too_many_lines)]
+fn conc_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    use saf_svcomp::Property;
+    use std::process::{Command, Stdio};
+
+    // Gate 0: there must be a reach_error site to reach.
+    if saf_svcomp::reach_error_call_sites(ctx.module).is_empty() {
+        return None;
+    }
+
+    // Gate 1: the program must be amenable to atomic-thread sequentialization
+    // (reachable spawn + only faithfully-modelled primitives, no forced nondet).
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if !saf_svcomp::conc_schedulable(ctx.module, &callgraph) {
+        return None;
+    }
+
+    // Gate 2 (R7): abstain on OpenMP / relaxed-memory the native SC replay cannot
+    // soundly arbitrate. The symbol-level gate above misses `#pragma omp` (the
+    // frontend drops it, so no `omp_*` symbol survives) — catch it at the source.
+    let source = std::fs::read_to_string(ctx.input).unwrap_or_default();
+    if let Some(reason) = tsan_out_of_scope(&source) {
+        eprintln!("saf verify: concurrency FALSE out of scope ({reason}) -> unknown");
+        return None;
+    }
+
+    let dir = ctx.tempdir;
+    let sentinel = dir.join("saf_conc.sentinel");
+    let driver_src = dir.join("saf_conc_driver.c");
+    let harness = dir.join("saf_conc_harness");
+
+    if std::fs::write(
+        &driver_src,
+        saf_svcomp::synthesize_conc_driver(&escape_c_string(&sentinel)),
+    )
+    .is_err()
+    {
+        return None;
+    }
+
+    // Compile the driver + original program ONCE, linking the pthread wrappers. As in
+    // the fuzz path: a two-pass __VERIFIER_assert neutralizer handles programs that
+    // DEFINE their own `void __VERIFIER_assert(int)` (else the stub's function-like
+    // macro breaks the build); -fsanitize-trap=signed-integer-overflow makes a path
+    // that reaches reach_error only via signed-overflow UB TRAP before the sentinel
+    // drops (R1 — the benchmarks are not UB-free), so it never confirms off the wrong
+    // event. `-lpthread` + the three wraps redirect create/join/exit into the driver.
+    let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
+    let build = |neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(ctx.clang);
+        cmd.args([
+            "-O0",
+            "-Wno-everything",
+            "-fsanitize=signed-integer-overflow",
+            "-fsanitize-trap=signed-integer-overflow",
+        ]);
+        cmd.arg(ctx.data_model.clang_flag())
+            .arg("-include")
+            .arg(ctx.stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include").arg(n);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(ctx.input)
+            .arg(&driver_src)
+            .arg("-Wl,--wrap=pthread_create,--wrap=pthread_join,--wrap=pthread_exit")
+            .arg("-lpthread")
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    let neutralizer = write_assert_neutralizer(dir).ok();
+    let compiled = matches!(build(None).status(), Ok(s) if s.success())
+        || neutralizer
+            .as_ref()
+            .is_some_and(|n| matches!(build(Some(n.as_path())).status(), Ok(s) if s.success()));
+    if !compiled {
+        eprintln!("saf verify: concurrency harness failed to compile -> unknown");
+        return None;
+    }
+
+    // Replay under each non-preemptive schedule; the first sentinel drop wins, then
+    // re-confirm (R6) before emitting.
+    for &schedule in saf_svcomp::CONC_SCHEDULES {
+        match run_conc_schedule(&harness, &sentinel, schedule, CONC_SCHED_TIMEOUT) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                eprintln!(
+                    "saf verify: concurrency replay ({}) errored: {e:#} -> continue",
+                    schedule.label()
+                );
+                continue;
+            }
+        }
+        // R6: require the identical deterministic reproduction on a second run.
+        if !matches!(
+            run_conc_schedule(&harness, &sentinel, schedule, CONC_SCHED_TIMEOUT),
+            Ok(true)
+        ) {
+            eprintln!(
+                "saf verify: concurrency schedule {} did not re-confirm deterministically -> continue",
+                schedule.label()
+            );
+            continue;
+        }
+        eprintln!(
+            "saf verify: FALSE (concurrency atomic-thread schedule '{}' reached reach_error)",
+            schedule.label()
+        );
+        let programfile = ctx.input.file_name().map_or_else(
+            || ctx.input.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let programhash = saf_svcomp::compute_file_hash(ctx.input);
+        let architecture = match ctx.data_model {
+            saf_svcomp::DataModel::ILP32 => "32bit",
+            saf_svcomp::DataModel::LP64 => "64bit",
+        };
+        let thread_count =
+            saf_svcomp::fast_paths::reachable_spawn_call_sites(ctx.module, &callgraph);
+        let graphml = saf_svcomp::conc_graphml_witness(
+            ctx.meta.specification.trim(),
+            &programfile,
+            &programhash,
+            architecture,
+            thread_count,
+            schedule,
+        );
+        return Some(VerdictOutcome {
+            verdict: format!("false({})", Property::UnreachCall.name()),
+            witness: None,
+            graphml: Some(graphml),
+        });
+    }
+
+    eprintln!("saf verify: no atomic-thread schedule reached reach_error -> unknown");
     None
 }
 

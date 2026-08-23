@@ -645,6 +645,40 @@ pub fn reachable_spawns_threads(module: &AirModule, callgraph: &CallGraph) -> bo
     false
 }
 
+/// Count reachable-from-`main` direct call sites to a thread-spawn primitive
+/// ([`SPAWN_FUNCTIONS`]), saturating at `cap`.
+///
+/// A static over-count of the threads a run may create (a `pthread_create` inside a
+/// loop is one call site but many runtime threads); used only to size a violation
+/// witness's `createThread` edges, so a saturating count is fine. Returns at least 1
+/// when a spawn is reachable.
+#[must_use]
+pub fn reachable_spawn_call_sites(module: &AirModule, callgraph: &CallGraph) -> usize {
+    const CAP: usize = 64;
+    let reachable = reachable_functions(callgraph, module);
+    let mut count = 0usize;
+    for func in &module.functions {
+        if func.is_declaration || !reachable.contains(&func.id) {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Operation::CallDirect { callee } = &inst.op {
+                    if let Some(target) = module.function(*callee) {
+                        if SPAWN_FUNCTIONS.contains(&target.name.as_str()) {
+                            count += 1;
+                            if count >= CAP {
+                                return CAP;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    count.max(1)
+}
+
 /// Check if all reachable functions are loop-free.
 ///
 /// Same as [`program_is_loop_free`] but only checks CFGs whose `FunctionId`
