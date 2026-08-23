@@ -81,11 +81,22 @@ use crate::fast_paths::cfg_has_loops;
 /// Bounds work on pathological IR; exceeding it ⇒ treat the value as opaque.
 const AFFINE_DEPTH_LIMIT: u32 = 64;
 
-/// Cap on the number of enumerated header→latch paths of one loop body. A body
-/// with more control-flow paths than this is not modelled path-sensitively
-/// (⇒ abstain / fall back to the single-transition havoc model) — this bounds the
-/// per-loop Z3 work and keeps the pass well within the SV-COMP time budget.
+/// Cap on the number of **feasible** header→latch paths modelled per loop body
+/// (equivalently: recursion entry→call paths). Bounds the per-loop Z3 work and
+/// keeps the pass within the SV-COMP time budget; a body with more *feasible*
+/// paths than this is not modelled path-sensitively (⇒ abstain / fall back to the
+/// single-transition havoc model).
 const MAX_PATHS: usize = 8;
+
+/// Cap on the number of **structurally enumerated** header→latch paths, before
+/// infeasible ones (short-circuit `&&`/`||` exit shortcuts — see
+/// [`path_guard_is_unsat`]) are pruned. A multi-conjunct short-circuit guard fans a
+/// single real path into a product of infeasible sibling paths, so this ceiling is
+/// higher than [`MAX_PATHS`]: it lets those phantom paths be enumerated *and then
+/// discarded* rather than tripping the abstain before the feasible paths are even
+/// seen. Still bounded (a body with more than this many *structural* paths abstains
+/// outright) so enumeration itself stays cheap.
+const MAX_ENUM_PATHS: usize = 64;
 
 /// Cap on the lexicographic ranking depth (number of greedy rounds). Real
 /// programs almost never need a deeper lexicographic tuple; exceeding it abstains.
@@ -1764,6 +1775,12 @@ fn build_recursion_model(
                     );
                 }
             }
+            // Drop an infeasible entry→call path (a short-circuit `&&`/`||` guard's
+            // exit shortcut): it models no reachable recursive step, and skipping it
+            // keeps the feasible-path count small.
+            if path_guard_is_unsat(&guards) {
+                continue;
+            }
             // Transition: parameter i ↦ affine form of argument i on this path.
             let mut raw_next: BTreeMap<ValueId, Option<Affine>> = BTreeMap::new();
             for p in &ordered {
@@ -1783,6 +1800,9 @@ fn build_recursion_model(
                 splits,
                 raw_next,
             });
+            if raws.len() > MAX_PATHS {
+                return None; // too many *feasible* entry→call paths ⇒ abstain.
+            }
         }
     }
     if raws.is_empty() {
@@ -2092,6 +2112,11 @@ fn build_mutual_recursion_model(
                         );
                     }
                 }
+                // Drop an infeasible entry→call path (a short-circuit `&&`/`||`
+                // guard's exit shortcut) before it contributes a vacuous branch.
+                if path_guard_is_unsat(&guards_local) {
+                    continue;
+                }
                 // Transition: shared symbol at position `p` ↦ affine of the call's
                 // argument operand `p` (the callee's param `p`), remapped.
                 let mut raw_next: BTreeMap<ValueId, Option<Affine>> = BTreeMap::new();
@@ -2137,6 +2162,9 @@ fn build_mutual_recursion_model(
                     splits,
                     raw_next,
                 });
+                if raws.len() > MAX_PATHS {
+                    return None; // too many *feasible* entry→call paths ⇒ abstain.
+                }
             }
         }
     }
@@ -2315,6 +2343,13 @@ fn build_multipath_model_multi(
                 module,
                 &path_pred,
             );
+
+            // Drop a path whose guard is unconditionally false (a short-circuit
+            // `&&`/`||` exit shortcut). It models no reachable transition, and
+            // skipping it here keeps the feasible-path count under `MAX_PATHS`.
+            if path_guard_is_unsat(&guards) {
+                continue;
+            }
 
             let mut raw_next: BTreeMap<ValueId, Option<Affine>> = BTreeMap::new();
             for &phi in &header_phis {
@@ -2553,7 +2588,9 @@ fn path_pred_map(path: &[BlockId]) -> BTreeMap<BlockId, BlockId> {
 /// excluding the `latch → header` back-edge (a continuing transition ends *at* the
 /// latch, about to take the back-edge). The body minus that back-edge is acyclic
 /// (the caller rejected nested loops), so simple-path enumeration is complete.
-/// Returns `None` if the path count would exceed [`MAX_PATHS`] (⇒ abstain).
+/// Returns `None` if the *structural* path count would exceed [`MAX_ENUM_PATHS`]
+/// (⇒ abstain). The caller then prunes infeasible paths ([`path_guard_is_unsat`])
+/// and enforces the tighter [`MAX_PATHS`] cap on the surviving feasible paths.
 fn enumerate_body_paths(
     cfg: &Cfg,
     body: &BTreeSet<BlockId>,
@@ -2575,8 +2612,9 @@ fn enumerate_body_paths(
     }
 }
 
-/// DFS helper for [`enumerate_body_paths`]; returns `false` once the [`MAX_PATHS`]
-/// cap is exceeded (deterministic: successors iterate in sorted `BTreeSet` order).
+/// DFS helper for [`enumerate_body_paths`]; returns `false` once the
+/// [`MAX_ENUM_PATHS`] cap is exceeded (deterministic: successors iterate in sorted
+/// `BTreeSet` order).
 fn dfs_body_paths(
     node: BlockId,
     cfg: &Cfg,
@@ -2588,7 +2626,7 @@ fn dfs_body_paths(
 ) -> bool {
     if node == latch {
         out.push(path.clone());
-        return out.len() <= MAX_PATHS;
+        return out.len() <= MAX_ENUM_PATHS;
     }
     if let Some(succs) = cfg.successors.get(&node) {
         for &s in succs {
@@ -2606,6 +2644,31 @@ fn dfs_body_paths(
         }
     }
     true
+}
+
+/// Does `guards` contain an **unconditional contradiction** — a constraint
+/// `Σ aᵢ·zᵢ + b ≥ 0` with *no* non-zero variable term and a negative constant
+/// (`b < 0`), i.e. `b ≥ 0` is false for every state? Such a guard proves the whole
+/// path is **infeasible**: no reachable state takes it.
+///
+/// [`resolve_bool_guard`] emits exactly this marker (`{}, −1`) when a *constant*
+/// boolean condition contradicts the polarity the path takes — the archetype being
+/// the **exit shortcut of a short-circuit `&&`/`||`**: `while (a && b && c)` lowers
+/// to a chain of blocks whose early-exit edges re-enter the merge with the `i1` phi
+/// pinned to `false`, so every path that leaves via a shortcut carries this
+/// contradiction.
+///
+/// Skipping such a path is sound (it models no real transition, so dropping it
+/// cannot hide a real non-terminating transition — it only removes a vacuously
+/// rankable branch). Its purpose is budget: these phantom shortcut paths otherwise
+/// multiply the feasible-path count past [`MAX_PATHS`], making an otherwise
+/// path-enumerable loop/recursion abstain. Pruning them up front lets a loop
+/// guarded by a multi-conjunct `&& … != …` (whose real body still has few paths)
+/// fit under the cap so its feasible `!=`-split paths are modelled.
+fn path_guard_is_unsat(guards: &[Constraint]) -> bool {
+    guards
+        .iter()
+        .any(|c| c.constant < 0 && c.coeffs.values().all(|&v| v == 0))
 }
 
 /// Add the necessary stay-condition imposed by taking the `block → next_block`
@@ -5022,6 +5085,324 @@ mod tests {
         // Same short-circuit shape, but the `else` branch does `y = y + 1` while
         // havocing `x` — no ranking tuple exists ⇒ abstain (never a wrong `true`).
         assert!(!ranked(&cook_see_zuleger(false)));
+    }
+
+    #[test]
+    fn path_guard_is_unsat_detects_contradiction_only() {
+        let x = vid("pgu_x");
+        // `−1 ≥ 0` (the short-circuit marker) ⇒ unsatisfiable.
+        assert!(path_guard_is_unsat(&[Constraint {
+            coeffs: BTreeMap::new(),
+            constant: -1,
+        }]));
+        // All-zero coefficients + negative constant ⇒ still unconditionally false.
+        assert!(path_guard_is_unsat(&[Constraint {
+            coeffs: BTreeMap::from([(x, 0)]),
+            constant: -3,
+        }]));
+        // A real half-space (`x ≥ 1`) is satisfiable ⇒ not pruned.
+        assert!(!path_guard_is_unsat(&[Constraint {
+            coeffs: BTreeMap::from([(x, 1)]),
+            constant: -1,
+        }]));
+        // `0 ≥ 0` (empty, non-negative constant) is trivially TRUE ⇒ not pruned.
+        assert!(!path_guard_is_unsat(&[Constraint {
+            coeffs: BTreeMap::new(),
+            constant: 0,
+        }]));
+    }
+
+    /// Build the LeikeHeizmann-TACAS2014-Ex9 loop
+    /// `while (x > 0 && y > 0 && x != y) { if (x < y) x--; else if (y < x) y--; }`.
+    /// Its **three**-conjunct short-circuit `&&` guard lowers to a merge block whose
+    /// `i1` phi is `false` on the two early-exit shortcuts, so the header→latch path
+    /// set is 3 (entry sub-paths) × 3 (body branches) = **9 structural paths** — over
+    /// [`MAX_PATHS`]. Six carry the short-circuit `false` marker (infeasible) and one
+    /// is the `x == y` stutter (excluded by the `!=` split); only two are feasible
+    /// (`x--` under `x < y`, `y--` under `y < x`), jointly ranked by `f = x + y`.
+    ///
+    /// When `terminating` is false the `x < y` branch does `y = y + 1` instead — a
+    /// genuinely non-terminating loop (`y` diverges while `x != y` stays true), the
+    /// negative control that the infeasible-path pruning did not drop a *real* path.
+    #[allow(clippy::too_many_lines)]
+    fn leike_two_var(terminating: bool) -> AirModule {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let zero = vid("l_zero");
+        let one = vid("l_one");
+        let false_c = vid("l_false");
+        constants.insert(zero, Constant::Int { value: 0, bits: 32 });
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+        constants.insert(false_c, Constant::Int { value: 0, bits: 1 });
+
+        let entry = bid("l_entry");
+        let h = bid("l_h");
+        let h2 = bid("l_h2");
+        let h3 = bid("l_h3");
+        let g = bid("l_g");
+        let body = bid("l_body");
+        let pmid = bid("l_pmid");
+        let pa = bid("l_pa");
+        let pb = bid("l_pb");
+        let pnone = bid("l_pnone");
+        let latch = bid("l_latch");
+        let exit = bid("l_exit");
+
+        let (x, y, x0, y0, xn, yn) = (
+            vid("l_x"),
+            vid("l_y"),
+            vid("l_x0"),
+            vid("l_y0"),
+            vid("l_xn"),
+            vid("l_yn"),
+        );
+        let (cx, cy, cn, gp, cxy, cyx) = (
+            vid("l_cx"),
+            vid("l_cy"),
+            vid("l_cn"),
+            vid("l_gp"),
+            vid("l_cxy"),
+            vid("l_cyx"),
+        );
+        // pa's update: terminating ⇒ x-1 (y held); else ⇒ y+1 (x held).
+        let pa_upd = vid("l_pa_upd");
+        let pb_dec = vid("l_pb_dec");
+
+        // entry: x0 = nondet; y0 = nondet; br h
+        let mut eb = AirBlock::new(entry);
+        eb.instructions
+            .push(ndcall("l_ndx", "__VERIFIER_nondet_int", x0, i32t));
+        eb.instructions
+            .push(ndcall("l_ndy", "__VERIFIER_nondet_int", y0, i32t));
+        eb.instructions
+            .push(term("l_bre", Operation::Br { target: h }, vec![]));
+
+        // h: phi x, phi y; cx = x > 0; condbr cx -> h2 else g
+        let mut hb = AirBlock::new(h);
+        hb.instructions.push(vinst(
+            "l_phix",
+            Operation::Phi {
+                incoming: vec![(entry, x0), (latch, xn)],
+            },
+            x,
+            vec![],
+            i32t,
+        ));
+        hb.instructions.push(vinst(
+            "l_phiy",
+            Operation::Phi {
+                incoming: vec![(entry, y0), (latch, yn)],
+            },
+            y,
+            vec![],
+            i32t,
+        ));
+        hb.instructions.push(vinst(
+            "l_cmpx",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            cx,
+            vec![x, zero],
+            i1t,
+        ));
+        hb.instructions.push(term(
+            "l_cbh",
+            Operation::CondBr {
+                then_target: h2,
+                else_target: g,
+            },
+            vec![cx],
+        ));
+
+        // h2: cy = y > 0; condbr cy -> h3 else g
+        let mut h2b = AirBlock::new(h2);
+        h2b.instructions.push(vinst(
+            "l_cmpy",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            cy,
+            vec![y, zero],
+            i1t,
+        ));
+        h2b.instructions.push(term(
+            "l_cbh2",
+            Operation::CondBr {
+                then_target: h3,
+                else_target: g,
+            },
+            vec![cy],
+        ));
+
+        // h3: cn = x != y; br g
+        let mut h3b = AirBlock::new(h3);
+        h3b.instructions.push(vinst(
+            "l_cmpn",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpNe,
+            },
+            cn,
+            vec![x, y],
+            i1t,
+        ));
+        h3b.instructions
+            .push(term("l_brh3", Operation::Br { target: g }, vec![]));
+
+        // g: gp = phi [false,h],[false,h2],[cn,h3]; condbr gp -> body else exit
+        let mut gb = AirBlock::new(g);
+        gb.instructions.push(vinst(
+            "l_phig",
+            Operation::Phi {
+                incoming: vec![(h, false_c), (h2, false_c), (h3, cn)],
+            },
+            gp,
+            vec![],
+            i1t,
+        ));
+        gb.instructions.push(term(
+            "l_cbg",
+            Operation::CondBr {
+                then_target: body,
+                else_target: exit,
+            },
+            vec![gp],
+        ));
+
+        // body: cxy = x < y; condbr cxy -> pa else pmid
+        let mut bb = AirBlock::new(body);
+        bb.instructions.push(vinst(
+            "l_cxy",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt,
+            },
+            cxy,
+            vec![x, y],
+            i1t,
+        ));
+        bb.instructions.push(term(
+            "l_cbb",
+            Operation::CondBr {
+                then_target: pa,
+                else_target: pmid,
+            },
+            vec![cxy],
+        ));
+
+        // pmid: cyx = y < x; condbr cyx -> pb else pnone
+        let mut pmb = AirBlock::new(pmid);
+        pmb.instructions.push(vinst(
+            "l_cyx",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt,
+            },
+            cyx,
+            vec![y, x],
+            i1t,
+        ));
+        pmb.instructions.push(term(
+            "l_cbm",
+            Operation::CondBr {
+                then_target: pb,
+                else_target: pnone,
+            },
+            vec![cyx],
+        ));
+
+        // pa: terminating ⇒ x-1; else ⇒ y+1. br latch
+        let mut pab = AirBlock::new(pa);
+        pab.instructions.push(vinst(
+            "l_paupd",
+            Operation::BinaryOp {
+                kind: if terminating {
+                    BinaryOp::Sub
+                } else {
+                    BinaryOp::Add
+                },
+            },
+            pa_upd,
+            if terminating {
+                vec![x, one]
+            } else {
+                vec![y, one]
+            },
+            i32t,
+        ));
+        pab.instructions
+            .push(term("l_brpa", Operation::Br { target: latch }, vec![]));
+
+        // pb: y - 1; br latch
+        let mut pbb = AirBlock::new(pb);
+        pbb.instructions.push(vinst(
+            "l_pbdec",
+            Operation::BinaryOp {
+                kind: BinaryOp::Sub,
+            },
+            pb_dec,
+            vec![y, one],
+            i32t,
+        ));
+        pbb.instructions
+            .push(term("l_brpb", Operation::Br { target: latch }, vec![]));
+
+        // pnone: (x == y stutter, infeasible under x != y) br latch
+        let mut pnb = AirBlock::new(pnone);
+        pnb.instructions
+            .push(term("l_brpn", Operation::Br { target: latch }, vec![]));
+
+        // latch: xn = phi; yn = phi; br h
+        let (pa_x, pa_y) = if terminating {
+            (pa_upd, y)
+        } else {
+            (x, pa_upd)
+        };
+        let mut latb = AirBlock::new(latch);
+        latb.instructions.push(vinst(
+            "l_phixn",
+            Operation::Phi {
+                incoming: vec![(pa, pa_x), (pb, x), (pnone, x)],
+            },
+            xn,
+            vec![],
+            i32t,
+        ));
+        latb.instructions.push(vinst(
+            "l_phiyn",
+            Operation::Phi {
+                incoming: vec![(pa, pa_y), (pb, pb_dec), (pnone, y)],
+            },
+            yn,
+            vec![],
+            i32t,
+        ));
+        latb.instructions
+            .push(term("l_brlat", Operation::Br { target: h }, vec![]));
+
+        let mut exb = AirBlock::new(exit);
+        exb.instructions.push(term("l_ret", Operation::Ret, vec![]));
+
+        let func = main_func(
+            vec![eb, hb, h2b, h3b, gb, bb, pmb, pab, pbb, pnb, latb, exb],
+            entry,
+        );
+        module_of(func, constants)
+    }
+
+    #[test]
+    fn leike_two_var_nine_paths_ranked_after_pruning() {
+        // 9 structural header→latch paths (> MAX_PATHS); the six short-circuit
+        // shortcuts are pruned as infeasible, leaving the two feasible `x--`/`y--`
+        // branches, jointly ranked by `f = x + y`. Without infeasible-path pruning
+        // the raw path count exceeds the cap and the loop abstains.
+        assert!(ranked(&leike_two_var(true)));
+    }
+
+    #[test]
+    fn leike_two_var_nonterminating_abstains() {
+        // The `x < y` branch now does `y = y + 1` (diverges) — no ranking function
+        // exists. Pruning must NOT have dropped this real feasible path ⇒ abstain.
+        assert!(!ranked(&leike_two_var(false)));
     }
 
     // --- recursion ranking --------------------------------------------------
