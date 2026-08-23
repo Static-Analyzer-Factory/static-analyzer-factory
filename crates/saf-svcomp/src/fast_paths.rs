@@ -585,6 +585,44 @@ pub fn reachable_has_heap_allocations(
     false
 }
 
+/// Does a reachable function perform a **dynamically-sized stack allocation**
+/// (a variable-length array or `alloca()` whose size is not a compile-time
+/// constant, i.e. `Operation::Alloca { size_bytes: None }`)?
+///
+/// This gates the `valid-memsafety` byte-stream ASan mini-fuzz (pass 3) OUT of such
+/// programs. Under SV-COMP's semantics the abstract stack is UNBOUNDED, so an
+/// `alloca(n)` / `T buf[n]` with an arbitrarily large `n` is a *safe* operation. But
+/// a coverage-guided fuzzer that drives the nondet size to a large value exhausts the
+/// concrete 8 MB native stack, which AddressSanitizer reports as a stack-exhaustion
+/// fault (`stack-overflow`, or a stack-region `SEGV` / `dynamic-stack-buffer-overflow`
+/// depending on where the guard page lands). That is an artifact of the bounded native
+/// stack, NOT a violation of the program under test — so emitting `false` on it would be
+/// a false alarm on a correct-TRUE task (`array-memsafety/{openbsd_cmemchr,subseq}-alloca-*`
+/// are exactly this shape). Fixed-size allocas (`int x[10]` ⇒ `size_bytes: Some(_)`)
+/// carry no such risk and are NOT flagged.
+///
+/// Fail-closed: a genuine violation in such a program is still eligible via the cheaper
+/// passes (uniform / uninitialized / threshold sweeps), which drive the same nondet
+/// sizes but never to a stack-exhausting magnitude; only the aggressive byte-stream
+/// search — the one that can wander into the exhaustion regime — is suppressed here.
+#[must_use]
+pub fn reachable_has_dynamic_alloca(module: &AirModule, callgraph: &CallGraph) -> bool {
+    let reachable = reachable_functions(callgraph, module);
+    for func in &module.functions {
+        if func.is_declaration || !reachable.contains(&func.id) {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if matches!(inst.op, Operation::Alloca { size_bytes: None }) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Thread-spawn primitive names — an actual thread *creation* (not mutex/atomic/
 /// join/`fork`). Any real POSIX/C11 thread spawn bottoms out in one of these, so
 /// call-graph reachability of one of these from `main` also captures spawns made
@@ -1761,6 +1799,55 @@ mod tests {
         let module = make_module(vec![foo, pthread_create]);
         let cg = CallGraph::build(&module);
         assert!(!reachable_spawns_threads(&module, &cg));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for reachable_has_dynamic_alloca (lever mem-fuzz-covguided)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dynamic_alloca_true_when_reachable_vla() {
+        // main performs a dynamically-sized stack allocation (VLA / alloca(n)):
+        // Alloca { size_bytes: None }. The fuzzer must NOT run on this (native
+        // stack-exhaustion false-alarm class).
+        let main = make_func_with_inst("main", Operation::Alloca { size_bytes: None }, vec![]);
+        let module = make_module(vec![main]);
+        let cg = CallGraph::build(&module);
+        assert!(reachable_has_dynamic_alloca(&module, &cg));
+    }
+
+    #[test]
+    fn dynamic_alloca_false_for_fixed_size_alloca() {
+        // A compile-time-constant-size alloca (`int x[10]`) cannot exhaust the stack
+        // under fuzzing (its size is not nondet-driven) -> not flagged.
+        let main = make_func_with_inst(
+            "main",
+            Operation::Alloca {
+                size_bytes: Some(40),
+            },
+            vec![],
+        );
+        let module = make_module(vec![main]);
+        let cg = CallGraph::build(&module);
+        assert!(!reachable_has_dynamic_alloca(&module, &cg));
+    }
+
+    #[test]
+    fn dynamic_alloca_ignores_unreachable_function() {
+        // A dynamic alloca in a function NOT reachable from main is irrelevant.
+        let dead = make_func_with_inst("dead", Operation::Alloca { size_bytes: None }, vec![]);
+        let main = make_defined_function("main");
+        let module = make_module(vec![main, dead]);
+        let cg = CallGraph::build(&module);
+        assert!(!reachable_has_dynamic_alloca(&module, &cg));
+    }
+
+    #[test]
+    fn dynamic_alloca_false_without_any_alloca() {
+        let main = make_defined_function("main");
+        let module = make_module(vec![main]);
+        let cg = CallGraph::build(&module);
+        assert!(!reachable_has_dynamic_alloca(&module, &cg));
     }
 
     // --- branch_steering_constants ---------------------------------------

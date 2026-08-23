@@ -3124,6 +3124,27 @@ fn asan_fuzz_pass(
         return Ok(None);
     }
 
+    // SOUNDNESS GATE (fail-closed): abstain when a dynamically-sized stack allocation
+    // (VLA / `alloca(n)` ⇒ `Alloca { size_bytes: None }`) is reachable from main. Under
+    // SV-COMP's UNBOUNDED-abstract-stack model such an allocation is safe for any size,
+    // but a coverage-guided byte-stream search that drives the nondet size large exhausts
+    // the concrete 8 MB native stack — AddressSanitizer then reports a stack-exhaustion
+    // fault (`stack-overflow` / stack-region `SEGV` / `dynamic-stack-buffer-overflow`)
+    // that is an artifact of the bounded native stack, NOT a violation of the program
+    // under test. Emitting `false` on it is a false alarm on a correct-TRUE task
+    // (`array-memsafety/{openbsd_cmemchr,subseq}-alloca-*` are exactly this shape). Only
+    // the aggressive fuzz pass can wander into the exhaustion regime, so it alone gates
+    // out; the cheaper passes (which never drive the size to a stack-exhausting magnitude)
+    // still handle a genuine violation in such a program. Fixed-size allocas are unaffected.
+    let callgraph = saf_analysis::callgraph::CallGraph::build(module);
+    if saf_svcomp::fast_paths::reachable_has_dynamic_alloca(module, &callgraph) {
+        eprintln!(
+            "saf verify: byte-stream ASan fuzz skipped — reachable dynamic alloca (native \
+             stack-exhaustion false-alarm class) -> unknown"
+        );
+        return Ok(None);
+    }
+
     let driver_src = dir.join("saf_asan_fuzz_driver.c");
     let harness = dir.join("saf_asan_fuzz_harness");
     let errpath = dir.join("saf_asan_fuzz_stderr.txt");
