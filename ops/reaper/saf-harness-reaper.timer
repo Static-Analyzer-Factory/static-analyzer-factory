@@ -1,0 +1,8 @@
+[Unit]
+Description=Run the SAF harness reaper every 2 minutes
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=120
+AccuracySec=15
+[Install]
+WantedBy=timers.target

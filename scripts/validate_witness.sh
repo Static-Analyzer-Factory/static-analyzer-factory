@@ -76,7 +76,7 @@ fi
 spec_arg=()
 [ -n "$PROPERTY" ] && spec_arg=(--spec "$PROPERTY")
 out_dir="$(mktemp -d)"
-out="$("$CPA_HOME/bin/cpachecker" \
+out="$(timeout -k 15 130 "$CPA_HOME/bin/cpachecker" \
         --config "$CPA_HOME/config/violation-witness-validation.properties" \
         --witness "$WITNESS" \
         "${spec_arg[@]}" \
@@ -111,7 +111,7 @@ case "$DATA_MODEL" in
     *) w2t_bit=--64 ;;
 esac
 out_dir2="$(mktemp -d)"
-out2="$(timeout 120 "$W2T" "$w2t_bit" --spec "$PROPERTY" \
+out2="$(timeout -k 15 120 "$W2T" "$w2t_bit" --spec "$PROPERTY" \
         --witness "$WITNESS" \
         --output-path "$out_dir2" \
         "$PROGRAM" 2>&1)" || true

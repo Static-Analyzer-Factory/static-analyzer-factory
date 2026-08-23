@@ -1,0 +1,5 @@
+[Unit]
+Description=Reap leaked SAF sanitizer harnesses (load-runaway guard)
+[Service]
+Type=oneshot
+ExecStart=%h/bin/saf-harness-reaper.sh
