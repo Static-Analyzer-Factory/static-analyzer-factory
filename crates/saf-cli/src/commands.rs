@@ -3573,19 +3573,118 @@ fn try_no_data_race_false(ctx: &VerifyCtx, source: &str) -> Option<VerdictOutcom
 ///
 /// - everything [`tsan_out_of_scope`] rejects (`OpenMP` pragmas, whose parallel
 ///   regions the frontend drops; relaxed-memory atomics), and
-/// - inline assembly, whose memory effects the frontend may drop entirely.
+/// - **effectful** inline assembly, whose memory effects the frontend drops
+///   entirely (the mapping layer lowers an inline-asm call to nothing, so a
+///   store/load performed by asm is invisible to the access scan).
+///
+/// A bare asm **symbol-rename label** (`extern int f(...) __asm__("f64");`) is NOT
+/// effectful — it only renames the link symbol and emits no instruction — so it
+/// must not gate. Preprocessed SV-COMP `.i` files pull in glibc headers riddled
+/// with such labels (`__sigsetjmp`, `fopen64`, …); the previous blunt substring
+/// gate abstained on almost every threaded `.i` file for a label it never needed to
+/// fear. [`contains_effectful_inline_asm`] distinguishes the two precisely.
 fn race_true_out_of_scope(source: &str) -> Option<&'static str> {
     if let Some(reason) = tsan_out_of_scope(source) {
         return Some(reason);
     }
-    if source.contains("__asm__")
-        || source.contains("__asm ")
-        || source.contains("asm volatile")
-        || source.contains("asm goto")
-    {
+    if contains_effectful_inline_asm(source) {
         return Some("inline asm");
     }
     None
+}
+
+/// Does `source` contain an inline-asm **statement** that could read/write memory
+/// or otherwise perturb concurrency — as opposed to a pure asm **symbol-rename
+/// label** (`__asm__("name")`, only string literals in the parens)?
+///
+/// Sound-conservative: returns `true` (⇒ abstain) on ANY asm usage that is not a
+/// provably-inert label. An asm occurrence is a label iff it is `asm`/`__asm__`/
+/// `__asm` immediately followed (after whitespace) by `(` whose content, up to the
+/// matching close paren, is **only** string literals — each a valid assembler
+/// **symbol name** (`[A-Za-z0-9_.$@]`, or empty) — and whitespace.
+///
+/// A symbol-rename label (`__asm__("" "__sigsetjmp")`) has exactly this form and
+/// emits no instruction, so it is inert. It is syntactically indistinguishable from
+/// basic asm *except* by string content: a real asm template needs operands or a
+/// multi-token instruction, which require spaces / `;` / `%` / `,` — none of which
+/// are legal in a symbol name. So any string carrying such a character (⇒ a genuine
+/// instruction template), a `volatile`/`goto` qualifier before the paren, an
+/// extended-asm `:` operand section, or a missing/short paren is treated as
+/// effectful. (A degenerate single-mnemonic basic asm like `asm("nop")` classifies
+/// as a label — sound for the data-race model: with no operand it cannot name any
+/// memory.)
+fn contains_effectful_inline_asm(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // Characters legal in an assembler symbol name (the only content a rename label
+    // may carry). Anything else inside the string ⇒ an instruction template.
+    let is_symbol_char =
+        |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'@');
+    let mut i = 0;
+    while i < bytes.len() {
+        // Match the longest asm keyword at `i`, on a word boundary.
+        let kw_len = if bytes[i..].starts_with(b"__asm__") {
+            7
+        } else if bytes[i..].starts_with(b"__asm") {
+            5
+        } else if bytes[i..].starts_with(b"asm") {
+            3
+        } else {
+            i += 1;
+            continue;
+        };
+        let boundary_before = i == 0 || !is_ident(bytes[i - 1]);
+        let after = i + kw_len;
+        let boundary_after = after >= bytes.len() || !is_ident(bytes[after]);
+        if !(boundary_before && boundary_after) {
+            i += 1;
+            continue;
+        }
+        // Skip whitespace after the keyword.
+        let mut j = after;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        // A qualifier (`volatile`/`goto`) or anything other than an opening paren
+        // means this is not a pure `asm("label")` — treat as effectful.
+        if j >= bytes.len() || bytes[j] != b'(' {
+            return true;
+        }
+        // Scan the parenthesised group: a label has ONLY string literals + ws.
+        j += 1; // consume '('
+        loop {
+            if j >= bytes.len() {
+                return true; // unterminated — fail closed
+            }
+            let c = bytes[j];
+            if c.is_ascii_whitespace() {
+                j += 1;
+            } else if c == b'"' {
+                // Scan a string literal, honouring `\"` escapes. A non-symbol char
+                // inside ⇒ a real instruction template ⇒ effectful.
+                j += 1;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    if bytes[j] == b'\\' {
+                        return true; // escape ⇒ instruction template, not a symbol
+                    }
+                    if !is_symbol_char(bytes[j]) {
+                        return true;
+                    }
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    return true; // unterminated string — fail closed
+                }
+                j += 1; // consume closing quote
+            } else if c == b')' {
+                break; // only strings + ws seen ⇒ inert label
+            } else {
+                return true; // any other token ⇒ effectful asm
+            }
+        }
+        i = j + 1;
+    }
+    false
 }
 
 /// R7 scope gate for `no-data-race`: returns `Some(reason)` when the program
@@ -5305,6 +5404,52 @@ void worker(void) { __VERIFIER_atomic_inc(&g); __VERIFIER_atomic_acquire(); }
             race_true_out_of_scope("asm volatile(\"nop\")"),
             Some("inline asm")
         );
+        // An asm symbol-rename LABEL is inert (link alias only) — must NOT gate.
+        assert_eq!(
+            race_true_out_of_scope(
+                "extern int f(int) __asm__(\"\" \"__sigsetjmp\") __attribute__((__nothrow__));"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn effectful_inline_asm_distinguishes_labels_from_statements() {
+        // Symbol-rename labels (only string literals in parens) are inert.
+        assert!(!contains_effectful_inline_asm(
+            "void g(void) __asm__(\"g64\");"
+        ));
+        assert!(!contains_effectful_inline_asm(
+            "extern int __sigsetjmp_cancel(void*) __asm__ (\"\" \"__sigsetjmp\");"
+        ));
+        assert!(!contains_effectful_inline_asm("int main(){return 0;}"));
+        // `asm` appearing as a substring of an identifier must not match.
+        assert!(!contains_effectful_inline_asm(
+            "int wasm; struct { int basmati; } s;"
+        ));
+        // Real inline-asm statements (volatile / goto / extended `:` operands / a
+        // bare mnemonic) are effectful ⇒ gate.
+        assert!(contains_effectful_inline_asm(
+            "asm volatile(\"mfence\" ::: \"memory\");"
+        ));
+        assert!(contains_effectful_inline_asm(
+            "__asm__ __volatile__(\"pause\");"
+        ));
+        assert!(contains_effectful_inline_asm(
+            "__asm__ (\"addl %1,%0\" : \"=r\"(out) : \"r\"(in));"
+        ));
+        assert!(contains_effectful_inline_asm(
+            "asm goto(\"jmp %l0\" ::::lbl);"
+        ));
+        // A multi-token / operand-bearing template carries non-symbol chars
+        // (space, `;`, `%`) ⇒ effectful, even without a colon section.
+        assert!(contains_effectful_inline_asm("asm(\"rep; nop\"); int x;"));
+        assert!(contains_effectful_inline_asm(
+            "__asm__(\"movl $0, (%eax)\");"
+        ));
+        // A degenerate single-mnemonic basic asm has no operand ⇒ names no memory ⇒
+        // classified as an inert label (sound for the data-race model).
+        assert!(!contains_effectful_inline_asm("__asm(\"nop\");"));
     }
 
     #[test]

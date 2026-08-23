@@ -234,15 +234,29 @@ struct Access {
 /// structural condition above? Sound and incomplete — `false` here ⇒ the strategy
 /// emits `unknown`, never a verdict.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn program_is_race_free(module: &AirModule) -> bool {
+    match race_free_classify(module) {
+        Ok(()) => true,
+        Err(reason) => {
+            if std::env::var_os("SAF_RACE_TRUE_DEBUG").is_some() {
+                eprintln!("race_true: abstain: {reason}");
+            }
+            false
+        }
+    }
+}
+
+/// Core of [`program_is_race_free`]: `Ok(())` = provably race-free, `Err(reason)` =
+/// abstain (the reason string is for diagnostics only, never affects the verdict).
+#[allow(clippy::too_many_lines)]
+fn race_free_classify(module: &AirModule) -> Result<(), String> {
     // (T) a defined `main`.
     let Some(main_func) = module
         .functions
         .iter()
         .find(|f| f.name == "main" && !f.is_declaration)
     else {
-        return false;
+        return Err("no-defined-main".into());
     };
     let main_id = main_func.id;
 
@@ -253,12 +267,12 @@ pub fn program_is_race_free(module: &AirModule) -> bool {
         .iter()
         .any(|g| g.name == "llvm.global_ctors" || g.name == "llvm.global_dtors")
     {
-        return false;
+        return Err("global-ctors-dtors".into());
     }
 
     let cg = CallGraph::build(module);
     if cg.node_for_function(main_id).is_none() {
-        return false;
+        return Err("main-not-in-callgraph".into());
     }
 
     // Points-to (Andersen, over-approximate) + MTA thread/concurrency model. MTA's
@@ -305,20 +319,20 @@ pub fn program_is_race_free(module: &AirModule) -> bool {
         }
         if func.is_declaration {
             if !is_race_inert_external(&func.name) {
-                return false;
+                return Err(format!("non-inert-external:{}", func.name));
             }
             continue;
         }
         for block in &func.blocks {
             if block.terminator().is_none() {
-                return false;
+                return Err("dropped-terminator".into());
             }
             if block
                 .instructions
                 .iter()
                 .any(|inst| matches!(inst.op, Operation::CallIndirect { .. }))
             {
-                return false;
+                return Err(format!("reachable-indirect-call:{}", func.name));
             }
         }
     }
@@ -328,18 +342,18 @@ pub fn program_is_race_free(module: &AirModule) -> bool {
     // No reachable spawn — and, since the body check above passed, no reachable
     // indirect call that could hide one — ⇒ genuinely sequential ⇒ no data race.
     if !has_reachable_spawn {
-        return true;
+        return Ok(());
     }
     // A spawn is reachable but MTA modeled ≤1 thread — do not trust a sequential
     // conclusion, abstain.
     if threads.len() <= 1 {
-        return false;
+        return Err("spawn-but-mta-single-thread".into());
     }
     // Completeness: every reachable spawn *site* must correspond to a discovered
     // thread context. A spawn MTA failed to model (e.g. an unresolved routine
     // pointer with empty points-to) could hide a racing thread ⇒ abstain.
     if !every_spawn_is_modeled(module, &reachable_fids, threads) {
-        return false;
+        return Err("spawn-not-modeled".into());
     }
 
     // Precompute which user functions may (transitively) touch a lock/unlock — a
@@ -443,7 +457,7 @@ pub fn program_is_race_free(module: &AirModule) -> bool {
                         }
                     }
                     if accesses.len() > MAX_ACCESSES {
-                        return false; // cost gate
+                        return Err("cost-gate-too-many-accesses".into()); // cost gate
                     }
                 }
             }
@@ -498,12 +512,12 @@ pub fn program_is_race_free(module: &AirModule) -> bool {
             }
             // Conflicting pair — require a provably-common unique lock.
             if a.must_locks.is_disjoint(&b.must_locks) {
-                return false;
+                return Err("conflicting-pair-no-common-lock".into());
             }
         }
     }
 
-    true
+    Ok(())
 }
 
 /// Forward, flow-sensitive, intra-procedural **must**-lockset per basic block
