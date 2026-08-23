@@ -220,6 +220,14 @@ struct Access {
     /// spawned (no `pthread_create` can precede it). Such an access cannot race
     /// (no other thread exists yet), so it is not concurrent with any thread.
     pre_spawn: bool,
+    /// This access is performed by the **main** thread (creation site `None`).
+    is_main: bool,
+    /// For a **main-thread** access: the set of thread **handle keys** that have
+    /// provably been `pthread_join`-ed on EVERY path reaching this access (a sound
+    /// under-approximation of joined-before). A thread whose handle key is in this
+    /// set has terminated (join is a happens-before edge), so it cannot race this
+    /// access. Empty for non-main accesses.
+    joined_keys: BTreeSet<ValueId>,
 }
 
 /// Does the program provably contain **no data race**, by the sufficient
@@ -365,6 +373,16 @@ pub fn program_is_race_free(module: &AirModule) -> bool {
     // Instructions in `main` that provably execute before any `pthread_create`.
     let main_prespawn = prespawn_insts(module, main_id);
 
+    // Join happens-before: resolve each spawned thread's handle object, and the
+    // set of handles provably `pthread_join`-ed on entry to each `main` block. A
+    // main-thread access dominated by a join of thread `t` is NOT concurrent with
+    // `t` (join is a happens-before edge — `t` has terminated). Handle resolution
+    // is fail-closed: an unresolved handle, a handle shared by ≥2 thread contexts
+    // (sequential reuse / handle arrays), or a recurrent thread never gets join
+    // credit.
+    let (thread_handles, ambiguous_handles) = build_thread_handles(module, threads, &res.defs);
+    let main_joined_in = compute_main_joined_in(main_func, &res.defs, module);
+
     let mut accesses: Vec<Access> = Vec::new();
     for (tid, tctx) in threads {
         let is_main = tctx.creation_site.is_none();
@@ -377,6 +395,14 @@ pub fn program_is_race_free(module: &AirModule) -> bool {
             let locksets = compute_function_locksets(func, &res, &sync_touching, module);
             for block in &func.blocks {
                 let mut held = locksets.get(&block.id).cloned().unwrap_or_default();
+                // Running must-joined handle set within this main block (starts at
+                // the block-entry must-join; a join call adds its handle for every
+                // subsequent instruction).
+                let mut joined_here: BTreeSet<ValueId> = if in_main_body {
+                    main_joined_in.get(&block.id).cloned().unwrap_or_default()
+                } else {
+                    BTreeSet::new()
+                };
                 for inst in &block.instructions {
                     let pre_spawn = in_main_body && main_prespawn.contains(&inst.id);
                     // (pointer, is_write) for each memory access this instruction
@@ -400,9 +426,22 @@ pub fn program_is_race_free(module: &AirModule) -> bool {
                             write,
                             must_locks: held.clone(),
                             pre_spawn,
+                            is_main,
+                            joined_keys: if is_main {
+                                joined_here.clone()
+                            } else {
+                                BTreeSet::new()
+                            },
                         });
                     }
                     apply_lock_transfer(inst, &res, &sync_touching, module, &mut held);
+                    // A join call establishes happens-before for every LATER access
+                    // in this block (and, via `main_joined_in`, later blocks).
+                    if in_main_body {
+                        if let Some(key) = join_key_of(inst, &res.defs, module) {
+                            joined_here.insert(key);
+                        }
+                    }
                     if accesses.len() > MAX_ACCESSES {
                         return false; // cost gate
                     }
@@ -421,18 +460,35 @@ pub fn program_is_race_free(module: &AirModule) -> bool {
     for (i, a) in accesses.iter().enumerate() {
         for b in &accesses[i..] {
             let same_thread = a.thread_id == b.thread_id;
-            // Concurrency is over-approximated: TWO DISTINCT threads are always
-            // treated as possibly-concurrent (we do NOT trust an MTA happens-before
-            // result to *rule out* an overlap — an under-approximation there, e.g.
-            // for `create(t1); create(t2); join(t1); join(t2)`, would make a genuine
-            // race look safe ⇒ a wrong `true`). The ONE sound exception is a
-            // main-thread access that provably precedes every spawn (`pre_spawn`):
-            // no other thread exists yet, so it cannot race. A single thread
-            // conflicts with a sibling instance of itself only when recurrent.
+            // Concurrency is over-approximated: TWO DISTINCT threads are treated as
+            // possibly-concurrent UNLESS a sound happens-before edge separates them.
+            // We do NOT trust MTA HB to *rule out* an overlap. The sound exceptions:
+            //  * a main-thread access that provably precedes every spawn
+            //    (`pre_spawn`) — no other thread exists yet; or
+            //  * a main-thread access provably dominated by a `pthread_join` of the
+            //    other thread (`joined_before`) — that thread has terminated. Only
+            //    for a single-instance thread with an unambiguously-resolved handle;
+            //    a recurrent / array / reused handle gets no join credit.
+            // A single thread conflicts with a sibling instance only when recurrent.
             let concurrent = if same_thread {
                 recurrent.contains(&a.thread_id)
             } else {
-                !(a.pre_spawn || b.pre_spawn)
+                !(a.pre_spawn
+                    || b.pre_spawn
+                    || joined_before(
+                        a,
+                        b.thread_id,
+                        &thread_handles,
+                        &ambiguous_handles,
+                        &recurrent,
+                    )
+                    || joined_before(
+                        b,
+                        a.thread_id,
+                        &thread_handles,
+                        &ambiguous_handles,
+                        &recurrent,
+                    ))
             };
             if !concurrent || (!a.write && !b.write) {
                 continue;
@@ -712,6 +768,231 @@ fn functions_reaching_unlock(
         }
     }
     result
+}
+
+/// Resolve a pointer value to the **canonical id of the memory object** it names —
+/// a module global's id or a stack `alloca`'s result id — forwarding through
+/// address-preserving casts/copies and no-op (non-indexing) GEPs. Returns `None`
+/// on ANY ambiguity (an indexing GEP into an aggregate — e.g. a `pthread_t`
+/// handle *array* element — a `phi`/`select`/`load`ed pointer, or a non-object
+/// base). This is the fail-closed identity used for thread-handle matching.
+fn resolve_ptr_base(v: ValueId, defs: &DefMap<'_>, module: &AirModule) -> Option<ValueId> {
+    let mut cur = v;
+    for _ in 0..64 {
+        if module.globals.iter().any(|g| g.id == cur) {
+            return Some(cur);
+        }
+        if let Some(Constant::GlobalRef(target)) = module.constants.get(&cur) {
+            return module
+                .globals
+                .iter()
+                .find(|g| g.id == *target)
+                .map(|g| g.id);
+        }
+        let inst = defs.get(&cur)?;
+        match &inst.op {
+            // A stack slot: its result id uniquely identifies the object.
+            Operation::Alloca { .. } => return Some(cur),
+            Operation::Cast { .. } | Operation::Copy | Operation::Freeze => {
+                cur = inst.operands.first().copied()?;
+            }
+            Operation::Gep { field_path } if !gep_has_indexing(field_path, inst.operands.len()) => {
+                cur = inst.operands.first().copied()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The **handle key** joined by a `pthread_join(thread, retval)` call: `thread` is
+/// a `pthread_t` *value*, in practice `load %handle`. Follow copies/casts to the
+/// defining `Load` and resolve the base object of the pointer it loaded from — the
+/// same object a matching `pthread_create(&handle, …)` stores into. `None` if the
+/// value is not a load of a resolvable handle object (⇒ no join credit).
+fn resolve_join_key(joinop: ValueId, defs: &DefMap<'_>, module: &AirModule) -> Option<ValueId> {
+    let mut cur = joinop;
+    for _ in 0..64 {
+        let inst = defs.get(&cur)?;
+        match &inst.op {
+            Operation::Load => {
+                return resolve_ptr_base(inst.operands.first().copied()?, defs, module);
+            }
+            Operation::Cast { .. } | Operation::Copy | Operation::Freeze => {
+                cur = inst.operands.first().copied()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// If `inst` is a `pthread_join`/`thrd_join` call, the resolved handle key it joins.
+fn join_key_of(
+    inst: &saf_core::air::Instruction,
+    defs: &DefMap<'_>,
+    module: &AirModule,
+) -> Option<ValueId> {
+    let Operation::CallDirect { callee } = &inst.op else {
+        return None;
+    };
+    if !module
+        .function(*callee)
+        .is_some_and(|f| JOIN_FUNCTIONS.contains(&f.name.as_str()))
+    {
+        return None;
+    }
+    resolve_join_key(inst.operands.first().copied()?, defs, module)
+}
+
+/// Resolve each spawned thread's `pthread_create` **handle key** (the object
+/// `&handle` addresses). Returns `(tid → handle key, ambiguous keys)`. A key used
+/// by ≥2 distinct thread contexts (a reused `pthread_t`, or a handle-array element
+/// the frontend collapsed) is ambiguous — join credit on it could match the wrong
+/// thread, so it is excluded (fail-closed).
+fn build_thread_handles(
+    module: &AirModule,
+    threads: &BTreeMap<ThreadId, saf_analysis::mta::ThreadContext>,
+    defs: &DefMap<'_>,
+) -> (BTreeMap<u32, ValueId>, BTreeSet<ValueId>) {
+    let mut handles: BTreeMap<u32, ValueId> = BTreeMap::new();
+    let mut uses: BTreeMap<ValueId, u32> = BTreeMap::new();
+    for (tid, tctx) in threads {
+        let Some(site) = tctx.creation_site else {
+            continue;
+        };
+        let Some(inst) = find_inst(module, site) else {
+            continue;
+        };
+        let Some(hptr) = inst.operands.first().copied() else {
+            continue;
+        };
+        if let Some(key) = resolve_ptr_base(hptr, defs, module) {
+            handles.insert(tid.0, key);
+            *uses.entry(key).or_insert(0) += 1;
+        }
+    }
+    let ambiguous: BTreeSet<ValueId> = uses
+        .into_iter()
+        .filter_map(|(k, c)| (c >= 2).then_some(k))
+        .collect();
+    (handles, ambiguous)
+}
+
+/// Must-join dataflow over `main`: the handle keys provably `pthread_join`-ed on
+/// EVERY path to the entry of each block (block-entry meet is set intersection).
+/// Sound under-approximation of joined-before: a conditional join is dropped at the
+/// merge. Within-block joins are added by the caller as it walks instructions.
+fn compute_main_joined_in(
+    main_func: &saf_core::air::AirFunction,
+    defs: &DefMap<'_>,
+    module: &AirModule,
+) -> BTreeMap<BlockId, BTreeSet<ValueId>> {
+    let cfg = Cfg::build(main_func);
+    let entry = cfg.entry;
+
+    // Per-block generated joins (handle keys joined somewhere in the block).
+    let join_gen: BTreeMap<BlockId, BTreeSet<ValueId>> = main_func
+        .blocks
+        .iter()
+        .map(|b| {
+            let mut keys = BTreeSet::new();
+            for inst in &b.instructions {
+                if let Some(k) = join_key_of(inst, defs, module) {
+                    keys.insert(k);
+                }
+            }
+            (b.id, keys)
+        })
+        .collect();
+
+    // `None` = ⊤ (unreachable) — identity for intersection.
+    let mut block_in: BTreeMap<BlockId, Option<BTreeSet<ValueId>>> = BTreeMap::new();
+    for block in &main_func.blocks {
+        block_in.insert(block.id, None);
+    }
+    block_in.insert(entry, Some(BTreeSet::new()));
+
+    let cap = main_func
+        .blocks
+        .len()
+        .saturating_mul(main_func.blocks.len())
+        .saturating_add(4);
+    let mut changed = true;
+    let mut rounds = 0;
+    while changed && rounds < cap {
+        changed = false;
+        rounds += 1;
+        for block in &main_func.blocks {
+            if block.id == entry {
+                continue;
+            }
+            let mut acc: Option<BTreeSet<ValueId>> = None;
+            if let Some(preds) = cfg.predecessors.get(&block.id) {
+                for p in preds {
+                    // OUT[p] = IN[p] ∪ join_gen[p].
+                    let pred_out = block_in.get(p).and_then(Clone::clone).map(|mut s| {
+                        if let Some(g) = join_gen.get(p) {
+                            s.extend(g.iter().copied());
+                        }
+                        s
+                    });
+                    acc = match (acc, pred_out) {
+                        (None, x) | (x, None) => x,
+                        (Some(a), Some(b)) => Some(a.intersection(&b).copied().collect()),
+                    };
+                }
+            }
+            if block_in.get(&block.id).and_then(Clone::clone) != acc {
+                block_in.insert(block.id, acc);
+                changed = true;
+            }
+        }
+    }
+
+    main_func
+        .blocks
+        .iter()
+        .map(|b| {
+            (
+                b.id,
+                block_in
+                    .get(&b.id)
+                    .and_then(Clone::clone)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// Is `main_acc` (a main-thread access) provably separated from thread `other_tid`
+/// by a `pthread_join` happens-before edge? True iff `other_tid` is single-instance
+/// (not recurrent) with an unambiguously-resolved handle key that `main_acc` has
+/// provably joined-before.
+fn joined_before(
+    main_acc: &Access,
+    other_tid: u32,
+    handles: &BTreeMap<u32, ValueId>,
+    ambiguous: &BTreeSet<ValueId>,
+    recurrent: &BTreeSet<u32>,
+) -> bool {
+    if !main_acc.is_main || recurrent.contains(&other_tid) {
+        return false;
+    }
+    match handles.get(&other_tid) {
+        Some(key) if !ambiguous.contains(key) => main_acc.joined_keys.contains(key),
+        _ => false,
+    }
+}
+
+/// Find the instruction with id `target` anywhere in the module.
+fn find_inst(module: &AirModule, target: InstId) -> Option<&saf_core::air::Instruction> {
+    module
+        .functions
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.instructions.iter())
+        .find(|inst| inst.id == target)
 }
 
 /// The net-acquired lock set of `func`: locks provably held on EVERY return path,
@@ -1136,6 +1417,23 @@ mod tests {
         }
     }
 
+    /// Like [`inst`] but sets the result value id (`dst`) — needed to build the
+    /// def-chains the handle/join resolvers walk.
+    fn inst_d(id: &str, op: Operation, operands: Vec<ValueId>, dst: ValueId) -> Instruction {
+        let mut i = inst(id, op, operands);
+        i.dst = Some(dst);
+        i
+    }
+
+    /// A declaration-only function (no body) with the given name — used so
+    /// `module.function(callee)` resolves a primitive's name.
+    fn declared(name: &str) -> AirFunction {
+        let mut f = defined(name, Vec::new());
+        f.blocks.clear();
+        f.is_declaration = true;
+        f
+    }
+
     fn defined(name: &str, insts: Vec<Instruction>) -> AirFunction {
         let mut block = AirBlock::new(block_id(&format!("{name}_entry")));
         for i in insts {
@@ -1296,6 +1594,152 @@ mod tests {
             },
             2,
         ));
+    }
+
+    #[test]
+    fn resolve_ptr_base_alloca_global_and_ambiguity() {
+        let vt = ValueId::new(0x100); // alloca result
+        let vg = ValueId::new(0x101); // no-op GEP result
+        let vidx = ValueId::new(0x102); // indexing GEP result
+        let vld = ValueId::new(0x103); // loaded pointer
+        let alloca = inst_d("a", Operation::Alloca { size_bytes: None }, vec![], vt);
+        let noop_gep = inst_d(
+            "g",
+            Operation::Gep {
+                field_path: FieldPath { steps: Vec::new() },
+            },
+            vec![vt],
+            vg,
+        );
+        let idx_gep = inst_d(
+            "gi",
+            Operation::Gep {
+                field_path: FieldPath {
+                    steps: vec![FieldStep::Index],
+                },
+            },
+            vec![vt, ValueId::new(9)],
+            vidx,
+        );
+        let load = inst_d("l", Operation::Load, vec![vt], vld);
+        let defs: DefMap = [
+            (vt, &alloca),
+            (vg, &noop_gep),
+            (vidx, &idx_gep),
+            (vld, &load),
+        ]
+        .into_iter()
+        .collect();
+        let m = module(vec![]);
+        // Alloca resolves to its own result id; a no-op GEP forwards to it.
+        assert_eq!(resolve_ptr_base(vt, &defs, &m), Some(vt));
+        assert_eq!(resolve_ptr_base(vg, &defs, &m), Some(vt));
+        // An indexing GEP (array element) and a loaded pointer are ambiguous.
+        assert_eq!(resolve_ptr_base(vidx, &defs, &m), None);
+        assert_eq!(resolve_ptr_base(vld, &defs, &m), None);
+    }
+
+    #[test]
+    fn join_key_resolves_load_of_handle() {
+        let vt = ValueId::new(0x200); // alloca'd pthread_t
+        let vv = ValueId::new(0x201); // loaded thread id value
+        let alloca = inst_d("h", Operation::Alloca { size_bytes: None }, vec![], vt);
+        let load = inst_d("lh", Operation::Load, vec![vt], vv);
+        let join = inst(
+            "j",
+            Operation::CallDirect {
+                callee: func_id("pthread_join"),
+            },
+            vec![vv, ValueId::new(0)],
+        );
+        // A non-join call with the same operand must resolve to nothing.
+        let other = inst(
+            "o",
+            Operation::CallDirect {
+                callee: func_id("printf"),
+            },
+            vec![vv],
+        );
+        let defs: DefMap = [(vt, &alloca), (vv, &load)].into_iter().collect();
+        let m = module(vec![declared("pthread_join"), declared("printf")]);
+        assert_eq!(join_key_of(&join, &defs, &m), Some(vt));
+        assert_eq!(join_key_of(&other, &defs, &m), None);
+    }
+
+    #[test]
+    fn joined_before_gates_recurrent_and_ambiguous() {
+        let key = ValueId::new(0x300);
+        let acc = Access {
+            thread_id: 0,
+            ptr: ValueId::new(1),
+            write: true,
+            must_locks: BTreeSet::new(),
+            pre_spawn: false,
+            is_main: true,
+            joined_keys: [key].into_iter().collect(),
+        };
+        let handles: BTreeMap<u32, ValueId> = [(1u32, key)].into_iter().collect();
+        let empty = BTreeSet::new();
+        let recurrent: BTreeSet<u32> = BTreeSet::new();
+        // Single-instance, unambiguous, joined handle ⇒ separated.
+        assert!(joined_before(&acc, 1, &handles, &empty, &recurrent));
+        // Recurrent thread ⇒ no join credit.
+        let rec: BTreeSet<u32> = [1u32].into_iter().collect();
+        assert!(!joined_before(&acc, 1, &handles, &empty, &rec));
+        // Ambiguous handle (reused / array) ⇒ no join credit.
+        let ambig: BTreeSet<ValueId> = [key].into_iter().collect();
+        assert!(!joined_before(&acc, 1, &handles, &ambig, &recurrent));
+        // A non-main access never gets join credit.
+        let mut thread_acc = acc;
+        thread_acc.is_main = false;
+        assert!(!joined_before(&thread_acc, 1, &handles, &empty, &recurrent));
+    }
+
+    #[test]
+    fn main_joined_in_propagates_must_join() {
+        // main: entry { alloca t; load v; join(v); br mid }  mid { ret }
+        // The must-join set at `mid`'s entry must contain the handle key `t`.
+        let vt = ValueId::new(0x400);
+        let vv = ValueId::new(0x401);
+        let entry = block_id("m_entry");
+        let mid = block_id("m_mid");
+        let mut eb = AirBlock::new(entry);
+        eb.instructions.push(inst_d(
+            "a",
+            Operation::Alloca { size_bytes: None },
+            vec![],
+            vt,
+        ));
+        eb.instructions
+            .push(inst_d("l", Operation::Load, vec![vt], vv));
+        eb.instructions.push(inst(
+            "j",
+            Operation::CallDirect {
+                callee: func_id("pthread_join"),
+            },
+            vec![vv, ValueId::new(0)],
+        ));
+        eb.instructions
+            .push(inst("br", Operation::Br { target: mid }, vec![]));
+        let mut mb = AirBlock::new(mid);
+        mb.instructions.push(inst("ret", Operation::Ret, vec![]));
+        let main = AirFunction {
+            id: func_id("main"),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![eb, mb],
+            entry_block: None,
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let m = module(vec![main.clone(), declared("pthread_join")]);
+        let defs = LockResolver::build(&m).defs;
+        let joined = compute_main_joined_in(&main, &defs, &m);
+        // Entry has joined nothing yet; `mid` (after the join) has the handle key.
+        assert!(joined.get(&entry).unwrap().is_empty());
+        assert!(joined.get(&mid).unwrap().contains(&vt));
     }
 
     #[test]
