@@ -1010,6 +1010,133 @@ fn arg_is_nonneg(arg: ValueId, caller: &AirFunction, module: &AirModule) -> bool
     false
 }
 
+/// Given a signed integer comparison of `arg` against the constant `0` used as a
+/// `CondBr` condition, return the successor edge target on which `arg >= 0` is
+/// *guaranteed* (or `None` for a non-signed / non-order predicate). `arg_is_lhs`
+/// says whether `arg` is the comparison's left operand (else it is the right, and
+/// the predicate is swapped to the equivalent `arg <p> 0` form).
+fn signed_cmp_nonneg_edge(
+    pred: BinaryOp,
+    arg_is_lhs: bool,
+    then_target: BlockId,
+    else_target: BlockId,
+) -> Option<BlockId> {
+    use BinaryOp::{ICmpSge, ICmpSgt, ICmpSle, ICmpSlt};
+    // Normalize to `arg <p> 0`: swap the predicate when `arg` is the right operand
+    // (`k <pred> arg` ⟺ `arg <swap(pred)> k`).
+    let p = if arg_is_lhs {
+        pred
+    } else {
+        match pred {
+            ICmpSge => ICmpSle,
+            ICmpSle => ICmpSge,
+            ICmpSgt => ICmpSlt,
+            ICmpSlt => ICmpSgt,
+            other => other,
+        }
+    };
+    match p {
+        // `arg >= 0` / `arg > 0`: the THEN edge is entered only when `arg >= 0`.
+        ICmpSge | ICmpSgt => Some(then_target),
+        // `arg < 0` / `arg <= 0`: the ELSE edge is `!(arg<0)` ⇒ `arg>=0`
+        // (resp. `!(arg<=0)` ⇒ `arg>0`).
+        ICmpSlt | ICmpSle => Some(else_target),
+        _ => None,
+    }
+}
+
+/// Is call argument `arg` (fed at a call in block `call_block` of `caller`)
+/// provably **non-negative** because a *dominating signed guard* `arg >= 0` gates
+/// the call — e.g. an early `if (arg < 0) return;`?
+///
+/// Sound sufficient condition: some block `g` in `caller` ends in a
+/// `CondBr` whose condition is a signed integer comparison of the *exact* value
+/// `arg` against the constant `0`, and the successor edge that is taken **only
+/// when `arg >= 0`** ([`signed_cmp_nonneg_edge`]) leads to a block `t` such that
+/// (a) `g` is `t`'s **sole predecessor** — so control reaches `t` only by taking
+/// that `arg >= 0` edge — and (b) `t` **dominates** `call_block` — so every path
+/// to the call passes through `t`. Together these establish `arg >= 0` on entry to
+/// the call. Because `arg` is matched by identity in both the guard and the call,
+/// in the mem2reg-promoted SSA the ranking analysis consumes it is the *same*
+/// value at both sites (never reassigned between them), so the fact is preserved.
+///
+/// Fails closed (returns `false`) on anything it cannot match — including
+/// un-promoted IR where the guard and the call load distinct SSA temporaries, so
+/// only recall is ever lost, never soundness.
+fn arg_is_guarded_nonneg(
+    arg: ValueId,
+    caller: &AirFunction,
+    call_block: BlockId,
+    module: &AirModule,
+) -> bool {
+    // dst ↦ (op, operands) for resolving each `CondBr` condition to its comparison.
+    let mut def_of: BTreeMap<ValueId, (&Operation, &[ValueId])> = BTreeMap::new();
+    for block in &caller.blocks {
+        for inst in &block.instructions {
+            if let Some(dst) = inst.dst {
+                def_of.insert(dst, (&inst.op, inst.operands.as_slice()));
+            }
+        }
+    }
+    let is_zero = |v: ValueId| {
+        matches!(
+            module.constants.get(&v),
+            Some(Constant::Int { value: 0, .. } | Constant::ZeroInit)
+        )
+    };
+    let cfg = Cfg::build(caller);
+    let idom = compute_dominators(&cfg);
+    for block in &caller.blocks {
+        let Some(term) = block.instructions.last() else {
+            continue;
+        };
+        let Operation::CondBr {
+            then_target,
+            else_target,
+        } = &term.op
+        else {
+            continue;
+        };
+        let Some(&cond) = term.operands.first() else {
+            continue;
+        };
+        let Some((Operation::BinaryOp { kind }, ops)) = def_of.get(&cond).copied() else {
+            continue;
+        };
+        if !matches!(
+            kind,
+            BinaryOp::ICmpSlt | BinaryOp::ICmpSle | BinaryOp::ICmpSgt | BinaryOp::ICmpSge
+        ) {
+            continue;
+        }
+        let (Some(&lo), Some(&ro)) = (ops.first(), ops.get(1)) else {
+            continue;
+        };
+        // Exactly one operand is `arg`, the other the constant `0`.
+        let arg_is_lhs = lo == arg && is_zero(ro);
+        let arg_is_rhs = ro == arg && is_zero(lo);
+        if !(arg_is_lhs || arg_is_rhs) {
+            continue;
+        }
+        let Some(nonneg_target) =
+            signed_cmp_nonneg_edge(*kind, arg_is_lhs, *then_target, *else_target)
+        else {
+            continue;
+        };
+        // Entering `nonneg_target` must imply the `arg >= 0` edge was taken (sole
+        // predecessor = this guard), and every path to the call must pass through
+        // it (dominance). Then `arg >= 0` holds at the call.
+        let sole_pred = cfg
+            .predecessors
+            .get(&nonneg_target)
+            .is_some_and(|preds| preds.len() == 1 && preds.contains(&block.id));
+        if sole_pred && dominates(nonneg_target, call_block, &idom) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parameter **positions** of a recursion SCC that are provably fed only
 /// non-negative unsigned values at every call site **from outside the SCC** (the
 /// base case of the recursion). Used to give an otherwise sign-`Unknown`
@@ -1021,26 +1148,30 @@ fn arg_is_nonneg(arg: ValueId, caller: &AirFunction, module: &AirModule) -> bool
 /// # Soundness
 ///
 /// A position `i` is returned only when **every** external (non-SCC) call site to
-/// **any** SCC member passes a provably-non-negative argument ([`arg_is_nonneg`])
-/// at position `i` — establishing the invariant "position `i` is a non-negative
-/// unsigned value" at the base (entry) of the recursion. That the invariant is
-/// *preserved* across recursive frames is a tautology: position `i` is a `w`-bit
-/// register, so its unsigned interpretation is *always* in `[0, 2^w−1]`; the
-/// caller only marks such positions `Unsigned` (never `Signed`), and the ranking
-/// model's guards on them are sign-agnostic (`==`/`!=`; a signed comparison would
-/// have made `infer_signs` return `Signed`, which the caller preserves). The
-/// affine transitions are overflow-checked against `[0, 2^w−1]` and demoted to a
-/// free in-range havoc on any wrap, so the model over-approximates the unsigned
-/// machine semantics — a ranking of it is a sound termination proof. The unsigned
-/// *source* requirement (rather than merely "≥ 0 at entry") additionally rules
-/// out a negative signed entry whose defined-wrap decrement would rest on signed
-/// overflow (UB). With **no** external call site the base case is unestablished,
-/// so the empty set is returned (fail-closed).
+/// **any** SCC member passes an argument at position `i` that is provably
+/// non-negative — either from an unsigned *source* ([`arg_is_nonneg`]) or gated by
+/// a *dominating signed guard* `arg >= 0` at the call ([`arg_is_guarded_nonneg`]) —
+/// establishing the invariant "position `i` is a non-negative value" at the base
+/// (entry) of the recursion. That the invariant is *preserved* across recursive
+/// frames is a tautology on the register's unsigned interpretation: position `i`
+/// is a `w`-bit register always in `[0, 2^w−1]`; the caller only marks such
+/// positions `Unsigned` (never `Signed`), and the ranking model's guards on them
+/// are sign-agnostic (`==`/`!=`; a signed comparison would have made `infer_signs`
+/// return `Signed`, which the caller preserves). The affine transitions are
+/// overflow-checked against `[0, 2^w−1]` and demoted to a free in-range havoc on
+/// any wrap, so the model over-approximates the unsigned machine semantics — a
+/// ranking of it is a sound termination proof. Crucially the overflow check is
+/// self-protecting: a decrement that could carry the value below `0` (the only way
+/// a genuinely-signed entry's `sub nsw` could reach signed-overflow UB) fails the
+/// `[0, 2^w−1]`-stability test and demotes to havoc ⇒ that half abstains, so a
+/// recursion that only terminates for negative inputs is never ranked. With **no**
+/// external call site the base case is unestablished, so the empty set is returned
+/// (fail-closed).
 fn scc_positions_unsigned_by_entry(
     module: &AirModule,
     scc: &BTreeSet<FunctionId>,
 ) -> BTreeSet<u32> {
-    let mut sites: Vec<(&AirFunction, &Vec<ValueId>)> = Vec::new();
+    let mut sites: Vec<(&AirFunction, BlockId, &Vec<ValueId>)> = Vec::new();
     for caller in &module.functions {
         if scc.contains(&caller.id) {
             continue; // an intra-SCC (recursive) call is the inductive step, not a base entry
@@ -1049,7 +1180,7 @@ fn scc_positions_unsigned_by_entry(
             for inst in &block.instructions {
                 if let Operation::CallDirect { callee } = &inst.op {
                     if scc.contains(callee) {
-                        sites.push((caller, &inst.operands));
+                        sites.push((caller, block.id, &inst.operands));
                     }
                 }
             }
@@ -1058,12 +1189,14 @@ fn scc_positions_unsigned_by_entry(
     if sites.is_empty() {
         return BTreeSet::new();
     }
-    let max_len = sites.iter().map(|(_, a)| a.len()).max().unwrap_or(0);
+    let max_len = sites.iter().map(|(_, _, a)| a.len()).max().unwrap_or(0);
     let mut out = BTreeSet::new();
     for i in 0..max_len {
-        let all_nonneg = sites.iter().all(|(caller, args)| {
-            args.get(i)
-                .is_some_and(|&a| arg_is_nonneg(a, caller, module))
+        let all_nonneg = sites.iter().all(|(caller, call_block, args)| {
+            args.get(i).is_some_and(|&a| {
+                arg_is_nonneg(a, caller, module)
+                    || arg_is_guarded_nonneg(a, caller, *call_block, module)
+            })
         });
         if all_nonneg {
             // INVARIANT: LLVM caps a call's positional argument count well below 2^32.
@@ -1199,6 +1332,26 @@ fn next_never_overflows(
         }
     }
     true
+}
+
+/// Is the conjunction of `region` constraints (`Σ aᵢ·zᵢ + b ≥ 0`) provably
+/// **unsatisfiable** (an empty region)? Returns `true` only on a definitive Z3
+/// `Unsat`; a `Sat` or `Unknown` (or any un-encodable constraint) returns `false`
+/// so the caller keeps the branch — dropping a branch is only sound when its
+/// region is *certainly* empty.
+fn region_is_infeasible(region: &[Constraint], universe: &BTreeSet<ValueId>) -> bool {
+    let index: BTreeMap<ValueId, usize> = universe.iter().copied().zip(0..).collect();
+    let vars: BTreeMap<usize, z3::ast::Int> = (0..universe.len())
+        .map(|i| (i, z3::ast::Int::new_const(sym_name(i))))
+        .collect();
+    let solver = new_solver();
+    for c in region {
+        let Some(b) = constraint_to_z3(c, &index, &vars) else {
+            return false; // un-encodable ⇒ cannot prove empty ⇒ keep the branch.
+        };
+        solver.assert(&b);
+    }
+    matches!(solver.check(), z3::SatResult::Unsat)
 }
 
 /// Assert `Σ aᵢ·zᵢ + b ≥ 0` as a Z3 `Bool`.
@@ -2331,6 +2484,21 @@ fn assemble_branches(
             let mut check_region = raw.guards.clone();
             check_region.extend(base_bounds.iter().cloned());
             check_region.extend(extra);
+
+            // A disjunctive `!=`-split can produce cross combinations whose region is
+            // empty (e.g. `x ≥ 1` from one guard's half AND `x ≤ 0` from another's).
+            // Such a sub-branch models no reachable continuing state, so dropping it
+            // is sound — the remaining feasible sub-branches still union-cover every
+            // real transition — and it keeps the branch count (hence the greedy
+            // lexicographic round count) proportional to the *feasible* paths, which
+            // is what lets a two-`!=`-guard recursion (e.g. `EvenOdd`: `n != 0` and
+            // `n != 1`) rank within [`MAX_LEX_ROUNDS`]. Only a *definitive* `Unsat`
+            // skips; an `Unknown` keeps the branch (fail-safe). Only split branches
+            // can be infeasible cross-products, so the (no-split) common path — one
+            // choice over the always-satisfiable base region — skips the SMT call.
+            if !raw.splits.is_empty() && region_is_infeasible(&check_region, universe) {
+                continue;
+            }
 
             let mut next: BTreeMap<ValueId, Affine> = BTreeMap::new();
             let mut fresh_bounds: Vec<Constraint> = Vec::new();
@@ -5479,6 +5647,344 @@ mod tests {
         let (m, _) = mutual_pair(BinaryOp::ICmpSgt, 0, -1);
         let solo: BTreeSet<FunctionId> = [m.functions[0].id].into_iter().collect();
         assert!(!mutual_recursion_is_ranked(&m, &solo));
+    }
+
+    // --- disjunctive `!=`-split: infeasible-branch skip + guarded non-negativity
+
+    #[test]
+    fn region_is_infeasible_detects_empty_and_keeps_nonempty() {
+        let x = vid("ri_x");
+        let universe: BTreeSet<ValueId> = [x].into_iter().collect();
+        // `x >= 1` ∧ `x <= 0` ⇒ empty.
+        let empty = vec![
+            Constraint {
+                coeffs: BTreeMap::from([(x, 1)]),
+                constant: -1,
+            },
+            Constraint {
+                coeffs: BTreeMap::from([(x, -1)]),
+                constant: 0,
+            },
+        ];
+        assert!(region_is_infeasible(&empty, &universe));
+        // `x >= 1` ∧ `x <= 5` ⇒ satisfiable ⇒ NOT skipped.
+        let nonempty = vec![
+            Constraint {
+                coeffs: BTreeMap::from([(x, 1)]),
+                constant: -1,
+            },
+            Constraint {
+                coeffs: BTreeMap::from([(x, -1)]),
+                constant: 5,
+            },
+        ];
+        assert!(!region_is_infeasible(&nonempty, &universe));
+    }
+
+    /// Build a caller `void caller() { int x = nondet_int(); [if (x < 0) return;]
+    /// callee(x); }`. When `guarded`, an early `x < 0` return dominates the call so
+    /// `x >= 0` holds at it; otherwise the call is unguarded.
+    fn guard_caller(guarded: bool) -> (AirModule, ValueId, BlockId) {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let zero = vid("gc_zero");
+        constants.insert(zero, Constant::Int { value: 0, bits: 32 });
+
+        let callee_id = FunctionId(make_id("func", b"callee"));
+        let x = vid("gc_x");
+        let cond = vid("gc_cond");
+        let entry = bid("gc_entry");
+        let ret_blk = bid("gc_ret");
+        let call_blk = bid("gc_call");
+
+        let mut eb = AirBlock::new(entry);
+        eb.instructions.push(vinst(
+            "gc_nd",
+            Operation::CallDirect {
+                callee: FunctionId(make_id("func", b"__VERIFIER_nondet_int")),
+            },
+            x,
+            vec![],
+            i32t,
+        ));
+        let call_block_id = if guarded {
+            eb.instructions.push(vinst(
+                "gc_cmp",
+                Operation::BinaryOp {
+                    kind: BinaryOp::ICmpSlt,
+                },
+                cond,
+                vec![x, zero],
+                i1t,
+            ));
+            eb.instructions.push(term(
+                "gc_condbr",
+                Operation::CondBr {
+                    then_target: ret_blk,
+                    else_target: call_blk,
+                },
+                vec![cond],
+            ));
+            call_blk
+        } else {
+            eb.instructions
+                .push(term("gc_br", Operation::Br { target: call_blk }, vec![]));
+            call_blk
+        };
+
+        let mut cb = AirBlock::new(call_blk);
+        cb.instructions.push(term(
+            "gc_call",
+            Operation::CallDirect { callee: callee_id },
+            vec![x],
+        ));
+        cb.instructions
+            .push(term("gc_call_ret", Operation::Ret, vec![]));
+
+        let mut blocks = vec![eb, cb];
+        if guarded {
+            let mut rb = AirBlock::new(ret_blk);
+            rb.instructions
+                .push(term("gc_ret_i", Operation::Ret, vec![]));
+            blocks.insert(1, rb);
+        }
+
+        let caller = AirFunction {
+            id: FunctionId(make_id("func", b"caller")),
+            name: "caller".to_string(),
+            params: Vec::new(),
+            blocks,
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        (module_of(caller, constants), x, call_block_id)
+    }
+
+    #[test]
+    fn arg_is_guarded_nonneg_recognizes_early_return_guard() {
+        let (m, x, call_blk) = guard_caller(true);
+        let caller = &m.functions[0];
+        assert!(arg_is_guarded_nonneg(x, caller, call_blk, &m));
+    }
+
+    #[test]
+    fn arg_is_guarded_nonneg_rejects_unguarded_call() {
+        let (m, x, call_blk) = guard_caller(false);
+        let caller = &m.functions[0];
+        assert!(!arg_is_guarded_nonneg(x, caller, call_blk, &m));
+    }
+
+    /// Build an `EvenOdd`-shaped SCC: two mutually-recursive members, each
+    /// `int h(int n){ if (n==0) return 0; if (n==1) return 1; return other(n-1); }`
+    /// (two `==` guards ⇒ the `!=`-split forks each recursive path into four
+    /// sub-branches, most infeasible), plus a `main` that reaches the SCC via
+    /// `int x = nondet_int(); [if (x < 0) return 0;] f(x);`. Returns the module and
+    /// the `{f, g}` SCC.
+    fn evenodd_scc(guarded: bool) -> (AirModule, BTreeSet<FunctionId>) {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let zero = vid("eo_zero");
+        let one = vid("eo_one");
+        constants.insert(zero, Constant::Int { value: 0, bits: 32 });
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+
+        let f_id = FunctionId(make_id("func", b"eo_f"));
+        let g_id = FunctionId(make_id("func", b"eo_g"));
+
+        let member = |name: &str, fid: FunctionId, callee: FunctionId, n: ValueId| -> AirFunction {
+            let c0 = vid(&format!("{name}_c0"));
+            let c1 = vid(&format!("{name}_c1"));
+            let na = vid(&format!("{name}_na"));
+            let entry = bid(&format!("{name}_entry"));
+            let t1 = bid(&format!("{name}_t1"));
+            let rec = bid(&format!("{name}_rec"));
+            let ret0 = bid(&format!("{name}_ret0"));
+            let ret1 = bid(&format!("{name}_ret1"));
+
+            let mut eb = AirBlock::new(entry);
+            eb.instructions.push(vinst(
+                &format!("{name}_cmp0"),
+                Operation::BinaryOp {
+                    kind: BinaryOp::ICmpEq,
+                },
+                c0,
+                vec![n, zero],
+                i1t,
+            ));
+            eb.instructions.push(term(
+                &format!("{name}_br0"),
+                Operation::CondBr {
+                    then_target: ret0,
+                    else_target: t1,
+                },
+                vec![c0],
+            ));
+
+            let mut t1b = AirBlock::new(t1);
+            t1b.instructions.push(vinst(
+                &format!("{name}_cmp1"),
+                Operation::BinaryOp {
+                    kind: BinaryOp::ICmpEq,
+                },
+                c1,
+                vec![n, one],
+                i1t,
+            ));
+            t1b.instructions.push(term(
+                &format!("{name}_br1"),
+                Operation::CondBr {
+                    then_target: ret1,
+                    else_target: rec,
+                },
+                vec![c1],
+            ));
+
+            let mut rb = AirBlock::new(rec);
+            rb.instructions.push(vinst(
+                &format!("{name}_sub"),
+                Operation::BinaryOp {
+                    kind: BinaryOp::Sub,
+                },
+                na,
+                vec![n, one],
+                i32t,
+            ));
+            rb.instructions.push(term(
+                &format!("{name}_call"),
+                Operation::CallDirect { callee },
+                vec![na],
+            ));
+            rb.instructions
+                .push(term(&format!("{name}_rret"), Operation::Ret, vec![]));
+
+            let mut r0 = AirBlock::new(ret0);
+            r0.instructions
+                .push(term(&format!("{name}_r0"), Operation::Ret, vec![]));
+            let mut r1 = AirBlock::new(ret1);
+            r1.instructions
+                .push(term(&format!("{name}_r1"), Operation::Ret, vec![]));
+
+            AirFunction {
+                id: fid,
+                name: name.to_string(),
+                params: vec![AirParam {
+                    id: n,
+                    name: None,
+                    index: 0,
+                    param_type: Some(i32t),
+                }],
+                blocks: vec![eb, t1b, rb, r0, r1],
+                entry_block: Some(entry),
+                is_declaration: false,
+                span: None,
+                symbol: None,
+                block_index: BTreeMap::new(),
+            }
+        };
+
+        let f = member("eo_f", f_id, g_id, vid("eo_f_n"));
+        let g = member("eo_g", g_id, f_id, vid("eo_g_n"));
+
+        // main: x = nondet_int(); [if (x < 0) return;] f(x);
+        let x = vid("eo_main_x");
+        let cond = vid("eo_main_cond");
+        let entry = bid("eo_main_entry");
+        let ret_blk = bid("eo_main_ret");
+        let call_blk = bid("eo_main_call");
+        let mut eb = AirBlock::new(entry);
+        eb.instructions.push(vinst(
+            "eo_main_nd",
+            Operation::CallDirect {
+                callee: FunctionId(make_id("func", b"__VERIFIER_nondet_int")),
+            },
+            x,
+            vec![],
+            i32t,
+        ));
+        let mut main_blocks;
+        if guarded {
+            eb.instructions.push(vinst(
+                "eo_main_cmp",
+                Operation::BinaryOp {
+                    kind: BinaryOp::ICmpSlt,
+                },
+                cond,
+                vec![x, zero],
+                i1t,
+            ));
+            eb.instructions.push(term(
+                "eo_main_br",
+                Operation::CondBr {
+                    then_target: ret_blk,
+                    else_target: call_blk,
+                },
+                vec![cond],
+            ));
+            let mut rb = AirBlock::new(ret_blk);
+            rb.instructions
+                .push(term("eo_main_ret_i", Operation::Ret, vec![]));
+            main_blocks = vec![eb, rb];
+        } else {
+            eb.instructions.push(term(
+                "eo_main_br",
+                Operation::Br { target: call_blk },
+                vec![],
+            ));
+            main_blocks = vec![eb];
+        }
+        let mut cb = AirBlock::new(call_blk);
+        cb.instructions.push(term(
+            "eo_main_call",
+            Operation::CallDirect { callee: f_id },
+            vec![x],
+        ));
+        cb.instructions
+            .push(term("eo_main_cret", Operation::Ret, vec![]));
+        main_blocks.push(cb);
+
+        let main = AirFunction {
+            id: FunctionId(make_id("func", b"eo_main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: main_blocks,
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+
+        let mut m = module_of(f, constants);
+        m.functions.push(g);
+        m.functions.push(main);
+        let scc: BTreeSet<FunctionId> = [f_id, g_id].into_iter().collect();
+        (m, scc)
+    }
+
+    #[test]
+    fn evenodd_two_eq_guards_ranked_under_nonneg_entry() {
+        // With `main`'s `if (x < 0) return;` guard, the SCC parameter is provably
+        // `>= 0` at entry, so the two `==`-else `!=`-splits' negative halves are
+        // infeasible (skipped) and the surviving `n >= 2` transition `n -> n - 1`
+        // ranks by `f = n`. Exercises BOTH the guarded-non-negativity precondition
+        // and the infeasible-branch skip (8 raw sub-branches ⇒ 2 feasible).
+        let (m, scc) = evenodd_scc(true);
+        assert!(mutual_recursion_is_ranked(&m, &scc));
+    }
+
+    #[test]
+    fn evenodd_two_eq_guards_abstains_without_guard() {
+        // Without the entry guard the parameter is a plain signed `int`: the
+        // `!=`-split's `n <= -1` half is feasible and `n - 1` diverges toward
+        // `INT_MIN` ⇒ that half cannot be ranked ⇒ abstain (sound: `isOdd(-1)`
+        // recurses forever). Negative control for the guarded case above.
+        let (m, scc) = evenodd_scc(false);
+        assert!(!mutual_recursion_is_ranked(&m, &scc));
     }
 
     // --- multi-latch loops (two back-edges into one header) -----------------
