@@ -1019,6 +1019,89 @@ fn def_result_nonneg(inst: &Instruction, module: &AirModule) -> bool {
     }
 }
 
+/// Leaf symbols that must **keep** their inferred signedness and may not be
+/// re-bounded by the unsigned bit-pattern range `[0, 2^w−1]`. A leaf is ineligible
+/// when it feeds — directly or through an affine derivation — either:
+///
+/// - an **ordered** integer comparison (`<`/`<=`/`>`/`>=`, signed *or* unsigned):
+///   [`comparison_constraints`] lowers ordered predicates into affine half-spaces
+///   *without regard to signedness*, so the lowering is a sound necessary
+///   condition only under the integer bound matching how the machine actually
+///   reads the value; forcing an unsigned bound could wrongly prune a real signed
+///   half (a `< 0` branch) and unsoundly claim termination; or
+/// - an **`nsw`** integer op (`add`/`sub`/`mul`/`shl`): a signed overflow there is
+///   undefined behavior, so the operand must not be modelled as a defined
+///   `mod 2^w` wraparound (a `sub nsw x, 1` from `INT_MIN` is UB, not a step to
+///   `INT_MAX`).
+///
+/// Equality/disequality (`==`/`!=`) is interpretation-independent (bit equality),
+/// so an Eq/Ne-only, `nsw`-free value is safe to bound by its bit pattern — which
+/// is exactly the lower bound the disjunctive `!=` split ([`ne_split`]) needs to
+/// prune its negative half-space.
+fn bitpattern_ineligible_leaves(
+    func: &AirFunction,
+    defs: &BTreeMap<ValueId, Def>,
+    header_phis: &BTreeSet<ValueId>,
+    module: &AirModule,
+) -> BTreeSet<ValueId> {
+    let mut out: BTreeSet<ValueId> = BTreeSet::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Operation::BinaryOp { kind } = &inst.op else {
+                continue;
+            };
+            let ordered = matches!(
+                kind,
+                BinaryOp::ICmpSgt
+                    | BinaryOp::ICmpSge
+                    | BinaryOp::ICmpSlt
+                    | BinaryOp::ICmpSle
+                    | BinaryOp::ICmpUgt
+                    | BinaryOp::ICmpUge
+                    | BinaryOp::ICmpUlt
+                    | BinaryOp::ICmpUle
+            );
+            if !(ordered || inst.has_no_signed_wrap()) {
+                continue;
+            }
+            for &op in inst.operands.iter().take(2) {
+                match resolve_affine(op, defs, header_phis, module, 0) {
+                    Some(aff) => out.extend(aff.terms.keys().copied()),
+                    None => {
+                        out.insert(op);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Promote every leaf in `candidates` whose signedness is currently *unknown*
+/// (absent, or explicitly [`Sign::Unknown`]) and that is **not** in `ineligible`
+/// to [`Sign::Unsigned`], giving it the sound `[0, 2^w−1]` bit-pattern bound.
+///
+/// This is unconditionally sound: `[0, 2^w−1]` is a true fact about *every* `w`-bit
+/// machine value, and [`bitpattern_ineligible_leaves`] excludes exactly the values
+/// whose guards or `nsw` arithmetic would make an unsigned reading unsound. It is
+/// also purely additive — only leaves that previously had *no* bound gain one — so
+/// a ranking that already succeeded cannot be lost, and the extra lower bound only
+/// lets the `!=`/`==`-else split prune its (now-infeasible) negative half.
+fn promote_bitpattern_unsigned(
+    signs: &mut BTreeMap<ValueId, Sign>,
+    candidates: &BTreeSet<ValueId>,
+    ineligible: &BTreeSet<ValueId>,
+) {
+    for &v in candidates {
+        if ineligible.contains(&v) {
+            continue;
+        }
+        if !matches!(signs.get(&v), Some(Sign::Signed | Sign::Unsigned)) {
+            signs.insert(v, Sign::Unsigned);
+        }
+    }
+}
+
 /// SV-COMP `__VERIFIER_nondet_*` sources that return a **non-negative** value
 /// (an unsigned integer or a boolean). A call to one of these is a sound witness
 /// that its result — and hence anything it is directly assigned to — lies in the
@@ -2305,6 +2388,16 @@ fn build_recursion_model(
         }
     }
 
+    // Give every sign-`Unknown`, `nsw`-free, Eq/Ne-only leaf the sound `[0, 2^w−1]`
+    // bit-pattern bound. This is what lets a recursion whose only stopping guard is
+    // a `!=`/`==` on a defined-wraparound counter — e.g. `int id(int x){ if(x==0)
+    // return 0; return id((unsigned)x-1)+1; }`, which terminates for *every* input
+    // via the well-defined unsigned decrement — rank: the `!=` split's negative half
+    // becomes infeasible and `x − 1` stays in range. A signed `sub nsw x, 1` counter
+    // stays `Unknown` (ineligible) ⇒ abstains, as it must.
+    let ineligible = bitpattern_ineligible_leaves(func, &defs, &header_phis, module);
+    promote_bitpattern_unsigned(&mut signs, &universe, &ineligible);
+
     // Type bounds: parameters use their `AirParam` type; every other integer leaf
     // uses its def's result type. True facts about the real values, shared by
     // every branch region.
@@ -2742,7 +2835,7 @@ fn build_multipath_model_multi(
     let latch_set: BTreeSet<BlockId> = latches.iter().copied().collect();
     let defs = index_defs(func, body);
     let block_of = index_block_of(func);
-    let signs = infer_signs(func, module);
+    let mut signs = infer_signs(func, module);
 
     // Reject a **nested inner loop**: the only dominance back-edges inside the body
     // may be this loop's own `latchᵢ → header` edges. Any other in-body back-edge is
@@ -2885,6 +2978,14 @@ fn build_multipath_model_multi(
         .iter()
         .filter_map(|p| p.param_type.map(|t| (p.id, t)))
         .collect();
+
+    // Give every sign-`Unknown`, `nsw`-free, Eq/Ne-only leaf the sound `[0, 2^w−1]`
+    // bit-pattern bound so a defined-wraparound counter guarded only by `!=`/`==`
+    // (`while (x != 0) x--` on an unsigned/`-fwrapv` `x`) ranks: the `!=` split's
+    // negative half is pruned and `x − 1` stays in range. A signed `nsw` counter or
+    // one feeding an ordered comparison stays `Unknown` ⇒ abstains, as it must.
+    let ineligible = bitpattern_ineligible_leaves(func, &defs, &header_phis, module);
+    promote_bitpattern_unsigned(&mut signs, &universe, &ineligible);
 
     // Type bounds for every integer leaf with a known signedness/width — true facts
     // about the real state, shared by every branch region.
@@ -3980,17 +4081,24 @@ mod tests {
             vec![cval],
         ));
 
-        // latch: xn = add(x, step) ; br header
+        // latch: xn = add nsw(x, step) ; br header. The counter derives from a signed
+        // `nondet_int`, so the update is `add nsw` — a signed overflow is UB, which is
+        // exactly why an *unguarded* `x` may not be read as an unsigned bit pattern
+        // (it keeps no bound ⇒ the `!=` split abstains). The defined-wraparound
+        // (plain-`add`) counterpart is built via [`strip_add_nsw`].
         let mut latch = AirBlock::new(l);
-        latch.instructions.push(vinst(
-            "add",
-            Operation::BinaryOp {
-                kind: BinaryOp::Add,
-            },
-            xn,
-            vec![x, step_v],
-            i32t,
-        ));
+        latch.instructions.push(
+            vinst(
+                "add",
+                Operation::BinaryOp {
+                    kind: BinaryOp::Add,
+                },
+                xn,
+                vec![x, step_v],
+                i32t,
+            )
+            .with_no_signed_wrap(),
+        );
         latch
             .instructions
             .push(term("br_latch", Operation::Br { target: h }, vec![]));
@@ -4043,10 +4151,20 @@ mod tests {
 
     #[test]
     fn unguarded_ne_decrement_abstains() {
-        // NO entry guard: `x` may start negative, so `while (x != 0) x--` diverges
-        // for `x < 0` ⇒ the negative half-space is feasible and cannot be ranked ⇒
-        // abstain (no wrong `true`).
+        // NO entry guard and a *signed* `add nsw` decrement: `x` may start negative, so
+        // `while (x != 0) x--` is UB / diverges for `x < 0` ⇒ the negative half-space
+        // is feasible and cannot be ranked ⇒ abstain (no wrong `true`).
         assert!(!ranked(&guarded_ne_loop(-1, 0, false, false)));
+    }
+
+    #[test]
+    fn unguarded_ne_decrement_plain_add_is_ranked() {
+        // Same loop but with a *defined-wraparound* (plain `add`) decrement — an
+        // unsigned / `-fwrapv` `while (x != 0) x--`. Even with NO entry guard, the
+        // Eq/Ne-only, `nsw`-free `x` earns the `[0, 2^w−1]` bit-pattern bound: the
+        // `!=` split's `x ≤ -1` half is pruned as infeasible and `x ≥ 1` ranks with
+        // `f = x`. Terminates for every input ⇒ TRUE.
+        assert!(ranked(&strip_add_nsw(guarded_ne_loop(-1, 0, false, false))));
     }
 
     #[test]
@@ -6237,15 +6355,24 @@ mod tests {
         ));
 
         let mut rb = AirBlock::new(rec);
-        rb.instructions.push(vinst(
-            "add",
-            Operation::BinaryOp {
-                kind: BinaryOp::Add,
-            },
-            na,
-            vec![n, step_v],
-            i32t,
-        ));
+        // Signed `int` counter update `n + step` ⇒ `add nsw` (a signed overflow is
+        // UB). The `nsw` flag keeps `n` ineligible for the unsigned bit-pattern
+        // bound, so a `!=`-guarded signed decrement stays *unranked* (its negative
+        // half cannot be pruned) — the soundness invariant this recursion model
+        // preserves. The unsigned/defined-wraparound counterpart is built without
+        // `nsw` (see `self_rec_plain_add`).
+        rb.instructions.push(
+            vinst(
+                "add",
+                Operation::BinaryOp {
+                    kind: BinaryOp::Add,
+                },
+                na,
+                vec![n, step_v],
+                i32t,
+            )
+            .with_no_signed_wrap(),
+        );
         rb.instructions.push(term(
             "call",
             Operation::CallDirect { callee: f_id },
@@ -6274,6 +6401,37 @@ mod tests {
             block_index: BTreeMap::new(),
         };
         module_of(func, constants)
+    }
+
+    /// Like [`self_rec`] but the counter update is a **plain** (non-`nsw`) `add` —
+    /// a *defined-wraparound* (unsigned / `-fwrapv`) decrement. Guarded only by
+    /// `!=`/`==`, such a counter reaches its bound for every input, so the
+    /// disjunctive `!=` split ranks it once the leaf carries the `[0, 2^w−1]`
+    /// bit-pattern bound. Models `int id(int x){ if(x==0) return 0;
+    /// return id((unsigned)x-1)+1; }`.
+    fn self_rec_plain_add(cmp: BinaryOp, bound: i64, step: i64) -> AirModule {
+        strip_add_nsw(self_rec(cmp, bound, step))
+    }
+
+    /// Drop the `nsw` flag from every `add` in the module, turning a signed counter
+    /// update into a *defined-wraparound* (unsigned / `-fwrapv`) one — the LLVM shape
+    /// of `(unsigned)x ± k`. Used to build the plain-`add` termination fixtures.
+    fn strip_add_nsw(mut m: AirModule) -> AirModule {
+        for func in &mut m.functions {
+            for block in &mut func.blocks {
+                for inst in &mut block.instructions {
+                    if matches!(
+                        inst.op,
+                        Operation::BinaryOp {
+                            kind: BinaryOp::Add
+                        }
+                    ) {
+                        inst.extensions.remove("llvm.nsw");
+                    }
+                }
+            }
+        }
+        m
     }
 
     fn rec_ranked(m: &AirModule) -> bool {
@@ -6621,10 +6779,30 @@ mod tests {
 
     #[test]
     fn ne_guard_recursion_not_ranked() {
-        // f(n){ if (n != 0) f(n - 1); }  — `!=` is not convex; with only a type
-        // bound the argument can decrease past INT_MIN ⇒ abstain (sound: this is
-        // non-terminating for a negative signed `n`).
+        // f(int n){ if (n != 0) f(n - 1); }  with a *signed* `sub nsw` decrement:
+        // decrementing past INT_MIN is undefined behavior, so `n` may not be read as
+        // an unsigned bit pattern ⇒ it keeps no bound, the `!=` split's negative half
+        // cannot be pruned ⇒ abstain (sound: a negative signed `n` is UB / diverges).
         assert!(!rec_ranked(&self_rec(BinaryOp::ICmpNe, 0, -1)));
+    }
+
+    #[test]
+    fn ne_guard_plain_add_recursion_is_ranked() {
+        // f(int x){ if (x != 0) f((unsigned)x - 1); }  — a *defined-wraparound*
+        // (non-`nsw`) decrement guarded only by `!=`. The Eq/Ne-only, `nsw`-free `x`
+        // earns the `[0, 2^w−1]` bit-pattern bound, so the `!=` split gives `x ≥ 1`
+        // (where `x − 1` never underflows ⇒ f = x ranks) and prunes `x ≤ −1` as
+        // infeasible. Terminates for every input ⇒ TRUE. (Was abstained: no bound.)
+        assert!(rec_ranked(&self_rec_plain_add(BinaryOp::ICmpNe, 0, -1)));
+    }
+
+    #[test]
+    fn ne_guard_plain_add_increasing_recursion_not_ranked() {
+        // f(int x){ if (x != 5) f((unsigned)x + 2); }  — even a defined-wraparound
+        // counter that *increases* away from the `!=` target does not rank: the
+        // split's `x > 5` half is unbounded above (and `x + 2` overflows the bound),
+        // so it cannot be ranked, and both halves must ⇒ abstain (the negative test).
+        assert!(!rec_ranked(&self_rec_plain_add(BinaryOp::ICmpNe, 5, 2)));
     }
 
     /// `unsigned f(n){ t = n / 1; if (n != 0) f(n - 1); }` — the `udiv` hints `n`

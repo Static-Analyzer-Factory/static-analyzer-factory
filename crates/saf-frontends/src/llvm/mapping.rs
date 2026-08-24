@@ -1257,6 +1257,25 @@ fn convert_instruction(
         }
     }
 
+    // Preserve the `nsw` (no-signed-wrap) flag of an integer `add`/`sub`/`mul`/`shl`.
+    // AIR's `Operation` enum does not model the flag, so record it as a frontend
+    // extension. Termination ranking uses its *absence* as positive evidence that
+    // an operand may be reasoned about as an unsigned bit pattern (a defined
+    // wraparound): a signed `sub nsw x, 1` from `INT_MIN` is undefined behavior, so
+    // the ranking analysis must not treat such a decrement as a defined `mod 2^w`
+    // step. `nuw` is deliberately ignored — it never invalidates unsigned reasoning.
+    if matches!(
+        air_inst.op,
+        Operation::BinaryOp {
+            kind: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Shl,
+        }
+    ) && instruction_has_nsw(inst)
+    {
+        air_inst
+            .extensions
+            .insert("llvm.nsw".to_string(), serde_json::Value::Bool(true));
+    }
+
     // Extract debug info
     air_inst.span = extract_span(inst, &mut ctx.source_files);
 
@@ -1821,6 +1840,18 @@ fn binary_op(
 ) -> (Operation, Vec<ValueId>, bool) {
     let operands = collect_operands(inst, ctx);
     (Operation::BinaryOp { kind }, operands, true)
+}
+
+/// Does the instruction carry the LLVM `nsw` (no-signed-wrap) poison flag?
+///
+/// The flag appears as a bare `nsw` token in the textual form, e.g.
+/// `%9 = sub nsw i32 %8, 1`. A named SSA value is always printed with a leading
+/// `%`/`@`, so the space-delimited token ` nsw ` is unambiguously the flag and
+/// never part of an operand name. Text parsing keeps this independent of the
+/// inkwell/LLVM-C version (which does not consistently surface the flag getters).
+fn instruction_has_nsw(inst: InstructionValue<'_>) -> bool {
+    let text = inst.print_to_string().to_string();
+    text.split(char::is_whitespace).any(|tok| tok == "nsw")
 }
 
 /// Helper for cast operations.

@@ -716,6 +716,28 @@ impl Instruction {
         self
     }
 
+    /// Mark this instruction with the LLVM `nsw` (no-signed-wrap) flag.
+    #[must_use]
+    pub fn with_no_signed_wrap(mut self) -> Self {
+        self.extensions
+            .insert("llvm.nsw".to_string(), serde_json::Value::Bool(true));
+        self
+    }
+
+    /// Does this instruction carry the LLVM `nsw` (no-signed-wrap) poison flag?
+    ///
+    /// Set by the LLVM frontend under the `llvm.nsw` extension key for integer
+    /// `add`/`sub`/`mul`/`shl`. Its presence means a signed overflow of the
+    /// operation is undefined behavior — so a consumer must not reason about the
+    /// operands as freely-wrapping (`mod 2^w`) bit patterns.
+    #[must_use]
+    pub fn has_no_signed_wrap(&self) -> bool {
+        matches!(
+            self.extensions.get("llvm.nsw"),
+            Some(serde_json::Value::Bool(true))
+        )
+    }
+
     /// Check if this is a terminator instruction.
     #[must_use]
     pub fn is_terminator(&self) -> bool {
