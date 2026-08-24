@@ -543,7 +543,13 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
     // from `main` OR from any discovered thread entry. `pthread_create` is opaque,
     // so a thread body is generally *not* reachable from `main` in the call graph —
     // union the per-entry reachable sets to see every access and every lock.
-    let mut reachable_fids: BTreeSet<FunctionId> = reachable_functions(&cg, main_id);
+    // The set of functions the **main thread** may execute (direct call graph from
+    // `main`). Its happens-before landmarks (pre-spawn, joins) are computed
+    // *interprocedurally* over this whole tree — not just `main`'s own body — so the
+    // ubiquitous driver idiom (`main` calls `module_init()` which spawns, then
+    // `module_exit()` which joins) is reasoned about soundly.
+    let main_tree = reachable_functions(&cg, main_id);
+    let mut reachable_fids: BTreeSet<FunctionId> = main_tree.clone();
     for tctx in threads.values() {
         reachable_fids.extend(reachable_functions(&cg, tctx.entry_function));
     }
@@ -642,18 +648,46 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
     compute_entry_locks(module, &reachable_defined, &roots, &mut res, &sync_touching);
 
     // Per-function sound must-lockset dataflow.
-    // Instructions in `main` that provably execute before any `pthread_create`.
-    let main_prespawn = prespawn_insts(module, main_id);
+    // Interprocedural **pre-spawn**: instructions (across `main`'s whole call tree)
+    // that provably execute before ANY thread spawn on every path — including a
+    // spawn buried in a helper (`main` → `module_init()` → `pthread_create`). A
+    // "spawn point" is a direct spawn call OR a call to a may-spawn function; an
+    // instruction is pre-spawn iff no spawn point precedes it interprocedurally
+    // (sound under-approximation — see [`build_global_prespawn`]).
+    let may_spawn = functions_may_spawn(module, &cg, &main_tree);
+    let global_prespawn = build_global_prespawn(module, main_id, &main_tree, &may_spawn);
 
     // Join happens-before: resolve each spawned thread's handle object, and the
-    // set of handles provably `pthread_join`-ed on entry to each `main` block. A
-    // main-thread access dominated by a join of thread `t` is NOT concurrent with
-    // `t` (join is a happens-before edge — `t` has terminated). Handle resolution
-    // is fail-closed: an unresolved handle, a handle shared by ≥2 thread contexts
-    // (sequential reuse / handle arrays), or a recurrent thread never gets join
-    // credit.
+    // set of handles provably `pthread_join`-ed on entry to each block of every
+    // main-thread function. A main-thread access dominated by a join of thread `t`
+    // is NOT concurrent with `t` (join is a happens-before edge — `t` has
+    // terminated). Handle resolution is fail-closed: an unresolved handle, a handle
+    // shared by ≥2 thread contexts (sequential reuse / handle arrays), or a
+    // recurrent thread never gets join credit. Join credit propagates
+    // interprocedurally (`main` → `module_exit()` → `pthread_join`) via a monotone
+    // must-joined-on-entry fixpoint mirroring [`compute_entry_locks`].
     let (thread_handles, ambiguous_handles) = build_thread_handles(module, threads, &res.defs);
-    let main_joined_in = compute_main_joined_in(main_func, &res.defs, module);
+    let joined_entry = compute_joined_entry(module, &main_tree, &roots, &res.defs);
+    let joined_in_by_func: BTreeMap<FunctionId, BTreeMap<BlockId, BTreeSet<ValueId>>> = main_tree
+        .iter()
+        .filter_map(|fid| {
+            module
+                .functions
+                .iter()
+                .find(|f| f.id == *fid && !f.is_declaration)
+                .map(|f| {
+                    (
+                        *fid,
+                        compute_joined_in(
+                            f,
+                            &joined_entry.get(fid).cloned().unwrap_or_default(),
+                            &res.defs,
+                            module,
+                        ),
+                    )
+                })
+        })
+        .collect();
 
     let mut accesses: Vec<Access> = Vec::new();
     for (tid, tctx) in threads {
@@ -663,20 +697,28 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
             if func.is_declaration || !thread_fns.contains(&func.id) {
                 continue;
             }
-            let in_main_body = is_main && func.id == main_id;
+            // A main-thread execution of a function in `main`'s call tree gets the
+            // interprocedural pre-spawn / join happens-before credit. (A function
+            // shared with a worker thread is walked once per thread context; only
+            // its main-thread copy carries this credit.)
+            let main_thread_fn = is_main && main_tree.contains(&func.id);
             let locksets = compute_function_locksets(func, &res, &sync_touching, module);
             for block in &func.blocks {
                 let mut held = locksets.get(&block.id).cloned().unwrap_or_default();
-                // Running must-joined handle set within this main block (starts at
-                // the block-entry must-join; a join call adds its handle for every
+                // Running must-joined handle set within this block (starts at the
+                // block-entry must-join seed; a join call adds its handle for every
                 // subsequent instruction).
-                let mut joined_here: BTreeSet<ValueId> = if in_main_body {
-                    main_joined_in.get(&block.id).cloned().unwrap_or_default()
+                let mut joined_here: BTreeSet<ValueId> = if main_thread_fn {
+                    joined_in_by_func
+                        .get(&func.id)
+                        .and_then(|m| m.get(&block.id))
+                        .cloned()
+                        .unwrap_or_default()
                 } else {
                     BTreeSet::new()
                 };
                 for inst in &block.instructions {
-                    let pre_spawn = in_main_body && main_prespawn.contains(&inst.id);
+                    let pre_spawn = main_thread_fn && global_prespawn.contains(&inst.id);
                     // (pointer, is_write) for each memory access this instruction
                     // performs. `Store`: operand[1] is the pointer; `memcpy`/`memset`
                     // write operand[0] and `memcpy` reads operand[1].
@@ -716,7 +758,7 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
                             must_locks: held.clone(),
                             pre_spawn,
                             is_main,
-                            joined_keys: if is_main {
+                            joined_keys: if main_thread_fn {
                                 joined_here.clone()
                             } else {
                                 BTreeSet::new()
@@ -725,8 +767,9 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
                     }
                     apply_lock_transfer(inst, &res, &sync_touching, module, &mut held);
                     // A join call establishes happens-before for every LATER access
-                    // in this block (and, via `main_joined_in`, later blocks).
-                    if in_main_body {
+                    // in this block (and, via `joined_in_by_func`, later blocks and
+                    // interprocedurally-later main-thread functions).
+                    if main_thread_fn {
                         if let Some(key) = join_key_of(inst, &res.defs, module) {
                             joined_here.insert(key);
                         }
@@ -740,9 +783,11 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
     }
 
     // Threads that may have ≥2 concurrent instances (race with themselves) — a
-    // SOUND over-approximation: a thread is treated as single-instance only when
-    // its spawn is directly in `main` and not inside a CFG loop.
-    let recurrent = recurrent_thread_ids(module, &mta, main_id);
+    // SOUND over-approximation: a thread is single-instance only when its entry is
+    // unshared AND its spawn site provably executes at most once (in an
+    // invoked-at-most-once main-tree function, not inside a CFG loop).
+    let invoked_once = compute_invoked_at_most_once(module, main_id, &main_tree);
+    let recurrent = recurrent_thread_ids(module, &mta, &invoked_once);
 
     // Pairwise conflict scan. Any conflicting pair without a common unique lock is
     // not provably race-free ⇒ abstain.
@@ -1296,16 +1341,17 @@ fn build_thread_handles(
 /// EVERY path to the entry of each block (block-entry meet is set intersection).
 /// Sound under-approximation of joined-before: a conditional join is dropped at the
 /// merge. Within-block joins are added by the caller as it walks instructions.
-fn compute_main_joined_in(
-    main_func: &saf_core::air::AirFunction,
+fn compute_joined_in(
+    func: &saf_core::air::AirFunction,
+    seed: &BTreeSet<ValueId>,
     defs: &DefMap<'_>,
     module: &AirModule,
 ) -> BTreeMap<BlockId, BTreeSet<ValueId>> {
-    let cfg = Cfg::build(main_func);
+    let cfg = Cfg::build(func);
     let entry = cfg.entry;
 
     // Per-block generated joins (handle keys joined somewhere in the block).
-    let join_gen: BTreeMap<BlockId, BTreeSet<ValueId>> = main_func
+    let join_gen: BTreeMap<BlockId, BTreeSet<ValueId>> = func
         .blocks
         .iter()
         .map(|b| {
@@ -1319,24 +1365,25 @@ fn compute_main_joined_in(
         })
         .collect();
 
-    // `None` = ⊤ (unreachable) — identity for intersection.
+    // `None` = ⊤ (unreachable) — identity for intersection. The entry block starts
+    // with the interprocedural `seed` (handles joined on every entry to `func`).
     let mut block_in: BTreeMap<BlockId, Option<BTreeSet<ValueId>>> = BTreeMap::new();
-    for block in &main_func.blocks {
+    for block in &func.blocks {
         block_in.insert(block.id, None);
     }
-    block_in.insert(entry, Some(BTreeSet::new()));
+    block_in.insert(entry, Some(seed.clone()));
 
-    let cap = main_func
+    let cap = func
         .blocks
         .len()
-        .saturating_mul(main_func.blocks.len())
+        .saturating_mul(func.blocks.len())
         .saturating_add(4);
     let mut changed = true;
     let mut rounds = 0;
     while changed && rounds < cap {
         changed = false;
         rounds += 1;
-        for block in &main_func.blocks {
+        for block in &func.blocks {
             if block.id == entry {
                 continue;
             }
@@ -1363,8 +1410,7 @@ fn compute_main_joined_in(
         }
     }
 
-    main_func
-        .blocks
+    func.blocks
         .iter()
         .map(|b| {
             (
@@ -1376,6 +1422,400 @@ fn compute_main_joined_in(
             )
         })
         .collect()
+}
+
+/// Interprocedural **must-joined-on-entry** per main-tree function: the thread
+/// handle keys provably `pthread_join`-ed on EVERY entry to the function (the
+/// intersection, over all direct call sites, of the handles the caller has joined
+/// just before the call). Roots (`main` + every thread entry) join nothing on
+/// entry and stay ∅.
+///
+/// Monotone least fixpoint from ∅, mirroring [`compute_entry_locks`]: each round
+/// recomputes, for every non-root `F`, `entry[F] := ⋂ over each site C→F of
+/// (handles joined in C just before the call, with C seeded by entry[C])`. Reading
+/// each caller with the *current* `entry` and combining by intersection is monotone
+/// and bounded by the finite handle universe, so it converges; stopping at any
+/// round is sound (it only loses precision — every intermediate `entry[F]` is `⊆`
+/// the true must-joined-on-entry). Computed Jacobi-style so intra-round order is
+/// irrelevant.
+fn compute_joined_entry(
+    module: &AirModule,
+    main_tree: &BTreeSet<FunctionId>,
+    roots: &BTreeSet<FunctionId>,
+    defs: &DefMap<'_>,
+) -> BTreeMap<FunctionId, BTreeSet<ValueId>> {
+    let defined: Vec<&saf_core::air::AirFunction> = module
+        .functions
+        .iter()
+        .filter(|f| !f.is_declaration && main_tree.contains(&f.id))
+        .collect();
+    let mut entry: BTreeMap<FunctionId, BTreeSet<ValueId>> = BTreeMap::new();
+    // Cost gate (same bound as the lockset fixpoint): leaving ∅ seeds is sound.
+    if defined.len() > MAX_INTERPROC_FUNCS {
+        return entry;
+    }
+    let cap = defined.len().saturating_add(2);
+    for _ in 0..cap {
+        let mut incoming: BTreeMap<FunctionId, Option<BTreeSet<ValueId>>> = BTreeMap::new();
+        for caller in &defined {
+            let seed = entry.get(&caller.id).cloned().unwrap_or_default();
+            for (callee, joined) in joins_before_calls(caller, &seed, defs, module) {
+                if roots.contains(&callee) {
+                    continue; // roots pinned at ∅
+                }
+                let slot = incoming.entry(callee).or_insert(None);
+                *slot = Some(match slot.take() {
+                    None => joined,
+                    Some(acc) => acc.intersection(&joined).copied().collect(),
+                });
+            }
+        }
+        let mut changed = false;
+        for (callee, set) in incoming {
+            let Some(set) = set else { continue };
+            if entry.get(&callee) != Some(&set) {
+                entry.insert(callee, set);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    entry
+}
+
+/// For caller `C` (seeded with its own must-joined-on-entry `seed`), the
+/// `(callee, handles-joined-just-before-the-call)` of every direct call `C` makes.
+/// Used by [`compute_joined_entry`] to propagate join happens-before into callees.
+fn joins_before_calls(
+    func: &saf_core::air::AirFunction,
+    seed: &BTreeSet<ValueId>,
+    defs: &DefMap<'_>,
+    module: &AirModule,
+) -> Vec<(FunctionId, BTreeSet<ValueId>)> {
+    let joined_in = compute_joined_in(func, seed, defs, module);
+    let mut out = Vec::new();
+    for block in &func.blocks {
+        let mut joined = joined_in.get(&block.id).cloned().unwrap_or_default();
+        for inst in &block.instructions {
+            if let Operation::CallDirect { callee } = &inst.op {
+                if module.function(*callee).is_some() {
+                    out.push((*callee, joined.clone()));
+                }
+            }
+            if let Some(key) = join_key_of(inst, defs, module) {
+                joined.insert(key);
+            }
+        }
+    }
+    out
+}
+
+/// Functions that may (transitively, via direct calls) execute a thread spawn.
+/// A call to one is a "spawn point" for [`build_global_prespawn`].
+fn functions_may_spawn(
+    module: &AirModule,
+    cg: &CallGraph,
+    reachable: &BTreeSet<FunctionId>,
+) -> BTreeSet<FunctionId> {
+    let mut direct: BTreeSet<FunctionId> = BTreeSet::new();
+    for func in &module.functions {
+        if func.is_declaration || !reachable.contains(&func.id) {
+            continue;
+        }
+        'outer: for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Operation::CallDirect { callee } = &inst.op {
+                    if module
+                        .function(*callee)
+                        .is_some_and(|t| SPAWN_FUNCTIONS.contains(&t.name.as_str()))
+                    {
+                        direct.insert(func.id);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    let mut result = BTreeSet::new();
+    for func in &module.functions {
+        if func.is_declaration || !reachable.contains(&func.id) {
+            continue;
+        }
+        if reachable_functions(cg, func.id)
+            .iter()
+            .any(|f| direct.contains(f))
+        {
+            result.insert(func.id);
+        }
+    }
+    result
+}
+
+/// Is `inst` a **spawn point** in a main-tree function — a direct thread-spawn call,
+/// OR a direct call to a function that may (transitively) spawn?
+fn is_spawn_point(
+    inst: &saf_core::air::Instruction,
+    module: &AirModule,
+    may_spawn: &BTreeSet<FunctionId>,
+) -> bool {
+    let Operation::CallDirect { callee } = &inst.op else {
+        return false;
+    };
+    if may_spawn.contains(callee) {
+        return true;
+    }
+    module
+        .function(*callee)
+        .is_some_and(|t| SPAWN_FUNCTIONS.contains(&t.name.as_str()))
+}
+
+/// Instructions of `func` that are **reached before any spawn point executes** on
+/// every path — the intra-procedural pre-spawn set (generalizes the old main-only
+/// `prespawn_insts` to an arbitrary function and interprocedural spawn points).
+///
+/// An instruction qualifies iff it is not in a block forward-reachable from a
+/// spawn-point block, and lies at or before the FIRST spawn point in its own block.
+/// The first spawn point itself is **included**: control reaches it before any
+/// spawn has executed (a spawn happens *at/after* it, and for a may-spawn *call*
+/// the spawn happens inside the callee — so entering the callee is still pre-spawn).
+/// Including it is what lets a helper `module_init()` that spawns internally be
+/// recognised as *entered* pre-spawn ([`build_global_prespawn`]); no access
+/// instruction is ever a spawn point, so this never marks a post-spawn access
+/// pre-spawn.
+fn intra_prespawn_insts(
+    func: &saf_core::air::AirFunction,
+    module: &AirModule,
+    may_spawn: &BTreeSet<FunctionId>,
+) -> BTreeSet<InstId> {
+    let cfg = Cfg::build(func);
+    let mut spawn_blocks: BTreeSet<BlockId> = BTreeSet::new();
+    for block in &func.blocks {
+        if block
+            .instructions
+            .iter()
+            .any(|i| is_spawn_point(i, module, may_spawn))
+        {
+            spawn_blocks.insert(block.id);
+        }
+    }
+    let mut post_blocks: BTreeSet<BlockId> = BTreeSet::new();
+    let mut stack: Vec<BlockId> = spawn_blocks
+        .iter()
+        .filter_map(|b| cfg.successors.get(b))
+        .flat_map(|s| s.iter().copied())
+        .collect();
+    while let Some(b) = stack.pop() {
+        if !post_blocks.insert(b) {
+            continue;
+        }
+        if let Some(succs) = cfg.successors.get(&b) {
+            stack.extend(succs.iter().copied());
+        }
+    }
+    let mut pre: BTreeSet<InstId> = BTreeSet::new();
+    for block in &func.blocks {
+        if post_blocks.contains(&block.id) {
+            continue; // whole block is post-spawn
+        }
+        for inst in &block.instructions {
+            // Reached before any spawn executes; the first spawn point is included
+            // (it is reached pre-spawn), and it terminates the pre-spawn prefix.
+            pre.insert(inst.id);
+            if is_spawn_point(inst, module, may_spawn) {
+                break;
+            }
+        }
+    }
+    pre
+}
+
+/// Interprocedural pre-spawn instruction set over `main`'s whole call tree: the
+/// instructions that provably execute before ANY thread spawn on every execution
+/// path of the main thread.
+///
+/// # Algorithm
+///
+/// A function `F` is **entered-pre-spawn** (`entry_pre[F]`) iff every direct call
+/// path from `main` reaches `F` before any spawn: `main` is entered-pre-spawn, and
+/// a non-`main` `F` is entered-pre-spawn iff it has ≥1 call site and EVERY site is
+/// (a) in an entered-pre-spawn caller and (b) at a pre-spawn point of that caller
+/// (`site ∈ intra_prespawn(caller)`). This is a greatest fixpoint (start all
+/// optimistically true, retract any function with a non-pre-spawn site until
+/// stable). Then an instruction `I` in `F` is globally pre-spawn iff
+/// `entry_pre[F] ∧ I ∈ intra_prespawn(F)`.
+///
+/// # Soundness
+///
+/// If `I` is globally pre-spawn then, on every main-thread execution reaching `I`,
+/// no spawn point (a `pthread_create` or a may-spawn call) has executed — so no
+/// second thread exists yet and `I` cannot race. Spawn points conservatively
+/// include *any* call that may transitively spawn (even conditionally), so the set
+/// is an under-approximation of the true pre-spawn region (fail-closed).
+fn build_global_prespawn(
+    module: &AirModule,
+    main_id: FunctionId,
+    main_tree: &BTreeSet<FunctionId>,
+    may_spawn: &BTreeSet<FunctionId>,
+) -> BTreeSet<InstId> {
+    // Cost gate (same bound as the lockset/join fixpoints): on an oversized main
+    // tree, return ∅ — no interprocedural pre-spawn credit. SOUND (only ever
+    // *reduces* the pre-spawn region), and bounds the fixpoint's worst case.
+    if main_tree.len() > MAX_INTERPROC_FUNCS {
+        return BTreeSet::new();
+    }
+
+    // Precompute per-function intra pre-spawn sets for defined main-tree functions.
+    let mut intra: BTreeMap<FunctionId, BTreeSet<InstId>> = BTreeMap::new();
+    for func in &module.functions {
+        if func.is_declaration || !main_tree.contains(&func.id) {
+            continue;
+        }
+        intra.insert(func.id, intra_prespawn_insts(func, module, may_spawn));
+    }
+
+    // Direct call sites within the main tree, indexed by callee: callee →
+    // [(caller, call-inst)]. A callee absent from the map has no in-tree site.
+    let mut sites_by_callee: BTreeMap<FunctionId, Vec<(FunctionId, InstId)>> = BTreeMap::new();
+    for func in &module.functions {
+        if func.is_declaration || !main_tree.contains(&func.id) {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Operation::CallDirect { callee } = &inst.op {
+                    if main_tree.contains(callee) {
+                        sites_by_callee
+                            .entry(*callee)
+                            .or_default()
+                            .push((func.id, inst.id));
+                    }
+                }
+            }
+        }
+    }
+
+    // Greatest fixpoint over `entry_pre`: start every defined main-tree function
+    // true, retract any (non-main) function that has no site, or a site in a
+    // non-entered-pre-spawn caller, or a site that is not a pre-spawn point.
+    let mut entry_pre: BTreeSet<FunctionId> = intra.keys().copied().collect();
+    entry_pre.insert(main_id);
+    loop {
+        let mut changed = false;
+        let snapshot: Vec<FunctionId> = entry_pre.iter().copied().collect();
+        for f in snapshot {
+            if f == main_id {
+                continue;
+            }
+            let ok = sites_by_callee.get(&f).is_some_and(|ss| {
+                !ss.is_empty()
+                    && ss.iter().all(|(caller, call_inst)| {
+                        entry_pre.contains(caller)
+                            && intra.get(caller).is_some_and(|s| s.contains(call_inst))
+                    })
+            });
+            if !ok {
+                entry_pre.remove(&f);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Global pre-spawn = union over entered-pre-spawn functions of their intra set.
+    let mut out: BTreeSet<InstId> = BTreeSet::new();
+    for (fid, set) in &intra {
+        if entry_pre.contains(fid) {
+            out.extend(set.iter().copied());
+        }
+    }
+    out
+}
+
+/// Main-tree functions that provably execute **at most once** per program run.
+/// `main` qualifies; a non-`main` function `F` qualifies iff it has exactly ONE
+/// direct call site within the main tree, that site is in an at-most-once caller,
+/// and the site's block is not inside a CFG cycle (a loop would call `F` many
+/// times). Greatest fixpoint (start all true, retract violators — recursion, in a
+/// call cycle, is retracted because its self/back-edge site sits in a cycle or its
+/// caller is itself retracted).
+///
+/// Soundness: if `F` is at-most-once then any `pthread_create` directly in `F` (not
+/// in a CFG loop within `F`) fires at most once — so the spawned thread has a
+/// single instance. Used only to *grant* single-instance status; failing the test
+/// keeps the conservative recurrent (self-racing) treatment.
+fn compute_invoked_at_most_once(
+    module: &AirModule,
+    main_id: FunctionId,
+    main_tree: &BTreeSet<FunctionId>,
+) -> BTreeSet<FunctionId> {
+    // Cost gate: on an oversized main tree, grant single-instance to no thread
+    // (∅) — SOUND (every thread then treated as recurrent/self-racing, the
+    // conservative default), bounding the fixpoint's worst case.
+    if main_tree.len() > MAX_INTERPROC_FUNCS {
+        return BTreeSet::new();
+    }
+
+    // Per-function CFG (to test whether a call site's block is in a cycle).
+    let mut cfgs: BTreeMap<FunctionId, Cfg> = BTreeMap::new();
+    for func in &module.functions {
+        if !func.is_declaration && main_tree.contains(&func.id) {
+            cfgs.insert(func.id, Cfg::build(func));
+        }
+    }
+    // Direct call sites within the main tree, indexed by callee: callee →
+    // [(caller, block-of-site)].
+    let mut sites_by_callee: BTreeMap<FunctionId, Vec<(FunctionId, BlockId)>> = BTreeMap::new();
+    for func in &module.functions {
+        if func.is_declaration || !main_tree.contains(&func.id) {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Operation::CallDirect { callee } = &inst.op {
+                    if main_tree.contains(callee) {
+                        sites_by_callee
+                            .entry(*callee)
+                            .or_default()
+                            .push((func.id, block.id));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut once: BTreeSet<FunctionId> = cfgs.keys().copied().collect();
+    once.insert(main_id);
+    loop {
+        let mut changed = false;
+        let snapshot: Vec<FunctionId> = once.iter().copied().collect();
+        for f in snapshot {
+            if f == main_id {
+                continue;
+            }
+            // Exactly one call site, in an at-most-once caller, not in a CFG loop.
+            let ok = sites_by_callee.get(&f).is_some_and(|ss| {
+                ss.len() == 1 && {
+                    let (caller, bid) = ss[0];
+                    once.contains(&caller)
+                        && cfgs
+                            .get(&caller)
+                            .is_some_and(|cfg| !block_in_cycle(cfg, bid))
+                }
+            });
+            if !ok {
+                once.remove(&f);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    once
 }
 
 /// Is `main_acc` (a main-thread access) provably separated from thread `other_tid`
@@ -1572,15 +2012,18 @@ fn functions_touching_sync(
 
 /// Threads that may have ≥2 concurrent instances (race with a sibling instance of
 /// themselves). SOUND over-approximation: a thread is single-instance **only**
-/// when it is the ONLY thread with its entry function AND its `pthread_create` is
-/// directly in `main` and not inside a CFG loop; every other spawn shape (a shared
-/// entry spawned from ≥2 sites, a loop-spawned entry, a spawn nested in a helper)
-/// is treated as recurrent. This catches e.g. `create(t); create(t);` where two
-/// instances of `t` race on an unprotected global.
+/// when it is the ONLY thread with its entry function AND its `pthread_create` site
+/// provably executes at most once — i.e. the site lies in an *invoked-at-most-once*
+/// main-tree function (`invoked_once`) and is not inside a CFG loop within that
+/// function. Every other spawn shape (a shared entry spawned from ≥2 sites, a
+/// loop-spawned entry, a spawn in a function reachable more than once) is treated
+/// as recurrent. This catches e.g. `create(t); create(t);` where two instances of
+/// `t` race on an unprotected global, while admitting the driver idiom where the
+/// single spawn sits in a `module_init()` helper `main` calls exactly once.
 fn recurrent_thread_ids(
     module: &AirModule,
     mta: &saf_analysis::mta::MtaResult,
-    main_id: FunctionId,
+    invoked_once: &BTreeSet<FunctionId>,
 ) -> BTreeSet<u32> {
     let threads = &mta.thread_graph.threads;
     // Entry functions shared by ≥2 spawned thread contexts (multi-instance).
@@ -1590,11 +2033,8 @@ fn recurrent_thread_ids(
             *entry_counts.entry(tctx.entry_function).or_insert(0) += 1;
         }
     }
-    let main_cfg = module
-        .functions
-        .iter()
-        .find(|f| f.id == main_id)
-        .map(Cfg::build);
+    // Cache each spawning function's CFG to test the site's block for a cycle.
+    let mut cfg_cache: BTreeMap<FunctionId, Cfg> = BTreeMap::new();
     let mut recurrent = BTreeSet::new();
     for (tid, tctx) in threads {
         if tctx.creation_site.is_none() {
@@ -1605,12 +2045,23 @@ fn recurrent_thread_ids(
             recurrent.insert(tid.0);
             continue;
         }
-        let single = match (tctx.creation_site, &main_cfg) {
-            (Some(site), Some(cfg)) => match locate_inst(module, site) {
-                Some((fid, bid)) => fid == main_id && !block_in_cycle(cfg, bid),
-                None => false,
+        let single = match tctx.creation_site {
+            Some(site) => match locate_inst(module, site) {
+                Some((fid, bid)) if invoked_once.contains(&fid) => {
+                    let cfg = cfg_cache.entry(fid).or_insert_with(|| {
+                        Cfg::build(
+                            module
+                                .functions
+                                .iter()
+                                .find(|f| f.id == fid)
+                                .expect("located function exists"),
+                        )
+                    });
+                    !block_in_cycle(cfg, bid)
+                }
+                _ => false,
             },
-            _ => false,
+            None => false,
         };
         if !single {
             recurrent.insert(tid.0);
@@ -1648,75 +2099,6 @@ fn every_spawn_is_modeled(
         }
     }
     true
-}
-
-/// Instructions in `main`'s own body that provably execute BEFORE any
-/// `pthread_create` on every path — i.e. while the program is still single-
-/// threaded. An access here cannot race (no other thread exists yet).
-///
-/// Sound (under-approximates pre-spawn): an instruction is pre-spawn only if no
-/// spawn can reach it. We compute the set of "post-spawn" instructions — those in
-/// a spawn block at/after the spawn, or in any block forward-reachable from a
-/// spawn block — and return the complement over `main`'s instructions.
-fn prespawn_insts(module: &AirModule, main_id: FunctionId) -> BTreeSet<InstId> {
-    let Some(main_func) = module.functions.iter().find(|f| f.id == main_id) else {
-        return BTreeSet::new();
-    };
-    let cfg = Cfg::build(main_func);
-
-    // Blocks that directly contain a spawn call.
-    let mut spawn_blocks: BTreeSet<BlockId> = BTreeSet::new();
-    for block in &main_func.blocks {
-        if block.instructions.iter().any(is_spawn_call_of(module)) {
-            spawn_blocks.insert(block.id);
-        }
-    }
-
-    // Blocks reachable AFTER a spawn: forward closure from spawn blocks'
-    // successors (a spawn block itself is only partly post-spawn — split below).
-    let mut post_blocks: BTreeSet<BlockId> = BTreeSet::new();
-    let mut stack: Vec<BlockId> = spawn_blocks
-        .iter()
-        .filter_map(|b| cfg.successors.get(b))
-        .flat_map(|s| s.iter().copied())
-        .collect();
-    while let Some(b) = stack.pop() {
-        if !post_blocks.insert(b) {
-            continue;
-        }
-        if let Some(succs) = cfg.successors.get(&b) {
-            stack.extend(succs.iter().copied());
-        }
-    }
-
-    let mut pre: BTreeSet<InstId> = BTreeSet::new();
-    for block in &main_func.blocks {
-        if post_blocks.contains(&block.id) {
-            continue; // whole block is post-spawn
-        }
-        // Within a block, instructions up to the FIRST spawn are pre-spawn; the
-        // spawn and everything after it are post-spawn.
-        let mut seen_spawn = false;
-        for inst in &block.instructions {
-            if seen_spawn {
-                break;
-            }
-            if is_spawn_call_of(module)(inst) {
-                seen_spawn = true;
-                continue;
-            }
-            pre.insert(inst.id);
-        }
-    }
-    pre
-}
-
-/// Predicate: is `inst` a direct call to a thread-spawn primitive?
-fn is_spawn_call_of(module: &AirModule) -> impl Fn(&saf_core::air::Instruction) -> bool + '_ {
-    move |inst| {
-        matches!(&inst.op, Operation::CallDirect { callee }
-            if module.function(*callee).is_some_and(|f| SPAWN_FUNCTIONS.contains(&f.name.as_str())))
-    }
 }
 
 /// Reachable spawn present among the reachable defined functions?
@@ -2173,7 +2555,7 @@ mod tests {
         };
         let m = module(vec![main.clone(), declared("pthread_join")]);
         let defs = LockResolver::build(&m).defs;
-        let joined = compute_main_joined_in(&main, &defs, &m);
+        let joined = compute_joined_in(&main, &BTreeSet::new(), &defs, &m);
         // Entry has joined nothing yet; `mid` (after the join) has the handle key.
         assert!(joined.get(&entry).unwrap().is_empty());
         assert!(joined.get(&mid).unwrap().contains(&vt));
@@ -2408,5 +2790,154 @@ mod tests {
         };
         assert!(block_in_cycle(&cfg, b1));
         assert!(!block_in_cycle(&cfg, b0));
+    }
+
+    #[test]
+    fn intra_prespawn_includes_first_spawn_and_cuts_after() {
+        // Block: [store A; create(worker); store B; ret]. Instructions up to AND
+        // including the `pthread_create` are reached pre-spawn; `store B` (after the
+        // spawn) is NOT.
+        let p = ValueId::new(0x10);
+        let store_a = inst("sA", Operation::Store, vec![ValueId::new(1), p]);
+        let create = inst(
+            "cr",
+            Operation::CallDirect {
+                callee: func_id("pthread_create"),
+            },
+            vec![
+                ValueId::new(2),
+                ValueId::new(3),
+                ValueId::new(4),
+                ValueId::new(5),
+            ],
+        );
+        let store_b = inst("sB", Operation::Store, vec![ValueId::new(6), p]);
+        let f = defined("f", vec![store_a, create, store_b]);
+        let m = module(vec![f.clone(), declared("pthread_create")]);
+        let may_spawn: BTreeSet<FunctionId> = BTreeSet::new(); // create is a primitive
+        let pre = intra_prespawn_insts(&f, &m, &may_spawn);
+        assert!(pre.contains(&inst_id("sA")), "pre-spawn store included");
+        assert!(
+            pre.contains(&inst_id("cr")),
+            "the spawn point itself is included"
+        );
+        assert!(
+            !pre.contains(&inst_id("sB")),
+            "post-spawn store must be excluded"
+        );
+    }
+
+    #[test]
+    fn intra_prespawn_treats_may_spawn_call_as_spawn_point() {
+        // A call to a may-spawn helper (`module_init()`) is a spawn point: the call
+        // is included (entering the helper is pre-spawn) but a later store is not.
+        let p = ValueId::new(0x20);
+        let store_a = inst("sA2", Operation::Store, vec![ValueId::new(1), p]);
+        let call = inst(
+            "ci",
+            Operation::CallDirect {
+                callee: func_id("module_init"),
+            },
+            vec![],
+        );
+        let store_b = inst("sB2", Operation::Store, vec![ValueId::new(2), p]);
+        let f = defined("caller", vec![store_a, call, store_b]);
+        let m = module(vec![f.clone(), defined("module_init", vec![])]);
+        let may_spawn: BTreeSet<FunctionId> = [func_id("module_init")].into_iter().collect();
+        let pre = intra_prespawn_insts(&f, &m, &may_spawn);
+        assert!(pre.contains(&inst_id("sA2")));
+        assert!(
+            pre.contains(&inst_id("ci")),
+            "entering a may-spawn helper is pre-spawn"
+        );
+        assert!(
+            !pre.contains(&inst_id("sB2")),
+            "after the helper is post-spawn"
+        );
+    }
+
+    #[test]
+    fn invoked_at_most_once_single_vs_multi_site() {
+        // main calls helper exactly once -> both at-most-once.
+        let call = inst(
+            "c1",
+            Operation::CallDirect {
+                callee: func_id("helper"),
+            },
+            vec![],
+        );
+        let main = defined("main", vec![call]);
+        let helper = defined("helper", vec![]);
+        let m = module(vec![main.clone(), helper.clone()]);
+        let main_tree: BTreeSet<FunctionId> =
+            [func_id("main"), func_id("helper")].into_iter().collect();
+        let once = compute_invoked_at_most_once(&m, func_id("main"), &main_tree);
+        assert!(once.contains(&func_id("main")));
+        assert!(once.contains(&func_id("helper")));
+
+        // main calls helper from TWO sites -> helper is NOT at-most-once.
+        let call_a = inst(
+            "ca",
+            Operation::CallDirect {
+                callee: func_id("helper"),
+            },
+            vec![],
+        );
+        let call_b = inst(
+            "cb",
+            Operation::CallDirect {
+                callee: func_id("helper"),
+            },
+            vec![],
+        );
+        let main2 = defined("main", vec![call_a, call_b]);
+        let m2 = module(vec![main2, helper]);
+        let once2 = compute_invoked_at_most_once(&m2, func_id("main"), &main_tree);
+        assert!(once2.contains(&func_id("main")));
+        assert!(
+            !once2.contains(&func_id("helper")),
+            "two call sites -> may run twice"
+        );
+    }
+
+    #[test]
+    fn joins_before_calls_carries_join_to_later_callee() {
+        // Block: [load h; join(h); call sink]. The call to `sink` is preceded by a
+        // join of handle `h` -> joins_before_calls reports `h` for the `sink` site.
+        let hbase = ValueId::new(0x30); // alloca'd handle object
+        let hval = ValueId::new(0x31); // loaded pthread_t value
+        let alloca = inst_d("ha", Operation::Alloca { size_bytes: None }, vec![], hbase);
+        let load = inst_d("hl", Operation::Load, vec![hbase], hval);
+        let join = inst(
+            "jn",
+            Operation::CallDirect {
+                callee: func_id("pthread_join"),
+            },
+            vec![hval, ValueId::new(0)],
+        );
+        let sink = inst(
+            "sk",
+            Operation::CallDirect {
+                callee: func_id("sink"),
+            },
+            vec![],
+        );
+        let f = defined("caller", vec![alloca, load, join, sink]);
+        let m = module(vec![
+            f.clone(),
+            declared("pthread_join"),
+            defined("sink", vec![]),
+        ]);
+        let defs = LockResolver::build(&m).defs;
+        let out = joins_before_calls(&f, &BTreeSet::new(), &defs, &m);
+        let sink_joins = out
+            .iter()
+            .find(|(callee, _)| *callee == func_id("sink"))
+            .map(|(_, j)| j.clone())
+            .expect("sink call recorded");
+        assert!(
+            sink_joins.contains(&hbase),
+            "join of h must be visible at the later sink call site"
+        );
     }
 }
