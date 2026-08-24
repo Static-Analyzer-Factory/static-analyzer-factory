@@ -71,7 +71,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use saf_analysis::cfg::Cfg;
 use saf_analysis::z3_utils::compute_dominators;
-use saf_core::air::{AirFunction, AirModule, AirParam, BinaryOp, CastKind, Constant, Operation};
+use saf_core::air::{
+    AirFunction, AirModule, AirParam, BinaryOp, CastKind, Constant, Instruction, Operation,
+};
 use saf_core::id::make_id;
 use saf_core::ids::{BlockId, FunctionId, TypeId, ValueId};
 
@@ -530,7 +532,7 @@ struct LoopModel {
 /// expressible (⇒ abstain).
 fn build_loop_model(func: &AirFunction, module: &AirModule, li: &LoopInfo) -> Option<LoopModel> {
     let defs = index_defs(func, &li.body);
-    let signs = infer_signs(func);
+    let signs = infer_signs(func, module);
 
     // Header phis and their back-edge (latch) incoming value.
     let header_block = func.blocks.iter().find(|b| b.id == li.header)?;
@@ -892,9 +894,15 @@ fn ne_split(
 }
 
 /// Infer each integer value's signedness from the operations that consume it.
-fn infer_signs(func: &AirFunction) -> BTreeMap<ValueId, Sign> {
+fn infer_signs(func: &AirFunction, module: &AirModule) -> BTreeMap<ValueId, Sign> {
     let mut signed: BTreeSet<ValueId> = BTreeSet::new();
     let mut unsigned: BTreeSet<ValueId> = BTreeSet::new();
+    // Values whose *defining* op yields an unconditionally **non-negative** result
+    // (bit pattern in `[0, 2^w−1]`), independent of any operand's sign. These carry
+    // a sound `[0, 2^w−1]` range even when no consuming op hints a signedness — the
+    // lower bound a `!=`/`==`-else guard needs to make its negative half-space
+    // infeasible. See [`def_result_nonneg`].
+    let mut nonneg_result: BTreeSet<ValueId> = BTreeSet::new();
     for block in &func.blocks {
         for inst in &block.instructions {
             // `hint`: Some(true) ⇒ its operands are used signed, Some(false) ⇒
@@ -939,18 +947,76 @@ fn infer_signs(func: &AirFunction) -> BTreeMap<ValueId, Sign> {
                     }
                 }
             }
+            if let Some(dst) = inst.dst {
+                if def_result_nonneg(inst, module) {
+                    nonneg_result.insert(dst);
+                }
+            }
         }
     }
     let mut out = BTreeMap::new();
-    for &v in signed.union(&unsigned) {
+    for &v in signed.union(&unsigned).chain(nonneg_result.iter()) {
+        // A value used *signed* keeps its (also sound) signed range; a value used
+        // *both* ways stays `Unknown` (fail-closed, no bound). Only a value with no
+        // consuming signedness hint is promoted to `Unsigned` by a non-negative
+        // defining op — a purely additive `[0, 2^w−1]` bound where there was none.
         let sign = match (signed.contains(&v), unsigned.contains(&v)) {
             (true, false) => Sign::Signed,
             (false, true) => Sign::Unsigned,
+            (false, false) if nonneg_result.contains(&v) => Sign::Unsigned,
             _ => Sign::Unknown,
         };
         out.insert(v, sign);
     }
     out
+}
+
+/// Does `inst`'s defining op produce an unconditionally **non-negative** integer
+/// result — a bit pattern in `[0, 2^w−1]` for *every* operand value, so the result
+/// can soundly carry the unsigned range `[0, 2^w−1]` regardless of its operands'
+/// signedness? Recognized (each provably clears the result's sign bit):
+///
+/// - **`urem`** (unsigned remainder): the result lies in `[0, divisor)` in every
+///   defined execution (an unsigned modulo is never negative).
+/// - **`lshr x, k`** with a *constant* shift `1 ≤ k < w`: the top `k` bits become
+///   `0`, so the sign bit is clear.
+/// - **`and x, m`** with a *constant* mask `m` whose sign bit is clear
+///   (`0 ≤ m < 2^(w−1)`): the result's bits are a subset of `m`'s, so `0 ≤ r ≤ m`.
+///
+/// Fails closed (returns `false`) on anything else — a value that might be negative
+/// keeps no bound, so only recall is affected, never soundness. This mirrors the
+/// non-negativity reasoning in [`arg_is_nonneg`], but for a *locally defined* result
+/// rather than a call argument, and feeds [`infer_signs`]'s `[0, 2^w−1]` bound.
+fn def_result_nonneg(inst: &Instruction, module: &AirModule) -> bool {
+    let Operation::BinaryOp { kind } = &inst.op else {
+        return false;
+    };
+    let const_int = |v: &ValueId| match module.constants.get(v) {
+        Some(Constant::Int { value, bits }) => Some((*value, *bits)),
+        _ => None,
+    };
+    match kind {
+        // Unsigned remainder is always in `[0, divisor)` — never negative.
+        BinaryOp::URem => true,
+        // Logical right shift by a positive constant clears the top bit(s).
+        BinaryOp::LShr => {
+            let width = inst
+                .result_type
+                .and_then(|t| int_width(module, t))
+                .map_or(0i128, i128::from);
+            inst.operands
+                .get(1)
+                .and_then(const_int)
+                .is_some_and(|(k, _)| width > 0 && k >= 1 && i128::from(k) < width)
+        }
+        // AND with a non-negative constant mask bounds the result to `[0, mask]`.
+        BinaryOp::And => inst.operands.iter().any(|op| {
+            const_int(op).is_some_and(|(value, bits)| {
+                (1..=64).contains(&bits) && value >= 0 && i128::from(value) < (1i128 << (bits - 1))
+            })
+        }),
+        _ => false,
+    }
 }
 
 /// SV-COMP `__VERIFIER_nondet_*` sources that return a **non-negative** value
@@ -986,7 +1052,10 @@ fn is_unsigned_nondet(name: &str) -> bool {
 /// - a non-negative integer constant (`Int`/`ZeroInit`);
 /// - the result of an unsigned nondet source ([`is_unsigned_nondet`]);
 /// - a zero-extension (`ZExt`) — its high bits are all `0`, so the value is
-///   non-negative in both the source and destination widths.
+///   non-negative in both the source and destination widths;
+/// - an unconditionally non-negative arithmetic result ([`def_result_nonneg`]):
+///   an unsigned remainder (`x % k`), a mask (`x & m`, `m ≥ 0`), or a logical
+///   right shift by a positive constant (`x >> k`).
 ///
 /// Anything else (a passed-through parameter, a signed nondet, an arbitrary
 /// arithmetic result, `Undef`/`BigInt`) fails closed ⇒ the position is *not*
@@ -1014,6 +1083,11 @@ fn arg_is_nonneg(arg: ValueId, caller: &AirFunction, module: &AirModule) -> bool
                     kind: CastKind::ZExt,
                     ..
                 } => true,
+                // An unconditionally non-negative arithmetic result — `x % k`
+                // (unsigned), `x & mask`, `x >> k` — is a sound witness that the
+                // callee parameter it feeds is non-negative, regardless of `x`'s
+                // sign. See [`def_result_nonneg`].
+                Operation::BinaryOp { .. } => def_result_nonneg(inst, module),
                 _ => false,
             };
         }
@@ -1683,7 +1757,7 @@ fn build_recursion_model(
         return None;
     }
 
-    let mut signs = infer_signs(func);
+    let mut signs = infer_signs(func, module);
 
     // Interprocedural non-negativity: a self-recursive parameter with no local
     // signedness hint (`Unknown`) — e.g. an unsigned `-O0` counter such as
@@ -2025,7 +2099,7 @@ fn build_mutual_recursion_model(
     let mut signs: BTreeMap<ValueId, Sign> = BTreeMap::new();
     let mut sign_conflict: BTreeSet<ValueId> = BTreeSet::new();
     for (i, f) in members.iter().enumerate() {
-        for (vid, sign) in infer_signs(f) {
+        for (vid, sign) in infer_signs(f, module) {
             if matches!(sign, Sign::Unknown) {
                 continue;
             }
@@ -2255,7 +2329,7 @@ fn build_multipath_model_multi(
     let latch_set: BTreeSet<BlockId> = latches.iter().copied().collect();
     let defs = index_defs(func, body);
     let block_of = index_block_of(func);
-    let signs = infer_signs(func);
+    let signs = infer_signs(func, module);
 
     // Reject a **nested inner loop**: the only dominance back-edges inside the body
     // may be this loop's own `latchᵢ → header` edges. Any other in-body back-edge is
@@ -5573,6 +5647,195 @@ mod tests {
             block_index: BTreeMap::new(),
         });
         m
+    }
+
+    /// Like [`self_rec_called`], but the entry argument is `f(inp <op> k)` where
+    /// `inp` is a **signed** `__VERIFIER_nondet_int()` and `op`/`k` form an
+    /// arithmetic expression. This isolates [`def_result_nonneg`] (via
+    /// [`arg_is_nonneg`]): the signed source alone leaves the position unbounded (⇒
+    /// abstain), so a `true` here comes *solely* from the non-negative-result
+    /// reasoning about the entry expression.
+    fn self_rec_called_expr(
+        cmp: BinaryOp,
+        bound: i64,
+        step: i64,
+        op: BinaryOp,
+        k: i64,
+    ) -> AirModule {
+        let mut m = self_rec(cmp, bound, step);
+        let i32t = tid("i32");
+        let f_id = FunctionId(make_id("func", b"f"));
+
+        let inp = vid("main_inp");
+        let kc = vid("main_k");
+        let arg = vid("main_arg");
+        m.constants.insert(kc, Constant::Int { value: k, bits: 32 });
+
+        let nondet_id = FunctionId(make_id("func", b"__VERIFIER_nondet_int"));
+        m.functions.push(AirFunction {
+            id: nondet_id,
+            name: "__VERIFIER_nondet_int".to_string(),
+            params: Vec::new(),
+            blocks: Vec::new(),
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        });
+
+        let mut main_entry = AirBlock::new(bid("main_entry"));
+        main_entry.instructions.push(vinst(
+            "main_call_nondet",
+            Operation::CallDirect { callee: nondet_id },
+            inp,
+            vec![],
+            i32t,
+        ));
+        main_entry.instructions.push(vinst(
+            "main_arg_expr",
+            Operation::BinaryOp { kind: op },
+            arg,
+            vec![inp, kc],
+            i32t,
+        ));
+        main_entry.instructions.push(term(
+            "main_call_f",
+            Operation::CallDirect { callee: f_id },
+            vec![arg],
+        ));
+        main_entry
+            .instructions
+            .push(term("main_ret", Operation::Ret, vec![]));
+
+        m.functions.push(AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![main_entry],
+            entry_block: Some(bid("main_entry")),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        });
+        m
+    }
+
+    #[test]
+    fn urem_entry_ne_zero_recursion_is_ranked() {
+        // f(n){ if (n != 0) f(n-1); } entered as `f(nondet_int() % 256)`. The nondet
+        // is SIGNED, so only `def_result_nonneg` (an unsigned remainder is never
+        // negative) proves the base non-negative and recovers the `!=`-split's
+        // dropped lower bound ⇒ `f = n` ranks.
+        assert!(rec_ranked(&self_rec_called_expr(
+            BinaryOp::ICmpNe,
+            0,
+            -1,
+            BinaryOp::URem,
+            256,
+        )));
+    }
+
+    #[test]
+    fn and_mask_entry_ne_zero_recursion_is_ranked() {
+        // Entered as `f(nondet_int() & 0xFF)`: the mask's sign bit is clear, so the
+        // result is in `[0, 255]` ⇒ non-negative base ⇒ ranks.
+        assert!(rec_ranked(&self_rec_called_expr(
+            BinaryOp::ICmpNe,
+            0,
+            -1,
+            BinaryOp::And,
+            0xFF,
+        )));
+    }
+
+    #[test]
+    fn lshr_entry_ne_zero_recursion_is_ranked() {
+        // Entered as `f(nondet_int() >> 1)` (logical): the top bit becomes `0` ⇒
+        // non-negative base ⇒ ranks.
+        assert!(rec_ranked(&self_rec_called_expr(
+            BinaryOp::ICmpNe,
+            0,
+            -1,
+            BinaryOp::LShr,
+            1,
+        )));
+    }
+
+    #[test]
+    fn srem_entry_ne_zero_recursion_not_ranked() {
+        // MANDATORY negative: a SIGNED remainder `nondet_int() % 256` (`srem`) can be
+        // NEGATIVE (e.g. `-7 % 256 = -7`), so the base is not provably non-negative ⇒
+        // the `!=`-split's negative half stays feasible ⇒ abstain (no wrong `true`).
+        assert!(!rec_ranked(&self_rec_called_expr(
+            BinaryOp::ICmpNe,
+            0,
+            -1,
+            BinaryOp::SRem,
+            256,
+        )));
+    }
+
+    #[test]
+    fn and_negative_mask_entry_ne_zero_recursion_not_ranked() {
+        // MANDATORY negative: `nondet_int() & -1` (all-ones mask, sign bit set) is
+        // just the signed nondet ⇒ may be negative ⇒ abstain.
+        assert!(!rec_ranked(&self_rec_called_expr(
+            BinaryOp::ICmpNe,
+            0,
+            -1,
+            BinaryOp::And,
+            -1,
+        )));
+    }
+
+    #[test]
+    fn def_result_nonneg_classifies_ops() {
+        let i32t = tid("i32");
+        let mut m = self_rec(BinaryOp::ICmpNe, 0, -1); // reuse for its i32 type table
+        m.types.insert(i32t, AirType::Integer { bits: 32 });
+        let x = vid("dr_x");
+        let k0 = vid("dr_k0");
+        let k1 = vid("dr_k1");
+        let mask = vid("dr_mask");
+        let negmask = vid("dr_negmask");
+        m.constants.insert(k0, Constant::Int { value: 0, bits: 32 });
+        m.constants.insert(k1, Constant::Int { value: 1, bits: 32 });
+        m.constants.insert(
+            mask,
+            Constant::Int {
+                value: 0xFF,
+                bits: 32,
+            },
+        );
+        m.constants.insert(
+            negmask,
+            Constant::Int {
+                value: -1,
+                bits: 32,
+            },
+        );
+        let mk = |op: BinaryOp, ops: Vec<ValueId>| {
+            vinst(
+                "dr_d",
+                Operation::BinaryOp { kind: op },
+                vid("dr_d"),
+                ops,
+                i32t,
+            )
+        };
+        // Non-negative results.
+        assert!(def_result_nonneg(&mk(BinaryOp::URem, vec![x, k0]), &m));
+        assert!(def_result_nonneg(&mk(BinaryOp::And, vec![x, mask]), &m));
+        assert!(def_result_nonneg(&mk(BinaryOp::And, vec![mask, x]), &m)); // commutative
+        assert!(def_result_nonneg(&mk(BinaryOp::LShr, vec![x, k1]), &m));
+        // Possibly-negative results (fail closed).
+        assert!(!def_result_nonneg(&mk(BinaryOp::SRem, vec![x, k0]), &m));
+        assert!(!def_result_nonneg(&mk(BinaryOp::AShr, vec![x, k1]), &m));
+        assert!(!def_result_nonneg(&mk(BinaryOp::And, vec![x, negmask]), &m));
+        assert!(!def_result_nonneg(&mk(BinaryOp::LShr, vec![x, k0]), &m)); // shift by 0
+        assert!(!def_result_nonneg(&mk(BinaryOp::Add, vec![x, k1]), &m));
     }
 
     #[test]
