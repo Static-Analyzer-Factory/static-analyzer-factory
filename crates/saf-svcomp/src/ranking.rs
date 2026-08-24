@@ -1222,6 +1222,262 @@ fn arg_is_guarded_nonneg(
     false
 }
 
+/// Given a signed integer comparison `v <pred> c` (with `v` the left operand when
+/// `v_is_lhs`, else the right) against the *constant* `c`, return the successor edge
+/// (`then`/`else`) on which `v >= 0` is guaranteed, or `None`. Generalizes
+/// [`signed_cmp_nonneg_edge`] (which fixes `c = 0`) to any constant, recognizing the
+/// canonical `v >= 0` forms `sge v, 0`, `sgt v, -1`, `slt v, 0`, `sle v, -1`
+/// (and rhs duals) that `-O0`+instcombine emits for `if (v < 0) …` / `if (v >= 0)`.
+fn signed_cmp_const_nonneg_edge(
+    pred: BinaryOp,
+    v_is_lhs: bool,
+    c: i128,
+    then_target: BlockId,
+    else_target: BlockId,
+) -> Option<BlockId> {
+    use BinaryOp::{ICmpSge, ICmpSgt, ICmpSle, ICmpSlt};
+    // Normalize to `v <p> c` (swap the predicate when `v` is the right operand).
+    let p = if v_is_lhs {
+        pred
+    } else {
+        match pred {
+            ICmpSge => ICmpSle,
+            ICmpSle => ICmpSge,
+            ICmpSgt => ICmpSlt,
+            ICmpSlt => ICmpSgt,
+            other => other,
+        }
+    };
+    match p {
+        // `v >= c` ⇒ `v >= 0` when `c >= 0`; the THEN edge is that branch.
+        ICmpSge if c >= 0 => Some(then_target),
+        // `v > c` ⇒ `v >= c + 1 >= 0` when `c >= -1`; THEN edge.
+        ICmpSgt if c >= -1 => Some(then_target),
+        // `v < c` false ⇒ `v >= c >= 0` when `c >= 0`; the ELSE edge.
+        ICmpSlt if c >= 0 => Some(else_target),
+        // `v <= c` false ⇒ `v >= c + 1 >= 0` when `c >= -1`; ELSE edge.
+        ICmpSle if c >= -1 => Some(else_target),
+        _ => None,
+    }
+}
+
+/// Does a *dominating* signed guard force `v >= 0` on every path to `header`? Sound
+/// sufficient condition (mirrors [`arg_is_guarded_nonneg`] but for a loop-entry use
+/// point and any constant bound): some block `g` ends in a `CondBr` on a signed
+/// comparison of the *exact* value `v` against a constant, whose `v >= 0` edge
+/// ([`signed_cmp_const_nonneg_edge`]) leads to a block `t` that (a) has `g` as its
+/// **sole predecessor** and (b) **dominates** `header`. In the mem2reg-promoted SSA
+/// the ranking analysis consumes, `v` is the same value at the guard and at the
+/// phi's preheader incoming (never reassigned between), so the fact holds on entry.
+fn value_dominating_nonneg(
+    v: ValueId,
+    func: &AirFunction,
+    header: BlockId,
+    module: &AirModule,
+) -> bool {
+    let mut def_of: BTreeMap<ValueId, (&Operation, &[ValueId])> = BTreeMap::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dst) = inst.dst {
+                def_of.insert(dst, (&inst.op, inst.operands.as_slice()));
+            }
+        }
+    }
+    let const_int = |x: ValueId| match module.constants.get(&x) {
+        Some(Constant::Int { value, .. }) => Some(i128::from(*value)),
+        Some(Constant::ZeroInit) => Some(0),
+        _ => None,
+    };
+    let cfg = Cfg::build(func);
+    let idom = compute_dominators(&cfg);
+    for block in &func.blocks {
+        let Some(term) = block.instructions.last() else {
+            continue;
+        };
+        let Operation::CondBr {
+            then_target,
+            else_target,
+        } = &term.op
+        else {
+            continue;
+        };
+        let Some(&cond) = term.operands.first() else {
+            continue;
+        };
+        let Some((Operation::BinaryOp { kind }, ops)) = def_of.get(&cond).copied() else {
+            continue;
+        };
+        if !matches!(
+            kind,
+            BinaryOp::ICmpSlt | BinaryOp::ICmpSle | BinaryOp::ICmpSgt | BinaryOp::ICmpSge
+        ) {
+            continue;
+        }
+        let (Some(&lo), Some(&ro)) = (ops.first(), ops.get(1)) else {
+            continue;
+        };
+        // Exactly one operand is `v`, the other a constant.
+        let (v_is_lhs, c) = if lo == v {
+            let Some(c) = const_int(ro) else { continue };
+            (true, c)
+        } else if ro == v {
+            let Some(c) = const_int(lo) else { continue };
+            (false, c)
+        } else {
+            continue;
+        };
+        let Some(nonneg_target) =
+            signed_cmp_const_nonneg_edge(*kind, v_is_lhs, c, *then_target, *else_target)
+        else {
+            continue;
+        };
+        let sole_pred = cfg
+            .predecessors
+            .get(&nonneg_target)
+            .is_some_and(|preds| preds.len() == 1 && preds.contains(&block.id));
+        if sole_pred && dominates(nonneg_target, header, &idom) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is value `v` provably a **non-negative** integer on entry to a loop whose header
+/// is `header` — either an unconditionally non-negative *source*
+/// ([`arg_is_nonneg`]: constant, unsigned nondet, `zext`, or a non-negative
+/// arithmetic result) or gated by a *dominating signed guard* forcing `v >= 0` that
+/// reaches the header ([`value_dominating_nonneg`], e.g. an early `if (v < 0)
+/// return;` / `if (!(v >= 0))`)? Used to establish the **base case** of a header
+/// phi's `phi >= 0` loop invariant in [`inductive_nonneg_header_phis`]. Fails closed
+/// (only recall is affected).
+fn value_is_entry_nonneg(
+    v: ValueId,
+    func: &AirFunction,
+    header: BlockId,
+    module: &AirModule,
+) -> bool {
+    arg_is_nonneg(v, func, module) || value_dominating_nonneg(v, func, header, module)
+}
+
+/// The header phis `p` for which `p >= 0` is a **sound inductive loop invariant**:
+///
+/// - **base case** — every *preheader* (non-latch) incoming value of `p` is provably
+///   non-negative ([`value_is_entry_nonneg`]); and
+/// - **inductive step** — every split-expanded, type-bounded continuing branch
+///   *preserves* it: `region ∧ p ≥ 0 ⇒ next(p) ≥ 0` (a Farkas/Z3 check, mirroring
+///   [`assemble_branches`]'s split expansion and infeasible-cross-product pruning so
+///   the proof uses exactly the regions the ranking will).
+///
+/// Adding a proven `p ≥ 0` to the region is sound — it is a true fact about every
+/// continuing state, so the branch regions stay a *superset* of the real transition
+/// relation (a ranking of the superset still soundly ranks the real loop). Its value
+/// is that the `!=`/`==`-else split's **negative** half-space (`p ≤ rhs − 1`) then
+/// becomes infeasible and is pruned, recovering a `while (x != 0) x--` (entry
+/// `x ≥ 0`) style loop whose lower bound the non-convex `!=` guard alone cannot
+/// supply. A phi whose `next` is a havoc (non-affine) on any feasible branch, or
+/// whose `p ≥ 0` is not preserved (e.g. `while (0 <= j && ...) j--`, where `j = 0`
+/// steps to `-1`), fails closed and is not returned — so a genuinely oscillating /
+/// diverging loop is never spuriously bounded.
+// NOTE: the arguments are the already-built pieces of the loop model
+// (function/module, the loop's header + latch set + header phis, and the raw
+// branches + base bounds + universe) — passing the assembled state avoids
+// recomputing it, and bundling it into a struct would only obscure the check.
+#[allow(clippy::too_many_arguments)]
+fn inductive_nonneg_header_phis(
+    func: &AirFunction,
+    module: &AirModule,
+    header: BlockId,
+    latch_set: &BTreeSet<BlockId>,
+    header_phis: &BTreeSet<ValueId>,
+    raws: &[RawBranch],
+    base_bounds: &[Constraint],
+    universe: &BTreeSet<ValueId>,
+) -> BTreeSet<ValueId> {
+    let mut out = BTreeSet::new();
+    let Some(header_block) = func.blocks.iter().find(|b| b.id == header) else {
+        return out;
+    };
+    for &p in header_phis {
+        // --- Base case: every preheader incoming value is provably non-negative. ---
+        let mut has_preheader = false;
+        let mut base_ok = true;
+        for inst in &header_block.instructions {
+            let Operation::Phi { incoming } = &inst.op else {
+                continue;
+            };
+            if inst.dst != Some(p) {
+                continue;
+            }
+            for (pred, v) in incoming {
+                if latch_set.contains(pred) {
+                    continue; // a back-edge value is the inductive step, not the base
+                }
+                has_preheader = true;
+                if !value_is_entry_nonneg(*v, func, header, module) {
+                    base_ok = false;
+                }
+            }
+        }
+        if !has_preheader || !base_ok {
+            continue;
+        }
+        // --- Inductive step: `p >= 0` preserved by every split-expanded branch. ---
+        let hyp = Constraint {
+            coeffs: BTreeMap::from([(p, 1)]),
+            constant: 0,
+        };
+        let mut preserved = true;
+        'branches: for raw in raws {
+            // Mirror `assemble_branches`: over the cap the splits are dropped (a
+            // weaker/larger region), so the induction proof must use that same larger
+            // region to stay valid for the branches actually assembled.
+            let choices = if raw.splits.len() <= MAX_NE_SPLITS {
+                split_half_space_choices(&raw.splits)
+            } else {
+                vec![Vec::new()]
+            };
+            for extra in choices {
+                let mut region = raw.guards.clone();
+                region.extend(base_bounds.iter().cloned());
+                region.extend(extra);
+                region.push(hyp.clone());
+                // An infeasible sub-branch models no reachable state ⇒ vacuously
+                // preserved (this is where the negative half of `p`'s own `!=`-split
+                // drops out under `p >= 0`).
+                if region_is_infeasible(&region, universe) {
+                    continue;
+                }
+                // `next(p)` must be a concrete affine on this feasible branch — a
+                // havoc `next` could take any in-range value, including a negative
+                // one, so it does not preserve `p >= 0`.
+                let Some(Some(a)) = raw.raw_next.get(&p) else {
+                    preserved = false;
+                    break 'branches;
+                };
+                // region ⇒ a >= 0, i.e. `region ∧ (a <= -1)` is unsatisfiable.
+                // `a <= -1` ⟺ `-a - 1 >= 0`.
+                let Some(neg) = a.scale(-1).and_then(|na| na.add(&Affine::constant(-1))) else {
+                    preserved = false;
+                    break 'branches;
+                };
+                let mut check = region;
+                check.push(Constraint {
+                    coeffs: neg.terms,
+                    constant: neg.constant,
+                });
+                if !region_is_infeasible(&check, universe) {
+                    preserved = false;
+                    break 'branches;
+                }
+            }
+        }
+        if preserved {
+            out.insert(p);
+        }
+    }
+    out
+}
+
 /// Parameter **positions** of a recursion SCC that are provably fed only
 /// non-negative unsigned values at every call site **from outside the SCC** (the
 /// base case of the recursion). Used to give an otherwise sign-`Unknown`
@@ -2495,6 +2751,56 @@ fn build_multipath_model_multi(
         }
     }
 
+    // Strengthen the region with sound inductive `phi >= 0` invariants derived from
+    // an entry-guarded / non-negative-source preheader value. Each proven bound lets
+    // the `!=`/`==`-else split's negative half-space be pruned as infeasible in
+    // `assemble_branches`, recovering entry-guarded decrement loops (`while (x != 0)
+    // x--`, entry `x >= 0`) whose lower bound the non-convex guard alone drops. This
+    // must run *before* `assemble_branches` consumes `raws`.
+    let nonneg_phis = inductive_nonneg_header_phis(
+        func,
+        module,
+        header,
+        &latch_set,
+        &header_phis,
+        &raws,
+        &base_bounds,
+        &universe,
+    );
+    for &p in &nonneg_phis {
+        base_bounds.push(Constraint {
+            coeffs: BTreeMap::from([(p, 1)]),
+            constant: 0,
+        });
+        match bound_of.get_mut(&p) {
+            // A sign-based type bound already exists ⇒ tighten its lower bound to `0`
+            // so the overflow-freedom check and any havoc box use `[0, hi]`.
+            Some(b) => b.0 = b.0.max(0),
+            // No type bound (sign `Unknown`, the common case for a `==`/`!=`-only
+            // counter). A proven-non-negative `w`-bit two's-complement value has a
+            // clear sign bit, so it lies in `[0, 2^(w-1) - 1]`. Recording that sound
+            // box lets `assemble_branches` classify the phi's affine `next` (e.g.
+            // `x - 1`) as overflow-stable instead of demoting it to a havoc symbol
+            // (which would erase the very decrease the ranking needs).
+            None => {
+                if let Some(w) = defs
+                    .get(&p)
+                    .and_then(|d| d.result_type)
+                    .and_then(|t| int_width(module, t))
+                    .map(i128::from)
+                    .filter(|w| (1..=64).contains(w))
+                {
+                    let hi = (1i128 << (w - 1)) - 1;
+                    bound_of.insert(p, (0, hi));
+                    base_bounds.push(Constraint {
+                        coeffs: BTreeMap::from([(p, -1)]),
+                        constant: hi,
+                    });
+                }
+            }
+        }
+    }
+
     // --- Pass 2: expand disjunctive splits, classify each transition
     // (affine-stable vs havoc), and assemble the final per-branch regions.
     let branches = assemble_branches(raws, &base_bounds, &bound_of, &mut universe);
@@ -3396,6 +3702,246 @@ mod tests {
         loops_are_ranked(func, m, &cfg)
     }
 
+    /// `n = nondet_int(); if (!(n >= 0)) return; x = n; while (x != c) x += step;`
+    ///
+    /// The header phi `x`'s preheader value is a **signed** nondet gated by a
+    /// dominating `n >= 0` guard (emitted as `icmp sgt n, -1` when `neg_one_form`,
+    /// else `icmp sge n, 0`), and `x` carries **no** signedness hint (used only in
+    /// `!=` / `+`). This isolates the inductive `x >= 0` invariant: without it the
+    /// non-convex `!=` guard supplies no lower bound and `x` has no type range, so
+    /// the loop abstains; with it the `!=`-split's negative half-space is pruned and
+    /// (for a decrement toward `0`) `f = x` ranks.
+    fn guarded_ne_loop(step: i64, c: i64, guarded: bool, neg_one_form: bool) -> AirModule {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut types = BTreeMap::new();
+        types.insert(i32t, AirType::Integer { bits: 32 });
+        types.insert(i1t, AirType::Integer { bits: 1 });
+        let mut constants = BTreeMap::new();
+
+        let b0 = bid("entry");
+        let pre = bid("pre");
+        let h = bid("header");
+        let l = bid("latch");
+        let e = bid("exit");
+        let early = bid("early");
+
+        let n = vid("n"); // nondet preheader value
+        let x = vid("x"); // header phi
+        let xn = vid("xn"); // latch: x + step
+        let gcmp = vid("gcmp"); // guard compare
+        let gk = vid("gk"); // guard constant (0 or -1)
+        let cval = vid("c"); // loop guard compare
+        let cbound = vid("cbound");
+        let step_v = vid("step");
+        constants.insert(cbound, Constant::Int { value: c, bits: 32 });
+        constants.insert(
+            step_v,
+            Constant::Int {
+                value: step,
+                bits: 32,
+            },
+        );
+        constants.insert(
+            gk,
+            Constant::Int {
+                value: if neg_one_form { -1 } else { 0 },
+                bits: 32,
+            },
+        );
+
+        // entry: n = nondet ; [if guarded: gcmp = n >(=) k ; condbr -> pre/early]
+        let mut entry = AirBlock::new(b0);
+        entry.instructions.push(vinst(
+            "n_call",
+            Operation::CallDirect {
+                callee: FunctionId(make_id("func", b"__VERIFIER_nondet_int")),
+            },
+            n,
+            vec![],
+            i32t,
+        ));
+        if guarded {
+            entry.instructions.push(vinst(
+                "gcmp",
+                Operation::BinaryOp {
+                    kind: if neg_one_form {
+                        BinaryOp::ICmpSgt
+                    } else {
+                        BinaryOp::ICmpSge
+                    },
+                },
+                gcmp,
+                vec![n, gk],
+                i1t,
+            ));
+            entry.instructions.push(term(
+                "g_condbr",
+                Operation::CondBr {
+                    then_target: pre,
+                    else_target: early,
+                },
+                vec![gcmp],
+            ));
+        } else {
+            entry
+                .instructions
+                .push(term("br_pre", Operation::Br { target: pre }, vec![]));
+        }
+
+        // pre: br header  (preheader — sole pred of header from the nonneg edge)
+        let mut preb = AirBlock::new(pre);
+        preb.instructions
+            .push(term("br_header", Operation::Br { target: h }, vec![]));
+
+        // header: phi x=[pre:n, latch:xn] ; c = icmp ne(x, cbound) ; condbr -> latch/exit
+        let mut header = AirBlock::new(h);
+        header.instructions.push(vinst(
+            "phi_x",
+            Operation::Phi {
+                incoming: vec![(pre, n), (l, xn)],
+            },
+            x,
+            vec![],
+            i32t,
+        ));
+        header.instructions.push(vinst(
+            "cmp",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpNe,
+            },
+            cval,
+            vec![x, cbound],
+            i1t,
+        ));
+        header.instructions.push(term(
+            "condbr",
+            Operation::CondBr {
+                then_target: l,
+                else_target: e,
+            },
+            vec![cval],
+        ));
+
+        // latch: xn = add(x, step) ; br header
+        let mut latch = AirBlock::new(l);
+        latch.instructions.push(vinst(
+            "add",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            xn,
+            vec![x, step_v],
+            i32t,
+        ));
+        latch
+            .instructions
+            .push(term("br_latch", Operation::Br { target: h }, vec![]));
+
+        let mut exit = AirBlock::new(e);
+        exit.instructions.push(term("ret", Operation::Ret, vec![x]));
+        let mut earlyb = AirBlock::new(early);
+        earlyb
+            .instructions
+            .push(term("ret_early", Operation::Ret, vec![n]));
+
+        let blocks = if guarded {
+            vec![entry, preb, header, latch, exit, earlyb]
+        } else {
+            vec![entry, preb, header, latch, exit]
+        };
+        let func = AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks,
+            entry_block: Some(b0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        AirModule {
+            id: ModuleId(make_id("module", b"t")),
+            name: Some("t".to_string()),
+            functions: vec![func],
+            globals: Vec::new(),
+            source_files: Vec::new(),
+            type_hierarchy: Vec::new(),
+            constants,
+            types,
+            target_pointer_width: 8,
+            function_index: BTreeMap::new(),
+            name_index: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn guarded_nonneg_ne_decrement_is_ranked() {
+        // if (n >= 0) { x = n; while (x != 0) x--; }  → f = x ranks.
+        assert!(ranked(&guarded_ne_loop(-1, 0, true, false)));
+        // `n > -1` (the instcombine `>= 0` form) must work identically.
+        assert!(ranked(&guarded_ne_loop(-1, 0, true, true)));
+    }
+
+    #[test]
+    fn unguarded_ne_decrement_abstains() {
+        // NO entry guard: `x` may start negative, so `while (x != 0) x--` diverges
+        // for `x < 0` ⇒ the negative half-space is feasible and cannot be ranked ⇒
+        // abstain (no wrong `true`).
+        assert!(!ranked(&guarded_ne_loop(-1, 0, false, false)));
+    }
+
+    #[test]
+    fn guarded_nonneg_ne_increment_abstains() {
+        // Entry `n >= 0` but `while (x != 0) x++`: non-terminating for `x > 0` (never
+        // returns to `0`). The `x >= 1` half-space diverges (`x++` unbounded above),
+        // so it cannot be ranked ⇒ abstain.
+        assert!(!ranked(&guarded_ne_loop(1, 0, true, false)));
+        // `while (x != 10) x++` with only `x >= 0` known: diverges for `x > 10` ⇒
+        // the `x >= 11` half cannot be ranked ⇒ abstain.
+        assert!(!ranked(&guarded_ne_loop(1, 10, true, false)));
+    }
+
+    #[test]
+    fn even_start_ne_odd_target_abstains() {
+        // `while (x != 5) x += 2` from an entry-nonneg start: the `x >= 6` half-space
+        // diverges (`x += 2` unbounded above) ⇒ abstain (mandatory negative test).
+        assert!(!ranked(&guarded_ne_loop(2, 5, true, false)));
+    }
+
+    #[test]
+    fn signed_cmp_const_nonneg_edge_forms() {
+        use BinaryOp::{ICmpSge, ICmpSgt, ICmpSle, ICmpSlt};
+        let (t, e) = (bid("t"), bid("e"));
+        // `v >= 0` / `v > -1` ⇒ THEN edge.
+        assert_eq!(
+            signed_cmp_const_nonneg_edge(ICmpSge, true, 0, t, e),
+            Some(t)
+        );
+        assert_eq!(
+            signed_cmp_const_nonneg_edge(ICmpSgt, true, -1, t, e),
+            Some(t)
+        );
+        // `v < 0` / `v <= -1` ⇒ ELSE edge.
+        assert_eq!(
+            signed_cmp_const_nonneg_edge(ICmpSlt, true, 0, t, e),
+            Some(e)
+        );
+        assert_eq!(
+            signed_cmp_const_nonneg_edge(ICmpSle, true, -1, t, e),
+            Some(e)
+        );
+        // Insufficient constants ⇒ no non-negativity edge.
+        assert_eq!(signed_cmp_const_nonneg_edge(ICmpSge, true, -1, t, e), None);
+        assert_eq!(signed_cmp_const_nonneg_edge(ICmpSgt, true, -2, t, e), None);
+        // rhs form `k <p> v` swaps the predicate: `-1 < v` ⟺ `v > -1` ⇒ THEN.
+        assert_eq!(
+            signed_cmp_const_nonneg_edge(ICmpSlt, false, -1, t, e),
+            Some(t)
+        );
+    }
+
     #[test]
     fn count_down_unsigned_is_ranked() {
         // while (x > 0) x += -1;   (unsigned)  →  f = x
@@ -3810,12 +4356,16 @@ mod tests {
     }
 
     #[test]
-    fn ne_zero_signed_countdown_abstains() {
-        // while (x != 0) x -= 1;  with `x` *signed*: the `x ≤ -1` half is feasible
-        // and `x -= 1` diverges toward INT_MIN (underflow) ⇒ that half cannot be
-        // ranked ⇒ abstain (sound: signed `x < 0` does not terminate here).
+    fn ne_zero_signed_countdown_from_zero_ranked() {
+        // while (x != 0) x -= 1;  with `x` *signed* and a constant-`0` preheader init
+        // (`ne_counter_loop` seeds `x_init = 0`). Since `x` starts non-negative, the
+        // inductive `x >= 0` invariant is established, the `!=`-split's `x ≤ -1` half
+        // is pruned as infeasible, and the `x ≥ 1` half ranks with `f = x`. This is
+        // sound and complete for THIS program: from `x = 0` the loop never enters, so
+        // it terminates. (A genuinely-unbounded signed init — where `x < 0` really is
+        // reachable — is the abstain case covered by `unguarded_ne_decrement_abstains`.)
         let m = ne_counter_loop(0, -1, false);
-        assert!(!ranked(&m));
+        assert!(ranked(&m));
     }
 
     #[test]
