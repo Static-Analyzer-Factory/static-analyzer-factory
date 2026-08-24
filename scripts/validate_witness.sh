@@ -134,6 +134,11 @@ case "$PROPERTY" in *memsafety*) is_memsafety=1 ;; esac
 if [ "$is_memsafety" = 0 ] && [ -n "$PROPERTY" ] && grep -qiE 'valid-(deref|free|memtrack)' "$PROPERTY" 2>/dev/null; then
     is_memsafety=1
 fi
+is_unreach=0
+case "$PROPERTY" in *unreach*) is_unreach=1 ;; esac
+if [ "$is_unreach" = 0 ] && [ -n "$PROPERTY" ] && grep -qiE 'reach_error|call\(' "$PROPERTY" 2>/dev/null; then
+    is_unreach=1
+fi
 cbmc_confirms_memsafety() {
     [ "${SAF_SKIP_CBMC:-0}" = "1" ] && return 1
     local cbmc_bin lines o fails ln
@@ -160,10 +165,35 @@ cbmc_confirms_memsafety() {
     done
     return 1
 }
+cbmc_confirms_unreach() {
+    # For unreach-call, reach_error() calls __assert_fail, so reaching it is a CBMC
+    # assertion FAILURE named after reach_error. Confirm iff CBMC reports that error
+    # target reachable; EXCLUDE bound artifacts (unwinding assertions -> inconclusive)
+    # and modeling artifacts (no body). reach_error reachability IS the property
+    # violation, so no line-matching is needed. Same soundness basis as memsafety: the
+    # confirmer only runs on SAF FALSE verdicts, and SAF abstains (unknown) on safe
+    # tasks -- verified CBMC also finds reach_error UNreachable on safe programs.
+    [ "${SAF_SKIP_CBMC:-0}" = "1" ] && return 1
+    local cbmc_bin o
+    if [ -x "$CBMC_HOME/cbmc" ]; then
+        cbmc_bin="$CBMC_HOME/cbmc"; export LD_LIBRARY_PATH="$CBMC_HOME:${LD_LIBRARY_PATH:-}"
+    elif command -v cbmc >/dev/null 2>&1; then
+        cbmc_bin="cbmc"
+    else
+        return 1
+    fi
+    o="$(timeout -k 15 120 "$cbmc_bin" --unwind 200 "$PROGRAM" 2>&1)" || true
+    printf '%s\n' "$o" \
+      | grep -E ': FAILURE$' \
+      | grep -viE 'unwinding assertion|no body for callee' \
+      | grep -qiE 'reach_error|__VERIFIER_error'
+}
 if printf '%s\n' "$out2" | grep -qE 'reached expected property violation|Verification result: FALSE'; then
     echo "CONFIRMED (witness2test-execution)"
 elif [ "$is_memsafety" = 1 ] && cbmc_confirms_memsafety; then
     echo "CONFIRMED (cbmc-memsafety)"
+elif [ "$is_unreach" = 1 ] && cbmc_confirms_unreach; then
+    echo "CONFIRMED (cbmc-unreach)"
 else
     echo "NOT_CONFIRMED (analysis=${verdict:-none}; witness2test/cbmc did not confirm)"
 fi
