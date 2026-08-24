@@ -201,6 +201,173 @@ const RACE_INERT_EXTERNALS: &[&str] = &[
     "pthread_equal",
 ];
 
+/// The program-visible memory effect of a **modeled** memory-touching libc
+/// external (`printf`, `strcpy`, …). Admitting these — instead of forcing a
+/// blanket `non-inert-external` abstain — lets the prover analyze the huge class
+/// of otherwise-race-free programs that merely call `printf`/`fprintf` (constant
+/// diagnostics) or a `str*` helper.
+///
+/// # Soundness contract
+///
+/// The single failure mode is **under**-counting an access (a write seen as a read,
+/// or a write missed entirely) — that could hide a race and yield a wrong `true`
+/// (−32). Every variant therefore **over**-approximates reads and is exact-or-
+/// conservative about writes:
+/// - a function is listed as read-only ONLY if it provably never writes program
+///   memory through any pointer argument (verified per entry in [`libc_model`]);
+/// - a writer lists operand 0 as its *only* written pointer (true for the entire
+///   `strcpy`/`strcat`/`sprintf` family) and treats every other operand as a read;
+/// - a variadic formatter is modeled ONLY when its format string is a compile-time
+///   constant with no `%n` (which would write through a hidden variadic pointer) —
+///   otherwise it falls back to abstain.
+///
+/// Marking a *non-pointer* operand as a read only ever adds a spurious conflict
+/// (costing recall, never soundness), so we mark *every* operand rather than risk
+/// missing a pointer we cannot type-check at the AIR level.
+enum LibcModel {
+    /// Reads (never writes program memory through) all pointer arguments. Every
+    /// operand is treated as a READ.
+    ReadAll,
+    /// A `printf`/`fprintf`-style variadic formatter: like [`LibcModel::ReadAll`],
+    /// but valid ONLY when the format-string operand (`fmt_idx`) is a constant
+    /// without `%n`; otherwise abstain.
+    ReadAllFormat {
+        /// Operand index of the format string.
+        fmt_idx: usize,
+    },
+    /// A `strcpy`/`sprintf`-style writer: operand 0 (the destination) is WRITTEN,
+    /// every other operand is READ. `fmt_idx`, when present, is gated exactly as in
+    /// [`LibcModel::ReadAllFormat`].
+    WriteDst {
+        /// Operand index of the format string, for the `s(n)printf` writers.
+        fmt_idx: Option<usize>,
+    },
+}
+
+/// The [`LibcModel`] for a libc external `name`, or `None` if `name` is not a
+/// modeled memory-touching libc (⇒ the completeness gate abstains, as before).
+///
+/// Every read-only entry is a function that provably writes NO program memory
+/// through a pointer argument (I/O to a synchronized `FILE`, or a pure string
+/// query). Every writer writes ONLY its operand-0 destination. Keep additions to
+/// functions whose pointer read/write set is unambiguous — a miscategorised writer
+/// is a wrong `true`.
+#[must_use]
+fn libc_model(name: &str) -> Option<LibcModel> {
+    match name {
+        // Variadic formatters (gated on a constant, `%n`-free format string).
+        "printf" => Some(LibcModel::ReadAllFormat { fmt_idx: 0 }),
+        "fprintf" | "dprintf" => Some(LibcModel::ReadAllFormat { fmt_idx: 1 }),
+        // Buffer-writing formatters: destination is operand 0.
+        "sprintf" => Some(LibcModel::WriteDst { fmt_idx: Some(1) }),
+        "snprintf" => Some(LibcModel::WriteDst { fmt_idx: Some(2) }),
+        // Destination-writing string helpers: operand 0 written, rest read.
+        "strcpy" | "strncpy" | "strcat" | "strncat" => Some(LibcModel::WriteDst { fmt_idx: None }),
+        // Pure readers: I/O of caller data to a synchronized stream, or string
+        // queries. None writes program memory through a pointer argument.
+        "puts" | "fputs" | "perror" | "putchar" | "putc" | "fputc" | "fwrite" | "strlen"
+        | "strnlen" | "strcmp" | "strncmp" | "strcasecmp" | "strncasecmp" | "strchr"
+        | "strrchr" | "strstr" | "strspn" | "strcspn" | "strpbrk" | "memcmp" | "memchr"
+        | "atoi" | "atol" | "atoll" | "atof" => Some(LibcModel::ReadAll),
+        _ => None,
+    }
+}
+
+/// The `(pointer, is_write)` accesses a modeled libc call performs, or `Err(())`
+/// when the call cannot be soundly modeled (a formatter with a non-constant or
+/// `%n`-bearing format ⇒ the caller abstains).
+fn libc_call_accesses(
+    inst: &saf_core::air::Instruction,
+    model: &LibcModel,
+    defs: &DefMap<'_>,
+    module: &AirModule,
+) -> Result<Vec<(ValueId, bool)>, ()> {
+    // Gate the format string (if this model carries one): it must resolve to a
+    // compile-time constant that does not contain `%n` (a `%n` directive writes an
+    // `int` through a variadic pointer we model as read-only — unsound).
+    let fmt_idx = match model {
+        LibcModel::ReadAllFormat { fmt_idx } => Some(*fmt_idx),
+        LibcModel::WriteDst { fmt_idx } => *fmt_idx,
+        LibcModel::ReadAll => None,
+    };
+    if let Some(idx) = fmt_idx {
+        let fmt_op = inst.operands.get(idx).copied().ok_or(())?;
+        let fmt = resolve_string_literal(fmt_op, defs, module).ok_or(())?;
+        if fmt.contains("%n") {
+            return Err(());
+        }
+    }
+    let mut out = Vec::with_capacity(inst.operands.len());
+    match model {
+        LibcModel::ReadAll | LibcModel::ReadAllFormat { .. } => {
+            out.extend(inst.operands.iter().map(|p| (*p, false)));
+        }
+        LibcModel::WriteDst { .. } => {
+            for (i, p) in inst.operands.iter().enumerate() {
+                out.push((*p, i == 0));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve a pointer value to the **string literal** it addresses, forwarding
+/// through casts/copies and GEPs to a global with a string (or byte-array)
+/// initializer. `None` on any non-constant / unresolvable pointer (⇒ the caller
+/// fails closed). The frontend collapses a `getelementptr @.str, 0, 0` onto the
+/// global's address, so the common case is a direct global reference.
+fn resolve_string_literal(v: ValueId, defs: &DefMap<'_>, module: &AirModule) -> Option<String> {
+    let mut cur = v;
+    for _ in 0..64 {
+        if let Some(Constant::String { value }) = module.constants.get(&cur) {
+            return Some(value.clone());
+        }
+        if let Some(g) = module.globals.iter().find(|g| g.id == cur) {
+            return string_from_init(g.init.as_ref());
+        }
+        if let Some(Constant::GlobalRef(t)) = module.constants.get(&cur) {
+            let g = module.globals.iter().find(|g| g.id == *t)?;
+            return string_from_init(g.init.as_ref());
+        }
+        let inst = defs.get(&cur)?;
+        match &inst.op {
+            Operation::Cast { .. }
+            | Operation::Copy
+            | Operation::Freeze
+            | Operation::Gep { .. } => {
+                cur = inst.operands.first().copied()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Decode a global's initializer to a string: a `Constant::String`, or an
+/// aggregate byte array (truncated at the first NUL). `None` for anything else.
+fn string_from_init(init: Option<&Constant>) -> Option<String> {
+    match init {
+        Some(Constant::String { value }) => Some(value.clone()),
+        Some(Constant::Aggregate { elements }) => {
+            let mut s = String::new();
+            for e in elements {
+                let Constant::Int { value, .. } = e else {
+                    return None;
+                };
+                // INVARIANT: byte-array element; low 8 bits are the character.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let b = *value as u8;
+                if b == 0 {
+                    break;
+                }
+                s.push(b as char);
+            }
+            Some(s)
+        }
+        _ => None,
+    }
+}
+
 /// Resolve the thread entry function of a `pthread_create`/`thrd_create` call to a
 /// **directly-named** function, or `None` if the entry is indirect / unresolved
 /// (⇒ the caller abstains — an unmodeled thread body could race invisibly).
@@ -365,7 +532,12 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
             continue;
         }
         if func.is_declaration {
-            if !is_race_inert_external(&func.name) {
+            // A modeled memory-touching libc external (`printf`/`strcpy`/…) is
+            // admitted: its accesses are generated in the access-collection loop
+            // and participate in the conflict scan (fail-closed on an unmodelable
+            // format there). Everything else not on the race-inert allowlist forces
+            // abstain (an unmodeled external could hide a spawn/lock/access).
+            if !is_race_inert_external(&func.name) && libc_model(&func.name).is_none() {
                 return Err(format!("non-inert-external:{}", func.name));
             }
             continue;
@@ -430,6 +602,20 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
     }
     res.acquire_summaries = acquire_summaries;
 
+    // Third phase: interprocedural must-lockset on entry. Propagate each caller's
+    // held locks into its callees so a shared access inside a helper (`push`,
+    // `get_top`) called only while a global mutex is held is seen as protected.
+    // Roots (`main` + every thread entry) hold nothing on entry. Sound (monotone
+    // under-approximation — see [`compute_entry_locks`]).
+    let reachable_defined: Vec<&saf_core::air::AirFunction> = module
+        .functions
+        .iter()
+        .filter(|f| !f.is_declaration && reachable_fids.contains(&f.id))
+        .collect();
+    let mut roots: BTreeSet<FunctionId> = threads.values().map(|t| t.entry_function).collect();
+    roots.insert(main_id);
+    compute_entry_locks(module, &reachable_defined, &roots, &mut res, &sync_touching);
+
     // Per-function sound must-lockset dataflow.
     // Instructions in `main` that provably execute before any `pthread_create`.
     let main_prespawn = prespawn_insts(module, main_id);
@@ -478,6 +664,23 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
                             ops.extend(inst.operands.get(1).map(|p| (*p, false)));
                         }
                         Operation::Memset => ops.extend(inst.operands.first().map(|p| (*p, true))),
+                        // A call to a modeled memory-touching libc external
+                        // (`printf`/`strcpy`/…) performs its accesses through the
+                        // pointer arguments. Generate them here so such calls no
+                        // longer force a blanket abstain (they were rejected by the
+                        // `non-inert-external` gate). Fail-closed: an unmodelable
+                        // format (non-constant, or `%n` which would WRITE through a
+                        // variadic pointer we cannot see) abstains.
+                        Operation::CallDirect { callee } => {
+                            if let Some(t) = module.function(*callee) {
+                                if let Some(model) = libc_model(&t.name) {
+                                    match libc_call_accesses(inst, &model, &res.defs, module) {
+                                        Ok(a) => ops.extend(a),
+                                        Err(()) => return Err("libc-unmodelable-format".into()),
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     for (ptr, write) in ops {
@@ -581,12 +784,16 @@ fn compute_function_locksets(
     let cfg = Cfg::build(func);
     let entry = cfg.entry;
 
+    // Interprocedural seed: the must-locks provably held on EVERY entry to this
+    // function (empty for roots / when interprocedural propagation is off).
+    let seed = res.entry_locks.get(&func.id).cloned().unwrap_or_default();
+
     // `None` = ⊤ (uninitialized / unreachable) — identity for intersection.
     let mut block_in: BTreeMap<BlockId, Option<BTreeSet<LockId>>> = BTreeMap::new();
     for block in &func.blocks {
         block_in.insert(block.id, None);
     }
-    block_in.insert(entry, Some(BTreeSet::new()));
+    block_in.insert(entry, Some(seed.clone()));
 
     // Bounded fixpoint (must-lattice height ≤ #blocks × #locks; sets only shrink).
     let cap = func
@@ -602,7 +809,7 @@ fn compute_function_locksets(
         for block in &func.blocks {
             // Meet of predecessor OUT states.
             let meet = if block.id == entry {
-                Some(BTreeSet::new())
+                Some(seed.clone())
             } else {
                 let mut acc: Option<BTreeSet<LockId>> = None;
                 if let Some(preds) = cfg.predecessors.get(&block.id) {
@@ -732,6 +939,16 @@ struct LockResolver<'a> {
     /// A call to such a function adds those locks to the caller's must-lockset.
     /// Populated in a second phase; empty during that phase's own computation.
     acquire_summaries: BTreeMap<FunctionId, BTreeSet<LockId>>,
+    /// Interprocedural **must-lockset on entry** per user function: the concrete
+    /// locks provably held on EVERY entry to the function (the intersection, over
+    /// all direct call sites, of the locks the caller holds at the call). This
+    /// seeds the intraprocedural lockset dataflow so that a shared access inside a
+    /// helper (`push`/`get_top`) called only while a global mutex is held is seen
+    /// as protected. Sound (a monotone under-approximation of the true must-set —
+    /// see [`compute_entry_locks`]); empty ⇒ the helper starts with no locks (the
+    /// pre-interprocedural behaviour). Thread-entry functions and `main` are roots
+    /// and stay empty (a fresh thread / the program start holds nothing).
+    entry_locks: BTreeMap<FunctionId, BTreeSet<LockId>>,
 }
 
 impl<'a> LockResolver<'a> {
@@ -790,8 +1007,112 @@ impl<'a> LockResolver<'a> {
             defs,
             ambiguous_globals,
             acquire_summaries: BTreeMap::new(),
+            entry_locks: BTreeMap::new(),
         }
     }
+}
+
+/// Upper bound on the number of reachable defined functions for which the
+/// interprocedural entry-lock fixpoint runs. Beyond this we skip it (seeding empty
+/// entry locks — the pre-interprocedural behaviour) to bound cost on huge CIL
+/// drivers, which is SOUND: an empty seed only ever under-approximates the
+/// must-lockset.
+const MAX_INTERPROC_FUNCS: usize = 400;
+
+/// Compute the interprocedural **must-lockset on entry** for every reachable
+/// defined function (see [`LockResolver::entry_locks`]).
+///
+/// # Algorithm (monotone least fixpoint from ∅)
+///
+/// `entry[F]` starts at ∅ for every function. `main` and every thread-entry
+/// function are **roots** and stay ∅ (a fresh thread / program start holds no
+/// lock). Each round recomputes, for every non-root `F`,
+///
+/// ```text
+/// entry[F] := ⋂ over every direct call site `C → F` of
+///                 (must-locks held in C just before the call, with C seeded by entry[C])
+/// ```
+///
+/// Reading each caller's locks with the *current* `entry` and combining by
+/// intersection is monotone (more caller locks ⇒ more site locks ⇒ larger
+/// intersection) and bounded by the finite lock universe, so it converges. It is
+/// computed Jacobi-style (all call-site locks are read from the pre-round `entry`,
+/// then applied together) so intra-round order is irrelevant.
+///
+/// # Soundness
+///
+/// Every intermediate `entry[F]` is `⊆` the true must-locks-held-on-entry: it
+/// starts at ∅ `⊆` true, and each update intersects sound per-site must-locksets
+/// over **all** the ways `F` is entered (there are no indirect calls — the caller
+/// abstains earlier if any exist — and thread-entry/`main` roots are pinned to ∅,
+/// covering the spawn/program-start entries). Hence stopping at ANY round (e.g. the
+/// iteration cap) is sound; it only loses precision.
+fn compute_entry_locks(
+    module: &AirModule,
+    reachable_defined: &[&saf_core::air::AirFunction],
+    roots: &BTreeSet<FunctionId>,
+    res: &mut LockResolver<'_>,
+    sync_touching: &BTreeSet<FunctionId>,
+) {
+    if reachable_defined.len() > MAX_INTERPROC_FUNCS {
+        return; // cost gate (sound: leaves empty ∅ seeds)
+    }
+    // Bounded rounds: monotone growth over a lattice of height ≤ #funcs × #locks;
+    // any early stop is sound, so a linear cap suffices.
+    let cap = reachable_defined.len().saturating_add(2);
+    for _ in 0..cap {
+        // Jacobi round: gather every non-root callee's incoming site locksets using
+        // the entry locks fixed at the start of the round.
+        let mut incoming: BTreeMap<FunctionId, Option<BTreeSet<LockId>>> = BTreeMap::new();
+        for caller in reachable_defined {
+            for (callee, locks) in locks_before_calls(caller, res, sync_touching, module) {
+                if roots.contains(&callee) {
+                    continue; // roots pinned at ∅
+                }
+                let slot = incoming.entry(callee).or_insert(None);
+                *slot = Some(match slot.take() {
+                    None => locks,
+                    Some(acc) => acc.intersection(&locks).copied().collect(),
+                });
+            }
+        }
+        let mut changed = false;
+        for (callee, set) in incoming {
+            let Some(set) = set else { continue };
+            if res.entry_locks.get(&callee) != Some(&set) {
+                res.entry_locks.insert(callee, set);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// For caller `C`, the `(callee, must-locks-held-just-before-the-call)` of every
+/// direct call `C` makes, using `C`'s current interprocedural entry seed. Used by
+/// [`compute_entry_locks`] to propagate a caller's held locks into its callees.
+fn locks_before_calls(
+    func: &saf_core::air::AirFunction,
+    res: &LockResolver<'_>,
+    sync_touching: &BTreeSet<FunctionId>,
+    module: &AirModule,
+) -> Vec<(FunctionId, BTreeSet<LockId>)> {
+    let locksets = compute_function_locksets(func, res, sync_touching, module);
+    let mut out = Vec::new();
+    for block in &func.blocks {
+        let mut held = locksets.get(&block.id).cloned().unwrap_or_default();
+        for inst in &block.instructions {
+            if let Operation::CallDirect { callee } = &inst.op {
+                if module.function(*callee).is_some() {
+                    out.push((*callee, held.clone()));
+                }
+            }
+            apply_lock_transfer(inst, res, sync_touching, module, &mut held);
+        }
+    }
+    out
 }
 
 /// Functions that may (transitively) call `pthread_mutex_unlock` — a call to one
@@ -1455,7 +1776,7 @@ fn reachable_functions(cg: &CallGraph, entry: FunctionId) -> BTreeSet<FunctionId
 mod tests {
     use super::*;
 
-    use saf_core::air::{AirBlock, AirFunction, FieldPath, FieldStep, Instruction};
+    use saf_core::air::{AirBlock, AirFunction, AirGlobal, FieldPath, FieldStep, Instruction};
     use saf_core::id::make_id;
     use saf_core::ids::{BlockId, ModuleId};
 
@@ -1865,6 +2186,163 @@ mod tests {
         assert!(
             !state.contains(&atomic_section_lock()),
             "end must release the atomic-section lock"
+        );
+    }
+
+    #[test]
+    fn libc_model_categorises_readers_writers_and_formatters() {
+        // Readers.
+        for n in [
+            "puts", "fputs", "perror", "strlen", "strcmp", "strchr", "memcmp", "atoi",
+        ] {
+            assert!(
+                matches!(libc_model(n), Some(LibcModel::ReadAll)),
+                "{n} should be ReadAll"
+            );
+        }
+        // Formatters (gated).
+        assert!(matches!(
+            libc_model("printf"),
+            Some(LibcModel::ReadAllFormat { fmt_idx: 0 })
+        ));
+        assert!(matches!(
+            libc_model("fprintf"),
+            Some(LibcModel::ReadAllFormat { fmt_idx: 1 })
+        ));
+        // Writers (destination = operand 0).
+        assert!(matches!(
+            libc_model("strcpy"),
+            Some(LibcModel::WriteDst { fmt_idx: None })
+        ));
+        assert!(matches!(
+            libc_model("snprintf"),
+            Some(LibcModel::WriteDst { fmt_idx: Some(2) })
+        ));
+        // Unmodeled / dangerous externals stay abstaining.
+        for n in [
+            "scanf",
+            "sscanf",
+            "fgets",
+            "fread",
+            "strtol",
+            "pthread_cond_wait",
+        ] {
+            assert!(libc_model(n).is_none(), "{n} must NOT be modeled");
+        }
+    }
+
+    #[test]
+    fn resolve_string_literal_reads_global_init() {
+        // A global `.str` with a String initializer, referenced directly (the
+        // frontend collapses the `getelementptr @.str, 0, 0` onto the address).
+        let gid = ValueId::new(0x500);
+        let mut m = module(vec![]);
+        m.globals.push(AirGlobal {
+            id: gid,
+            obj: ObjId::new(0x501),
+            name: ".str".to_string(),
+            init: Some(Constant::String {
+                value: "hi %d\n".to_string(),
+            }),
+            is_constant: true,
+            span: None,
+            value_type: None,
+        });
+        let defs: DefMap = BTreeMap::new();
+        assert_eq!(
+            resolve_string_literal(gid, &defs, &m),
+            Some("hi %d\n".to_string())
+        );
+        // An unresolvable (non-constant) pointer yields None.
+        assert_eq!(
+            resolve_string_literal(ValueId::new(0xdead), &defs, &m),
+            None
+        );
+    }
+
+    #[test]
+    fn libc_call_accesses_reads_writes_and_format_gate() {
+        let gid = ValueId::new(0x600); // constant format string
+        let good = ValueId::new(0x601);
+        let bad = ValueId::new(0x602); // format with %n
+        let mut m = module(vec![]);
+        m.globals.push(AirGlobal {
+            id: gid,
+            obj: ObjId::new(0x610),
+            name: ".fmt".to_string(),
+            init: Some(Constant::String {
+                value: "%s ok".to_string(),
+            }),
+            is_constant: true,
+            span: None,
+            value_type: None,
+        });
+        m.globals.push(AirGlobal {
+            id: bad,
+            obj: ObjId::new(0x611),
+            name: ".fmtn".to_string(),
+            init: Some(Constant::String {
+                value: "x%ny".to_string(),
+            }),
+            is_constant: true,
+            span: None,
+            value_type: None,
+        });
+        let defs: DefMap = BTreeMap::new();
+
+        // printf(fmt, arg): every operand is a READ; format gate passes.
+        let call = inst(
+            "pf",
+            Operation::CallDirect {
+                callee: func_id("printf"),
+            },
+            vec![gid, good],
+        );
+        let acc =
+            libc_call_accesses(&call, &LibcModel::ReadAllFormat { fmt_idx: 0 }, &defs, &m).unwrap();
+        assert_eq!(acc, vec![(gid, false), (good, false)]);
+
+        // A `%n` format cannot be soundly modeled -> Err (abstain).
+        let calln = inst(
+            "pfn",
+            Operation::CallDirect {
+                callee: func_id("printf"),
+            },
+            vec![bad, good],
+        );
+        assert!(
+            libc_call_accesses(&calln, &LibcModel::ReadAllFormat { fmt_idx: 0 }, &defs, &m)
+                .is_err()
+        );
+
+        // strcpy(dst, src): operand 0 WRITTEN, operand 1 READ.
+        let cp = inst(
+            "cp",
+            Operation::CallDirect {
+                callee: func_id("strcpy"),
+            },
+            vec![good, gid],
+        );
+        let acc =
+            libc_call_accesses(&cp, &LibcModel::WriteDst { fmt_idx: None }, &defs, &m).unwrap();
+        assert_eq!(acc, vec![(good, true), (gid, false)]);
+
+        // A non-constant format operand -> Err (abstain).
+        let call_nc = inst(
+            "nc",
+            Operation::CallDirect {
+                callee: func_id("printf"),
+            },
+            vec![ValueId::new(0x999), good],
+        );
+        assert!(
+            libc_call_accesses(
+                &call_nc,
+                &LibcModel::ReadAllFormat { fmt_idx: 0 },
+                &defs,
+                &m
+            )
+            .is_err()
         );
     }
 
