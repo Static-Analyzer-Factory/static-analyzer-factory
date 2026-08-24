@@ -460,6 +460,31 @@ pub fn program_is_race_free(module: &AirModule) -> bool {
     }
 }
 
+/// Names of module functions that are **declarations** (no body ingested here) and
+/// are NOT on the race-inert allowlist nor a modeled memory-touching libc — i.e.
+/// exactly the "undefined user-looking" functions that would force
+/// [`race_free_classify`] to abstain with a `non-inert-external` reason if they turn
+/// out to be reachable.
+///
+/// The intended caller cross-checks these names against the C source: any that the
+/// source defines as a C99 **bare `inline`** helper (`inline void f(...)`, not
+/// `static`/`extern inline`) was silently dropped to a bodyless declaration by the
+/// default compile (no `-fgnu89-inline`), so a re-ingest with `-fgnu89-inline`
+/// exposes the body and the prover can then discharge the (otherwise abstained)
+/// program. Returning declaration names is deliberately *reachability-free* and
+/// cheap — a superset is fine, since acting on it only ever triggers a (sound)
+/// re-ingest attempt, never a verdict.
+#[must_use]
+pub fn undefined_userfn_names(module: &AirModule) -> BTreeSet<String> {
+    module
+        .functions
+        .iter()
+        .filter(|f| f.is_declaration)
+        .filter(|f| !is_race_inert_external(&f.name) && libc_model(&f.name).is_none())
+        .map(|f| f.name.clone())
+        .collect()
+}
+
 /// Core of [`program_is_race_free`]: `Ok(())` = provably race-free, `Err(reason)` =
 /// abstain (the reason string is for diagnostics only, never affects the verdict).
 #[allow(clippy::too_many_lines)]
@@ -1935,6 +1960,27 @@ mod tests {
             vec![dummy, dummy, opaque, dummy],
         );
         assert_eq!(resolve_direct_thread_fn(&m, &create2), None);
+    }
+
+    #[test]
+    fn undefined_userfns_lists_only_unmodeled_declarations() {
+        // A module with: a defined `main`, an inert declared external (`malloc`), a
+        // modeled-libc declared external (`printf`), and an undefined user-looking
+        // helper declaration (`findMax`) — only the last is reported.
+        let m = module(vec![
+            defined("main", Vec::new()),
+            declared("malloc"),
+            declared("printf"),
+            declared("findMax"),
+        ]);
+        let got = undefined_userfn_names(&m);
+        assert!(got.contains("findMax"), "user helper decl must be listed");
+        assert!(!got.contains("malloc"), "inert external must be excluded");
+        assert!(!got.contains("printf"), "modeled libc must be excluded");
+        assert!(
+            !got.contains("main"),
+            "a defined function is not a declaration"
+        );
     }
 
     #[test]

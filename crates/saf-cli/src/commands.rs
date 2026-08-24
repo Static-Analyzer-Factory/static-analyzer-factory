@@ -4039,13 +4039,31 @@ fn no_data_race_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     // TRUE prover first (cheap-gated). Gate on the same out-of-scope source
     // features (OpenMP / relaxed-memory) plus inline asm, since those can hide
     // concurrency or memory effects the AIR-level proof would not see (a wrong TRUE).
-    if race_true_out_of_scope(&source).is_none() && saf_svcomp::program_is_race_free(ctx.module) {
-        eprintln!("saf verify: no-data-race structurally proven race-free -> true");
-        return VerdictOutcome {
-            verdict: saf_svcomp::race_true_verdict().to_string(),
-            witness: None,
-            graphml: None,
-        };
+    if race_true_out_of_scope(&source).is_none() {
+        if saf_svcomp::program_is_race_free(ctx.module) {
+            eprintln!("saf verify: no-data-race structurally proven race-free -> true");
+            return race_true_outcome();
+        }
+        // Retry after a `-fgnu89-inline` re-ingest when a reachable helper is a C99
+        // **bare `inline`** function (`inline void f(...)`): the default compile
+        // emits NO out-of-line body for such a definition, so the frontend sees a
+        // bodyless declaration and the prover abstains (`non-inert-external:f`)
+        // even though the program is race-free. `-fgnu89-inline` makes clang emit
+        // the out-of-line definition, exposing the real body. This is sound: it
+        // only makes MORE code visible to the (fail-closed) prover — the body is the
+        // program's actual code, and an opaque declaration already forces abstain,
+        // so we can only move a task from `unknown` to prove-or-abstain, never to a
+        // wrong `true`. Gated on an actual bare-inline definition in the source, so
+        // programs without one (incl. the large CIL driver reservoir, whose
+        // undefined callees are kernel externals) pay no extra compile.
+        if let Some(module2) = race_gnu89_reingest_if_beneficial(ctx, &source) {
+            if saf_svcomp::program_is_race_free(&module2) {
+                eprintln!(
+                    "saf verify: no-data-race proven race-free after -fgnu89-inline re-ingest -> true"
+                );
+                return race_true_outcome();
+            }
+        }
     }
 
     // FALSE pipeline (concrete TSan confirmation).
@@ -4055,6 +4073,119 @@ fn no_data_race_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
 
     eprintln!("saf verify: no-data-race neither proven TRUE nor confirmed FALSE -> unknown");
     unknown_outcome()
+}
+
+/// The proven-race-free verdict outcome (bare `true`, no witness — R7).
+fn race_true_outcome() -> VerdictOutcome {
+    VerdictOutcome {
+        verdict: saf_svcomp::race_true_verdict().to_string(),
+        witness: None,
+        graphml: None,
+    }
+}
+
+/// Re-ingest `ctx.input` with `-fgnu89-inline` and return the fresh module **iff**
+/// doing so could plausibly help the no-data-race TRUE prover — i.e. some function
+/// the default ingest left as a bodyless declaration is defined in the C source as
+/// a C99 **bare `inline`** helper (which the default compile emits no out-of-line
+/// body for). Returns `None` (skip the extra compile) when no such helper exists,
+/// or on any compile/ingest error (fail-closed — the caller then just abstains from
+/// the TRUE proof).
+fn race_gnu89_reingest_if_beneficial(
+    ctx: &VerifyCtx,
+    source: &str,
+) -> Option<saf_core::air::AirModule> {
+    let undefined = saf_svcomp::undefined_userfn_names(ctx.module);
+    if !undefined
+        .iter()
+        .any(|name| source_has_bare_inline_def(source, name))
+    {
+        return None;
+    }
+    let ir = match compile_to_ir_with(
+        ctx.input,
+        ctx.data_model,
+        ctx.stub,
+        ctx.tempdir,
+        &["-fgnu89-inline"],
+        "mem2reg",
+    ) {
+        Ok(ir) => ir,
+        Err(e) => {
+            eprintln!("saf verify: -fgnu89-inline re-ingest compile failed: {e:#}");
+            return None;
+        }
+    };
+    match driver::AnalysisDriver::ingest(&[ir], CliFrontend::Llvm) {
+        Ok(b) => Some(b.module),
+        Err(e) => {
+            eprintln!("saf verify: -fgnu89-inline re-ingest failed: {e:#}");
+            None
+        }
+    }
+}
+
+/// Does the C `source` define `name` with a C99 **bare `inline`** specifier — i.e.
+/// `inline <ret> name(...)` NOT qualified by `static`/`extern` and not the GNU
+/// `__inline` spelling? Such a definition emits no out-of-line body under the
+/// default (C99) inline semantics, so `name` reaches the frontend as a bodyless
+/// declaration; `-fgnu89-inline` restores the out-of-line body.
+///
+/// Conservative and cost-only: a miss merely skips the (recall-adding) re-ingest
+/// and a spurious hit only wastes one compile — neither can affect a verdict.
+fn source_has_bare_inline_def(source: &str, name: &str) -> bool {
+    let nb = name.as_bytes();
+    if nb.is_empty() {
+        return false;
+    }
+    let bytes = source.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while let Some(rel) = source[i..].find(name) {
+        let pos = i + rel;
+        i = pos + nb.len();
+        // Whole-word match for `name`.
+        if pos > 0 && is_ident(bytes[pos - 1]) {
+            continue;
+        }
+        // Must be a call/decl form `name(` (allowing whitespace before `(`).
+        let mut j = pos + nb.len();
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'(' {
+            continue;
+        }
+        // Scan back to the enclosing statement/declaration boundary and inspect the
+        // qualifier/return-type prefix for a bare `inline`.
+        let start = source[..pos].rfind([';', '{', '}']).map_or(0, |b| b + 1);
+        if prefix_has_bare_inline(&source[start..pos]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is there a whole-word `inline` keyword in a declaration-prefix `head` that is a
+/// C99 *bare* inline (no `static`/`extern`/`__inline` in the same prefix)?
+fn prefix_has_bare_inline(head: &str) -> bool {
+    if head.contains("static") || head.contains("extern") {
+        return false;
+    }
+    let bytes = head.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while let Some(rel) = head[i..].find("inline") {
+        let pos = i + rel;
+        i = pos + 6;
+        let before_ok = pos == 0 || !is_ident(bytes[pos - 1]);
+        let after = pos + 6;
+        let after_ok = after >= bytes.len() || !is_ident(bytes[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
 }
 
 /// The FALSE half of [`no_data_race_strategy`] (lever `race-find`). Returns
@@ -6037,6 +6168,59 @@ void worker(void) { __VERIFIER_atomic_inc(&g); __VERIFIER_atomic_acquire(); }
         // A degenerate single-mnemonic basic asm has no operand ⇒ names no memory ⇒
         // classified as an inert label (sound for the data-race model).
         assert!(!contains_effectful_inline_asm("__asm(\"nop\");"));
+    }
+
+    #[test]
+    fn bare_inline_definition_is_detected_for_gnu89_reingest() {
+        // A C99 bare `inline` helper (dropped to a bodyless declaration by the
+        // default compile) is detected — this is the pthread-ext fmaxsym/stack/inc
+        // shape.
+        let src = "pthread_mutex_t m;\ninline void findMax(int offset)\n{\n  pthread_mutex_lock(&m);\n}\n";
+        assert!(source_has_bare_inline_def(src, "findMax"));
+        assert!(source_has_bare_inline_def(
+            "inline unsigned inc() { return 0; }",
+            "inc"
+        ));
+        assert!(source_has_bare_inline_def(
+            "inline int push(int d) {\n return d;\n}",
+            "push"
+        ));
+
+        // `static inline` / `extern inline` DO emit an out-of-line body under the
+        // default compile, so re-ingesting would not help — must NOT match.
+        assert!(!source_has_bare_inline_def(
+            "static inline int helper(void) { return 1; }",
+            "helper"
+        ));
+        assert!(!source_has_bare_inline_def(
+            "extern inline int helper(void) { return 1; }",
+            "helper"
+        ));
+        // The GNU `__inline` spelling (glibc's `extern __inline`) must not match.
+        assert!(!source_has_bare_inline_def(
+            "extern __inline int __attribute__((__gnu_inline__)) foo(void) { return 0; }",
+            "foo"
+        ));
+        // A plain (non-inline) definition or an unrelated name must not match.
+        assert!(!source_has_bare_inline_def(
+            "void findMax(int o) { }",
+            "findMax"
+        ));
+        assert!(!source_has_bare_inline_def(
+            "inline void findMax(int o) { }",
+            "other"
+        ));
+        // A substring name must not spuriously match (`Max` inside `findMax`).
+        assert!(!source_has_bare_inline_def(
+            "inline void findMax(int o) { }",
+            "Max"
+        ));
+        // The `inline` of a PRIOR definition must not leak across the `}` boundary
+        // to a following plain definition.
+        assert!(!source_has_bare_inline_def(
+            "inline void a(void) { }\nvoid b(void) { }",
+            "b"
+        ));
     }
 
     #[test]

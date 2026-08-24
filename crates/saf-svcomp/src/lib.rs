@@ -60,6 +60,7 @@ pub use race::{
 };
 pub use race_true::{
     is_race_inert_external, program_is_race_free, race_true_verdict, resolve_direct_thread_fn,
+    undefined_userfn_names,
 };
 pub use termination::{
     is_known_returning_external, program_structurally_terminates, termination_verdict,
