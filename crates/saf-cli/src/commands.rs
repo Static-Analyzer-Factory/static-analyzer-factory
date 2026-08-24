@@ -1459,7 +1459,56 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         }
     }
 
-    let total = candidates.len() + interproc.len() + bmc.len();
+    // Stage 4c (KLEE-style forward symbolic execution): the fixed-k BMC engine
+    // above only unwinds loops to their acyclic base case (k = 1), so a violation
+    // reachable only after a loop runs a few iterations (`for(i=0;i<4;i++) s+=x;
+    // if(s==40) reach_error();`) is proposed with the accumulator un-grown and the
+    // guard UNSAT. The SE engine forward-executes from the error function's entry,
+    // forking on Z3-feasible branches and unwinding loops to a bounded per-block
+    // visit cap, so the model gives the actual nondet INPUT vector — in execution
+    // order, so per-iteration nondet reads each get their own value. Gated to
+    // functions with a nondet input AND a CFG cycle (the loop-carried class BMC
+    // misses). Candidates go through the SAME native-replay gate (the sole
+    // arbiter), so a spurious/imprecise model can only ever yield `unknown`.
+    let se = saf_svcomp::enumerate_se_candidates(ctx.module, &config, ctx.data_model);
+    if !se.is_empty() {
+        eprintln!(
+            "saf verify: SE enumerated {} candidate(s) (forward)",
+            se.len()
+        );
+    }
+    for (idx, candidate) in se.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
+        match replay_confirms_false(
+            ctx.input,
+            ctx.data_model,
+            ctx.stub,
+            ctx.tempdir,
+            ctx.clang,
+            3 * MAX_REPLAY_CANDIDATES + idx,
+            candidate,
+        ) {
+            Ok(true) => {
+                let witness =
+                    build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, candidate));
+                if witness.is_none() {
+                    eprintln!(
+                        "saf verify: FALSE (SE replay-confirmed) but witness unconstructible -> emitting false without a witness"
+                    );
+                }
+                return VerdictOutcome {
+                    verdict: format!("false({})", Property::UnreachCall.name()),
+                    witness,
+                    graphml: None,
+                };
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("saf verify: SE replay of candidate {idx} errored: {e:#} -> continue");
+            }
+        }
+    }
+
+    let total = candidates.len() + interproc.len() + bmc.len() + se.len();
     if total == 0 {
         eprintln!(
             "saf verify: no FALSE candidate proposed (reach_error not proven reachable) -> unknown"
@@ -1468,10 +1517,11 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         // Candidates were over-approximated as FALSE but did not reproduce under
         // concrete replay — the soundness filter that keeps false alarms out.
         eprintln!(
-            "saf verify: {total} candidate(s) enumerated ({} intraproc + {} interproc + {} bmc); none reproduced reach_error at runtime -> unknown",
+            "saf verify: {total} candidate(s) enumerated ({} intraproc + {} interproc + {} bmc + {} se); none reproduced reach_error at runtime -> unknown",
             candidates.len(),
             interproc.len(),
-            bmc.len()
+            bmc.len(),
+            se.len()
         );
     }
 

@@ -27,7 +27,9 @@ pub mod property_kind;
 pub mod race;
 pub mod race_true;
 pub mod ranking;
+pub mod se_interp;
 pub mod slicing;
+mod ssa_encode;
 pub mod summaries;
 pub mod termination;
 pub mod witness_lower;
@@ -62,6 +64,7 @@ pub use race_true::{
     is_race_inert_external, program_is_race_free, race_true_verdict, resolve_direct_thread_fn,
     undefined_userfn_names,
 };
+pub use se_interp::enumerate_se_candidates;
 pub use termination::{
     is_known_returning_external, program_structurally_terminates, termination_verdict,
 };

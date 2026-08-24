@@ -55,11 +55,7 @@ use crate::property::{
     FalseCandidate, PropertyAnalysisConfig, is_scalar_integer_nondet, resolve_nondet_sequence,
 };
 use crate::property_kind::DataModel;
-
-/// Uniform bitvector width for the SSA encoding. Machine `int`/`long` arithmetic
-/// that stays in range is faithful at 64 bits; wider/narrower widths differ only
-/// on overflow, which the native replay filters out (a wrong model → `unknown`).
-const BV_WIDTH: u32 = 64;
+use crate::ssa_encode::{self, BV_WIDTH};
 
 /// Max acyclic (k = 1 unwound) paths explored per error site.
 const BMC_MAX_PATHS: usize = 8;
@@ -428,10 +424,6 @@ impl<'a> Encoder<'a> {
         BV::from_i64(0, BV_WIDTH)
     }
 
-    fn one() -> BV {
-        BV::from_i64(1, BV_WIDTH)
-    }
-
     /// Encode operand `vid` to a 64-bit bitvector, memoized.
     fn enc(&mut self, vid: ValueId) -> BV {
         if let Some(bv) = self.cache.get(&vid) {
@@ -458,8 +450,7 @@ impl<'a> Encoder<'a> {
     /// Encode a value operand as a Z3 boolean (`value != 0`).
     fn enc_bool(&mut self, vid: ValueId) -> Bool {
         let v = self.enc(vid);
-        #[allow(deprecated)]
-        v._eq(Self::zero()).not()
+        ssa_encode::truthy(&v)
     }
 
     /// Assign the SSA definition produced by `inst` (a non-terminator).
@@ -521,7 +512,7 @@ impl<'a> Encoder<'a> {
     /// (confirmer contract R5), recorded for model read-back.
     fn fresh_nondet(&mut self, dst: Option<ValueId>, name: &str) -> BV {
         let bv = self.fresh("n");
-        if let Some((lo, hi)) = nondet_range(name, self.data_model) {
+        if let Some((lo, hi)) = ssa_encode::nondet_range(name, self.data_model) {
             self.solver.assert(bv.bvsge(BV::from_i64(lo, BV_WIDTH)));
             self.solver.assert(bv.bvsle(BV::from_i64(hi, BV_WIDTH)));
         }
@@ -546,55 +537,12 @@ impl<'a> Encoder<'a> {
         }
         let a = self.enc(operands[0]);
         let b = self.enc(operands[1]);
-        match kind {
-            BinaryOp::Add => a.bvadd(&b),
-            BinaryOp::Sub => a.bvsub(&b),
-            BinaryOp::Mul => a.bvmul(&b),
-            BinaryOp::SDiv => {
-                self.assert_nonzero(&b);
-                a.bvsdiv(&b)
-            }
-            BinaryOp::UDiv => {
-                self.assert_nonzero(&b);
-                a.bvudiv(&b)
-            }
-            BinaryOp::SRem => {
-                self.assert_nonzero(&b);
-                a.bvsrem(&b)
-            }
-            BinaryOp::URem => {
-                self.assert_nonzero(&b);
-                a.bvurem(&b)
-            }
-            BinaryOp::And => a.bvand(&b),
-            BinaryOp::Or => a.bvor(&b),
-            BinaryOp::Xor => a.bvxor(&b),
-            BinaryOp::Shl => a.bvshl(&b),
-            BinaryOp::LShr => a.bvlshr(&b),
-            BinaryOp::AShr => a.bvashr(&b),
-            BinaryOp::ICmpEq => Self::from_bool(&a.eq_bv(&b)),
-            BinaryOp::ICmpNe => Self::from_bool(&a.eq_bv(&b).not()),
-            BinaryOp::ICmpSlt => Self::from_bool(&a.bvslt(&b)),
-            BinaryOp::ICmpSle => Self::from_bool(&a.bvsle(&b)),
-            BinaryOp::ICmpSgt => Self::from_bool(&a.bvsgt(&b)),
-            BinaryOp::ICmpSge => Self::from_bool(&a.bvsge(&b)),
-            BinaryOp::ICmpUlt => Self::from_bool(&a.bvult(&b)),
-            BinaryOp::ICmpUle => Self::from_bool(&a.bvule(&b)),
-            BinaryOp::ICmpUgt => Self::from_bool(&a.bvugt(&b)),
-            BinaryOp::ICmpUge => Self::from_bool(&a.bvuge(&b)),
-            // Float arithmetic / comparisons are not modelled → havoc.
-            _ => self.fresh("h"),
+        let mut guards = Vec::new();
+        let result = ssa_encode::encode_binop(kind, &a, &b, &mut guards);
+        for g in &guards {
+            self.solver.assert(g);
         }
-    }
-
-    fn assert_nonzero(&self, b: &BV) {
-        #[allow(deprecated)]
-        self.solver.assert(b._eq(Self::zero()).not());
-    }
-
-    /// Materialize an i1 boolean as a 0/1 bitvector.
-    fn from_bool(cond: &Bool) -> BV {
-        cond.ite(&Self::one(), &Self::zero())
+        result.unwrap_or_else(|| self.fresh("h"))
     }
 
     /// Constrain the path to leave `inst`'s block toward `next`.
@@ -646,58 +594,6 @@ impl<'a> Encoder<'a> {
             _ => {}
         }
     }
-}
-
-/// Ergonomic `_eq` wrapper isolating the single deprecation allow.
-trait EqBv {
-    fn eq_bv(&self, other: &BV) -> Bool;
-}
-
-impl EqBv for BV {
-    fn eq_bv(&self, other: &BV) -> Bool {
-        #[allow(deprecated)]
-        self._eq(other)
-    }
-}
-
-/// In-range `[min, max]` for a scalar-int `__VERIFIER_nondet_*` result, honouring
-/// the data model for width-dependent types (`long`/`ulong`/`size_t`). Values are
-/// kept representable as `i64` (64-bit unsigned is clamped to the non-negative
-/// `i64` half — still in range, R5-compliant, just not exhaustive).
-fn nondet_range(name: &str, dm: DataModel) -> Option<(i64, i64)> {
-    let long_bits = match dm {
-        DataModel::ILP32 => 32u32,
-        DataModel::LP64 => 64,
-    };
-    let signed = |bits: u32| -> (i64, i64) {
-        if bits >= 64 {
-            (i64::MIN, i64::MAX)
-        } else {
-            let hi = (1i64 << (bits - 1)) - 1;
-            (-(1i64 << (bits - 1)), hi)
-        }
-    };
-    let unsigned = |bits: u32| -> (i64, i64) {
-        if bits >= 64 {
-            (0, i64::MAX)
-        } else {
-            (0, (1i64 << bits) - 1)
-        }
-    };
-    Some(match name {
-        "__VERIFIER_nondet_int" => signed(32),
-        "__VERIFIER_nondet_uint" => unsigned(32),
-        "__VERIFIER_nondet_short" => signed(16),
-        "__VERIFIER_nondet_ushort" => unsigned(16),
-        "__VERIFIER_nondet_char" => signed(8),
-        "__VERIFIER_nondet_uchar" => unsigned(8),
-        "__VERIFIER_nondet_bool" => (0, 1),
-        "__VERIFIER_nondet_long" => signed(long_bits),
-        "__VERIFIER_nondet_ulong" | "__VERIFIER_nondet_size_t" => unsigned(long_bits),
-        "__VERIFIER_nondet_longlong" => signed(64),
-        "__VERIFIER_nondet_ulonglong" => unsigned(64),
-        _ => return None,
-    })
 }
 
 #[cfg(test)]
