@@ -1933,7 +1933,28 @@ fn greedy_lex_rank(model: &MultiPathModel) -> bool {
     if model.branches.is_empty() {
         return false;
     }
-    let mut remaining: Vec<usize> = (0..model.branches.len()).collect();
+    let all: Vec<usize> = (0..model.branches.len()).collect();
+    // Fast path: a single lexicographic tuple that ranks every branch jointly (the
+    // classic Cook/BMS synthesis). Covers all previously-ranked programs at no extra
+    // Z3 cost, so it can never regress a `true`.
+    if greedy_lex_subset(model, &all) {
+        return true;
+    }
+    // Disjunctive fallback (only when the joint tuple fails — so zero cost on the
+    // common case): decompose the branch "can-immediately-follow" graph into SCCs
+    // and rank each *cyclic* SCC independently. See [`disjunctive_scc_rank`].
+    disjunctive_scc_rank(model, &all)
+}
+
+/// Greedy lexicographic synthesis restricted to a subset of branch indices. Each
+/// round finds one `f` that is bounded (`f ≥ 0`) and non-increasing on every
+/// remaining branch in the subset and strictly decreasing on one of them; that
+/// branch is removed. All removed within [`MAX_LEX_ROUNDS`] ⇒ the subset jointly
+/// admits a lexicographic ranking. An empty subset is vacuously ranked (no cyclic
+/// branch to bound). Sound because [`synthesize_round`] over a subset is exactly
+/// the joint-ranking soundness condition applied to those branches only.
+fn greedy_lex_subset(model: &MultiPathModel, indices: &[usize]) -> bool {
+    let mut remaining: Vec<usize> = indices.to_vec();
     let mut rounds = 0;
     while !remaining.is_empty() {
         if rounds >= MAX_LEX_ROUNDS {
@@ -1955,6 +1976,142 @@ fn greedy_lex_rank(model: &MultiPathModel) -> bool {
         }
     }
     true
+}
+
+/// Maximum branch count for the disjunctive SCC fallback. The fallback is
+/// `O(n²)` Z3 feasibility checks; above this cap it abstains (recall-only — a
+/// larger model simply falls back to `unknown`, never to a wrong verdict).
+const MAX_DISJUNCTIVE_BRANCHES: usize = 16;
+
+/// Disjunctive termination via a **strongly-connected-component decomposition** of
+/// the branch *can-immediately-follow* graph (a Podelski–Rybalchenko disjunctive
+/// / transition-invariant argument that a single lexicographic tuple cannot
+/// express).
+///
+/// Build a directed graph `E` over the branches where `i → j` iff branch `j` can
+/// fire immediately after branch `i` ([`branch_can_follow`], a sound
+/// over-approximation — an edge is present unless *provably* infeasible). Any
+/// infinite execution is an infinite walk in `E`, whose tail is confined to a
+/// single strongly-connected component (finitely many branches). So if **every
+/// cyclic SCC** (a component that contains a cycle — size ≥ 2, or a singleton with
+/// a self-edge) admits its own lexicographic ranking, no infinite execution can
+/// exist and the loop/recursion terminates. A singleton SCC with no self-edge can
+/// only occur finitely often, so it needs no ranking.
+///
+/// # Soundness
+///
+/// `E` never drops a real edge: [`branch_can_follow`] keeps `i → j` unless the
+/// *superset* region of `j` is UNSAT on the *superset* post-state of `i`, so every
+/// real transition sequence is a walk in `E`. Hence the SCCs are a superset of the
+/// real recurrent branch sets, and ranking each SCC is at least as strong as
+/// required — no wrong `true`. The classic ping-pong counterexample (two branches
+/// each individually well-founded but jointly divergent) is rejected because its
+/// cross edges are feasible ⇒ the two branches share one SCC ⇒ they must rank
+/// *jointly*, which they cannot.
+fn disjunctive_scc_rank(model: &MultiPathModel, indices: &[usize]) -> bool {
+    let n = indices.len();
+    if n == 0 || n > MAX_DISJUNCTIVE_BRANCHES {
+        return false;
+    }
+    // Adjacency (positions 0..n map to `indices[pos]`), including self-edges.
+    let mut adj = vec![vec![false; n]; n];
+    for (a, row) in adj.iter_mut().enumerate() {
+        for (b, cell) in row.iter_mut().enumerate() {
+            *cell = branch_can_follow(model, indices[a], indices[b]);
+        }
+    }
+    // Reachability over paths of length ≥ 1 (Floyd–Warshall transitive closure).
+    let mut reach = adj;
+    for k in 0..n {
+        for i in 0..n {
+            if reach[i][k] {
+                for j in 0..n {
+                    if reach[k][j] {
+                        reach[i][j] = true;
+                    }
+                }
+            }
+        }
+    }
+    // Rank each cyclic SCC. A branch `i` is on a cycle iff `reach[i][i]`; its SCC
+    // is `{ j : reach[i][j] ∧ reach[j][i] }`. Non-cyclic singletons need no rank.
+    let mut done = vec![false; n];
+    for i in 0..n {
+        if done[i] {
+            continue;
+        }
+        if !reach[i][i] {
+            done[i] = true; // non-recurrent singleton — occurs finitely often.
+            continue;
+        }
+        let mut scc: Vec<usize> = Vec::new();
+        for j in 0..n {
+            if reach[i][j] && reach[j][i] {
+                done[j] = true;
+                scc.push(indices[j]);
+            }
+        }
+        if !greedy_lex_subset(model, &scc) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Can branch `j` fire *immediately after* branch `i`? A sound
+/// **over-approximation** for [`disjunctive_scc_rank`]: returns `true` unless the
+/// follow-on is provably infeasible (Z3 `Unsat`). Any `Sat`/`Unknown`/encoding
+/// failure keeps the edge — a kept edge only enlarges an SCC, making the
+/// disjunctive proof strictly harder (fail-closed), never spuriously easier.
+///
+/// Encoding: pre-state variables satisfy `region_i`; the post-state applies
+/// branch `i`'s transition (each ranking-state phi `m` takes `next_i(m)` over the
+/// pre-state; loop-invariant template symbols are unchanged; every other leaf is a
+/// fresh unconstrained value — a sound loosening). The edge is infeasible iff
+/// `region_j` is UNSAT on that post-state.
+fn branch_can_follow(model: &MultiPathModel, i: usize, j: usize) -> bool {
+    let bi = &model.branches[i];
+    let bj = &model.branches[j];
+    let index: BTreeMap<ValueId, usize> = model.universe.iter().copied().zip(0..).collect();
+    let n = model.universe.len();
+    let pre: BTreeMap<usize, z3::ast::Int> = (0..n)
+        .map(|k| (k, z3::ast::Int::new_const(format!("pre_{k}"))))
+        .collect();
+
+    let solver = new_solver();
+    // region_i(pre) ≥ 0.
+    for c in &bi.region {
+        let Some(b) = constraint_to_z3(c, &index, &pre) else {
+            return true; // encoding failure ⇒ keep the edge (fail-closed).
+        };
+        solver.assert(&b);
+    }
+    // Post-state: phi ↦ next_i(pre); invariant template symbol ↦ itself; else fresh.
+    let mut post: BTreeMap<usize, z3::ast::Int> = BTreeMap::new();
+    for (m, &idx) in &index {
+        let expr = if let Some(nxt) = bi.next.get(m) {
+            match affine_to_z3(nxt, &index, &pre) {
+                Some(e) => e,
+                None => return true, // encoding failure ⇒ keep the edge.
+            }
+        } else if model.template.contains(m) {
+            // Loop-invariant template symbol: unchanged across the step.
+            pre[&idx].clone()
+        } else {
+            // Havoc leaf (re-read each iteration): a fresh unconstrained value.
+            z3::ast::Int::new_const(format!("post_{idx}"))
+        };
+        post.insert(idx, expr);
+    }
+    // region_j(post) ≥ 0.
+    for c in &bj.region {
+        let Some(b) = constraint_to_z3(c, &index, &post) else {
+            return true;
+        };
+        solver.assert(&b);
+    }
+    // Infeasible only on a definitive UNSAT; Sat/Unknown keep the edge.
+    !matches!(solver.check(), z3::SatResult::Unsat)
 }
 
 // ---------------------------------------------------------------------------
@@ -7353,5 +7510,108 @@ mod tests {
         // while (i>0) { if (*) i-=1; else i+=1; }  — the `i+=1` latch can be taken
         // forever, so no common ranking exists ⇒ abstain (never a wrong `true`).
         assert!(!ranked(&multilatch_loop(-1, 1)));
+    }
+
+    // --- Disjunctive SCC ranking (branch can-follow decomposition) -----------
+
+    /// `expr ≥ 0` constraint from a symbol coefficient list + constant.
+    fn cons(terms: &[(ValueId, i128)], k: i128) -> Constraint {
+        Constraint {
+            coeffs: terms.iter().copied().collect(),
+            constant: k,
+        }
+    }
+    /// Affine form `Σ cᵢ·sᵢ + k`.
+    fn aff(terms: &[(ValueId, i128)], k: i128) -> Affine {
+        Affine {
+            terms: terms.iter().copied().collect(),
+            constant: k,
+        }
+    }
+
+    #[test]
+    fn disjunctive_two_directional_counter_is_ranked() {
+        // Two mutually-exclusive convex branches whose union is a `!=` guard:
+        //   A: x ≥ 1 ⇒ x := x-1     B: x ≤ -1 ⇒ x := x+1
+        // (the shape of `addition(m,n)`: `n>0 ⇒ n-1`, `n<0 ⇒ n+1`). No single
+        // linear `f` decreases on both, so the joint greedy tuple fails; but the
+        // cross edges are infeasible (A stays ≥ 0, B stays ≤ 0), so each singleton
+        // SCC ranks on its own (`f = x` / `f = -x`) ⇒ disjunctively terminating.
+        let x = vid("x");
+        let a = Branch {
+            region: vec![cons(&[(x, 1)], -1)],               // x - 1 ≥ 0
+            next: BTreeMap::from([(x, aff(&[(x, 1)], -1))]), // x - 1
+        };
+        let b = Branch {
+            region: vec![cons(&[(x, -1)], -1)],             // -x - 1 ≥ 0
+            next: BTreeMap::from([(x, aff(&[(x, 1)], 1))]), // x + 1
+        };
+        let model = MultiPathModel {
+            template: BTreeSet::from([x]),
+            universe: BTreeSet::from([x]),
+            branches: vec![a, b],
+        };
+        // The joint tuple genuinely fails, and the disjunctive fallback succeeds.
+        assert!(!greedy_lex_subset(&model, &[0, 1]));
+        assert!(greedy_lex_rank(&model));
+    }
+
+    #[test]
+    fn disjunctive_pingpong_havoc_abstains() {
+        // Ping-pong: A decreases x but RESETS y to an arbitrary in-range value; B
+        // decreases y but RESETS x. Each branch is individually well-founded, yet
+        // the loop can diverge by alternating (the classic transition-invariant
+        // counterexample). The cross edges are feasible (the reset value can
+        // re-enable the other guard), so A and B share one SCC and must rank
+        // jointly — which they cannot ⇒ abstain. MANDATORY soundness test.
+        let x = vid("x");
+        let y = vid("y");
+        let ha = vid("ha"); // fresh reset value for y in branch A
+        let hb = vid("hb"); // fresh reset value for x in branch B
+        let bound = |s: ValueId| vec![cons(&[(s, 1)], 0), cons(&[(s, -1)], 1_000_000)];
+        let mut a_region = vec![cons(&[(x, 1)], -1)]; // x ≥ 1
+        a_region.extend(bound(ha));
+        let mut b_region = vec![cons(&[(y, 1)], -1)]; // y ≥ 1
+        b_region.extend(bound(hb));
+        let a = Branch {
+            region: a_region,
+            next: BTreeMap::from([(x, aff(&[(x, 1)], -1)), (y, aff(&[(ha, 1)], 0))]),
+        };
+        let b = Branch {
+            region: b_region,
+            next: BTreeMap::from([(y, aff(&[(y, 1)], -1)), (x, aff(&[(hb, 1)], 0))]),
+        };
+        let model = MultiPathModel {
+            template: BTreeSet::from([x, y]),
+            universe: BTreeSet::from([x, y, ha, hb]),
+            branches: vec![a, b],
+        };
+        assert!(branch_can_follow(&model, 0, 1)); // A → B is feasible (reset).
+        assert!(branch_can_follow(&model, 1, 0)); // B → A is feasible (reset).
+        assert!(!greedy_lex_rank(&model)); // one SCC, not jointly rankable ⇒ abstain.
+    }
+
+    #[test]
+    fn disjunctive_diverging_half_abstains() {
+        // `while (x != 5) x += 2` (even start): the split gives A: x ≥ 6 ⇒ x+2 and
+        // B: x ≤ 4 ⇒ x+2. Branch A self-loops (x stays ≥ 6) but has no bounded
+        // decreasing rank (x grows unboundedly) ⇒ its SCC cannot rank ⇒ abstain.
+        let x = vid("x");
+        let a = Branch {
+            region: vec![cons(&[(x, 1)], -6)],              // x - 6 ≥ 0
+            next: BTreeMap::from([(x, aff(&[(x, 1)], 2))]), // x + 2
+        };
+        let b = Branch {
+            region: vec![cons(&[(x, -1)], 4)], // -x + 4 ≥ 0  (x ≤ 4)
+            next: BTreeMap::from([(x, aff(&[(x, 1)], 2))]), // x + 2
+        };
+        let model = MultiPathModel {
+            template: BTreeSet::from([x]),
+            universe: BTreeSet::from([x]),
+            branches: vec![a, b],
+        };
+        assert!(branch_can_follow(&model, 0, 0)); // A → A (diverging self-loop).
+        assert!(!branch_can_follow(&model, 0, 1)); // A (x≥6→x+2) can't reach B (x≤4).
+        assert!(!greedy_lex_rank(&model));
     }
 }
