@@ -2706,6 +2706,40 @@ fn replay_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Per-candidate replay timeout (seconds) for the `valid-memsafety` `ASan` sweep —
+/// the base passes ([`asan_confirm`]), the threshold/argv pass
+/// ([`asan_threshold_argv_sweep`]) and the byte-stream pass 3 ([`asan_fuzz_pass`]).
+/// Overridable via `$SAF_MEMSAFETY_REPLAY_TIMEOUT`.
+///
+/// Deliberately SHORTER than the shared [`replay_timeout`] (4 s vs 10 s), because the
+/// memsafety confirmer runs a MULTI-RUN sweep (two base passes × two `ASAN_OPTIONS` ×
+/// the constant spread, then the threshold and byte-stream passes) that must all fit
+/// inside the per-task wall-clock budget (60 s in the loop eval). An `ASan` memory
+/// violation traps essentially instantly once the faulting access executes; the only
+/// runs that approach the cap are NON-faulting ones that spin in a long/│unbounded loop
+/// under a pathological constant (e.g. an array size of `INT_MAX`, or a self-referential
+/// `while` that never advances). With the shared 10 s cap those wasted runs starve the
+/// LATER passes (the uninitialised-variable pass 2, the threshold sweep, pass 3) that
+/// would confirm the violation quickly — so a task that is trivially confirmable in
+/// isolation times out at 60 s. A 4 s cap bounds each wasted run, leaving budget for the
+/// confirming pass; measured, it recovers cost-bound tasks (e.g.
+/// `array-memsafety/bubblesort_unsafe`, `termination-crafted/NonTermination3-1`) with no
+/// observed recall loss on a broad sample.
+///
+/// SOUND (fail-closed): a shorter timeout can only kill a run EARLIER, so the strictly
+/// worse case is a missing report ⇒ abstain (`unknown`). It can never turn a clean run
+/// into a fault, so it never adds a false alarm — the risk is bounded to recall, and
+/// only for the rare violation whose faulting access is reached only after >4 s of
+/// native execution (billions of iterations), which cannot fit a 60 s multi-run sweep
+/// anyway.
+fn memsafety_replay_timeout() -> std::time::Duration {
+    let secs = std::env::var("SAF_MEMSAFETY_REPLAY_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(4);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Escape a filesystem path for embedding in a C string literal.
 fn escape_c_string(p: &Path) -> String {
     let mut out = String::new();
@@ -3119,7 +3153,7 @@ fn asan_confirm(
         .with_context(|| "writing ASan replay driver")?;
 
     let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
-    let timeout = replay_timeout();
+    let timeout = memsafety_replay_timeout();
 
     // Mini-fuzz candidate constants: the fixed NONDET_CONSTS spread followed by the
     // program's own branch-steering literals (see `replay_candidates`). A guard-gated
@@ -3439,7 +3473,7 @@ fn asan_fuzz_pass(
     corpus.extend(saf_svcomp::slicing::sequence_seeds(&slice.guard_constants));
     // Fixed seed -> the whole search (and therefore the verdict) is reproducible.
     let mut rng = fuzz::XorShift64::new(0x5AF3_C0DE);
-    let per_run = replay_timeout();
+    let per_run = memsafety_replay_timeout();
     let iters = mem_fuzz_iters();
     let deadline = std::time::Instant::now() + mem_fuzz_time_budget();
     let mut max_depth = 0usize;
@@ -3551,7 +3585,7 @@ fn asan_threshold_argv_sweep(
     use anyhow::Context;
     use std::process::{Command, Stdio};
 
-    let per_run = replay_timeout();
+    let per_run = memsafety_replay_timeout();
     let pass_deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(MEMSAFETY_SPLIT_WALL_SECS);
 
@@ -5287,6 +5321,26 @@ mod verify_tests {
         module.functions.push(main);
         module.constants = constants;
         module
+    }
+
+    #[test]
+    fn memsafety_replay_timeout_defaults_shorter_than_the_shared_replay_timeout() {
+        // The memsafety ASan sweep runs a multi-pass, multi-constant set of native runs
+        // that must all fit the per-task wall-clock budget, so its per-run cap is
+        // deliberately shorter than the shared default (4 s vs 10 s). Keeping it strictly
+        // below the shared cap is the invariant this change relies on; assert it so a
+        // future default bump cannot silently re-starve the later confirming passes.
+        // (Assumes neither `$SAF_MEMSAFETY_REPLAY_TIMEOUT` nor `$SAF_VERIFY_REPLAY_TIMEOUT`
+        // is set — the default in every CI/eval run; the env override path is exercised
+        // in production, not here, to avoid process-global env mutation in the test.)
+        assert_eq!(
+            memsafety_replay_timeout(),
+            std::time::Duration::from_secs(4)
+        );
+        assert!(
+            memsafety_replay_timeout() < replay_timeout(),
+            "memsafety per-run cap must stay below the shared replay cap"
+        );
     }
 
     #[test]
