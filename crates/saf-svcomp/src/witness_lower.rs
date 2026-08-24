@@ -196,6 +196,40 @@ pub fn lower_candidate(module: &AirModule, cand: &FalseCandidate) -> Option<Vec<
     Some(waypoints)
 }
 
+/// Lower the module's first `reach_error` / `__VERIFIER_error` call site (in
+/// deterministic module order) to a single-`target` waypoint list — a minimal,
+/// always-valid YAML-2.0 violation-witness anchor for a **concurrency**
+/// unreach-call FALSE.
+///
+/// The concurrency confirmers prove the violation by forced-schedule native
+/// replay, not a sequential must-reach chain, so there is no block path to lower;
+/// the reproducing interleaving is carried by the companion `GraphML` witness. But
+/// an execution / re-verification validator (`CBMC`, `cpa-witness2test`, `CPAchecker`)
+/// re-derives the schedule itself and only needs the violation *location* to
+/// confirm — a target-only witness at the `reach_error` call gives exactly that,
+/// and passes `WitnessLint`'s 2.0 violation-witness schema (the `GraphML` witness
+/// does not, so a validator panel with no concurrency member scores it 0). This is
+/// a witness *artifact* only: the FALSE verdict itself is already sound (native
+/// replay confirmed), so the anchor can never turn a right verdict into a wrong
+/// one. Returns `None` if no `reach_error` call carries a source span (the FALSE is
+/// still emitted, just witnessless).
+#[must_use]
+pub fn lower_reach_error_target(module: &AirModule) -> Option<Vec<SourceWaypoint>> {
+    for inst_id in crate::property::reach_error_call_sites(module) {
+        let Some((func, inst)) = find_inst(module, inst_id) else {
+            continue;
+        };
+        let Some(span) = inst.span.as_ref() else {
+            continue;
+        };
+        let Some(location) = span_to_location(module, span) else {
+            continue;
+        };
+        return Some(vec![target_waypoint(location, Some(func.name.clone()))]);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +363,59 @@ mod tests {
         assert_eq!(wps[0].kind, WaypointKind::Target);
         assert_eq!(wps[0].line, 33);
         assert_eq!(wps[0].file_name, "t.c");
+    }
+
+    #[test]
+    fn lower_reach_error_target_emits_target_at_first_error_call() {
+        let (main_id, err_id) = (FunctionId::new(1), FunctionId::new(2));
+        let (bb0, bb1) = (BlockId::new(10), BlockId::new(11));
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.source_files.push(SourceFile::new(FileId::new(1), "t.c"));
+        let err_call = Instruction::new(InstId::new(3), Operation::CallDirect { callee: err_id })
+            .with_span(point_span(41, 9));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(bb0, vec![]), blk(bb1, vec![err_call, ret(4)])],
+            bb0,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+
+        let wps = lower_reach_error_target(&m).expect("lowered");
+        assert_eq!(wps.len(), 1);
+        assert_eq!(wps[0].kind, WaypointKind::Target);
+        assert_eq!(wps[0].action, Action::Follow);
+        assert_eq!(wps[0].line, 41);
+        assert_eq!(wps[0].file_name, "t.c");
+        assert_eq!(wps[0].function.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn lower_reach_error_target_none_when_no_error_span() {
+        let (main_id, err_id) = (FunctionId::new(1), FunctionId::new(2));
+        let bb = BlockId::new(10);
+        let mut m = AirModule::new(ModuleId::new(1));
+        // reach_error call carries no span, and there are no source files.
+        let err_call = Instruction::new(InstId::new(3), Operation::CallDirect { callee: err_id });
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(bb, vec![err_call, ret(4)])],
+            bb,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert!(lower_reach_error_target(&m).is_none());
+    }
+
+    #[test]
+    fn lower_reach_error_target_none_when_no_error_call() {
+        let main_id = FunctionId::new(1);
+        let bb = BlockId::new(10);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.source_files.push(SourceFile::new(FileId::new(1), "t.c"));
+        m.functions
+            .push(func(main_id, "main", vec![blk(bb, vec![ret(4)])], bb));
+        assert!(lower_reach_error_target(&m).is_none());
     }
 
     // ---- Slice A (plan 195): Tier A branching waypoints (no column) ----

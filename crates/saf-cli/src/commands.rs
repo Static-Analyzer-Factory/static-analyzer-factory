@@ -830,20 +830,14 @@ pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
     // alongside a sound FALSE. The verdict is printed regardless: a `false`
     // whose witness is missing/unwritable is still sound (it just scores 0).
     if outcome.verdict.starts_with("false") {
-        if let Some(graphml) = &outcome.graphml {
-            // Concurrency witnesses are GraphML 1.0 (R7); write the pre-serialized
-            // string verbatim.
-            match std::fs::write(&args.witness, graphml) {
-                Ok(()) => eprintln!(
-                    "saf verify: wrote GraphML violation witness to {}",
-                    args.witness.display()
-                ),
-                Err(e) => eprintln!(
-                    "saf verify: failed to write GraphML witness to {}: {e} (verdict still emitted)",
-                    args.witness.display()
-                ),
-            }
-        } else if let Some(witness) = &outcome.witness {
+        // Precedence: prefer a YAML-2.0 violation witness when present, because the
+        // `--witness` path is a `.yml` validated against the 2.0 schema. A
+        // concurrency FALSE now carries BOTH — a YAML-2.0 target witness (for the
+        // re-verification validator panel, which re-derives the interleaving) AND a
+        // GraphML-1.0 interleaving witness — so the YAML wins here; GraphML remains
+        // the only witness for `no-data-race` (no reach_error to anchor a target),
+        // and so is written when no YAML witness exists.
+        if let Some(witness) = &outcome.witness {
             match witness.to_yaml_string() {
                 Ok(yaml) => match std::fs::write(&args.witness, yaml) {
                     Ok(()) => eprintln!(
@@ -857,6 +851,19 @@ pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
                 },
                 Err(e) => eprintln!(
                     "saf verify: witness serialization failed: {e:#} (verdict still emitted)"
+                ),
+            }
+        } else if let Some(graphml) = &outcome.graphml {
+            // Concurrency witnesses are GraphML 1.0 (R7); write the pre-serialized
+            // string verbatim.
+            match std::fs::write(&args.witness, graphml) {
+                Ok(()) => eprintln!(
+                    "saf verify: wrote GraphML violation witness to {}",
+                    args.witness.display()
+                ),
+                Err(e) => eprintln!(
+                    "saf verify: failed to write GraphML witness to {}: {e} (verdict still emitted)",
+                    args.witness.display()
                 ),
             }
         }
@@ -1217,6 +1224,24 @@ fn build_witness(
             None
         }
     }
+}
+
+/// Build the target-only YAML-2.0 violation witness for a **concurrency**
+/// unreach-call FALSE, anchored at the module's `reach_error` call site.
+///
+/// The concurrency confirmers reproduce the violation by forced-schedule native
+/// replay (not a sequential must-reach chain), so there is no block path to lower;
+/// the reproducing interleaving is carried by the companion `GraphML` witness. This
+/// target-only YAML witness exists so the eval's validator panel — whose
+/// re-verification members (`CBMC`, `cpa-witness2test`, `CPAchecker`) re-derive the
+/// schedule themselves and only need the violation *location* — can actually score
+/// the FALSE: a `GraphML` 1.0 witness is rejected by `WitnessLint`'s 2.0 schema gate
+/// before any validator runs, so without this a confirmed concurrency FALSE scores
+/// 0. Returns `None` when no `reach_error` call carries a span (the FALSE is still
+/// emitted, witnessless). The verdict is already sound, so the witness can never
+/// change a right verdict into a wrong one.
+fn conc_target_witness(ctx: &VerifyCtx) -> Option<saf_svcomp::ViolationWitness> {
+    build_witness(ctx, saf_svcomp::lower_reach_error_target(ctx.module))
 }
 
 /// The `unreach-call` FALSE pipeline (plan 192 §1.6 / slice 1c), now emitting a
@@ -1993,6 +2018,13 @@ fn conc_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
         };
         let thread_count =
             saf_svcomp::fast_paths::reachable_spawn_call_sites(ctx.module, &callgraph);
+        let sites = saf_svcomp::ConcWitnessSites {
+            spawn_lines: saf_svcomp::fast_paths::reachable_spawn_startlines(ctx.module, &callgraph),
+            error_line: saf_svcomp::fast_paths::error_call_startline(ctx.module),
+            entry_function: saf_svcomp::fast_paths::spawn_start_routine_name(
+                ctx.module, &callgraph,
+            ),
+        };
         let graphml = saf_svcomp::conc_graphml_witness(
             ctx.meta.specification.trim(),
             &programfile,
@@ -2000,10 +2032,16 @@ fn conc_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             architecture,
             thread_count,
             schedule,
+            &sites,
         );
+        // Also emit a target-only YAML-2.0 violation witness anchored at the
+        // reach_error site (see `conc_target_witness`): a re-verification validator
+        // (CBMC / cpa-witness2test) re-derives the interleaving itself and only
+        // needs the violation location, and — unlike the GraphML witness — a YAML
+        // 2.0 witness passes WitnessLint's schema gate so the panel can score it.
         return Some(VerdictOutcome {
             verdict: format!("false({})", Property::UnreachCall.name()),
-            witness: None,
+            witness: conc_target_witness(ctx),
             graphml: Some(graphml),
         });
     }
@@ -2211,8 +2249,16 @@ fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
         };
         let thread_count =
             saf_svcomp::fast_paths::reachable_spawn_call_sites(ctx.module, &callgraph);
+        let sites = saf_svcomp::ConcWitnessSites {
+            spawn_lines: saf_svcomp::fast_paths::reachable_spawn_startlines(ctx.module, &callgraph),
+            error_line: saf_svcomp::fast_paths::error_call_startline(ctx.module),
+            entry_function: saf_svcomp::fast_paths::spawn_start_routine_name(
+                ctx.module, &callgraph,
+            ),
+        };
         // Reuse the concurrency GraphML violation-witness emitter; the schedule label
-        // records which forced interleaving reached the violation.
+        // records which forced interleaving reached the violation (as provenance, not
+        // a threadId).
         let graphml = saf_svcomp::conc_graphml_witness_labeled(
             ctx.meta.specification.trim(),
             &programfile,
@@ -2220,10 +2266,14 @@ fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             architecture,
             thread_count,
             &plan.label(),
+            &sites,
         );
         return Some(VerdictOutcome {
             verdict: format!("false({})", Property::UnreachCall.name()),
-            witness: None,
+            // YAML-2.0 target witness anchored at reach_error (schema-valid, panel-
+            // scorable) alongside the GraphML interleaving witness — see
+            // `conc_confirm_false` / `conc_target_witness`.
+            witness: conc_target_witness(ctx),
             graphml: Some(graphml),
         });
     }
@@ -2445,6 +2495,13 @@ fn conc_shim_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
         };
         let thread_count =
             saf_svcomp::fast_paths::reachable_spawn_call_sites(ctx.module, &callgraph);
+        let sites = saf_svcomp::ConcWitnessSites {
+            spawn_lines: saf_svcomp::fast_paths::reachable_spawn_startlines(ctx.module, &callgraph),
+            error_line: saf_svcomp::fast_paths::error_call_startline(ctx.module),
+            entry_function: saf_svcomp::fast_paths::spawn_start_routine_name(
+                ctx.module, &callgraph,
+            ),
+        };
         let graphml = saf_svcomp::conc_graphml_witness_labeled(
             ctx.meta.specification.trim(),
             &programfile,
@@ -2452,10 +2509,14 @@ fn conc_shim_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             architecture,
             thread_count,
             &plan.label(),
+            &sites,
         );
         return Some(VerdictOutcome {
             verdict: format!("false({})", Property::UnreachCall.name()),
-            witness: None,
+            // YAML-2.0 target witness anchored at reach_error (schema-valid, panel-
+            // scorable) alongside the GraphML interleaving witness — see
+            // `conc_confirm_false` / `conc_target_witness`.
+            witness: conc_target_witness(ctx),
             graphml: Some(graphml),
         });
     }

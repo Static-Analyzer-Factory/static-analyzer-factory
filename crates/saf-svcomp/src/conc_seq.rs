@@ -345,15 +345,44 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+/// Source-level anchors extracted from the confirmed program that make a
+/// concurrency violation witness matchable by a validator's CFA walk.
+///
+/// All fields are advisory: a missing anchor only drops the corresponding
+/// `startline` (the witness stays structurally valid). They are extracted from the
+/// AIR spans via [`crate::fast_paths::reachable_spawn_startlines`] /
+/// [`crate::fast_paths::error_call_startline`].
+#[derive(Debug, Clone, Default)]
+pub struct ConcWitnessSites {
+    /// Source lines of reachable `pthread_create` call sites (deterministic order).
+    /// Each becomes one `createThread` transition, capped to keep the witness small.
+    pub spawn_lines: Vec<u32>,
+    /// Source line of the `reach_error` / assertion-failure violation, if known.
+    /// Anchors the witness's target transition.
+    pub error_line: Option<u32>,
+    /// The resolved start-routine name of the (single) spawned thread, if known.
+    /// Emitted as an `enterFunction` transition for thread `1` — the created
+    /// thread's initial function — only when exactly one spawn is modelled (so the
+    /// created thread is unambiguously thread `1`). `None` ⇒ the anchor is omitted.
+    pub entry_function: Option<String>,
+}
+
+/// The maximum number of `createThread` transitions modelled in a witness. One is
+/// enough to mark the execution as concurrent; a few more faithfully record a
+/// small spawn set without over-constraining the validator's interleaving search
+/// (each extra edge forces one more create before the violation). A spawn-in-a-loop
+/// task (many runtime threads, few call sites) stays small.
+const MAX_MODELLED_SPAWNS: usize = 4;
+
 /// Build a GraphML 1.0 violation witness for a confirmed concurrency `unreach-call`
 /// FALSE (confirmer-contract R7 — a YAML-2.0 witness scores 0 for concurrency).
 ///
-/// Emits the mandatory graph metadata plus, for the winning schedule, a `main` entry
-/// node, one `createThread` edge per spawned thread (bounded to `thread_count`, capped
-/// so a 10^4-thread task stays small), and a `threadId`-annotated edge into the
-/// `violation` node. The `schedule` label records which non-preemptive order reached
-/// the violation. Fully deterministic given its inputs. Targeted at CPAchecker /
-/// Dartagnan / `ConcurrentWitness2Test`.
+/// Emits the mandatory graph metadata plus a linear error-path automaton: a `main`
+/// entry node (thread `0`), one `createThread` transition per modelled spawn (the
+/// creating thread is `main`, so `threadId="0"`; the new thread gets id `1..=k`,
+/// anchored to the `pthread_create` `startline`), then a target transition anchored
+/// to the violation `startline` into the `violation` node. Fully deterministic
+/// given its inputs. Targeted at CPAchecker / Dartagnan / `ConcurrentWitness2Test`.
 #[must_use]
 pub fn conc_graphml_witness(
     spec: &str,
@@ -362,6 +391,7 @@ pub fn conc_graphml_witness(
     architecture: &str,
     thread_count: usize,
     schedule: ConcSchedule,
+    sites: &ConcWitnessSites,
 ) -> String {
     conc_graphml_witness_labeled(
         spec,
@@ -370,13 +400,21 @@ pub fn conc_graphml_witness(
         architecture,
         thread_count,
         schedule.label(),
+        sites,
     )
 }
 
 /// Like [`conc_graphml_witness`] but takes an arbitrary schedule label string, so
 /// confirmers with their own schedule vocabulary (e.g. the forced-interleaving replay
 /// engine, [`crate::conc_replay`]) can reuse the same GraphML-1.0 emitter without
-/// inventing a [`ConcSchedule`] variant.
+/// inventing a [`ConcSchedule`] variant. `schedule_label` is recorded only as a
+/// provenance comment — it is NEVER used as a `threadId` (a thread id must identify
+/// a thread the witness created; a schedule label like `reverse` would make the
+/// automaton unmatchable).
+// NOTE: assembling the whole GraphML document (keys, metadata, and the linear
+// create→run→violation path) is one cohesive unit; splitting it would obscure the
+// witness shape.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn conc_graphml_witness_labeled(
     spec: &str,
@@ -385,11 +423,17 @@ pub fn conc_graphml_witness_labeled(
     architecture: &str,
     thread_count: usize,
     schedule_label: &str,
+    sites: &ConcWitnessSites,
 ) -> String {
-    // Cap the number of modelled threads in the witness so a 10^4-spawn task does not
-    // produce a pathologically large witness; one createThread edge is enough to make
-    // the witness structurally valid.
-    let modelled = thread_count.clamp(1, 16);
+    // How many spawns to model as `createThread` edges. Prefer the concrete spawn
+    // call sites we found source lines for; otherwise fall back to the static count.
+    // At least one createThread is emitted so the witness always marks concurrency.
+    let modelled = sites
+        .spawn_lines
+        .len()
+        .max(1)
+        .min(thread_count.max(1))
+        .min(MAX_MODELLED_SPAWNS);
 
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n");
@@ -426,8 +470,20 @@ xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n",
     s.push_str(
         "  <key attr.name=\"createThread\" attr.type=\"string\" for=\"edge\" id=\"createThread\"/>\n",
     );
+    s.push_str(
+        "  <key attr.name=\"startline\" attr.type=\"int\" for=\"edge\" id=\"startline\"/>\n",
+    );
+    s.push_str(
+        "  <key attr.name=\"enterFunction\" attr.type=\"string\" for=\"edge\" id=\"enterFunction\"/>\n",
+    );
 
     s.push_str("  <graph edgedefault=\"directed\">\n");
+    // Record the winning schedule as provenance (a comment, not a threadId).
+    let _ = writeln!(
+        s,
+        "    <!-- reproducing schedule: {} -->",
+        xml_escape(schedule_label)
+    );
     for (k, v) in [
         ("witness-type", "violation_witness"),
         ("sourcecodelang", "C"),
@@ -440,28 +496,61 @@ xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n",
     ] {
         let _ = writeln!(s, "    <data key=\"{k}\">{}</data>", xml_escape(v));
     }
-    // Entry node (thread 0 = main).
+    // Entry node: thread 0 = main.
     s.push_str("    <node id=\"N0\"><data key=\"entry\">true</data></node>\n");
-    // One node + createThread edge per modelled spawned thread.
+    // A chain of createThread transitions: main (threadId 0) creates threads
+    // 1..=modelled, anchored to each pthread_create source line when known.
     for t in 1..=modelled {
         let _ = writeln!(s, "    <node id=\"N{t}\"/>");
-        let _ = writeln!(
+        let startline = sites.spawn_lines.get(t - 1).copied();
+        let _ = write!(
             s,
-            "    <edge source=\"N0\" target=\"N{t}\"><data key=\"createThread\">{}</data></edge>",
+            "    <edge source=\"N{}\" target=\"N{t}\">\
+<data key=\"threadId\">0</data><data key=\"createThread\">{t}</data>",
             t - 1
         );
+        if let Some(line) = startline {
+            let _ = write!(s, "<data key=\"startline\">{line}</data>");
+        }
+        s.push_str("</edge>\n");
     }
-    // Violation node reached by the last modelled thread under `schedule`.
-    let vnode = modelled + 1;
+    // Optional `enterFunction` transition: the created thread (`threadId=1`) begins
+    // in its start routine. Emitted ONLY when exactly one spawn is modelled — then
+    // the created thread is unambiguously thread `1`, and it always enters its start
+    // routine before the violation is reachable under any schedule. `tail` tracks the
+    // node the violation edge departs from.
+    let mut tail = modelled;
+    if modelled == 1 {
+        if let Some(entry_fn) = &sites.entry_function {
+            let step = modelled + 1;
+            let _ = writeln!(s, "    <node id=\"N{step}\"/>");
+            // No `startline` here: the start routine's body line is not known
+            // reliably, and a wrong one would block matching. `enterFunction` alone
+            // (matching the thread-entry CFA edge for the named function) is the
+            // sound, sufficient constraint.
+            let _ = writeln!(
+                s,
+                "    <edge source=\"N{tail}\" target=\"N{step}\">\
+<data key=\"threadId\">1</data><data key=\"enterFunction\">{}</data></edge>",
+                xml_escape(entry_fn)
+            );
+            tail = step;
+        }
+    }
+    // Target transition into the violation node, anchored to the violation source
+    // line. `threadId` is deliberately omitted so the validator may match the
+    // violation in whichever thread reaches it (main after a join, or a spawned
+    // thread) — the most permissive sound anchoring.
+    let vnode = tail + 1;
     let _ = writeln!(
         s,
         "    <node id=\"N{vnode}\"><data key=\"violation\">true</data></node>"
     );
-    let _ = writeln!(
-        s,
-        "    <edge source=\"N{modelled}\" target=\"N{vnode}\"><data key=\"threadId\">{}</data></edge>",
-        xml_escape(schedule_label)
-    );
+    let _ = write!(s, "    <edge source=\"N{tail}\" target=\"N{vnode}\">");
+    if let Some(line) = sites.error_line {
+        let _ = write!(s, "<data key=\"startline\">{line}</data>");
+    }
+    s.push_str("</edge>\n");
     s.push_str("  </graph>\n");
     s.push_str("</graphml>\n");
     s
@@ -629,6 +718,11 @@ mod tests {
 
     #[test]
     fn graphml_witness_is_well_formed() {
+        let sites = ConcWitnessSites {
+            spawn_lines: vec![7],
+            error_line: Some(15),
+            entry_function: None,
+        };
         let w = conc_graphml_witness(
             "CHECK( init(main()), LTL(G ! call(reach_error())) )",
             "p.i",
@@ -636,17 +730,99 @@ mod tests {
             "32bit",
             3,
             ConcSchedule::ReverseDrain,
+            &sites,
         );
         assert!(w.starts_with("<?xml"));
         assert!(w.contains("violation_witness"));
         assert!(w.contains("createThread"));
         assert!(w.contains("<data key=\"violation\">true</data>"));
-        assert!(w.contains("reverse"));
+        // The winning schedule is recorded as a provenance comment, never a threadId.
+        assert!(w.contains("<!-- reproducing schedule: reverse -->"));
         assert!(w.trim_end().ends_with("</graphml>"));
+    }
+
+    /// The created-thread id must start at 1 (main is thread 0), the creating edge
+    /// must be executed by `main` (`threadId=0`), the schedule label must NEVER be
+    /// emitted as a `threadId`, and the source anchors must appear as `startline`s.
+    /// These are exactly the defects that made a validator reject the old witness.
+    #[test]
+    fn graphml_witness_is_spec_compliant_and_anchored() {
+        let sites = ConcWitnessSites {
+            spawn_lines: vec![11],
+            error_line: Some(23),
+            entry_function: None,
+        };
+        let w = conc_graphml_witness(
+            "CHECK( init(main()), LTL(G ! call(reach_error())) )",
+            "p.i",
+            "hash",
+            "64bit",
+            1,
+            ConcSchedule::Eager,
+            &sites,
+        );
+        // main (thread 0) creates thread 1 — never thread 0 (which would recreate main).
+        assert!(w.contains("<data key=\"threadId\">0</data><data key=\"createThread\">1</data>"));
+        assert!(!w.contains("<data key=\"createThread\">0</data>"));
+        // The schedule label is never a threadId value.
+        assert!(!w.contains("<data key=\"threadId\">eager"));
+        // Source anchors present on the create and target transitions.
+        assert!(w.contains("<data key=\"startline\">11</data>"));
+        assert!(w.contains("<data key=\"startline\">23</data>"));
+        // Deterministic.
+        let w2 = conc_graphml_witness(
+            "CHECK( init(main()), LTL(G ! call(reach_error())) )",
+            "p.i",
+            "hash",
+            "64bit",
+            1,
+            ConcSchedule::Eager,
+            &sites,
+        );
+        assert_eq!(w, w2);
+    }
+
+    /// With a single modelled spawn and a resolved start routine, the witness emits
+    /// an `enterFunction` transition executed by the created thread (`threadId=1`),
+    /// placed between the createThread edge and the violation.
+    #[test]
+    fn graphml_witness_emits_enter_function_for_single_spawn() {
+        let sites = ConcWitnessSites {
+            spawn_lines: vec![11],
+            error_line: Some(23),
+            entry_function: Some("worker".to_string()),
+        };
+        let w = conc_graphml_witness_labeled("SPEC", "p.i", "h", "64bit", 1, "eager", &sites);
+        assert!(
+            w.contains("<data key=\"threadId\">1</data><data key=\"enterFunction\">worker</data>")
+        );
+        // Still ends at a violation node anchored to the error line.
+        assert!(w.contains("<data key=\"violation\">true</data>"));
+        assert!(w.contains("<data key=\"startline\">23</data>"));
+    }
+
+    /// The `enterFunction` anchor is suppressed when more than one spawn is modelled
+    /// (the created thread reaching the violation is then ambiguous) — fail-safe.
+    #[test]
+    fn graphml_witness_suppresses_enter_function_for_multi_spawn() {
+        let sites = ConcWitnessSites {
+            spawn_lines: vec![11, 12],
+            error_line: Some(23),
+            entry_function: Some("worker".to_string()),
+        };
+        let w = conc_graphml_witness_labeled("SPEC", "p.i", "h", "64bit", 2, "eager", &sites);
+        assert!(!w.contains("<data key=\"enterFunction\">"));
     }
 
     #[test]
     fn graphml_witness_escapes_and_caps_threads() {
+        // Many spawn sites + a huge static thread count: the modelled createThread
+        // edges must cap at MAX_MODELLED_SPAWNS so a 10^4-spawn task stays tiny.
+        let sites = ConcWitnessSites {
+            spawn_lines: (1..=10).collect(),
+            error_line: Some(99),
+            entry_function: None,
+        };
         let w = conc_graphml_witness(
             "a & b < c",
             "p.i",
@@ -654,10 +830,39 @@ mod tests {
             "32bit",
             10_000,
             ConcSchedule::Eager,
+            &sites,
         );
         assert!(w.contains("a &amp; b &lt; c"));
-        // capped at 16 modelled threads.
-        assert!(w.contains("N16"));
+        // Exactly MAX_MODELLED_SPAWNS createThread nodes, then the violation node.
+        assert!(w.contains(&format!(
+            "<data key=\"createThread\">{MAX_MODELLED_SPAWNS}</data>"
+        )));
+        assert!(!w.contains(&format!(
+            "<data key=\"createThread\">{}</data>",
+            MAX_MODELLED_SPAWNS + 1
+        )));
+        // Violation node is the one past the last createThread node.
+        assert!(w.contains(&format!("<node id=\"N{}\">", MAX_MODELLED_SPAWNS + 1)));
         assert!(!w.contains("N9999"));
+    }
+
+    /// With no anchors at all the witness is still structurally valid: at least one
+    /// createThread edge (thread 1) and a violation node, just without `startline`s.
+    #[test]
+    fn graphml_witness_valid_without_anchors() {
+        let w = conc_graphml_witness_labeled(
+            "SPEC",
+            "p.i",
+            "h",
+            "64bit",
+            0,
+            "round-robin",
+            &ConcWitnessSites::default(),
+        );
+        assert!(w.contains("<data key=\"createThread\">1</data>"));
+        assert!(w.contains("<data key=\"violation\">true</data>"));
+        // The startline KEY is always declared, but no startline DATA value is
+        // emitted when no anchors are known.
+        assert!(!w.contains("<data key=\"startline\">"));
     }
 }

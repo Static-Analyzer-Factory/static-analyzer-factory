@@ -683,6 +683,130 @@ pub fn reachable_spawns_threads(module: &AirModule, callgraph: &CallGraph) -> bo
     false
 }
 
+/// `reach_error` / `__VERIFIER_error` / assertion-failure call names whose call
+/// site is the `unreach-call` violation point. Used only to anchor a concurrency
+/// violation witness's target transition to a source line (`startline`), never to
+/// decide a verdict.
+const ERROR_CALL_NAMES: &[&str] = &[
+    "reach_error",
+    "__VERIFIER_error",
+    "__assert_fail",
+    "__assert_rtn",
+];
+
+/// Source line (1-based) of the first `reach_error` / `__VERIFIER_error` /
+/// assertion-failure call in the module, in deterministic (module → block →
+/// instruction) order, if a span is recorded.
+///
+/// Used purely to give a concurrency GraphML violation witness a `startline`
+/// anchor on its target transition so a validator's CFA walk can locate the
+/// violation. Returns `None` when no such call carries a span — the witness then
+/// omits the anchor (still structurally valid, just less precise). Scanning all
+/// defined functions (not just `main`-reachable) is fine: the anchor is advisory.
+#[must_use]
+pub fn error_call_startline(module: &AirModule) -> Option<u32> {
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Operation::CallDirect { callee } = &inst.op {
+                    if let Some(target) = module.function(*callee) {
+                        if ERROR_CALL_NAMES.contains(&target.name.as_str()) {
+                            if let Some(span) = &inst.span {
+                                return Some(span.line_start);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Source lines (1-based) of reachable-from-`main` direct thread-spawn call sites
+/// ([`SPAWN_FUNCTIONS`]), in deterministic encounter order, deduplicated, capped.
+///
+/// Used to anchor a concurrency violation witness's `createThread` transitions to
+/// the `pthread_create` source lines so a validator's CFA walk can locate them.
+/// Only call sites that carry a span contribute; the list may therefore be shorter
+/// than [`reachable_spawn_call_sites`] (which counts every site). The cap keeps a
+/// spawn-in-a-loop task's witness small.
+#[must_use]
+pub fn reachable_spawn_startlines(module: &AirModule, callgraph: &CallGraph) -> Vec<u32> {
+    const CAP: usize = 16;
+    let reachable = reachable_functions(callgraph, module);
+    let mut lines: Vec<u32> = Vec::new();
+    for func in &module.functions {
+        if func.is_declaration || !reachable.contains(&func.id) {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Operation::CallDirect { callee } = &inst.op {
+                    if let Some(target) = module.function(*callee) {
+                        if SPAWN_FUNCTIONS.contains(&target.name.as_str()) {
+                            if let Some(span) = &inst.span {
+                                if !lines.contains(&span.line_start) {
+                                    lines.push(span.line_start);
+                                    if lines.len() >= CAP {
+                                        return lines;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// Resolve the start-routine function NAME of the first reachable-from-`main`
+/// `pthread_create` / `thrd_create` call, if it is a **directly-named** defined
+/// function.
+///
+/// Used only to anchor a concurrency violation witness's `enterFunction` transition
+/// (the created thread's initial function). Delegates to
+/// [`crate::race_true::resolve_direct_thread_fn`], which mirrors the frontend's
+/// function-address encodings (a `Constant::GlobalRef` to a function, or an operand
+/// whose raw id *is* a function's `ObjId`) and returns `None` on any indirect /
+/// unresolved entry. On `None` the witness simply omits the anchor — a wrong
+/// `enterFunction` would make the automaton unmatchable, so fail closed.
+#[must_use]
+pub fn spawn_start_routine_name(module: &AirModule, callgraph: &CallGraph) -> Option<String> {
+    let reachable = reachable_functions(callgraph, module);
+    for func in &module.functions {
+        if func.is_declaration || !reachable.contains(&func.id) {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let Operation::CallDirect { callee } = &inst.op else {
+                    continue;
+                };
+                let Some(target) = module.function(*callee) else {
+                    continue;
+                };
+                if !SPAWN_FUNCTIONS.contains(&target.name.as_str()) {
+                    continue;
+                }
+                if let Some(fid) = crate::race_true::resolve_direct_thread_fn(module, inst) {
+                    if let Some(routine) = module.function(fid) {
+                        if !routine.is_declaration {
+                            return Some(routine.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Count reachable-from-`main` direct call sites to a thread-spawn primitive
 /// ([`SPAWN_FUNCTIONS`]), saturating at `cap`.
 ///
@@ -1770,6 +1894,94 @@ mod tests {
         let module = make_module(vec![main, pthread_create]);
         let cg = CallGraph::build(&module);
         assert!(reachable_spawns_threads(&module, &cg));
+    }
+
+    /// The start-routine resolver returns the directly-named thread body: a
+    /// `pthread_create(&t, attr, worker, arg)` whose 3rd operand's raw id IS the
+    /// `worker` function's object id resolves to `"worker"`.
+    #[test]
+    fn spawn_start_routine_resolves_direct_named_function() {
+        let worker = make_defined_function("worker");
+        let pthread_create = make_declaration("pthread_create");
+        // main: pthread_create(v0, v1, <worker addr>, v3).
+        let bid = make_block_id("main_entry");
+        let mut block = AirBlock::new(bid);
+        let routine = saf_core::ids::ValueId(worker.id.raw());
+        block.instructions.push(Instruction {
+            id: make_inst_id("main_spawn"),
+            op: Operation::CallDirect {
+                callee: pthread_create.id,
+            },
+            operands: vec![
+                make_value_id("v0"),
+                make_value_id("v1"),
+                routine,
+                make_value_id("v3"),
+            ],
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        });
+        let main = AirFunction {
+            id: make_func_id("main"),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![block],
+            entry_block: None,
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let module = make_module(vec![main, worker, pthread_create]);
+        let cg = CallGraph::build(&module);
+        assert_eq!(
+            spawn_start_routine_name(&module, &cg).as_deref(),
+            Some("worker")
+        );
+    }
+
+    /// An indirect / unresolved thread entry yields `None` (fail-safe — the witness
+    /// omits the `enterFunction` anchor rather than guessing).
+    #[test]
+    fn spawn_start_routine_none_when_unresolved() {
+        let pthread_create = make_declaration("pthread_create");
+        // main spawns, but the routine operand resolves to no defined function.
+        let bid = make_block_id("main_entry");
+        let mut block = AirBlock::new(bid);
+        block.instructions.push(Instruction {
+            id: make_inst_id("main_spawn"),
+            op: Operation::CallDirect {
+                callee: pthread_create.id,
+            },
+            operands: vec![
+                make_value_id("v0"),
+                make_value_id("v1"),
+                make_value_id("opaque_fp"),
+                make_value_id("v3"),
+            ],
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        });
+        let main = AirFunction {
+            id: make_func_id("main"),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![block],
+            entry_block: None,
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let module = make_module(vec![main, pthread_create]);
+        let cg = CallGraph::build(&module);
+        assert_eq!(spawn_start_routine_name(&module, &cg), None);
     }
 
     #[test]

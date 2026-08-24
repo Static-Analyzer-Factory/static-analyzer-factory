@@ -38,8 +38,8 @@ pub use conc_replay::{
     ReplayPlan, conc_replay_schedulable, replay_plans, synthesize_conc_replay_driver,
 };
 pub use conc_seq::{
-    CONC_SCHEDULES, ConcSchedule, conc_graphml_witness, conc_graphml_witness_labeled,
-    conc_schedulable, synthesize_conc_driver,
+    CONC_SCHEDULES, ConcSchedule, ConcWitnessSites, conc_graphml_witness,
+    conc_graphml_witness_labeled, conc_schedulable, synthesize_conc_driver,
 };
 pub use conc_shim::{
     SHIM_CBOUND, SHIM_MAX_STEP, ShimPlan, conc_shim_schedulable, shim_preemption_plans,
@@ -64,7 +64,9 @@ pub use race_true::{
 pub use termination::{
     is_known_returning_external, program_structurally_terminates, termination_verdict,
 };
-pub use witness_lower::{lower_candidate, lower_must_reach, span_to_location};
+pub use witness_lower::{
+    lower_candidate, lower_must_reach, lower_reach_error_target, span_to_location,
+};
 pub use witness_yaml::{
     Action, Constraint, SourceWaypoint, ViolationWitness, WaypointKind, WitnessMeta,
     compute_file_hash,
