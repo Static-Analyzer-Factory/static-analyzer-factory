@@ -2246,12 +2246,34 @@ fn build_recursion_model(
     module: &AirModule,
     cfg: &Cfg,
 ) -> Option<MultiPathModel> {
-    // A looping body would make entry→call path enumeration incomplete (an
-    // unbounded loop between entry and the recursive call is not path-enumerable);
-    // abstain and let the loop-ranking gate handle loops separately.
-    if cfg_has_loops(cfg) {
+    // A loop *on an entry→recursive-call path* would make that path's simple-path
+    // enumeration incomplete (a real execution could iterate the loop before
+    // reaching the call, a transition simple paths miss — unsound to drop for a
+    // termination over-approximation). But a loop that lies **entirely off** every
+    // entry→call path — e.g. a counted loop the function runs *after* its recursive
+    // call, or in a branch that never reaches a call — cannot affect which
+    // recursive frames are spawned, so the call-argument transition relation is
+    // still fully enumerable. Reject only when the region of blocks that are both
+    // reachable-from-entry AND can-reach a recursive call site contains a cycle;
+    // otherwise proceed (the caller's (L) gate still independently ranks every one
+    // of the function's loops). Strictly additive over the old `cfg_has_loops`
+    // rejection: a fully loop-free body has an acyclic region (accept, as before),
+    // and any loop on the call path keeps the region cyclic (reject, as before).
+    let entry = func.entry_block.unwrap_or(func.blocks.first()?.id);
+    let call_blocks: BTreeSet<BlockId> = func
+        .blocks
+        .iter()
+        .filter(|b| {
+            b.instructions.iter().any(
+                |inst| matches!(&inst.op, Operation::CallDirect { callee } if *callee == func.id),
+            )
+        })
+        .map(|b| b.id)
+        .collect();
+    if call_blocks.is_empty() {
         return None;
     }
+    let call_region = entry_to_call_acyclic_region(cfg, entry, &call_blocks)?;
 
     let mut signs = infer_signs(func, module);
 
@@ -2291,9 +2313,9 @@ fn build_recursion_model(
         return None;
     }
 
-    // The whole (loop-free) body is the affine "region": every def is expandable,
-    // and the parameters are the leaves (played by `header_phis` in the shared
-    // helpers, which treat that set as un-expanded ranking leaves).
+    // Affine leaves come from every def in the body; parameters are the leaves
+    // (played by `header_phis` in the shared helpers, which treat that set as
+    // un-expanded ranking leaves).
     let all_blocks: BTreeSet<BlockId> = func.blocks.iter().map(|b| b.id).collect();
     let defs = index_defs(func, &all_blocks);
     let block_of = index_block_of(func);
@@ -2315,15 +2337,15 @@ fn build_recursion_model(
         return None;
     }
 
-    let entry = func.entry_block.unwrap_or(func.blocks.first()?.id);
-
     // --- Pass 1: one raw transition per (call site × entry→site path). ---------
     let mut raws: Vec<RawBranch> = Vec::new();
     let mut universe: BTreeSet<ValueId> = param_ids.clone();
     for (cb, args) in &sites {
-        // Every simple path from the entry to the call-site block (the body minus
-        // no back-edges is already acyclic — we rejected loops above).
-        let paths = enumerate_body_paths(cfg, &all_blocks, entry, *cb)?;
+        // Every simple path from the entry to the call-site block, enumerated over
+        // the entry→call region only (`call_region`, proven acyclic above), so the
+        // enumeration is complete: any loop the function has lies off this region
+        // (e.g. after the call) and cannot alter which recursive frames are spawned.
+        let paths = enumerate_body_paths(cfg, &call_region, entry, *cb)?;
         for path in &paths {
             let path_pred = path_pred_map(path);
             let mut guards: Vec<Constraint> = Vec::new();
@@ -3220,6 +3242,99 @@ fn path_pred_map(path: &[BlockId]) -> BTreeMap<BlockId, BlockId> {
         out.insert(pair[1], pair[0]);
     }
     out
+}
+
+/// The **entry→call region**: every block that is *both* reachable from `entry`
+/// *and* can reach some block in `call_blocks`. Every simple path from `entry` to a
+/// recursive call site is contained in this set (each of its blocks is reachable
+/// from the entry and reaches the call). Returns `Some(region)` when the sub-graph
+/// induced on that region is **acyclic** — so a simple-path enumeration over it is
+/// *complete* (there are no multi-visit paths to miss) — or `None` when it contains
+/// a cycle (a loop lies on an entry→call path, making enumeration incomplete ⇒ the
+/// recursion model would be an unsound under-approximation, so abstain).
+///
+/// A loop lying **off** this region (e.g. one the function runs *after* its
+/// recursive call, or in a branch that never reaches a call) is excluded and
+/// therefore permitted: it cannot change which recursive frames are spawned, and
+/// the caller's `(L)` gate ranks it independently.
+fn entry_to_call_acyclic_region(
+    cfg: &Cfg,
+    entry: BlockId,
+    call_blocks: &BTreeSet<BlockId>,
+) -> Option<BTreeSet<BlockId>> {
+    // Reachable-from-entry (forward closure over successors).
+    let mut from_entry: BTreeSet<BlockId> = BTreeSet::new();
+    let mut stack = vec![entry];
+    while let Some(b) = stack.pop() {
+        if !from_entry.insert(b) {
+            continue;
+        }
+        if let Some(succs) = cfg.successors.get(&b) {
+            for &s in succs {
+                if !from_entry.contains(&s) {
+                    stack.push(s);
+                }
+            }
+        }
+    }
+    // Can-reach-a-call (backward closure over predecessors from the call blocks).
+    let mut reaches_call: BTreeSet<BlockId> = BTreeSet::new();
+    let mut stack: Vec<BlockId> = call_blocks.iter().copied().collect();
+    while let Some(b) = stack.pop() {
+        if !reaches_call.insert(b) {
+            continue;
+        }
+        if let Some(preds) = cfg.predecessors.get(&b) {
+            for &p in preds {
+                if !reaches_call.contains(&p) {
+                    stack.push(p);
+                }
+            }
+        }
+    }
+    let region: BTreeSet<BlockId> = from_entry.intersection(&reaches_call).copied().collect();
+
+    // Cycle detection restricted to `region` (edges with both endpoints inside it):
+    // a back-edge to a block on the current DFS stack ⇒ a cycle ⇒ reject.
+    let mut visited = BTreeSet::new();
+    let mut on_stack = BTreeSet::new();
+    for &b in &region {
+        if !visited.contains(&b)
+            && region_dfs_has_cycle(b, cfg, &region, &mut visited, &mut on_stack)
+        {
+            return None;
+        }
+    }
+    Some(region)
+}
+
+/// Recursive DFS back-edge detector for [`entry_to_call_acyclic_region`], restricted
+/// to successors that stay inside `region`. A successor already on the current DFS
+/// stack is a back-edge (cycle).
+fn region_dfs_has_cycle(
+    node: BlockId,
+    cfg: &Cfg,
+    region: &BTreeSet<BlockId>,
+    visited: &mut BTreeSet<BlockId>,
+    stack: &mut BTreeSet<BlockId>,
+) -> bool {
+    if stack.contains(&node) {
+        return true;
+    }
+    if visited.contains(&node) {
+        return false;
+    }
+    visited.insert(node);
+    stack.insert(node);
+    if let Some(succs) = cfg.successors.get(&node) {
+        for &s in succs {
+            if region.contains(&s) && region_dfs_has_cycle(s, cfg, region, visited, stack) {
+                return true;
+            }
+        }
+    }
+    stack.remove(&node);
+    false
 }
 
 /// Enumerate **every** simple path from `header` to `latch` through the loop body,
@@ -6438,6 +6553,161 @@ mod tests {
         let func = &m.functions[0];
         let cfg = Cfg::build(func);
         recursion_is_ranked(func, m, &cfg)
+    }
+
+    /// Build a self-recursive `int f(int n){ if (n>0){ n--; f(n); <loop> } }` whose
+    /// body contains a trivial `while`-loop. `loop_before_call == false` places the
+    /// loop **after** the recursive call (off every entry→call path — should be
+    /// accepted, region acyclic); `true` places it **before** the call (on the
+    /// entry→call path — must be rejected, region cyclic).
+    ///
+    /// The recursion itself ranks by `f = n` (guard `n > 0` ⇒ `n ≥ 1`, arg `n − 1`
+    /// stays in range under `nsw`), so `recursion_is_ranked` returns `true` iff the
+    /// entry→call region is proven acyclic (i.e. iff the loop is off the call path).
+    fn self_rec_with_loop(loop_before_call: bool) -> AirModule {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let zero = vid("zero");
+        let one = vid("one");
+        let truth = vid("truth");
+        constants.insert(zero, Constant::Int { value: 0, bits: 32 });
+        constants.insert(one, Constant::Int { value: 1, bits: 32 });
+        constants.insert(truth, Constant::Int { value: 1, bits: 1 });
+
+        let f_id = FunctionId(make_id("func", b"f"));
+        let n = vid("n");
+        let c = vid("c");
+        let na = vid("na");
+
+        let entry = bid("f_entry");
+        let rec = bid("f_rec");
+        let base = bid("f_base");
+        let lh = bid("f_loop_h");
+        let lb = bid("f_loop_b");
+
+        // The guard `n > 0` and the decrement `n - 1` (a `nsw` sub), shared by both
+        // layouts; only the block wiring around them differs.
+        let mut eb = AirBlock::new(entry);
+        eb.instructions.push(vinst(
+            "cmp",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            c,
+            vec![n, zero],
+            i1t,
+        ));
+
+        let mut rb = AirBlock::new(rec);
+        rb.instructions.push(
+            vinst(
+                "sub",
+                Operation::BinaryOp {
+                    kind: BinaryOp::Sub,
+                },
+                na,
+                vec![n, one],
+                i32t,
+            )
+            .with_no_signed_wrap(),
+        );
+        rb.instructions.push(term(
+            "call",
+            Operation::CallDirect { callee: f_id },
+            vec![na],
+        ));
+
+        // The trivial loop header/body (a `loop_h ⇄ loop_b` two-node cycle).
+        let mut lhb = AirBlock::new(lh);
+        lhb.instructions.push(term(
+            "loop_cond",
+            Operation::CondBr {
+                then_target: lb,
+                else_target: base,
+            },
+            vec![truth],
+        ));
+        let mut lbb = AirBlock::new(lb);
+        lbb.instructions
+            .push(term("loop_back", Operation::Br { target: lh }, vec![]));
+
+        let mut bb = AirBlock::new(base);
+        bb.instructions.push(term("ret", Operation::Ret, vec![]));
+
+        let blocks = if loop_before_call {
+            // entry → loop_h ⇄ loop_b, loop_h → rec(call) → base.  The loop is on
+            // the entry→call path ⇒ must be rejected.
+            eb.instructions.push(term(
+                "condbr",
+                Operation::CondBr {
+                    then_target: lh,
+                    else_target: base,
+                },
+                vec![c],
+            ));
+            lhb.instructions.pop();
+            lhb.instructions.push(term(
+                "loop_cond",
+                Operation::CondBr {
+                    then_target: lb,
+                    else_target: rec,
+                },
+                vec![truth],
+            ));
+            rb.instructions
+                .push(term("br_rec", Operation::Br { target: base }, vec![]));
+            vec![eb, lhb, lbb, rb, bb]
+        } else {
+            // entry → rec(call) → loop_h ⇄ loop_b, loop_h → base.  The loop is off
+            // every entry→call path (runs *after* the call) ⇒ must be accepted.
+            eb.instructions.push(term(
+                "condbr",
+                Operation::CondBr {
+                    then_target: rec,
+                    else_target: base,
+                },
+                vec![c],
+            ));
+            rb.instructions
+                .push(term("br_rec", Operation::Br { target: lh }, vec![]));
+            vec![eb, rb, lhb, lbb, bb]
+        };
+
+        let func = AirFunction {
+            id: f_id,
+            name: "f".to_string(),
+            params: vec![AirParam {
+                id: n,
+                name: None,
+                index: 0,
+                param_type: Some(i32t),
+            }],
+            blocks,
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        module_of(func, constants)
+    }
+
+    #[test]
+    fn recursion_with_post_call_loop_is_ranked() {
+        // A loop that runs *after* the recursive call lies off every entry→call
+        // path, so it cannot alter which frames are spawned: the recursion model is
+        // still complete and `f = n` ranks it. (New: previously any loop in the body
+        // forced an abstain.)
+        assert!(rec_ranked(&self_rec_with_loop(false)));
+    }
+
+    #[test]
+    fn recursion_with_pre_call_loop_abstains() {
+        // A loop *before* the recursive call is on the entry→call path, so
+        // simple-path enumeration would miss its multi-iteration transitions — an
+        // unsound under-approximation. Must abstain (model = None).
+        assert!(!rec_ranked(&self_rec_with_loop(true)));
     }
 
     /// `self_rec` (recursive `f`) plus an external `main` that calls `f(entry)`,
