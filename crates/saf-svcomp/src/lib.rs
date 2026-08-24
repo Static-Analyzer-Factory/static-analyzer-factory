@@ -16,6 +16,7 @@
 pub mod bmc;
 pub mod conc_replay;
 pub mod conc_seq;
+pub mod conc_shim;
 pub mod fast_paths;
 pub mod fuzz;
 pub mod memsafety;
@@ -39,6 +40,10 @@ pub use conc_replay::{
 pub use conc_seq::{
     CONC_SCHEDULES, ConcSchedule, conc_graphml_witness, conc_graphml_witness_labeled,
     conc_schedulable, synthesize_conc_driver,
+};
+pub use conc_shim::{
+    SHIM_CBOUND, SHIM_MAX_STEP, ShimPlan, conc_shim_schedulable, shim_preemption_plans,
+    synthesize_conc_shim_driver,
 };
 pub use memsafety::{
     AsanHit, asan_class_to_subproperty, lower_memsafety_hit, memsafety_verdict, parse_asan_report,

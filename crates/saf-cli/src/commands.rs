@@ -1280,6 +1280,16 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         if let Some(outcome) = conc_replay_confirm_false(ctx) {
             return outcome;
         }
+        // Third concurrency confirmer (lever `conc-shim-firstpass`): a SYSTEMATIC
+        // bounded-preemption (CHESS-style) cooperative scheduler that MODELS pthread
+        // mutexes and preempts at shared memory accesses. Reaches the mutex-guarded
+        // interleaving bugs neither engine above can (`conc_seq` is whole-thread;
+        // `conc_replay` refuses any mutex). Every forced schedule is a real serialized
+        // SC interleaving with mutual exclusion enforced, so a `reach_error` it hits is a
+        // genuine violation (R1/R6/R7, GraphML witness); any miss ⇒ abstain.
+        if let Some(outcome) = conc_shim_confirm_false(ctx) {
+            return outcome;
+        }
         eprintln!(
             "saf verify: a thread spawn is reachable from main (no atomic-thread schedule confirmed) -> unknown"
         );
@@ -2219,6 +2229,238 @@ fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     }
 
     eprintln!("saf verify: no forced-interleaving plan reached reach_error -> unknown");
+    None
+}
+
+/// Per-run timeout for one bounded-preemption shim schedule. Short: a mutex-guarded
+/// program that does not reproduce under a given `(p1,p2)` terminates in milliseconds;
+/// only a pathological (schedule-induced) spin hits this, and a timeout just means "this
+/// schedule did not reach the error" → try the next plan / abstain.
+const CONC_SHIM_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Total wall-clock budget across ALL shim schedules for one task. Bounds per-task cost
+/// even though the `c<=2` sweep enumerates many `(p1,p2)` pairs; when exhausted we abstain
+/// (no verdict lost — the schedule is the sole arbiter).
+const CONC_SHIM_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Run the bounded-preemption shim harness once under one `(p1,p2)` schedule. Returns
+/// `Ok(true)` iff the sentinel dropped (the property's violation event fired). Timeout /
+/// normal exit / crash all return `Ok(false)` — the sentinel is the sole confirmer. A
+/// runaway (spinning) harness is killed with its whole group.
+fn run_conc_shim_plan(
+    harness: &Path,
+    sentinel: &Path,
+    plan: saf_svcomp::ShimPlan,
+    timeout: std::time::Duration,
+) -> anyhow::Result<bool> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+
+    let _ = std::fs::remove_file(sentinel);
+    let mut cmd = Command::new(harness);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("SAF_SHIM_P1", plan.p1_env())
+        .env("SAF_SHIM_P2", plan.p2_env());
+    let mut child = harden_replay_spawn(&mut cmd)
+        .spawn()
+        .with_context(|| "spawning concurrency shim harness")?;
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    kill_replay_group(&mut child);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) => return Err(e).context("waiting on concurrency shim harness"),
+        }
+    }
+    Ok(sentinel.exists())
+}
+
+/// Mutex-aware bounded-preemption concurrency `unreach-call` FALSE confirmer (lever
+/// `conc-shim-firstpass`).
+///
+/// Runs AFTER [`conc_confirm_false`] and [`conc_replay_confirm_false`] both abstain.
+/// Compiles the ORIGINAL program with the systematic bounded-preemption driver
+/// ([`saf_svcomp::synthesize_conc_shim_driver`]) ONCE — with `SanitizerCoverage` load/store
+/// tracing so shared accesses become scheduling points, and `signed-integer-overflow`
+/// trapping so a path that reaches `reach_error` only via signed-overflow UB TRAPs before
+/// the sentinel (R1 — the benchmarks are not UB-free). Then it replays under each
+/// bounded-preemption schedule ([`saf_svcomp::shim_preemption_plans`] — every `c=1` then
+/// every `c=2` pair). The FIRST schedule that drops the sentinel (the property's
+/// `reach_error` / `__assert_fail` event, R1) is RE-RUN to require the identical
+/// deterministic reproduction (R6) before emitting `false(unreach-call)` + a GraphML-1.0
+/// violation witness (R7). Returns `None` (abstain) on any gate miss / compile failure / no
+/// reproduction / budget exhaustion — the schedule is the sole arbiter, so a spurious model
+/// can only ever yield `unknown`.
+// NOTE: compile-once / replay-each-plan / re-confirm is one cohesive fail-closed unit;
+// splitting it would obscure the control flow.
+#[allow(clippy::too_many_lines)]
+fn conc_shim_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    use saf_svcomp::Property;
+    use std::process::{Command, Stdio};
+
+    // Gate 0: there must be a reach_error site to reach.
+    if saf_svcomp::reach_error_call_sites(ctx.module).is_empty() {
+        return None;
+    }
+
+    // Gate 1: the program must be amenable to the mutex-aware bounded-preemption model
+    // (reachable spawn, no nondet / condvars / …, no __VERIFIER_atomic, no non-default mutex
+    // type — see conc_shim_schedulable).
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if !saf_svcomp::conc_shim_schedulable(ctx.module, &callgraph) {
+        return None;
+    }
+
+    // Gate 2 (R7): abstain on OpenMP / relaxed-memory the SC replay cannot arbitrate
+    // (symbol-level gates miss `#pragma omp` — the frontend drops it — so catch it here).
+    let source = std::fs::read_to_string(ctx.input).unwrap_or_default();
+    if let Some(reason) = tsan_out_of_scope(&source) {
+        eprintln!("saf verify: concurrency shim out of scope ({reason}) -> unknown");
+        return None;
+    }
+
+    let dir = ctx.tempdir;
+    let sentinel = dir.join("saf_shim.sentinel");
+    let driver_src = dir.join("saf_shim_driver.c");
+    let harness = dir.join("saf_shim_harness");
+
+    if std::fs::write(
+        &driver_src,
+        saf_svcomp::synthesize_conc_shim_driver(&escape_c_string(&sentinel)),
+    )
+    .is_err()
+    {
+        return None;
+    }
+
+    // Compile the driver + original program ONCE. As in the replay path: a two-pass
+    // __VERIFIER_assert neutralizer handles programs that DEFINE their own
+    // `void __VERIFIER_assert(int)`; SanitizerCoverage load/store tracing turns shared
+    // accesses into scheduling points (the driver defines the callbacks, so no coverage
+    // runtime is linked); the six wraps redirect create/join/exit + the mutex API into the
+    // driver. If the coverage-instrumented build fails, fall back to a plain build — the
+    // scheduler still preempts at the lock/unlock boundaries (fewer points, still sound).
+    let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
+    let build = |neutralizer: Option<&Path>, cov: bool| {
+        let mut cmd = Command::new(ctx.clang);
+        cmd.args([
+            "-O0",
+            "-Wno-everything",
+            "-fsanitize=signed-integer-overflow",
+            "-fsanitize-trap=signed-integer-overflow",
+        ]);
+        if cov {
+            cmd.args([
+                "-fsanitize-coverage=trace-pc-guard",
+                "-mllvm",
+                "-sanitizer-coverage-trace-loads=1",
+                "-mllvm",
+                "-sanitizer-coverage-trace-stores=1",
+            ]);
+        }
+        cmd.arg(ctx.data_model.clang_flag())
+            .arg("-include")
+            .arg(ctx.stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include").arg(n);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(ctx.input)
+            .arg(&driver_src)
+            .arg(
+                "-Wl,--wrap=pthread_create,--wrap=pthread_join,--wrap=pthread_exit,\
+--wrap=pthread_mutex_lock,--wrap=pthread_mutex_unlock,--wrap=pthread_mutex_trylock",
+            )
+            .arg("-lpthread")
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    let neutralizer = write_assert_neutralizer(dir).ok();
+    let try_build = |cov: bool| {
+        matches!(build(None, cov).status(), Ok(s) if s.success())
+            || neutralizer.as_ref().is_some_and(
+                |n| matches!(build(Some(n.as_path()), cov).status(), Ok(s) if s.success()),
+            )
+    };
+    if !try_build(true) && !try_build(false) {
+        eprintln!("saf verify: concurrency shim harness failed to compile -> unknown");
+        return None;
+    }
+
+    // Replay under each bounded-preemption schedule; the first sentinel drop wins, then
+    // re-confirm (R6) before emitting. A total wall-clock budget bounds per-task cost.
+    let budget_start = std::time::Instant::now();
+    for plan in saf_svcomp::shim_preemption_plans() {
+        if budget_start.elapsed() >= CONC_SHIM_TOTAL_BUDGET {
+            eprintln!("saf verify: concurrency shim budget exhausted -> unknown");
+            break;
+        }
+        match run_conc_shim_plan(&harness, &sentinel, plan, CONC_SHIM_RUN_TIMEOUT) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                eprintln!(
+                    "saf verify: concurrency shim ({}) errored: {e:#} -> continue",
+                    plan.label()
+                );
+                continue;
+            }
+        }
+        // R6: require the identical deterministic reproduction on a second run.
+        if !matches!(
+            run_conc_shim_plan(&harness, &sentinel, plan, CONC_SHIM_RUN_TIMEOUT),
+            Ok(true)
+        ) {
+            eprintln!(
+                "saf verify: concurrency shim schedule {} did not re-confirm deterministically -> continue",
+                plan.label()
+            );
+            continue;
+        }
+        eprintln!(
+            "saf verify: FALSE (concurrency bounded-preemption schedule '{}' reached reach_error)",
+            plan.label()
+        );
+        let programfile = ctx.input.file_name().map_or_else(
+            || ctx.input.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let programhash = saf_svcomp::compute_file_hash(ctx.input);
+        let architecture = match ctx.data_model {
+            saf_svcomp::DataModel::ILP32 => "32bit",
+            saf_svcomp::DataModel::LP64 => "64bit",
+        };
+        let thread_count =
+            saf_svcomp::fast_paths::reachable_spawn_call_sites(ctx.module, &callgraph);
+        let graphml = saf_svcomp::conc_graphml_witness_labeled(
+            ctx.meta.specification.trim(),
+            &programfile,
+            &programhash,
+            architecture,
+            thread_count,
+            &plan.label(),
+        );
+        return Some(VerdictOutcome {
+            verdict: format!("false({})", Property::UnreachCall.name()),
+            witness: None,
+            graphml: Some(graphml),
+        });
+    }
+
+    eprintln!("saf verify: no bounded-preemption schedule reached reach_error -> unknown");
     None
 }
 
