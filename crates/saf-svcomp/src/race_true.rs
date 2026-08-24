@@ -52,9 +52,11 @@
 //! To keep the direct call graph *complete* (so the analysis sees every access and
 //! every lock), we abstain on any reachable **indirect call**, any reachable
 //! external not on a small **race-inert** allowlist, any unresolved thread entry,
-//! and any threading feature we do not model (only `pthread_mutex_lock/unlock` are
-//! modeled — trylock / cond / rwlock / spin / sem / barrier / atomics / OpenMP all
-//! force abstain via the external allowlist). A thread that may have ≥2 concurrent
+//! and any threading feature we do not model (only `pthread_mutex_lock/unlock` and
+//! the `__VERIFIER_atomic_begin/end` section delimiters are modeled — trylock /
+//! cond / rwlock / spin / sem / barrier / C11-atomics / whole-function
+//! `__VERIFIER_atomic_<name>` / OpenMP all force abstain via the external
+//! allowlist). A thread that may have ≥2 concurrent
 //! instances is treated as racing with itself unless it is provably single-instance.
 //!
 //! Verdict-only (no witness): SV-COMP's frozen validator scores every `no-data-race`
@@ -82,6 +84,45 @@ const JOIN_FUNCTIONS: &[&str] = &["pthread_join", "thrd_join"];
 const LOCK_FUNCTIONS: &[&str] = &["pthread_mutex_lock"];
 /// The **only** lock-release primitives we model.
 const UNLOCK_FUNCTIONS: &[&str] = &["pthread_mutex_unlock"];
+/// The SV-COMP atomic-section **begin** primitive. Semantically, the region
+/// between a matching `__VERIFIER_atomic_begin` and `__VERIFIER_atomic_end`
+/// executes *atomically* (no other thread interleaves). For race-freedom this is
+/// modeled — soundly and precisely — as acquiring a single, program-wide synthetic
+/// mutex ([`atomic_section_lock`]): two accesses that both hold it are mutually
+/// excluded, exactly as under a real global lock. The mutex model is *weaker* than
+/// true atomicity (it lets other threads run their non-atomic code while the
+/// section is held), so a race-freedom proof under it is a fortiori valid under the
+/// stronger atomic-section semantics — no wrong `true` can arise. A conflicting
+/// access left *outside* every section keeps a disjoint lockset and forces abstain.
+const ATOMIC_BEGIN_FUNCTIONS: &[&str] = &["__VERIFIER_atomic_begin"];
+/// The SV-COMP atomic-section **end** primitive (releases [`atomic_section_lock`]).
+const ATOMIC_END_FUNCTIONS: &[&str] = &["__VERIFIER_atomic_end"];
+
+/// The single synthetic lock identity denoting "inside a `__VERIFIER_atomic`
+/// section". A fixed `BLAKE3`-derived id in a private namespace — deterministic and,
+/// with overwhelming probability, distinct from every real object id (so it can
+/// never be conflated with a program mutex or global).
+#[must_use]
+fn atomic_section_lock() -> LockId {
+    ObjId::new(saf_core::id::make_id(
+        "race_true_atomic_section",
+        b"__VERIFIER_atomic",
+    ))
+}
+
+/// Does `name` **acquire** a lock we model (a real mutex lock or an atomic-section
+/// begin)?
+#[must_use]
+fn is_lock_acquire(name: &str) -> bool {
+    LOCK_FUNCTIONS.contains(&name) || ATOMIC_BEGIN_FUNCTIONS.contains(&name)
+}
+
+/// Does `name` **release** a lock we model (a real mutex unlock or an atomic-section
+/// end)?
+#[must_use]
+fn is_lock_release(name: &str) -> bool {
+    UNLOCK_FUNCTIONS.contains(&name) || ATOMIC_END_FUNCTIONS.contains(&name)
+}
 
 /// Cost gate: abstain rather than run the O(n²) pairwise conflict scan on a huge
 /// access set (large CIL drivers), which could time a sibling task out.
@@ -105,10 +146,11 @@ pub fn race_true_verdict() -> &'static str {
 /// **excluded** (it could read/write a shared object invisibly) and every
 /// unmodeled sync primitive (`pthread_mutex_trylock`, `pthread_cond_*`,
 /// `pthread_rwlock_*`, `pthread_spin_*`, `sem_*`, `pthread_barrier_*`,
-/// `pthread_once`, C11 `atomic_*` / `__atomic_*` / `__sync_*`, custom
-/// `__VERIFIER_atomic_*`) is **excluded**.
+/// `pthread_once`, C11 `atomic_*` / `__atomic_*` / `__sync_*`, and custom
+/// *whole-function* `__VERIFIER_atomic_<name>` wrappers) is **excluded**.
 ///
-/// `pthread_mutex_lock`/`pthread_mutex_unlock` ARE listed: their concurrency
+/// `pthread_mutex_lock`/`pthread_mutex_unlock` and the atomic-section delimiters
+/// `__VERIFIER_atomic_begin`/`__VERIFIER_atomic_end` ARE listed: their concurrency
 /// effect is modeled explicitly by the lockset dataflow, so they are inert to the
 /// *external-effect* gate. The modeled spawn/join/init/attr/exit helpers are also
 /// listed (single-threaded init before spawn; join only adds happens-before).
@@ -144,6 +186,11 @@ const RACE_INERT_EXTERNALS: &[&str] = &[
     "thrd_join",
     "pthread_mutex_lock",
     "pthread_mutex_unlock",
+    // Atomic-section primitives: their concurrency effect is modeled explicitly by
+    // the lockset dataflow (begin = acquire / end = release of the synthetic
+    // atomic-section lock), so they are inert to the external-effect gate.
+    "__VERIFIER_atomic_begin",
+    "__VERIFIER_atomic_end",
     "pthread_mutex_init",
     "pthread_mutex_destroy",
     "pthread_mutexattr_init",
@@ -624,7 +671,13 @@ fn apply_lock_transfer(
         return;
     };
     let name = target.name.as_str();
-    if LOCK_FUNCTIONS.contains(&name) {
+    // Atomic-section begin/end take NO mutex pointer — they acquire/release the
+    // single synthetic atomic-section lock directly.
+    if ATOMIC_BEGIN_FUNCTIONS.contains(&name) {
+        state.insert(atomic_section_lock());
+    } else if ATOMIC_END_FUNCTIONS.contains(&name) {
+        state.remove(&atomic_section_lock());
+    } else if LOCK_FUNCTIONS.contains(&name) {
         if let Some(p) = inst.operands.first().copied() {
             // Only a statically-resolved concrete lock adds must-knowledge; an
             // ambiguous acquire (unknown index / merged pointer / runtime value)
@@ -760,7 +813,7 @@ fn functions_reaching_unlock(
                 if let Operation::CallDirect { callee } = &inst.op {
                     if module
                         .function(*callee)
-                        .is_some_and(|t| UNLOCK_FUNCTIONS.contains(&t.name.as_str()))
+                        .is_some_and(|t| is_lock_release(t.name.as_str()))
                     {
                         direct.insert(func.id);
                         break 'outer;
@@ -1146,9 +1199,7 @@ fn functions_touching_sync(
             for inst in &block.instructions {
                 if let Operation::CallDirect { callee } = &inst.op {
                     if let Some(t) = module.function(*callee) {
-                        if LOCK_FUNCTIONS.contains(&t.name.as_str())
-                            || UNLOCK_FUNCTIONS.contains(&t.name.as_str())
-                        {
+                        if is_lock_acquire(t.name.as_str()) || is_lock_release(t.name.as_str()) {
                             direct.insert(func.id);
                             break 'outer;
                         }
@@ -1499,6 +1550,9 @@ mod tests {
             "pthread_create",
             "pthread_join",
             "pthread_mutex_init",
+            // Atomic-section delimiters are modeled (synthetic global lock).
+            "__VERIFIER_atomic_begin",
+            "__VERIFIER_atomic_end",
             "malloc",
             "free",
             "abort",
@@ -1520,7 +1574,9 @@ mod tests {
             "atomic_fetch_add",
             "__atomic_load",
             "__sync_fetch_and_add",
-            "__VERIFIER_atomic_begin",
+            // A whole-function atomic WRAPPER (not a section delimiter) is NOT
+            // modeled — it must still force abstain.
+            "__VERIFIER_atomic_inc",
             "memcpy",
             "memset",
             "strcpy",
@@ -1754,6 +1810,62 @@ mod tests {
         // Entry has joined nothing yet; `mid` (after the join) has the handle key.
         assert!(joined.get(&entry).unwrap().is_empty());
         assert!(joined.get(&mid).unwrap().contains(&vt));
+    }
+
+    #[test]
+    fn lock_classifiers_cover_atomic_section() {
+        assert!(is_lock_acquire("pthread_mutex_lock"));
+        assert!(is_lock_acquire("__VERIFIER_atomic_begin"));
+        assert!(!is_lock_acquire("__VERIFIER_atomic_end"));
+        assert!(is_lock_release("pthread_mutex_unlock"));
+        assert!(is_lock_release("__VERIFIER_atomic_end"));
+        assert!(!is_lock_release("__VERIFIER_atomic_begin"));
+        // A whole-function atomic wrapper is neither a modeled acquire nor release.
+        assert!(!is_lock_acquire("__VERIFIER_atomic_inc"));
+        assert!(!is_lock_release("__VERIFIER_atomic_inc"));
+    }
+
+    #[test]
+    fn atomic_section_lock_is_deterministic() {
+        // Same synthetic identity every call (determinism / stable set membership).
+        assert_eq!(atomic_section_lock(), atomic_section_lock());
+    }
+
+    #[test]
+    fn atomic_begin_end_transfer_acquires_and_releases() {
+        // A `__VERIFIER_atomic_begin` call adds the synthetic section lock to the
+        // running must-set; a matching `__VERIFIER_atomic_end` removes it.
+        let m = module(vec![
+            declared("__VERIFIER_atomic_begin"),
+            declared("__VERIFIER_atomic_end"),
+        ]);
+        let res = LockResolver::build(&m);
+        let sync: BTreeSet<FunctionId> = BTreeSet::new();
+        let begin = inst(
+            "b",
+            Operation::CallDirect {
+                callee: func_id("__VERIFIER_atomic_begin"),
+            },
+            vec![],
+        );
+        let end = inst(
+            "e",
+            Operation::CallDirect {
+                callee: func_id("__VERIFIER_atomic_end"),
+            },
+            vec![],
+        );
+        let mut state: BTreeSet<LockId> = BTreeSet::new();
+        apply_lock_transfer(&begin, &res, &sync, &m, &mut state);
+        assert!(
+            state.contains(&atomic_section_lock()),
+            "begin must acquire the atomic-section lock"
+        );
+        apply_lock_transfer(&end, &res, &sync, &m, &mut state);
+        assert!(
+            !state.contains(&atomic_section_lock()),
+            "end must release the atomic-section lock"
+        );
     }
 
     #[test]
