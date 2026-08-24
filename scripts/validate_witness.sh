@@ -116,9 +116,55 @@ out2="$(timeout -k 15 120 "$W2T" "$w2t_bit" --spec "$PROPERTY" \
         --output-path "$out_dir2" \
         "$PROGRAM" 2>&1)" || true
 rm -rf "$out_dir2"
+# ---- Stage 4: CBMC memory-safety confirmation (independent SV-COMP validator) --
+# CPAchecker's SMG analysis and non-sanitized cpa-witness2test are blind to many
+# stack/heap overflows (e.g. Juliet CWE121) that SAF detects via ASan; CBMC -- an
+# official SV-COMP validator -- re-verifies bit-precisely and DOES find them.
+# SV-COMP confirms a witness if ANY panel validator agrees, so a genuine CBMC
+# memory-safety FAILURE is a legitimate, competition-predictive confirmation. Runs
+# only for valid-memsafety, only after Stages 2-3 miss. SOUNDNESS: a CBMC failure
+# is credited ONLY when it is (a) a real mem-safety violation class -- modeling
+# artifacts ("no body for callee" / unwinding assertions) are excluded -- AND (b)
+# located AT the witness's target line, so unrelated CBMC false positives (e.g. a
+# spurious libc-model overflow inside strtol on nondet input, at a different line)
+# do NOT confirm. Provisioned to $SAF_CBMC (cbmc + libminisat.so.2); skips if absent.
+CBMC_HOME="${SAF_CBMC:-/workspace/.svtools/cbmc}"
+is_memsafety=0
+case "$PROPERTY" in *memsafety*) is_memsafety=1 ;; esac
+if [ "$is_memsafety" = 0 ] && [ -n "$PROPERTY" ] && grep -qiE 'valid-(deref|free|memtrack)' "$PROPERTY" 2>/dev/null; then
+    is_memsafety=1
+fi
+cbmc_confirms_memsafety() {
+    [ "${SAF_SKIP_CBMC:-0}" = "1" ] && return 1
+    local cbmc_bin lines o fails ln
+    if [ -x "$CBMC_HOME/cbmc" ]; then
+        cbmc_bin="$CBMC_HOME/cbmc"; export LD_LIBRARY_PATH="$CBMC_HOME:${LD_LIBRARY_PATH:-}"
+    elif command -v cbmc >/dev/null 2>&1; then
+        cbmc_bin="cbmc"
+    else
+        return 1
+    fi
+    # target line(s) the witness points at (the location SAF flagged the violation)
+    lines="$(grep -oE 'line:[[:space:]]*[0-9]+' "$WITNESS" 2>/dev/null | grep -oE '[0-9]+' | sort -u)"
+    [ -n "$lines" ] || return 1
+    o="$(timeout -k 15 120 "$cbmc_bin" --bounds-check --pointer-check --unwind 500 "$PROGRAM" 2>&1)" || true
+    # genuine, FAILED memory-safety properties (status at end of line), minus artifacts
+    fails="$(printf '%s\n' "$o" \
+      | grep -E ': FAILURE$' \
+      | grep -viE 'no body for callee|unwinding assertion' \
+      | grep -iE 'region (writeable|readable)|(upper|lower) bound|object bounds|dereference failure|dynamically allocated|deallocated|dead object|invalid pointer|pointer NULL')"
+    [ -n "$fails" ] || return 1
+    # require a genuine failure AT one of the witness target lines
+    for ln in $lines; do
+        printf '%s\n' "$fails" | grep -qE "line ${ln}[^0-9]" && return 0
+    done
+    return 1
+}
 if printf '%s\n' "$out2" | grep -qE 'reached expected property violation|Verification result: FALSE'; then
     echo "CONFIRMED (witness2test-execution)"
+elif [ "$is_memsafety" = 1 ] && cbmc_confirms_memsafety; then
+    echo "CONFIRMED (cbmc-memsafety)"
 else
-    echo "NOT_CONFIRMED (analysis=${verdict:-none}; witness2test did not reproduce)"
+    echo "NOT_CONFIRMED (analysis=${verdict:-none}; witness2test/cbmc did not confirm)"
 fi
 exit 0
