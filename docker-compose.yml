@@ -3,6 +3,11 @@ services:
   # LLVM 18 (default) — the main dev / test / runtime image stream.
   # -------------------------------------------------------------------------
   dev:
+    # OOM safeguard: cap the eval/worker container so a memory-heavy lever (e.g.
+    # harness-havoc KLEE symbolic memory) fails gracefully at the container limit
+    # (docker OOM-kills inside -> eval fails -> arm reverts -> lever parks) instead
+    # of a SYSTEM OOM that kills the supervisor + thrashes the box. 52g of 62g.
+    mem_limit: 52g
     build:
       context: .
       target: dev
