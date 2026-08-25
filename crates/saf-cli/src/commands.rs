@@ -1750,6 +1750,16 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
     // single I2S step often clears a magic-value / state-machine guard that blind
     // mutation would need millions of execs to hit.
     let mut i2s_pending: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+    // Driller-style concolic plateau escape (lever `fuzz-concolic-z3`). When
+    // coverage stops growing for `CONCOLIC_STUCK_THRESHOLD` mutation execs, the
+    // last input that DID reach new coverage is handed to a concolic executor that
+    // Z3-solves the negation of each branch it took, producing inputs that flip the
+    // guards blind mutation is stuck on; those are queued as fresh seeds. Bounded to
+    // `MAX_CONCOLIC_RUNS` invocations. Pure search steering — native replay (R6)
+    // stays the sole FALSE arbiter, so a solved seed can never manufacture a verdict.
+    let mut stuck = 0usize;
+    let mut concolic_runs = 0usize;
+    let mut plateau_seq: Vec<saf_svcomp::NondetCall> = Vec::new();
 
     // Trial 0..N: the seed corpus first (its entries are tried verbatim before any
     // mutation), then mutations of corpus entries. A run that consumes MORE nondet
@@ -1854,6 +1864,15 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
                 // novelty keeps the queue tight and walks the fill frontier stage by
                 // stage instead of flooding it with redundant candidates.
                 if novel {
+                    // Coverage advanced: reset the plateau counter and remember this
+                    // input's concrete nondet sequence as the concolic base.
+                    stuck = 0;
+                    if let Ok(log) = std::fs::read_to_string(&log_path) {
+                        let seq = fuzz::parse_fuzz_log(&log);
+                        if !seq.is_empty() {
+                            plateau_seq = seq;
+                        }
+                    }
                     if i >= corpus.len() && corpus.len() < MAX_FUZZ_CORPUS {
                         corpus.push(input.clone());
                     }
@@ -1866,6 +1885,39 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
                                 i2s_pending.pop_front(); // bounded: drop the oldest
                             }
                             i2s_pending.push_back(cand);
+                        }
+                    }
+                } else if i >= corpus.len() {
+                    // A mutation exec that reached nowhere new: a coverage plateau is
+                    // building. After enough consecutive stalls, invoke the Driller
+                    // concolic escape on the last new-coverage seed to solve past the
+                    // guards blind mutation cannot flip. Bounded invocations; the
+                    // solved inputs are queued as ordinary seeds (native replay stays
+                    // the sole arbiter).
+                    stuck += 1;
+                    if stuck >= CONCOLIC_STUCK_THRESHOLD
+                        && concolic_runs < MAX_CONCOLIC_RUNS
+                        && !plateau_seq.is_empty()
+                    {
+                        stuck = 0;
+                        concolic_runs += 1;
+                        let flips = saf_svcomp::enumerate_concolic_flip_seeds(
+                            ctx.module,
+                            &plateau_seq,
+                            ctx.data_model,
+                        );
+                        if !flips.is_empty() {
+                            eprintln!(
+                                "saf verify: concolic plateau escape #{concolic_runs} -> {} flip seed(s) queued",
+                                flips.len()
+                            );
+                        }
+                        for fseq in &flips {
+                            let seed = fuzz::nondet_seq_to_input(fseq, ctx.data_model);
+                            if i2s_pending.len() >= MAX_I2S_PENDING {
+                                i2s_pending.pop_front();
+                            }
+                            i2s_pending.push_back(seed);
                         }
                     }
                 }
@@ -2602,6 +2654,16 @@ const MAX_I2S_PER_RUN: usize = 256;
 /// earliest few matches walk the left-to-right byte-stream fill frontier without a
 /// high-multiplicity noise pair crowding out the load-bearing magic-value pair.
 const I2S_PER_PAIR: usize = 3;
+
+/// Consecutive new-coverage-free mutation execs that mark a coverage plateau and
+/// trigger the Driller concolic escape ([`saf_svcomp::enumerate_concolic_flip_seeds`]).
+/// Large enough that `CmpLog` / I2S / havoc get a fair shot first (concolic is the
+/// expensive last resort), small enough to fire within the per-task fuzz budget.
+const CONCOLIC_STUCK_THRESHOLD: usize = 300;
+
+/// Cap on concolic plateau-escape invocations per task — each is a bounded Z3 budget,
+/// but capping the count keeps the total solver cost per task predictable.
+const MAX_CONCOLIC_RUNS: usize = 4;
 
 /// Run the byte-stream fuzz harness on one input under a short timeout, feeding
 /// `$SAF_FUZZ_INPUT` / `$SAF_FUZZ_LOG`. Success/normal-exit/timeout all return

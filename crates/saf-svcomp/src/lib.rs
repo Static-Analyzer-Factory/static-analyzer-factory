@@ -65,7 +65,7 @@ pub use race_true::{
     is_race_inert_external, program_is_race_free, race_true_verdict, resolve_direct_thread_fn,
     undefined_userfn_names,
 };
-pub use se_interp::enumerate_se_candidates;
+pub use se_interp::{enumerate_concolic_flip_seeds, enumerate_se_candidates};
 pub use termination::{
     is_known_returning_external, program_structurally_terminates, termination_verdict,
 };

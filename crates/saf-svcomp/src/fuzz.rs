@@ -36,6 +36,7 @@
 //!   deterministically on the original program (the re-confirm) before emitting.
 
 use crate::property::NondetCall;
+use crate::property_kind::DataModel;
 use saf_core::air::{AirModule, Constant};
 use std::collections::BTreeSet;
 
@@ -532,6 +533,65 @@ pub fn parse_fuzz_log(log: &str) -> Vec<NondetCall> {
         });
     }
     seq
+}
+
+// ---------------------------------------------------------------------------
+// Nondet-sequence -> byte-stream input conversion.
+// ---------------------------------------------------------------------------
+
+/// Byte width the byte-stream shim consumes for a scalar-integer
+/// `__VERIFIER_nondet_T()` call — i.e. `sizeof(T)` under the task's data model
+/// (long / unsigned long / size_t are pointer-width). `0` for names the shim does
+/// not drive from the byte stream (pointer/float/double return a fixed default and
+/// consume nothing, so they never appear in the fuzz log).
+#[must_use]
+pub fn nondet_width(name: &str, dm: DataModel) -> usize {
+    let long_bytes = match dm {
+        DataModel::ILP32 => 4,
+        DataModel::LP64 => 8,
+    };
+    match name {
+        "__VERIFIER_nondet_char" | "__VERIFIER_nondet_uchar" | "__VERIFIER_nondet_bool" => 1,
+        "__VERIFIER_nondet_short" | "__VERIFIER_nondet_ushort" => 2,
+        "__VERIFIER_nondet_int" | "__VERIFIER_nondet_uint" => 4,
+        "__VERIFIER_nondet_long" | "__VERIFIER_nondet_ulong" | "__VERIFIER_nondet_size_t" => {
+            long_bytes
+        }
+        "__VERIFIER_nondet_longlong" | "__VERIFIER_nondet_ulonglong" => 8,
+        _ => 0,
+    }
+}
+
+/// Lay a concrete nondet-value sequence into a byte-stream fuzz input the shim
+/// reproduces verbatim: each call's value is written as its `sizeof(T)` low
+/// little-endian bytes at the running offset (exactly how the shim's `__saf_take`
+/// consumes them). The buffer is [`INPUT_LEN`] bytes, zero-padded; a value whose
+/// name the shim does not drive (`width == 0`) or that would overrun the buffer is
+/// skipped. Deterministic. Used to feed a concolically-solved flip sequence back into
+/// the greybox fuzz loop as a seed — it steers the search only; native replay of the
+/// original program remains the sole FALSE arbiter.
+#[must_use]
+pub fn nondet_seq_to_input(seq: &[NondetCall], dm: DataModel) -> Vec<u8> {
+    let mut buf = vec![0u8; INPUT_LEN];
+    let mut off = 0usize;
+    for call in seq {
+        let w = nondet_width(&call.func_name, dm);
+        if w == 0 {
+            continue;
+        }
+        if off + w > buf.len() {
+            break;
+        }
+        #[allow(clippy::cast_sign_loss)]
+        let bits = call.value as u64;
+        for i in 0..w {
+            #[allow(clippy::cast_possible_truncation)]
+            let b = (bits >> (8 * i)) as u8;
+            buf[off + i] = b;
+        }
+        off += w;
+    }
+    buf
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,6 +1355,67 @@ mod tests {
         }
         // The biased draw lands in the top half markedly more often than uniform.
         assert!(high > plain, "biased={high} uniform={plain}");
+    }
+
+    #[test]
+    fn nondet_width_tracks_data_model() {
+        assert_eq!(nondet_width("__VERIFIER_nondet_int", DataModel::LP64), 4);
+        assert_eq!(nondet_width("__VERIFIER_nondet_char", DataModel::LP64), 1);
+        assert_eq!(nondet_width("__VERIFIER_nondet_short", DataModel::LP64), 2);
+        // long / size_t are pointer-width: 8 under LP64, 4 under ILP32.
+        assert_eq!(nondet_width("__VERIFIER_nondet_long", DataModel::LP64), 8);
+        assert_eq!(nondet_width("__VERIFIER_nondet_long", DataModel::ILP32), 4);
+        assert_eq!(
+            nondet_width("__VERIFIER_nondet_size_t", DataModel::ILP32),
+            4
+        );
+        assert_eq!(
+            nondet_width("__VERIFIER_nondet_longlong", DataModel::ILP32),
+            8
+        );
+        // Non-driven names consume nothing.
+        assert_eq!(nondet_width("__VERIFIER_nondet_float", DataModel::LP64), 0);
+    }
+
+    #[test]
+    fn nondet_seq_to_input_lays_le_bytes_the_shim_reads() {
+        let seq = vec![
+            NondetCall {
+                func_name: "__VERIFIER_nondet_int".to_string(),
+                value: 42,
+            },
+            NondetCall {
+                func_name: "__VERIFIER_nondet_short".to_string(),
+                value: -1,
+            },
+        ];
+        let buf = nondet_seq_to_input(&seq, DataModel::LP64);
+        assert_eq!(buf.len(), INPUT_LEN);
+        // First int at offset 0..4 reads back as 42.
+        assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), 42);
+        // The short at offset 4..6 reads back as 0xffff (-1 truncated to 16 bits).
+        assert_eq!(u16::from_le_bytes([buf[4], buf[5]]), 0xffff);
+        // Everything after is zero-padded.
+        assert!(buf[6..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn nondet_seq_to_input_is_deterministic_and_skips_undriven() {
+        let seq = vec![
+            NondetCall {
+                func_name: "__VERIFIER_nondet_float".to_string(), // width 0 -> skipped
+                value: 5,
+            },
+            NondetCall {
+                func_name: "__VERIFIER_nondet_int".to_string(),
+                value: 7,
+            },
+        ];
+        let a = nondet_seq_to_input(&seq, DataModel::LP64);
+        let b = nondet_seq_to_input(&seq, DataModel::LP64);
+        assert_eq!(a, b);
+        // The float consumed no bytes, so the int lands at offset 0.
+        assert_eq!(u32::from_le_bytes([a[0], a[1], a[2], a[3]]), 7);
     }
 
     #[test]

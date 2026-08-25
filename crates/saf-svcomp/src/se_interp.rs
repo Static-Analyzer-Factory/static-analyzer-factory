@@ -148,6 +148,88 @@ pub fn enumerate_se_candidates(
     candidates
 }
 
+// ---------------------------------------------------------------------------
+// Driller-style concolic flip-seed generation (lever `fuzz-concolic-z3`)
+// ---------------------------------------------------------------------------
+
+/// Max flip *seeds* returned by one concolic invocation (bounds the extra fuzz
+/// execs the caller queues).
+const CONC_MAX_FLIPS: usize = 24;
+
+/// Max conditional/switch branch points examined on the concrete path (bounds the
+/// Z3 direction + flip solves).
+const CONC_MAX_BRANCHES: usize = 512;
+
+/// Per-block visit cap for the concrete path. Set much higher than the forking
+/// engine's [`SE_BLOCK_VISIT_CAP`]: concolic follows ONE concrete path (no fork
+/// explosion), so it can afford to unwind a constant-bounded loop far deeper — which
+/// is precisely its edge, cracking a computed guard *after* a loop whose trip count
+/// exceeds the forking engine's cap (`for(i=0;i<20;i++) s+=x; if(s==C) reach_error();`).
+/// Still bounded, so an input-independent loop cannot spin forever.
+const CONC_BLOCK_VISIT_CAP: usize = 128;
+
+/// Concolically generate new nondet-input seeds that flip the branches a *stuck*
+/// fuzz seed did NOT take — the Driller "selective symbolic execution on a
+/// coverage plateau" mechanism (Stephens et al., NDSS 2016), implemented fresh.
+///
+/// `seq` is the concrete scalar-integer `__VERIFIER_nondet_*` value sequence a
+/// coverage-plateaued fuzz input produced (in call order). This function
+/// *concolically* re-executes that concrete path over the AIR of the
+/// `reach_error`-containing function: it feeds each nondet read its concrete value
+/// from `seq` (pinning it, so the taken direction of every branch is the one the
+/// seed actually took), while symbolically accumulating the path condition over the
+/// nondet inputs. At every conditional it Z3-solves the path prefix conjoined with
+/// the *negation* of the taken guard (constraint-sliced to the connected component,
+/// with an optimistic fallback that drops the prefix when the exact preimage is
+/// UNSAT), reading a model back into a fresh nondet-value sequence that drives
+/// execution down the un-taken side.
+///
+/// # Why this is sound
+///
+/// The returned sequences are only *fuzz seeds*: the caller lays them into the
+/// byte-stream input and re-runs the ORIGINAL program, whose native replay remains
+/// the sole FALSE arbiter (confirmer contract R6). An imprecise model — from the
+/// 64-bit-uniform bitvector encoding, an optimistic (prefix-dropped) solve, or a
+/// misaligned concrete value when nondet reads live in a callee — can only ever
+/// yield a seed that fails to advance coverage, never a wrong verdict. Nondet reads
+/// automatically stay in range (R5): `fresh_nondet` asserts the declared type's
+/// bounds, which the flip solve carries along via constraint slicing.
+///
+/// Deterministic: single concrete path, path-order flip enumeration, fixed Z3 seed.
+#[must_use]
+pub fn enumerate_concolic_flip_seeds(
+    module: &AirModule,
+    seq: &[NondetCall],
+    data_model: DataModel,
+) -> Vec<Vec<NondetCall>> {
+    let Some(func) = module.functions.iter().find(|f| {
+        !f.is_declaration && function_has_error_call(f, module) && has_scalar_nondet(f, module)
+    }) else {
+        return Vec::new();
+    };
+    let Some(entry) = func
+        .entry_block
+        .or_else(|| func.blocks.first().map(|b| b.id))
+    else {
+        return Vec::new();
+    };
+    let mut interp = Interp::new(module, func, data_model);
+    interp.concolic_run(entry, seq)
+}
+
+/// Does `func` contain a call to a scalar-integer `__VERIFIER_nondet_*`?
+fn has_scalar_nondet(func: &AirFunction, module: &AirModule) -> bool {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|inst| {
+            matches!(&inst.op, Operation::CallDirect { callee }
+                if module
+                    .function(*callee)
+                    .is_some_and(|f| is_scalar_integer_nondet(&f.name)))
+        })
+}
+
 const ERROR_NAMES: &[&str] = &["reach_error", "__VERIFIER_error"];
 
 /// Does `func` directly call `reach_error` / `__VERIFIER_error`?
@@ -804,6 +886,355 @@ impl<'a> Interp<'a> {
             nondet_sequence,
         })
     }
+
+    // -- Concolic flip-seed generation ----------------------------------
+
+    /// Single concrete path (guided by `seq`) with per-branch flip solving. See
+    /// [`enumerate_concolic_flip_seeds`] for the mechanism/soundness contract.
+    // NOTE: the concrete-execute-then-fork-per-terminator loop is one cohesive unit
+    // (instruction stepping, nondet pinning, branch/switch flip solving); splitting it
+    // would scatter the shared state (pins, cursor, flips) across helpers.
+    #[allow(clippy::too_many_lines)]
+    fn concolic_run(&mut self, entry: BlockId, seq: &[NondetCall]) -> Vec<Vec<NondetCall>> {
+        let mut state = State::new(entry);
+        // Concrete-value pins (`nondet_k == seq[k]`), used ONLY to decide which
+        // branch direction the seed took — never added to the path condition, so a
+        // flip solve leaves the nondet inputs free.
+        let mut pins: Vec<Con> = Vec::new();
+        let mut cursor = 0usize;
+        let mut flips: Vec<Vec<NondetCall>> = Vec::new();
+        let mut seen: BTreeSet<Vec<(String, i64)>> = BTreeSet::new();
+        let mut branches = 0usize;
+
+        loop {
+            if flips.len() >= CONC_MAX_FLIPS
+                || branches >= CONC_MAX_BRANCHES
+                || self.steps >= SE_MAX_STEPS
+                || self.solver_calls >= SE_MAX_SOLVER_CALLS
+            {
+                break;
+            }
+            let cur = state.block;
+            let count = state.visits.entry(cur).or_insert(0);
+            *count += 1;
+            if *count > CONC_BLOCK_VISIT_CAP
+                || state.trace.len() >= SE_MAX_TRACE
+                || state.constraints.len() >= SE_MAX_CON
+            {
+                break;
+            }
+            state.trace.push(cur);
+            let Some(block) = self.block_by_id.get(&cur).copied() else {
+                break;
+            };
+            let prev = state.prev;
+
+            // Non-terminator instructions: intercept scalar nondet reads (to pin the
+            // concrete value) and error calls (concrete seed already at the sink →
+            // stop this path); everything else reuses the shared SSA encoder.
+            let mut hit_error = false;
+            for inst in &block.instructions {
+                if inst.is_terminator() {
+                    break;
+                }
+                self.steps += 1;
+                if self.steps >= SE_MAX_STEPS {
+                    return flips;
+                }
+                if let Operation::CallDirect { callee } = &inst.op {
+                    let name = self.module.function(*callee).map(|f| f.name.as_str());
+                    if let Some(name) = name {
+                        if ERROR_NAMES.contains(&name) {
+                            hit_error = true;
+                            break;
+                        }
+                        if is_scalar_integer_nondet(name) {
+                            if let Some(dst) = inst.dst {
+                                let concrete = seq.get(cursor).map_or(0, |c| c.value);
+                                cursor += 1;
+                                let name = name.to_string();
+                                let (bv, vars) =
+                                    self.concolic_nondet(&mut state, &name, concrete, &mut pins);
+                                state.values.insert(dst, bv);
+                                state.vref.insert(dst, vars);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                self.define(&mut state, inst, prev);
+            }
+            if hit_error {
+                break;
+            }
+
+            let Some(term) = block.terminator() else {
+                break;
+            };
+            match &term.op {
+                Operation::Br { target } => {
+                    state.prev = Some(cur);
+                    state.block = *target;
+                }
+                Operation::CondBr {
+                    then_target,
+                    else_target,
+                } => {
+                    if then_target == else_target {
+                        state.prev = Some(cur);
+                        state.block = *then_target;
+                        continue;
+                    }
+                    let Some(&cond) = term.operands.first() else {
+                        break;
+                    };
+                    branches += 1;
+                    let then_con = self.cond_con(&mut state, cond, false);
+                    let else_con = self.cond_con(&mut state, cond, true);
+                    let took_then = self.concolic_dir(&state, &pins, &then_con);
+                    let (taken, flip) = if took_then {
+                        (then_con, else_con)
+                    } else {
+                        (else_con, then_con)
+                    };
+                    // Flip goal: reach this branch (prefix) then diverge (`flip`).
+                    if let Some(s) = self.solve_flip(&state, &flip) {
+                        let key: Vec<(String, i64)> =
+                            s.iter().map(|c| (c.func_name.clone(), c.value)).collect();
+                        if seen.insert(key) {
+                            flips.push(s);
+                        }
+                    }
+                    state.constraints.push(taken);
+                    state.prev = Some(cur);
+                    state.block = if took_then {
+                        *then_target
+                    } else {
+                        *else_target
+                    };
+                }
+                Operation::Switch { default, cases } => {
+                    branches += 1;
+                    if let Some(next) = self.concolic_switch(
+                        &mut state, term, *default, cases, &pins, &mut flips, &mut seen,
+                    ) {
+                        state.prev = Some(cur);
+                        state.block = next;
+                    } else {
+                        break;
+                    }
+                }
+                _ => break, // Ret / Unreachable — the concrete path ends here.
+            }
+        }
+        flips
+    }
+
+    /// Concolic switch step: decide the concrete target under the pins, solve a flip
+    /// seed for every OTHER reachable target, and return the taken target.
+    // NOTE: the arguments (state, term, default, cases, pins, flips, seen) are the
+    // full concolic context for one terminator; bundling them into a struct would
+    // only obscure this single-use helper.
+    #[allow(clippy::too_many_arguments)]
+    fn concolic_switch(
+        &mut self,
+        state: &mut State,
+        term: &Instruction,
+        default: BlockId,
+        cases: &[(i64, BlockId)],
+        pins: &[Con],
+        flips: &mut Vec<Vec<NondetCall>>,
+        seen: &mut BTreeSet<Vec<(String, i64)>>,
+    ) -> Option<BlockId> {
+        let &disc_v = term.operands.first()?;
+        let disc = self.enc(state, disc_v);
+        let dvars = Self::vref_of(state, disc_v);
+
+        let mut targets: BTreeSet<BlockId> = BTreeSet::new();
+        targets.insert(default);
+        for (_, t) in cases {
+            targets.insert(*t);
+        }
+        // Build one match-condition per target (deterministic BlockId order).
+        let cons: Vec<(BlockId, Con)> = targets
+            .iter()
+            .map(|&t| (t, self.switch_target_con(&disc, &dvars, cases, t)))
+            .collect();
+
+        // Concrete target = the first (ordered) whose condition holds under the pins.
+        let taken = cons
+            .iter()
+            .find(|(_, con)| self.concolic_dir(state, pins, con))
+            .map_or(default, |(t, _)| *t);
+
+        for (t, con) in &cons {
+            if *t == taken || flips.len() >= CONC_MAX_FLIPS {
+                continue;
+            }
+            if let Some(s) = self.solve_flip(state, con) {
+                let key: Vec<(String, i64)> =
+                    s.iter().map(|c| (c.func_name.clone(), c.value)).collect();
+                if seen.insert(key) {
+                    flips.push(s);
+                }
+            }
+        }
+        // Commit the taken condition to the path and continue.
+        if let Some((_, con)) = cons.into_iter().find(|(t, _)| *t == taken) {
+            state.constraints.push(con);
+        }
+        Some(taken)
+    }
+
+    /// The Z3 condition for `switch` discriminant `disc` selecting `target`: a
+    /// disjunction of `disc == case_value` for the case(s) routing to `target`, or —
+    /// for the default target — the conjunction of `disc != v` over every case value.
+    fn switch_target_con(
+        &mut self,
+        disc: &BV,
+        dvars: &BTreeSet<u32>,
+        cases: &[(i64, BlockId)],
+        target: BlockId,
+    ) -> Con {
+        let matching: Vec<i64> = cases
+            .iter()
+            .filter(|(_, t)| *t == target)
+            .map(|(v, _)| *v)
+            .collect();
+        let b = if matching.is_empty() {
+            let nes: Vec<Bool> = cases
+                .iter()
+                .map(|(v, _)| ssa_encode::eq(disc, &BV::from_i64(*v, BV_WIDTH)).not())
+                .collect();
+            let refs: Vec<&Bool> = nes.iter().collect();
+            Bool::and(&refs)
+        } else {
+            let ors: Vec<Bool> = matching
+                .iter()
+                .map(|v| ssa_encode::eq(disc, &BV::from_i64(*v, BV_WIDTH)))
+                .collect();
+            Bool::or(&ors)
+        };
+        self.mk_con(b, dvars.clone())
+    }
+
+    /// A fresh nondet input, additionally *pinned* to the concrete value the stuck
+    /// seed produced (clamped into the declared range so the pin is consistent with
+    /// the range constraints `fresh_nondet` already asserted). The pin decides branch
+    /// direction only; it is never part of the path condition a flip solves.
+    fn concolic_nondet(
+        &mut self,
+        state: &mut State,
+        name: &str,
+        concrete: i64,
+        pins: &mut Vec<Con>,
+    ) -> (BV, BTreeSet<u32>) {
+        let (bv, vars) = self.fresh_nondet(state, name);
+        let c = ssa_encode::nondet_range(name, self.data_model)
+            .map_or(concrete, |(lo, hi)| concrete.clamp(lo, hi));
+        let pin = self.mk_con(
+            ssa_encode::eq(&bv, &BV::from_i64(c, BV_WIDTH)),
+            vars.clone(),
+        );
+        pins.push(pin);
+        (bv, vars)
+    }
+
+    /// Did the concrete seed take the `then` side (guard `then_con` holds under the
+    /// pins)? A single constraint-sliced feasibility solve over `state.constraints ∪
+    /// pins` (which pin every nondet to its concrete value). On budget exhaustion
+    /// defaults to `false` — deterministic, and only affects which seeds we generate.
+    fn concolic_dir(&mut self, state: &State, pins: &[Con], then_con: &Con) -> bool {
+        self.solver_calls += 1;
+        if self.solver_calls > SE_MAX_SOLVER_CALLS {
+            return false;
+        }
+        let base: Vec<&Con> = state.constraints.iter().chain(pins.iter()).collect();
+        let chosen = component(&base, &then_con.vars);
+        let solver = new_solver();
+        for b in chosen {
+            solver.assert(b);
+        }
+        solver.assert(&then_con.b);
+        matches!(solver.check(), SatResult::Sat)
+    }
+
+    /// Solve for a nondet-input sequence that reaches the current branch and takes the
+    /// `flip` (un-taken) side. First tries the exact preimage — the constraint-sliced
+    /// path prefix conjoined with `flip`; if that is UNSAT/unknown, falls back to the
+    /// *optimistic* solve of `flip` alone (dropping the prefix), matching QSYM/Driller
+    /// optimistic solving. Safe because the caller replay-gates every seed. Returns the
+    /// model's value for each nondet read so far, or `None` when unsatisfiable / the
+    /// flip does not depend on any input.
+    fn solve_flip(&mut self, state: &State, flip: &Con) -> Option<Vec<NondetCall>> {
+        self.solver_calls += 1;
+        if self.solver_calls > SE_MAX_SOLVER_CALLS {
+            return None;
+        }
+        let base: Vec<&Con> = state.constraints.iter().collect();
+        let chosen = component(&base, &flip.vars);
+        let solver = new_solver();
+        for b in chosen {
+            solver.assert(b);
+        }
+        solver.assert(&flip.b);
+        let model = if matches!(solver.check(), SatResult::Sat) {
+            solver.get_model()
+        } else {
+            // Optimistic fallback: satisfy only the flipped guard.
+            self.solver_calls += 1;
+            let s2 = new_solver();
+            s2.assert(&flip.b);
+            if matches!(s2.check(), SatResult::Sat) {
+                s2.get_model()
+            } else {
+                None
+            }
+        }?;
+        let mut out = Vec::with_capacity(state.nondet.len());
+        for (bv, name) in &state.nondet {
+            let value = model.eval(bv, true).and_then(|b| b.as_i64()).unwrap_or(0);
+            out.push(NondetCall {
+                func_name: name.clone(),
+                value,
+            });
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some(out)
+    }
+}
+
+/// Constraint-independence component: the connected set of constraints reachable from
+/// the `seed` variable frontier (plus all variable-free constraints, which are always
+/// relevant), as the Z3 booleans to assert. Shared by the concolic direction and flip
+/// solves — sending Z3 only the relevant slice keeps each solve small.
+fn component<'c>(cons: &[&'c Con], seed: &BTreeSet<u32>) -> Vec<&'c Bool> {
+    let mut vs = seed.clone();
+    let mut chosen_ids: BTreeSet<u32> = BTreeSet::new();
+    let mut chosen: Vec<&Bool> = Vec::new();
+    for c in cons {
+        if c.vars.is_empty() && chosen_ids.insert(c.id) {
+            chosen.push(&c.b);
+        }
+    }
+    loop {
+        let mut grew = false;
+        for c in cons {
+            if chosen_ids.contains(&c.id) || c.vars.is_disjoint(&vs) {
+                continue;
+            }
+            chosen_ids.insert(c.id);
+            chosen.push(&c.b);
+            vs.extend(c.vars.iter().copied());
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    chosen
 }
 
 /// Push `state` onto the worklist advanced to `target`, recording `cur` as the
@@ -950,6 +1381,12 @@ mod tests {
     /// case cannot crack. `target == 40` is SAT (x = 10); a non-multiple-of-4 is
     /// UNSAT.
     fn build_loop_module(target: i64) -> AirModule {
+        build_counted_loop_module(4, target)
+    }
+
+    /// As [`build_loop_module`] but with an explicit loop bound: `s = bound * x`
+    /// after `for (i=0;i<bound;i++) s += x;`, then `if (s == target) reach_error()`.
+    fn build_counted_loop_module(bound: i64, target: i64) -> AirModule {
         let (main_id, nd_id, err_id) = (fid(1), fid(2), fid(3));
         let (entry, header, body, exit, err_bb, ret_bb) =
             (bid(10), bid(11), bid(12), bid(13), bid(14), bid(15));
@@ -1039,9 +1476,13 @@ mod tests {
         module
             .constants
             .insert(zero, Constant::Int { value: 0, bits: 32 });
-        module
-            .constants
-            .insert(four, Constant::Int { value: 4, bits: 32 });
+        module.constants.insert(
+            four,
+            Constant::Int {
+                value: bound,
+                bits: 32,
+            },
+        );
         module
             .constants
             .insert(one, Constant::Int { value: 1, bits: 32 });
@@ -1152,5 +1593,132 @@ mod tests {
     fn cycle_detector_flags_loop_and_clears_acyclic() {
         let looped = build_loop_module(40);
         assert!(cfg_has_cycle(looped.function_by_name("main").unwrap()));
+    }
+
+    /// Build `main` implementing `int x = nondet(); if (x == guard) reach_error();`
+    /// (acyclic equality guard) — the concolic flip target.
+    fn build_eq_guard_module(guard: i64) -> AirModule {
+        let (main_id, nd_id, err_id) = (fid(1), fid(2), fid(3));
+        let (entry, err_bb, ret_bb) = (bid(10), bid(11), bid(12));
+        let x = vid(100);
+        let c = vid(101);
+        let cmp = vid(102);
+        let insts = vec![
+            Instruction::new(iid(1), Operation::CallDirect { callee: nd_id }).with_dst(x),
+            binop(2, BinaryOp::ICmpEq, x, c, cmp),
+            Instruction::new(
+                iid(3),
+                Operation::CondBr {
+                    then_target: err_bb,
+                    else_target: ret_bb,
+                },
+            )
+            .with_operands(vec![cmp]),
+        ];
+        let main = func(
+            main_id,
+            "main",
+            vec![
+                blk(entry, insts),
+                blk(
+                    err_bb,
+                    vec![
+                        Instruction::new(iid(4), Operation::CallDirect { callee: err_id }),
+                        Instruction::new(iid(5), Operation::Ret),
+                    ],
+                ),
+                blk(ret_bb, vec![Instruction::new(iid(6), Operation::Ret)]),
+            ],
+            entry,
+        );
+        let mut module = AirModule::new(ModuleId::new(1));
+        module.constants.insert(
+            c,
+            Constant::Int {
+                value: guard,
+                bits: 32,
+            },
+        );
+        module.functions.push(main);
+        module.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
+        module.functions.push(decl(err_id, "reach_error"));
+        module
+    }
+
+    #[test]
+    fn concolic_flips_equality_guard() {
+        // A stuck seed drove x = 0 (the else side). Concolic must solve the flip:
+        // x == 42 to take the reach_error branch.
+        let module = build_eq_guard_module(42);
+        let seq = vec![NondetCall {
+            func_name: "__VERIFIER_nondet_int".to_string(),
+            value: 0,
+        }];
+        let flips = enumerate_concolic_flip_seeds(&module, &seq, DataModel::LP64);
+        assert!(
+            flips.iter().any(|f| f.len() == 1
+                && f[0].value == 42
+                && f[0].func_name == "__VERIFIER_nondet_int"),
+            "expected a flip seed x == 42, got {flips:?}"
+        );
+    }
+
+    #[test]
+    fn concolic_flip_is_deterministic() {
+        let module = build_eq_guard_module(1337);
+        let seq = vec![NondetCall {
+            func_name: "__VERIFIER_nondet_int".to_string(),
+            value: 0,
+        }];
+        let a = enumerate_concolic_flip_seeds(&module, &seq, DataModel::LP64);
+        let b = enumerate_concolic_flip_seeds(&module, &seq, DataModel::LP64);
+        assert_eq!(a, b);
+        assert!(a.iter().any(|f| f.iter().any(|c| c.value == 1337)));
+    }
+
+    #[test]
+    fn concolic_solves_deep_counted_loop_past_forking_cap() {
+        // `for (i=0;i<20;i++) s+=x; if (s == 140) reach_error();` — s = 20*x, so
+        // x = 7. The loop needs 20 iterations, well past the forking engine's
+        // SE_BLOCK_VISIT_CAP (8), so `enumerate_se_candidates` cannot reach the guard;
+        // the deeper concolic visit cap follows the whole concrete loop and flips it.
+        assert!(20 > SE_BLOCK_VISIT_CAP, "test must exceed the forking cap");
+        let module = build_counted_loop_module(20, 140);
+        // A trivial (all-zero) plateau seed still drives the input-independent loop to
+        // completion, so no fuzz-discovered depth is even required here.
+        let seq = vec![NondetCall {
+            func_name: "__VERIFIER_nondet_int".to_string(),
+            value: 0,
+        }];
+        let flips = enumerate_concolic_flip_seeds(&module, &seq, DataModel::LP64);
+        assert!(
+            flips.iter().any(|f| f.iter().any(|c| c.value == 7)),
+            "expected a flip seed x == 7 (20*x == 140), got {flips:?}"
+        );
+    }
+
+    #[test]
+    fn concolic_no_error_function_yields_no_flips() {
+        // A module with nondet but no reach_error: nothing to flip toward.
+        let (main_id, nd_id) = (fid(1), fid(2));
+        let entry = bid(10);
+        let x = vid(100);
+        let main = func(
+            main_id,
+            "main",
+            vec![blk(
+                entry,
+                vec![
+                    Instruction::new(iid(1), Operation::CallDirect { callee: nd_id }).with_dst(x),
+                    Instruction::new(iid(2), Operation::Ret),
+                ],
+            )],
+            entry,
+        );
+        let mut module = AirModule::new(ModuleId::new(1));
+        module.functions.push(main);
+        module.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
+        let flips = enumerate_concolic_flip_seeds(&module, &[], DataModel::LP64);
+        assert!(flips.is_empty());
     }
 }
