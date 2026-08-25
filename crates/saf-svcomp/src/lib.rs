@@ -15,6 +15,7 @@
 
 pub mod bmc;
 pub mod bmc_incremental;
+pub mod cbmc;
 pub mod conc_replay;
 pub mod conc_seq;
 pub mod conc_shim;
@@ -37,6 +38,7 @@ pub mod witness_lower;
 pub mod witness_yaml;
 
 pub use bmc::enumerate_bmc_candidates;
+pub use cbmc::{DEFAULT_UNWIND, NondetSite, cbmc_precheck, nondet_line_map, parse_cbmc_trace};
 pub use conc_replay::{
     ReplayPlan, conc_replay_schedulable, replay_plans, synthesize_conc_replay_driver,
 };

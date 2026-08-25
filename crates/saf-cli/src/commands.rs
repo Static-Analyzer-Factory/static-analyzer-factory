@@ -1541,12 +1541,40 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     // (R6) before any verdict — so the fuzzer can only ever propose, never
     // manufacture a wrong FALSE. Runs only when the program has scalar nondet
     // input to fuzz and a reach_error to reach.
-    match fuzz_confirm_false(ctx) {
+    if let Some(candidate) = fuzz_confirm_false(ctx) {
+        let witness = build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, &candidate));
+        if witness.is_none() {
+            eprintln!(
+                "saf verify: FALSE (fuzz replay-confirmed) but witness unconstructible -> emitting false without a witness"
+            );
+        }
+        return VerdictOutcome {
+            verdict: format!("false({})", Property::UnreachCall.name()),
+            witness,
+            graphml: None,
+        };
+    }
+
+    // Stage 6 (CBMC bit-precise oracle): the blind fuzzer and the Z3 stages both
+    // stall on modular bit-vector transition systems (the hardware-verification-bv
+    // btor2c cluster: masked `SORT_n` arithmetic behind a `for(;;)` step loop) —
+    // SAF's linear-integer models over-approximate and blind mutation cannot crack
+    // the deep multi-step guards. The now-provisioned CBMC 6.x is a bit-precise
+    // SAT-backed BMC: unwinding the step loop a fixed `k` times and solving the
+    // resulting propositional formula yields the exact nondet input vector that
+    // reaches reach_error. CBMC is used ONLY as an oracle — the vector it reports is
+    // parsed into a nondet sequence and RE-CONFIRMED through the SAME native-replay
+    // gate (the sole arbiter, R6), so a wrong/over-approximate CBMC model can only
+    // ever yield `unknown`. Gated behind a cheap structural pre-filter (loops
+    // present AND scalar-integer nondet AND no float/pointer nondet) and run LAST,
+    // only when every earlier stage abstained, so its cost is paid rarely. Degrades
+    // to a no-op when the CBMC binary is not provisioned ($SAF_CBMC absent).
+    match cbmc_confirm_false(ctx) {
         Some(candidate) => {
             let witness = build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, &candidate));
             if witness.is_none() {
                 eprintln!(
-                    "saf verify: FALSE (fuzz replay-confirmed) but witness unconstructible -> emitting false without a witness"
+                    "saf verify: FALSE (CBMC replay-confirmed) but witness unconstructible -> emitting false without a witness"
                 );
             }
             VerdictOutcome {
@@ -1935,6 +1963,184 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
 
     eprintln!("saf verify: blind fuzz exhausted (no confirmed reach_error) -> unknown");
     None
+}
+
+/// The CBMC loop-unwinding bound (`--unwind k`), overridable via `$SAF_CBMC_UNWIND`.
+///
+/// This — not the outer wall-clock safety valve — is the DETERMINISTIC cost bound
+/// (the lever's cost-gate contract): the SAT instance size is a function of `k`, so
+/// the search and therefore the verdict is reproducible across machines. A shallow
+/// reachable violation is found well inside the safety-valve timeout; a genuinely
+/// deep one is missed *consistently* (a recall cost, never a soundness one).
+fn cbmc_unwind() -> u32 {
+    std::env::var("SAF_CBMC_UNWIND")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|k| *k > 0)
+        .unwrap_or(saf_svcomp::DEFAULT_UNWIND)
+}
+
+/// Outer wall-clock cap on a single CBMC invocation — a pathological-slowness
+/// SAFETY VALVE only, NOT the cost gate (that is [`cbmc_unwind`]). Generous by
+/// default so it trips only on a genuine SAT hang; on either a hang or a clean
+/// `SUCCESSFUL` the outcome is the same (no trace → abstain), so the timeout never
+/// changes a FALSE into anything but an abstain. Overridable via `$SAF_CBMC_TIMEOUT`
+/// (seconds).
+fn cbmc_timeout() -> std::time::Duration {
+    let secs = std::env::var("SAF_CBMC_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(30);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Resolve the provisioned CBMC install directory (containing `cbmc` +
+/// `libminisat.so.2`) from `$SAF_CBMC`, defaulting to the bind-mount path the
+/// validator uses. Returns `None` (→ CBMC stage no-ops) when the binary is absent.
+fn resolve_cbmc() -> Option<std::path::PathBuf> {
+    let home = std::env::var("SAF_CBMC").unwrap_or_else(|_| "/workspace/.svtools/cbmc".to_string());
+    let bin = std::path::Path::new(&home).join("cbmc");
+    if bin.is_file() {
+        Some(std::path::PathBuf::from(home))
+    } else {
+        None
+    }
+}
+
+/// CBMC bit-precise oracle confirmer for `unreach-call` (Stage 6, last resort).
+///
+/// Runs the provisioned CBMC on the ORIGINAL program with a fixed `--unwind k`,
+/// `--no-standard-checks` (so only the `reach_error` assertion / no-body failure is
+/// a target — R1) and `--stop-on-fail --trace`; parses the counterexample's
+/// `__VERIFIER_nondet_*` return values into a concrete input vector (in nondet-call
+/// order); and RE-CONFIRMS that vector through the existing native-replay gate
+/// ([`replay_confirms_false`]) on the original program. Returns the confirmed
+/// [`saf_svcomp::FalseCandidate`], or `None` (abstain) on any gate miss / missing
+/// binary / no counterexample / non-reproduction. CBMC is only an oracle — the
+/// native replay is the sole arbiter, so a spurious model can never yield a wrong
+/// FALSE (R6).
+fn cbmc_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
+    use std::process::{Command, Stdio};
+
+    // Gate 1: a reach_error site to reach.
+    let error_sites = saf_svcomp::reach_error_call_sites(ctx.module);
+    let &reach_error_inst = error_sites.first()?;
+
+    // Gate 2: the cheap, deterministic structural pre-filter (loops present AND
+    // scalar-integer nondet AND no float/pointer nondet).
+    if !saf_svcomp::cbmc_precheck(ctx.module) {
+        return None;
+    }
+
+    // Gate 3: the CBMC binary must be provisioned (degrade to no-op otherwise).
+    let cbmc_home = resolve_cbmc()?;
+    let cbmc_bin = cbmc_home.join("cbmc");
+
+    let unwind = cbmc_unwind();
+    // CBMC's own data-model flag (mirrors the task's declared ILP32/LP64, R3).
+    let dm_flag = match ctx.data_model {
+        saf_svcomp::DataModel::ILP32 => "--ILP32",
+        saf_svcomp::DataModel::LP64 => "--LP64",
+    };
+    let trace_out = ctx.tempdir.join("saf_cbmc.trace");
+    let Ok(out) = std::fs::File::create(&trace_out) else {
+        return None;
+    };
+
+    let mut cmd = Command::new(&cbmc_bin);
+    cmd.arg(dm_flag)
+        .arg("--unwind")
+        .arg(unwind.to_string())
+        // Only the property's own violation event is a target: disable CBMC's
+        // incidental default checks (overflow / bounds / pointer / div-by-zero) so
+        // --stop-on-fail lands on the reach_error assertion, not an unrelated trap
+        // (R1). A path that reaches reach_error only via signed overflow still gets
+        // rejected downstream: the native replay compiles with
+        // -fsanitize-trap=signed-integer-overflow and traps before the sentinel.
+        .arg("--no-standard-checks")
+        .arg("--stop-on-fail")
+        .arg("--trace")
+        // Speed: drop functions trivially unreachable from main.
+        .arg("--drop-unused-functions")
+        .arg(ctx.input)
+        .env("LD_LIBRARY_PATH", &cbmc_home)
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(Stdio::null());
+
+    let mut child = harden_replay_spawn(&mut cmd).spawn().ok()?;
+
+    // Poll to the safety-valve timeout; a hang is killed with its whole group.
+    let timeout = cbmc_timeout();
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    kill_replay_group(&mut child);
+                    eprintln!("saf verify: CBMC oracle timed out (unwind {unwind}) -> unknown");
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+
+    let trace = std::fs::read_to_string(&trace_out).ok()?;
+    // The trace reports raw nondet reads by SOURCE LINE (a simple `x = f();` read is
+    // assigned directly to `x` with no `return_value` temp — the load-bearing
+    // per-iteration loop inputs), so parse guided by a source-line map of the
+    // original program (CBMC runs on the original .c, so its line numbers match).
+    let source = std::fs::read_to_string(ctx.input).ok()?;
+    let line_map = saf_svcomp::nondet_line_map(&source);
+    let nondet_sequence = saf_svcomp::parse_cbmc_trace(&trace, &line_map);
+    if nondet_sequence.is_empty() {
+        // No counterexample within the bound (SUCCESSFUL / no nondet in the trace)
+        // -> abstain.
+        return None;
+    }
+    eprintln!(
+        "saf verify: CBMC oracle proposed a {}-value nondet vector (unwind {unwind}); re-confirming natively",
+        nondet_sequence.len()
+    );
+
+    let candidate = saf_svcomp::FalseCandidate {
+        reach_error_inst,
+        block_path: Vec::new(),
+        assignments: std::collections::BTreeMap::new(),
+        nondet_sequence,
+    };
+    match replay_confirms_false(
+        ctx.input,
+        ctx.data_model,
+        ctx.stub,
+        ctx.tempdir,
+        ctx.clang,
+        // Offset the replay index well past every earlier batch so temp files
+        // never collide.
+        5 * MAX_REPLAY_CANDIDATES,
+        &candidate,
+    ) {
+        Ok(true) => {
+            eprintln!(
+                "saf verify: CBMC-proposed vector re-confirmed reach_error -> false(unreach-call)"
+            );
+            Some(candidate)
+        }
+        Ok(false) => {
+            eprintln!(
+                "saf verify: CBMC-proposed vector did not re-confirm deterministically -> unknown"
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("saf verify: CBMC re-confirm errored: {e:#} -> unknown");
+            None
+        }
+    }
 }
 
 /// Per-schedule wall-clock cap for the concurrency atomic-thread replay. Short: the
