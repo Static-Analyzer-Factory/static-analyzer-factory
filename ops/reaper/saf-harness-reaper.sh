@@ -25,4 +25,22 @@ for pid in $(pgrep -f "$PATTERN" 2>/dev/null); do
   fi
 done
 [ "$reaped" -gt 0 ] && echo "saf-harness-reaper: reaped $reaped leaked process(es)"
+
+# --- Reap ORPHANED eval containers -------------------------------------------
+# The eval runs in a `docker compose run --rm dev` container. On a supervisor stop
+# or OOM-crash the `docker compose run` PARENT dies but the container keeps running
+# under dockerd (the --rm never fires). Because mem_limit is PER-container, an orphan
+# (<=52g) coexisting with a fresh eval (<=52g) can exceed box RAM -> SYSTEM OOM. So:
+# if NO `docker compose run ... dev` parent is alive, any saf-dev-run container is
+# orphaned -> kill it. Live evals (the loop's or a manual one) keep a parent, so are
+# left untouched. All docker calls are timeout-wrapped so a slow daemon cannot hang
+# the reaper.
+if command -v docker >/dev/null 2>&1; then
+  cids=$(timeout 20 docker ps -q --filter name=static-analyzer-factory-dev-run 2>/dev/null)
+  if [ -n "$cids" ] && ! pgrep -f 'compose.*run.*dev' >/dev/null 2>&1; then
+    for cid in $cids; do
+      timeout 30 docker kill "$cid" >/dev/null 2>&1 && echo "saf-harness-reaper: killed orphaned eval container $cid"
+    done
+  fi
+fi
 exit 0
