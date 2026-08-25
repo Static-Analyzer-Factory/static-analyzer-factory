@@ -14,6 +14,7 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod bmc;
+pub mod bmc_incremental;
 pub mod conc_replay;
 pub mod conc_seq;
 pub mod conc_shim;

@@ -136,7 +136,17 @@ pub fn enumerate_bmc_candidates(
         }
     }
 
-    let _ = config; // config timeouts are advisory; BMC uses its own hard caps.
+    // Incremental unwinding for cyclic error-functions: the acyclic base case
+    // above only reaches `k = 1`, so a violation gated behind several loop
+    // iterations (`for(i=0;i<20;i++) s+=x; if(s==60) reach_error();`) is missed.
+    // The incremental engine grows the unwinding bound in ONE persistent Z3
+    // context, gating each depth's reach_error check with a `check-sat-assuming`
+    // activation literal, so it reaches an order of magnitude deeper per solver
+    // budget. Its candidates go through the SAME native-replay gate.
+    candidates.extend(crate::bmc_incremental::enumerate_incremental_candidates(
+        module, config, data_model,
+    ));
+
     candidates
 }
 

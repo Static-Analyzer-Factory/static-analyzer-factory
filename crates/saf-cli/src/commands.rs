@@ -1415,16 +1415,21 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     // the nondet inputs (`y = x*3+7; if (y==100)`) is proposed with the guard operand
     // pinned but the INPUT `x` left free — the replay then fails. The BMC engine
     // instead symbolically executes from `main` with every value modelled as a
-    // bitvector of its width (loops unwound to a fixed bound, callees inlined to a
-    // bounded depth), so the Z3 model gives the actual nondet INPUT vector that makes
-    // the arithmetic guard true. Candidates go through the SAME native-replay gate
-    // (the sole arbiter), so a spurious/imprecise model can only ever yield `unknown`.
-    // Runs before the blind fuzzer because it cracks arithmetic guards the fuzzer's
-    // blind/CmpLog search cannot (the input is a preimage of the compared value).
+    // bitvector of its width, so the Z3 model gives the actual nondet INPUT vector
+    // that makes the arithmetic guard true. Two sub-engines: the acyclic base case
+    // (k = 1) and an INCREMENTAL unwinder that grows the loop bound in ONE persistent
+    // Z3 context, gating each depth's reach_error check with a `check-sat-assuming`
+    // activation literal — so a violation gated behind several loop iterations
+    // (`for(i=0;i<20;i++) s+=x; if(s==60) reach_error();`) is reached an order of
+    // magnitude deeper per solver budget than re-solving whole paths. Candidates go
+    // through the SAME native-replay gate (the sole arbiter), so a spurious/imprecise
+    // model can only ever yield `unknown`. Runs before the blind fuzzer because it
+    // cracks arithmetic guards the fuzzer's blind/CmpLog search cannot (the input is
+    // a preimage of the compared value).
     let bmc = saf_svcomp::enumerate_bmc_candidates(ctx.module, &config, ctx.data_model);
     if !bmc.is_empty() {
         eprintln!(
-            "saf verify: BMC enumerated {} candidate(s) (fixed-k)",
+            "saf verify: BMC enumerated {} candidate(s) (fixed-k + incremental)",
             bmc.len()
         );
     }
