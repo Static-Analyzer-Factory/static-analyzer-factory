@@ -733,6 +733,29 @@ mod tests {
     /// typed `i32`, so the whole reachable call graph is `main → f → f` (a size-1
     /// self-recursive SCC). `step = -1` ⇒ terminating (ranked); `step = +1` ⇒ not.
     fn self_rec_program(step: i64) -> AirModule {
+        // Preserve the original shape exactly: `n > 0` guard, plain (non-`nsw`) add.
+        self_rec_program_cmp(saf_core::air::BinaryOp::ICmpSgt, 0, step, false)
+    }
+
+    /// A module `main(){ f(0); }` with a self-recursive
+    /// `void f(int n){ if (n <cmp> bound) f(n + step); }`, typed `i32`, so the whole
+    /// reachable call graph is `main → f → f` (a size-1 self-recursive SCC). `nsw`
+    /// tags the `n + step` decrement with `no-signed-wrap` (the LLVM shape of a
+    /// *signed* `int` update, where overflow past `INT_MIN`/`INT_MAX` is UB) vs a
+    /// plain add (a *defined-wraparound* / unsigned update). This exercises the
+    /// `ll_create_rec` sentinel shape — a `!=`-guarded (`ICmpNe`) decrement — at the
+    /// whole-`program_structurally_terminates` level: signed (`nsw`) must abstain
+    /// (non-terminating for a negative `n`), defined-wraparound must rank.
+    // NOTE: one cohesive AIR fixture (f's entry/rec/base blocks + main + nondet
+    // decl + type/constant tables); splitting it would scatter the shared id and
+    // constant state, mirroring the `self_rec` builder in `ranking.rs`.
+    #[allow(clippy::too_many_lines)]
+    fn self_rec_program_cmp(
+        cmp: saf_core::air::BinaryOp,
+        bound: i64,
+        step: i64,
+        nsw: bool,
+    ) -> AirModule {
         use saf_core::air::{AirParam, AirType, Constant};
 
         let i32t = TypeId(make_id("type", b"i32"));
@@ -744,7 +767,7 @@ mod tests {
         let bound_v = make_value_id("bound");
         let step_v = make_value_id("step");
 
-        // f blocks: entry (guard n>0), rec (na=n+step; call f(na); ret), base (ret).
+        // f blocks: entry (guard n<cmp>bound), rec (na=n+step; call f(na); ret), base (ret).
         let f_entry = make_block_id("f_entry");
         let f_rec = make_block_id("f_rec");
         let f_base = make_block_id("f_base");
@@ -752,9 +775,7 @@ mod tests {
         let mut eb = AirBlock::new(f_entry);
         eb.instructions.push(typed_inst(
             "cmp",
-            Operation::BinaryOp {
-                kind: saf_core::air::BinaryOp::ICmpSgt,
-            },
+            Operation::BinaryOp { kind: cmp },
             c,
             vec![n, bound_v],
             i1t,
@@ -769,7 +790,7 @@ mod tests {
         ));
 
         let mut rb = AirBlock::new(f_rec);
-        rb.instructions.push(typed_inst(
+        let add = typed_inst(
             "add",
             Operation::BinaryOp {
                 kind: saf_core::air::BinaryOp::Add,
@@ -777,7 +798,9 @@ mod tests {
             na,
             vec![n, step_v],
             i32t,
-        ));
+        );
+        rb.instructions
+            .push(if nsw { add.with_no_signed_wrap() } else { add });
         rb.instructions.push(typed_term(
             "call",
             Operation::CallDirect { callee: f_id },
@@ -807,14 +830,27 @@ mod tests {
             block_index: BTreeMap::new(),
         };
 
-        // main: call f(zero); ret.
-        let zero = make_value_id("zero");
+        // main: `int e = __VERIFIER_nondet_int(); f(e);`. The entry value is a
+        // *signed* nondet (it may be negative), so a signed (`nsw`) `!=`-guarded
+        // recursion is NOT provably non-negative at entry — exactly the
+        // `ll_create_rec-alloca-3` shape that must abstain. (Feeding a non-negative
+        // constant here would instead let interprocedural non-negativity promote the
+        // parameter to unsigned and mask the divergence.)
+        let nondet_id = make_func_id("__VERIFIER_nondet_int");
+        let entry_v = make_value_id("m_entry_val");
         let m_entry = make_block_id("m_entry");
         let mut mb = AirBlock::new(m_entry);
+        mb.instructions.push(typed_inst(
+            "mnondet",
+            Operation::CallDirect { callee: nondet_id },
+            entry_v,
+            vec![],
+            i32t,
+        ));
         mb.instructions.push(typed_term(
             "mcall",
             Operation::CallDirect { callee: f_id },
-            vec![zero],
+            vec![entry_v],
         ));
         mb.instructions
             .push(typed_term("mret", Operation::Ret, vec![]));
@@ -829,14 +865,28 @@ mod tests {
             symbol: None,
             block_index: BTreeMap::new(),
         };
+        let nondet_f = AirFunction {
+            id: nondet_id,
+            name: "__VERIFIER_nondet_int".to_string(),
+            params: Vec::new(),
+            blocks: Vec::new(),
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
 
-        let mut m = module(vec![main_f, f]);
+        let mut m = module(vec![main_f, f, nondet_f]);
         m.types.insert(i32t, AirType::Integer { bits: 32 });
         m.types.insert(i1t, AirType::Integer { bits: 1 });
-        m.constants
-            .insert(zero, Constant::Int { value: 0, bits: 32 });
-        m.constants
-            .insert(bound_v, Constant::Int { value: 0, bits: 32 });
+        m.constants.insert(
+            bound_v,
+            Constant::Int {
+                value: bound,
+                bits: 32,
+            },
+        );
         m.constants.insert(
             step_v,
             Constant::Int {
@@ -858,5 +908,42 @@ mod tests {
         // main → f, f(n){ if (n>0) f(n+1); } — recurses forever; no ranking ⇒
         // abstain (never a wrong `true`).
         assert!(!program_structurally_terminates(&self_rec_program(1)));
+    }
+
+    // --- ll_create_rec sentinel: a `!=`-guarded recursive decrement -----------
+    //
+    // `termination-memory-linkedlists/ll_create_rec-alloca-*` build a linked list
+    // by recursion: `T* new_ll(N n){ if (n == 0) return NULL; ...; new_ll(n-1); }`.
+    // The soundness hinge is the SIGNEDNESS of `n` (an `!=` guard, unlike `> 0`,
+    // does NOT bound `n` below):
+    //   * SIGNED `int n` entered from an unguarded `nondet_int()` (alloca-3,
+    //     expected NON-terminating): a negative `n` never reaches `0`, so the
+    //     recursion diverges — `program_structurally_terminates` MUST abstain. The
+    //     `nsw` decrement keeps `n` ineligible for the unsigned bit-pattern bound,
+    //     so no bogus ranking function is synthesized. (This is the wrong-TRUE the
+    //     soundness sentinel guards against — a regression here is a −32.)
+    //   * DEFINED-WRAPAROUND / unsigned `n` (alloca-1, expected terminating): the
+    //     plain (non-`nsw`) decrement earns the `[0, 2^w−1]` bit-pattern bound, the
+    //     `!=` split proves `n − 1` never underflows, and `f = n` ranks ⇒ TRUE.
+
+    #[test]
+    fn ne_guarded_signed_recursion_abstains() {
+        // f(int n){ if (n != 0) f(n - 1); } entered as `f(nondet_int())`, with a
+        // SIGNED (`nsw`) decrement — non-terminating for a negative `n`. Abstaining
+        // is the sound verdict (never a wrong `true`); this is the `ll_create_rec`
+        // soundness-sentinel case at the whole-program level.
+        let m = self_rec_program_cmp(saf_core::air::BinaryOp::ICmpNe, 0, -1, true);
+        assert!(!program_structurally_terminates(&m));
+    }
+
+    #[test]
+    fn ne_guarded_wraparound_recursion_terminates() {
+        // f(unsigned n){ if (n != 0) f(n - 1); } — a plain (defined-wraparound)
+        // decrement guarded by `!=`. It terminates for every input (unsigned `n`
+        // strictly decreases to 0), so `f = n` ranks ⇒ TRUE. Pins the terminating
+        // `ll_create_rec-alloca-1` recall so future ranking tuning cannot silently
+        // over-tighten the sentinel guard above into a recall loss.
+        let m = self_rec_program_cmp(saf_core::air::BinaryOp::ICmpNe, 0, -1, false);
+        assert!(program_structurally_terminates(&m));
     }
 }
