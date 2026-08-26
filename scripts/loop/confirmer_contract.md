@@ -187,3 +187,28 @@ on the unsound case), NOT a blunt gate that tanks recall. Root causes + specs:**
    and abstain. Verdict-only property; abstaining is always sound.
 
 After these land FP=0 on the sentinel, resume the normal lever rotation.
+
+## SENTINEL UPDATE 2026-08-26 — the 3 sentinel LEVERS are RETIRED (verified clean at HEAD)
+
+Two independent lines of evidence now agree the FP/wrong-TRUE surface these three
+levers targeted is NOT present at current HEAD, so they are PARKED in levers.tsv
+(they were burning arms re-litigating phantom bugs and stalling the campaign):
+
+- **termination-recursion-sound** — the wrong-TRUE task `ll_create_rec-alloca-1` was
+  rewritten signed->unsigned (FALSE->TRUE) and RELABELED upstream; SAF now correctly
+  emits `true`. Abstaining would LOSE a correct point. Arm-146 verified sound across
+  all 12 FALSE recursion tasks + an 84-task FALSE sweep. Nothing to fix.
+- **overflow-nonlinear-sound** — the nonlinear-abstain was REVERTED twice (arm-142
+  gen_dw=-5, arm-145 gen_dw=-1): it costs correct overflow detections with NO soundness
+  payoff at HEAD. Net-negative.
+- **fuzz-pointer-sound** — banked (ACCUMULATE). The real SV-COMP YAML validator (Witch3/
+  Symbiotic-Witch, run offline on cd-vm-14, 2026-08-26) shows ZERO unreach-call false
+  alarms across the full 48,380-task run; the pointer-nondet class is correct-but-
+  sometimes-unconfirmed (KLEE incompleteness), not a false alarm.
+
+IMPORTANT — soundness protection is NOT removed. The sentinel GATE stays fully active:
+`tests/benchmarks/svcomp-splits/soundness-sentinel.jsonl` is raw-evaluated EVERY arm and
+any arm that raises FP+wrong-TRUE is hard-reverted (ALERT_SENTINEL_REGRESSION). Retiring
+the *levers* only stops the redundant fix-attempts; the *gate* still guards regressions.
+Future arms: do NOT re-investigate these three. Focus on the recall frontier
+(input-synthesis/last-mile + confirmation-gap).
