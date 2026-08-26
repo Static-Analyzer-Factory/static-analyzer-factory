@@ -3397,15 +3397,90 @@ fn escape_c_string(p: &Path) -> String {
     out
 }
 
+/// Emit the fixed-width typedef nondet family and the lazy-init nondet pointer into
+/// the replay driver `s` for `candidate`.
+///
+/// The [`saf_svcomp::fuzz::EXTENDED_NONDET`] typedefs are defined WEAK (a task-supplied
+/// body wins) and replay their recorded sequence, mirroring the fuzz shim so a
+/// fuzz-discovered run re-confirms byte-for-byte (R6); an unrecorded name still gets a
+/// weak `0`-returning stub so the native link never fails. The nondet pointer replays
+/// the fuzz shim's recorded NULL/object selector (even ⇒ NULL, odd ⇒ fresh zero-filled
+/// object) and — crucially — defaults to NULL once the selectors are exhausted, so a
+/// candidate that recorded NO pointer selector (every Z3 / BMC / CBMC path, which do
+/// not model the pointer) keeps the historical NULL behaviour and cannot regress.
+fn push_extended_and_pointer_replay_defs(s: &mut String, candidate: &saf_svcomp::FalseCandidate) {
+    use std::fmt::Write as _;
+
+    for (fname, cty) in saf_svcomp::fuzz::EXTENDED_NONDET {
+        let suffix = fname.trim_start_matches("__VERIFIER_nondet_");
+        let values: Vec<i64> = candidate
+            .nondet_sequence
+            .iter()
+            .filter(|n| n.func_name == *fname)
+            .map(|n| n.value)
+            .collect();
+        if values.is_empty() {
+            let _ = writeln!(
+                s,
+                "__attribute__((weak)) {cty} __VERIFIER_nondet_{suffix}(void) {{ return ({cty})0; }}"
+            );
+            continue;
+        }
+        let elems = values
+            .iter()
+            .map(|v| format!("{v}LL"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(s, "static long long __saf_xarr_{suffix}[] = {{ {elems} }};");
+        let _ = writeln!(
+            s,
+            "static unsigned long __saf_xn_{suffix} = {};",
+            values.len()
+        );
+        let _ = writeln!(s, "static unsigned long __saf_xi_{suffix} = 0;");
+        let _ = writeln!(
+            s,
+            "__attribute__((weak)) {cty} __VERIFIER_nondet_{suffix}(void) {{ return (__saf_xi_{suffix} < __saf_xn_{suffix}) ? ({cty})__saf_xarr_{suffix}[__saf_xi_{suffix}++] : ({cty})0; }}"
+        );
+    }
+
+    let selectors: Vec<i64> = candidate
+        .nondet_sequence
+        .iter()
+        .filter(|n| n.func_name == "__VERIFIER_nondet_pointer")
+        .map(|n| n.value)
+        .collect();
+    let elems = if selectors.is_empty() {
+        "0".to_string()
+    } else {
+        selectors
+            .iter()
+            .map(|v| format!("{v}LL"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let _ = writeln!(s, "static long long __saf_pptr_arr[] = {{ {elems} }};");
+    let _ = writeln!(
+        s,
+        "static unsigned long __saf_pptr_n = {};",
+        selectors.len()
+    );
+    s.push_str("static unsigned long __saf_pptr_i = 0;\n");
+    s.push_str(
+        "void* __VERIFIER_nondet_pointer(void) { if (__saf_pptr_i < __saf_pptr_n) { long long __s = __saf_pptr_arr[__saf_pptr_i++]; return (__s & 1LL) ? calloc(1, 4096) : (void*)0; } return (void*)0; }\n",
+    );
+}
+
 /// Build the replay driver C source for `candidate`.
 ///
 /// It defines every SV-COMP special function the program may reference (so the
 /// native link succeeds): the scalar-integer nondet generators replay the model
-/// sequence (a per-function counter over a fixed array; exhausted ⇒ `0`);
-/// pointer/float/double nondet return `0`/`NULL`; `__VERIFIER_assume` blocks
-/// assumed-false paths at runtime (so an assume-pruned error can never be a
-/// false confirmation); and `reach_error`/`__VERIFIER_error` drop the sentinel
-/// file and `_exit`.
+/// sequence (a per-function counter over a fixed array; exhausted ⇒ `0`); the
+/// fixed-width typedef family and the lazy-init nondet pointer are emitted by
+/// [`push_extended_and_pointer_replay_defs`]; float/double nondet return `0`;
+/// `__VERIFIER_assume` blocks assumed-false paths at runtime (so an assume-pruned
+/// error can never be a false confirmation); and `reach_error`/`__VERIFIER_error`
+/// drop the sentinel file and `_exit`.
 fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) -> String {
     use std::fmt::Write as _;
 
@@ -3418,6 +3493,7 @@ fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) ->
     );
     s.push_str("#include <stddef.h>\n");
     s.push_str("#include <stdio.h>\n");
+    s.push_str("#include <stdlib.h>\n");
     s.push_str("extern void _exit(int) __attribute__((noreturn));\n");
 
     for (fname, cty) in SCALAR_NONDET {
@@ -3452,8 +3528,8 @@ fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) ->
         );
     }
 
-    // Non-integer / pointer nondet: legal defaults so the program links + runs.
-    s.push_str("void* __VERIFIER_nondet_pointer(void) { return (void*)0; }\n");
+    push_extended_and_pointer_replay_defs(&mut s, candidate);
+
     s.push_str("float __VERIFIER_nondet_float(void) { return 0.0f; }\n");
     s.push_str("double __VERIFIER_nondet_double(void) { return 0.0; }\n");
     s.push_str("void __VERIFIER_atomic_begin(void) { }\n");
@@ -6038,6 +6114,66 @@ mod verify_tests {
         // The default sweep (run FIRST) must NOT disable the quarantine — that is what
         // preserves its committed use-after-free recall before the additive variant.
         assert!(!ASAN_OPTS.contains("quarantine_size_mb=0"));
+    }
+
+    #[test]
+    fn replay_driver_drives_extended_typedefs_and_lazy_pointer() {
+        // A candidate that recorded a u32 nondet must replay it through a WEAK,
+        // recorded-sequence def (so a task-supplied body still wins) and the nondet
+        // pointer must be the same lazy-init object the fuzz shim produced (R6).
+        let candidate = saf_svcomp::FalseCandidate {
+            reach_error_inst: InstId(make_id("inst", b"err")),
+            block_path: Vec::new(),
+            assignments: BTreeMap::new(),
+            nondet_sequence: vec![saf_svcomp::NondetCall {
+                func_name: "__VERIFIER_nondet_u32".to_string(),
+                value: 777,
+            }],
+        };
+        let sentinel = std::path::Path::new("/tmp/s.sentinel");
+        let src = synthesize_driver(&candidate, sentinel);
+        // u32 is defined WEAK and replays the recorded value.
+        assert!(
+            src.contains("__attribute__((weak)) unsigned int __VERIFIER_nondet_u32(void)"),
+            "{src}"
+        );
+        assert!(
+            src.contains("777LL"),
+            "recorded u32 value must be embedded: {src}"
+        );
+        // Every extended typedef is defined (so the native link never fails on an
+        // unreferenced-but-declared generator), even without a recorded value.
+        for (fname, _) in saf_svcomp::fuzz::EXTENDED_NONDET {
+            assert!(src.contains(fname), "replay driver missing {fname}");
+        }
+        // Lazy-init nondet pointer replays a selector array (odd => calloc object).
+        assert!(src.contains("__saf_pptr_arr"), "{src}");
+        assert!(src.contains("calloc(1, 4096)"), "{src}");
+        // calloc requires stdlib.
+        assert!(src.contains("#include <stdlib.h>"));
+    }
+
+    #[test]
+    fn replay_driver_nondet_pointer_defaults_to_null_without_selectors() {
+        // NON-REGRESSION: a candidate that recorded no pointer selector (every Z3 / BMC
+        // / CBMC path) must keep the historical NULL default so those confirmations are
+        // unchanged — the object branch is reachable only for fuzz-recorded selectors.
+        let candidate = saf_svcomp::FalseCandidate {
+            reach_error_inst: InstId(make_id("inst", b"err")),
+            block_path: Vec::new(),
+            assignments: BTreeMap::new(),
+            nondet_sequence: Vec::new(),
+        };
+        let src = synthesize_driver(&candidate, std::path::Path::new("/tmp/s.sentinel"));
+        // Empty selector array + count 0 => the runtime returns NULL on every call.
+        assert!(
+            src.contains("static unsigned long __saf_pptr_n = 0;"),
+            "{src}"
+        );
+        assert!(
+            src.contains("return (void*)0; }"),
+            "exhausted/empty selectors must fall back to NULL: {src}"
+        );
     }
 
     #[test]

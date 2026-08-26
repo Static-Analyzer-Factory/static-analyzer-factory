@@ -59,6 +59,74 @@ pub const SCALAR_NONDET: &[(&str, &str)] = &[
     ("__VERIFIER_nondet_size_t", "size_t"),
 ];
 
+/// Fixed-width integer `__VERIFIER_nondet_*` typedefs from the SV-COMP nondet API
+/// whose bit width is **fixed by the standard** (data-model independent), paired with
+/// a C type of exactly that width.
+///
+/// These are the `uN`/`sN` (stdint-style) and `unsigned`/`loff_t` generators that
+/// pervade the device-driver harnesses (ldv-linux / ddv-machzwd) and the
+/// firmware/entry-point batches. Unlike [`SCALAR_NONDET`], a task almost never
+/// supplies a body for them — the harness only *declares* `extern u32
+/// __VERIFIER_nondet_u32(void)` and expects the verifier to model it — so without a
+/// definition the native harness fails to LINK and the whole fuzz/replay confirmer
+/// abstains before it can drive a single input.
+///
+/// They are emitted as **WEAK** definitions (see [`push_bytestream_nondet_defs`] /
+/// the replay driver) so that on the rare task that *does* define its own body
+/// (e.g. `u32 __VERIFIER_nondet_u32(void){ return __VERIFIER_nondet_uint(); }`) the
+/// task's strong symbol wins the link and behaviour is unchanged — the driven
+/// definition only fills in the missing extern, never overrides a real one. Widths
+/// are model-independent (`unsigned char`/`short`/`int`/`long long` are 1/2/4/8 on
+/// both ILP32 and LP64), so the same `sizeof(T)`-byte consumption re-confirms
+/// byte-for-byte across data models (R5).
+pub const EXTENDED_NONDET: &[(&str, &str)] = &[
+    ("__VERIFIER_nondet_u8", "unsigned char"),
+    ("__VERIFIER_nondet_u16", "unsigned short"),
+    ("__VERIFIER_nondet_u32", "unsigned int"),
+    ("__VERIFIER_nondet_u64", "unsigned long long"),
+    ("__VERIFIER_nondet_s8", "signed char"),
+    ("__VERIFIER_nondet_s16", "short"),
+    ("__VERIFIER_nondet_s32", "int"),
+    ("__VERIFIER_nondet_s64", "long long"),
+    ("__VERIFIER_nondet_unsigned", "unsigned int"),
+    ("__VERIFIER_nondet_loff_t", "long long"),
+];
+
+/// Byte size of the zero-filled heap object a fuzzable `__VERIFIER_nondet_pointer()`
+/// returns (see [`FUZZ_NONDET_POINTER_C`]). Generous enough to cover a typical harness
+/// struct/array so field reads land inside the deterministic zero region.
+pub const NONDET_OBJ_SIZE: usize = 4096;
+
+/// Fuzz-shim definition of a **lazy-initialised** `__VERIFIER_nondet_pointer()`
+/// (KLEE-style symbolic-object havocking).
+///
+/// It consumes ONE selector byte from the input stream and logs it (so the replay
+/// driver reproduces the exact choice, R6): an **even** selector returns `NULL`, an
+/// **odd** selector returns a fresh, zero-filled heap object of [`NONDET_OBJ_SIZE`]
+/// bytes. Both the NULL and the valid-object outcomes of the nondeterministic pointer
+/// are therefore explorable in a single run.
+///
+/// # Why this is sound for unreach-call
+///
+/// `__VERIFIER_nondet_pointer()` returns an *arbitrary* pointer; NULL and a valid
+/// pointer to a zeroed object are both concrete members of that nondeterministic set.
+/// The common firmware/entry-point harness shape is `p =
+/// __VERIFIER_nondet_pointer(); if (!p) return; p->field = __VERIFIER_nondet_int();
+/// ...` — with a hard `NULL` the harness bails and NOTHING downstream is explored;
+/// with the valid-object branch it proceeds and the fields are driven by the ordinary
+/// scalar nondet generators, whose values ARE logged and replayed. Reaching
+/// `reach_error` this way is a genuine feasible execution, only ever *emitted* after
+/// the deterministic native re-confirm on the ORIGINAL program (R6) — the shim never
+/// decides a verdict. A genuinely-safe (TRUE) task has no nondet pointer value
+/// reaching `reach_error`, so this cannot manufacture a wrong FALSE.
+///
+/// The object is left zero-filled (not byte-stream-filled) so it re-confirms through
+/// the EXISTING scalar-sequence replay gate without capturing pointee bytes: field
+/// *contents* come from replayed scalar nondet writes, not from the pointer function.
+/// Reads of an unwritten field observe `0`, a valid nondet concretisation. Emitted
+/// inside the driver body (it references `__saf_take`/`__saf_note`).
+const FUZZ_NONDET_POINTER_C: &str = "void* __VERIFIER_nondet_pointer(void) { unsigned long long __s = __saf_take(1); __saf_note(\"__VERIFIER_nondet_pointer\", (long long)__s); return (__s & 1ULL) ? calloc(1, 4096) : (void*)0; }\n";
+
 /// Classic AFL "interesting" integer values (8/16/32-bit boundary and near-boundary
 /// constants). Used both as a fixed part of the mutation dictionary and as the seed
 /// of the harvested dictionary so a guard like `if (nondet()==INT_MAX)` is reachable
@@ -88,16 +156,23 @@ pub const INTERESTING_VALUES: &[i64] = &[
     -2_147_483_648,
 ];
 
-/// True iff the program references any scalar-integer `__VERIFIER_nondet_*`
-/// function (declared or defined). When it does not, blind fuzzing cannot change
+/// True iff the byte-stream shim drives `name`: the standard scalar-integer family
+/// ([`SCALAR_NONDET`]), the fixed-width typedef family ([`EXTENDED_NONDET`]), or the
+/// lazy-init nondet pointer (whose NULL/object selector is fuzzed).
+#[must_use]
+pub fn is_fuzzable_nondet(name: &str) -> bool {
+    SCALAR_NONDET.iter().any(|(n, _)| *n == name)
+        || EXTENDED_NONDET.iter().any(|(n, _)| *n == name)
+        || name == "__VERIFIER_nondet_pointer"
+}
+
+/// True iff the program references any nondet input the byte-stream shim can drive
+/// (see [`is_fuzzable_nondet`]). When it does not, blind fuzzing cannot change
 /// behaviour — the single deterministic path is already covered by the earlier
 /// stages — so the caller skips the fuzzer.
 #[must_use]
 pub fn references_scalar_nondet(module: &AirModule) -> bool {
-    module
-        .functions
-        .iter()
-        .any(|f| SCALAR_NONDET.iter().any(|(name, _)| *name == f.name))
+    module.functions.iter().any(|f| is_fuzzable_nondet(&f.name))
 }
 
 /// Number of scalar-integer `__VERIFIER_nondet_*` CALL SITES in the module's
@@ -455,6 +530,36 @@ __SAF_NOCOV static void __saf_cov_dump(void) {\n\
 }\n\
 __attribute__((constructor)) static void __saf_cov_ctor(void) { atexit(__saf_cov_dump); }\n";
 
+/// Emit byte-stream-driven definitions for a nondet `table` into `s`.
+///
+/// Each `__VERIFIER_nondet_T()` consumes `sizeof(T)` little-endian bytes from the
+/// input buffer, reinterprets them as `T`, logs `"<name> <value>\n"` (so a
+/// fuzz-discovered sequence re-confirms through the replay gate, R6), and returns the
+/// value. `_Bool` is normalised to `0`/`1` (an arbitrary byte in a `_Bool` object is
+/// UB). When `weak`, each definition is `__attribute__((weak))` so a task that
+/// supplies its own body wins the link — used for [`EXTENDED_NONDET`], whose typedef
+/// generators device-driver models occasionally define themselves.
+fn push_bytestream_nondet_defs(s: &mut String, table: &[(&str, &str)], weak: bool) {
+    use std::fmt::Write as _;
+    let attr = if weak { "__attribute__((weak)) " } else { "" };
+    for (fname, cty) in table {
+        if *fname == "__VERIFIER_nondet_bool" {
+            let _ = writeln!(
+                s,
+                "{attr}_Bool {fname}(void) {{ unsigned long long r = __saf_take(1); _Bool v = (_Bool)(r & 1ULL); __saf_note(\"{fname}\", (long long)v); return v; }}"
+            );
+            continue;
+        }
+        // Reinterpret the low sizeof(T) little-endian bytes as T, then log the value
+        // reinterpreted back to `long long` (bit-preserving on two's-complement), so
+        // the sequence-replay driver's `(T)value` cast recovers the exact T value.
+        let _ = writeln!(
+            s,
+            "{attr}{cty} {fname}(void) {{ {cty} v; unsigned long long r = __saf_take(sizeof({cty})); memcpy(&v, &r, sizeof({cty})); __saf_note(\"{fname}\", (long long)v); return v; }}"
+        );
+    }
+}
+
 /// Generate the C source of the byte-stream nondet shim + error sentinel driver.
 ///
 /// Each scalar-integer `__VERIFIER_nondet_T()` consumes `sizeof(T)` little-endian
@@ -462,7 +567,8 @@ __attribute__((constructor)) static void __saf_cov_ctor(void) { atexit(__saf_cov
 /// `0`), reinterprets them as `T`, appends `"<name> <value>\n"` to
 /// `$SAF_FUZZ_LOG`, and returns the value. `reach_error` / `__VERIFIER_error` /
 /// `__assert_fail` drop `sentinel` and `_exit`; `__VERIFIER_assume(false)` exits
-/// without a hit. Pointer/float/double nondet return `0`/`NULL`.
+/// without a hit. Float/double nondet return `0`; a nondet pointer returns a fresh
+/// zero-filled object (see [`NONDET_POINTER_OBJ_C`]).
 #[must_use]
 pub fn synthesize_bytestream_driver(sentinel_c_literal: &str) -> String {
     use std::fmt::Write as _;
@@ -504,24 +610,11 @@ pub fn synthesize_bytestream_driver(sentinel_c_literal: &str) -> String {
          }\n",
     );
 
-    for (fname, cty) in SCALAR_NONDET {
-        if *fname == "__VERIFIER_nondet_bool" {
-            // _Bool: an arbitrary byte in a _Bool object is UB; normalise to 0/1
-            // (matching the replay driver's `(_Bool)value`).
-            let _ = writeln!(
-                s,
-                "_Bool {fname}(void) {{ unsigned long long r = __saf_take(1); _Bool v = (_Bool)(r & 1ULL); __saf_note(\"{fname}\", (long long)v); return v; }}"
-            );
-            continue;
-        }
-        // Reinterpret the low sizeof(T) little-endian bytes as T, then log the value
-        // reinterpreted back to `long long` (bit-preserving on two's-complement), so
-        // the sequence-replay driver's `(T)value` cast recovers the exact T value.
-        let _ = writeln!(
-            s,
-            "{cty} {fname}(void) {{ {cty} v; unsigned long long r = __saf_take(sizeof({cty})); memcpy(&v, &r, sizeof({cty})); __saf_note(\"{fname}\", (long long)v); return v; }}"
-        );
-    }
+    // Standard scalar-integer nondet family (strong defs), then the fixed-width
+    // typedef family (weak, so a task-supplied body wins). Both are byte-stream
+    // driven and logged, so a discovered sequence re-confirms through the replay gate.
+    push_bytestream_nondet_defs(&mut s, SCALAR_NONDET, false);
+    push_bytestream_nondet_defs(&mut s, EXTENDED_NONDET, true);
 
     // SanitizerCoverage feedback (INERT unless the harness is compiled with
     // `-fsanitize-coverage=...`). We define the standalone-sancov callbacks the
@@ -538,9 +631,11 @@ pub fn synthesize_bytestream_driver(sentinel_c_literal: &str) -> String {
     // coverage feedback can never manufacture a wrong FALSE.
     s.push_str(COVERAGE_FEEDBACK_C);
 
-    // Non-integer / pointer nondet: same legal defaults the replay driver uses, so
-    // the fuzz path and the re-confirm path stay behaviourally equivalent.
-    s.push_str("void* __VERIFIER_nondet_pointer(void) { return (void*)0; }\n");
+    // Non-integer nondet defaults. The nondet pointer is lazy-init havocked: it logs a
+    // selector so the replay driver reproduces the same NULL / zero-filled-object
+    // choice (R6), letting a harness that takes a nondet struct/array pointer run past
+    // the pointer instead of bailing at a NULL check.
+    s.push_str(FUZZ_NONDET_POINTER_C);
     s.push_str("float __VERIFIER_nondet_float(void) { return 0.0f; }\n");
     s.push_str("double __VERIFIER_nondet_double(void) { return 0.0; }\n");
     s.push_str("void __VERIFIER_atomic_begin(void) { }\n");
@@ -652,19 +747,11 @@ pub fn synthesize_bytestream_asan_shim() -> String {
          }\n",
     );
 
-    for (fname, cty) in SCALAR_NONDET {
-        if *fname == "__VERIFIER_nondet_bool" {
-            let _ = writeln!(
-                s,
-                "_Bool {fname}(void) {{ unsigned long long r = __saf_take(1); _Bool v = (_Bool)(r & 1ULL); __saf_note(\"{fname}\", (long long)v); return v; }}"
-            );
-            continue;
-        }
-        let _ = writeln!(
-            s,
-            "{cty} {fname}(void) {{ {cty} v; unsigned long long r = __saf_take(sizeof({cty})); memcpy(&v, &r, sizeof({cty})); __saf_note(\"{fname}\", (long long)v); return v; }}"
-        );
-    }
+    // Standard scalar-integer family (strong) plus the fixed-width typedef family
+    // (weak). Driving the extended typedefs lets a memsafety harness that only
+    // *declares* e.g. `u32 __VERIFIER_nondet_u32(void)` link and be fuzzed.
+    push_bytestream_nondet_defs(&mut s, SCALAR_NONDET, false);
+    push_bytestream_nondet_defs(&mut s, EXTENDED_NONDET, true);
 
     // SanitizerCoverage feedback (INERT unless the harness is compiled with
     // `-fsanitize-coverage=...`), identical to the unreach byte-stream driver. It
@@ -747,13 +834,31 @@ pub fn nondet_width(name: &str, dm: DataModel) -> usize {
         DataModel::LP64 => 8,
     };
     match name {
-        "__VERIFIER_nondet_char" | "__VERIFIER_nondet_uchar" | "__VERIFIER_nondet_bool" => 1,
-        "__VERIFIER_nondet_short" | "__VERIFIER_nondet_ushort" => 2,
-        "__VERIFIER_nondet_int" | "__VERIFIER_nondet_uint" => 4,
+        // 1-byte scalars, plus the lazy-init nondet pointer's NULL/object selector
+        // byte (see FUZZ_NONDET_POINTER_C) so a sequence-derived seed stays aligned.
+        "__VERIFIER_nondet_char"
+        | "__VERIFIER_nondet_uchar"
+        | "__VERIFIER_nondet_bool"
+        | "__VERIFIER_nondet_u8"
+        | "__VERIFIER_nondet_s8"
+        | "__VERIFIER_nondet_pointer" => 1,
+        "__VERIFIER_nondet_short"
+        | "__VERIFIER_nondet_ushort"
+        | "__VERIFIER_nondet_u16"
+        | "__VERIFIER_nondet_s16" => 2,
+        "__VERIFIER_nondet_int"
+        | "__VERIFIER_nondet_uint"
+        | "__VERIFIER_nondet_u32"
+        | "__VERIFIER_nondet_s32"
+        | "__VERIFIER_nondet_unsigned" => 4,
         "__VERIFIER_nondet_long" | "__VERIFIER_nondet_ulong" | "__VERIFIER_nondet_size_t" => {
             long_bytes
         }
-        "__VERIFIER_nondet_longlong" | "__VERIFIER_nondet_ulonglong" => 8,
+        "__VERIFIER_nondet_longlong"
+        | "__VERIFIER_nondet_ulonglong"
+        | "__VERIFIER_nondet_u64"
+        | "__VERIFIER_nondet_s64"
+        | "__VERIFIER_nondet_loff_t" => 8,
         _ => 0,
     }
 }
@@ -1201,6 +1306,107 @@ mod tests {
     }
 
     #[test]
+    fn driver_drives_extended_typedef_family_as_weak_defs() {
+        let src = synthesize_bytestream_driver("/tmp/s.sentinel");
+        // Every fixed-width typedef generator is defined and driven from the stream.
+        for (fname, _) in EXTENDED_NONDET {
+            assert!(src.contains(fname), "missing extended nondet {fname}");
+            // Driven, not a constant stub: it consumes bytes and logs the value.
+            let driven = format!("{fname}(void) {{ ");
+            assert!(src.contains(&driven), "not defined as a function: {fname}");
+        }
+        // The typedef defs are WEAK so a task-supplied body wins the link.
+        assert!(
+            src.contains("__attribute__((weak)) unsigned int __VERIFIER_nondet_u32(void)"),
+            "u32 must be a weak driven def"
+        );
+        // The standard scalar family stays STRONG (unchanged link behaviour).
+        assert!(
+            src.contains("int __VERIFIER_nondet_int(void)")
+                && !src.contains("__attribute__((weak)) int __VERIFIER_nondet_int(void)"),
+            "scalar int must remain a strong def"
+        );
+    }
+
+    #[test]
+    fn asan_shim_drives_extended_typedef_family() {
+        let src = synthesize_bytestream_asan_shim();
+        for (fname, _) in EXTENDED_NONDET {
+            assert!(
+                src.contains(fname),
+                "asan shim missing extended nondet {fname}"
+            );
+        }
+        assert!(src.contains("__attribute__((weak)) unsigned int __VERIFIER_nondet_u32(void)"));
+    }
+
+    #[test]
+    fn nondet_pointer_is_a_lazy_init_selector_object() {
+        // The unreach fuzz driver's nondet pointer logs a selector and returns a fresh
+        // zero-filled object on the odd branch — no longer a hard NULL.
+        let src = synthesize_bytestream_driver("/tmp/s.sentinel");
+        assert!(
+            src.contains(FUZZ_NONDET_POINTER_C.trim_end()),
+            "fuzz driver must lazy-init the nondet pointer: {src}"
+        );
+        assert!(
+            !src.contains("__VERIFIER_nondet_pointer(void) { return (void*)0; }"),
+            "nondet pointer must no longer be a hard NULL in the unreach driver"
+        );
+        // Both nondet outcomes are explorable (selector parity) and the object is
+        // zero-filled (calloc) so unwritten fields read a deterministic 0.
+        assert!(FUZZ_NONDET_POINTER_C.contains("__saf_take(1)"));
+        assert!(FUZZ_NONDET_POINTER_C.contains("calloc(1, 4096)"));
+        assert!(FUZZ_NONDET_POINTER_C.contains("(void*)0"));
+        assert_eq!(NONDET_OBJ_SIZE, 4096);
+        // The selector is logged so the replay driver reproduces the same choice (R6).
+        assert!(FUZZ_NONDET_POINTER_C.contains("__VERIFIER_nondet_pointer"));
+        // The selector byte is accounted for in seed conversion.
+        assert_eq!(
+            nondet_width("__VERIFIER_nondet_pointer", DataModel::LP64),
+            1
+        );
+        assert_eq!(
+            nondet_width("__VERIFIER_nondet_pointer", DataModel::ILP32),
+            1
+        );
+    }
+
+    #[test]
+    fn extended_nondet_widths_are_model_independent() {
+        // The fixed-width typedefs consume the same number of bytes under both models
+        // (unlike long/size_t), so a discovered sequence re-confirms across ILP32/LP64.
+        for dm in [DataModel::ILP32, DataModel::LP64] {
+            assert_eq!(nondet_width("__VERIFIER_nondet_u8", dm), 1);
+            assert_eq!(nondet_width("__VERIFIER_nondet_s8", dm), 1);
+            assert_eq!(nondet_width("__VERIFIER_nondet_u16", dm), 2);
+            assert_eq!(nondet_width("__VERIFIER_nondet_u32", dm), 4);
+            assert_eq!(nondet_width("__VERIFIER_nondet_unsigned", dm), 4);
+            assert_eq!(nondet_width("__VERIFIER_nondet_u64", dm), 8);
+            assert_eq!(nondet_width("__VERIFIER_nondet_loff_t", dm), 8);
+        }
+    }
+
+    #[test]
+    fn extended_nondet_seq_round_trips_a_u32() {
+        // A logged u32 sequence lays exactly 4 little-endian bytes per call, so the
+        // byte-stream shim reproduces the same value the fuzz run recorded (R6).
+        let seq = vec![
+            NondetCall {
+                func_name: "__VERIFIER_nondet_u32".to_string(),
+                value: 0x0102_0304,
+            },
+            NondetCall {
+                func_name: "__VERIFIER_nondet_u8".to_string(),
+                value: 0xAB,
+            },
+        ];
+        let bytes = nondet_seq_to_input(&seq, DataModel::LP64);
+        assert_eq!(&bytes[0..4], &[0x04, 0x03, 0x02, 0x01], "u32 little-endian");
+        assert_eq!(bytes[4], 0xAB, "u8 byte");
+    }
+
+    #[test]
     fn dictionary_includes_interesting_and_module_constants() {
         let mut m = AirModule::new(ModuleId::new(1));
         m.constants
@@ -1292,6 +1498,43 @@ mod tests {
         m.functions.push(AirFunction {
             id: FunctionId::new(9),
             name: "__VERIFIER_nondet_int".to_string(),
+            params: vec![],
+            blocks: vec![],
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        });
+        assert!(references_scalar_nondet(&m));
+    }
+
+    #[test]
+    fn is_fuzzable_nondet_covers_scalar_extended_and_pointer() {
+        // Standard scalar family.
+        assert!(is_fuzzable_nondet("__VERIFIER_nondet_int"));
+        // Fixed-width typedef family (the newly driven names).
+        assert!(is_fuzzable_nondet("__VERIFIER_nondet_u32"));
+        assert!(is_fuzzable_nondet("__VERIFIER_nondet_loff_t"));
+        assert!(is_fuzzable_nondet("__VERIFIER_nondet_unsigned"));
+        // Lazy-init nondet pointer (selector is fuzzed).
+        assert!(is_fuzzable_nondet("__VERIFIER_nondet_pointer"));
+        // Not a driven input.
+        assert!(!is_fuzzable_nondet("__VERIFIER_nondet_float"));
+        assert!(!is_fuzzable_nondet("printf"));
+    }
+
+    #[test]
+    fn references_scalar_nondet_triggers_on_extended_only_module() {
+        // A harness that declares ONLY a fixed-width typedef generator (no standard
+        // scalar family) must still engage the fuzzer.
+        use saf_core::air::AirFunction;
+        use saf_core::ids::FunctionId;
+        use std::collections::BTreeMap;
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(AirFunction {
+            id: FunctionId::new(9),
+            name: "__VERIFIER_nondet_u32".to_string(),
             params: vec![],
             blocks: vec![],
             entry_block: None,
