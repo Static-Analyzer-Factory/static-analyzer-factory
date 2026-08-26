@@ -49,7 +49,7 @@ STATE_DIR="${SAF_LOOP_STATE:-$REPO_ROOT/.loop-state}"
 : "${ALLOWED_TOOLS:=Read,Grep,Glob,Edit,Write,Bash,WebSearch,WebFetch}"
 # Immutable set — the scorer/splitter/validator/labels/holdout AND the loop's own harness
 # (`scripts/loop`, hashed recursively) so a worker can't edit its own gate. The agent may never alter these.
-: "${IMMUTABLE_GLOBS:=scripts/svcomp_split_eval.py scripts/svcomp_split.py scripts/validate_witness.sh tests/benchmarks/svcomp-splits/holdout.jsonl tests/benchmarks/svcomp-splits/train.jsonl tests/benchmarks/svcomp-splits/val.jsonl scripts/loop}"
+: "${IMMUTABLE_GLOBS:=scripts/svcomp_split_eval.py scripts/svcomp_split.py scripts/validate_witness.sh tests/benchmarks/svcomp-splits/holdout.jsonl tests/benchmarks/svcomp-splits/train.jsonl tests/benchmarks/svcomp-splits/val.jsonl tests/benchmarks/svcomp-splits/soundness-sentinel.jsonl scripts/loop}"
 # Forbidden reads audited in the worker transcript (the held-out manifest — the agent may not READ it).
 : "${FORBIDDEN_READS:=svcomp-splits/holdout}"
 : "${LEVER_BUDGET:=6}"              # park a lever after this many CONSECUTIVE REVERTs (progress resets it)
@@ -125,6 +125,17 @@ PY
   # Defense in depth: make plain-file immutables read-only on disk (a-w). Dirs stay hash-gated only
   # (chmod -R would make scripts/loop read-only and can trip git ops; the hash check + pristine gate copy cover it).
   for rel in $IMMUTABLE_GLOBS; do [ -f "$REPO_ROOT/$rel" ] && chmod a-w "$REPO_ROOT/$rel" || true; done
+}
+
+# Freeze the soundness-sentinel baseline (raw FP + wrong-TRUE on the known-unsound
+# task classes from the full-svcomp25 run) at start, so the per-arm gate can hard-
+# revert any arm that RAISES it. Fail-open: any eval/parse issue leaves no baseline
+# and the per-arm check is simply skipped.
+freeze_sentinel_baseline() {
+  local sm="$REPO_ROOT/tests/benchmarks/svcomp-splits/soundness-sentinel.jsonl"
+  [ -f "$sm" ] || { log "no soundness-sentinel manifest — skipping baseline"; return 0; }
+  log "freezing soundness-sentinel baseline (raw FP+wrong-TRUE)"
+  saf_eval "$sm" "$GATE_LIB/sentinel_baseline.json" >/dev/null 2>&1 || log "WARN: sentinel baseline eval failed; gate check disabled this run"
 }
 snapshot_gate_lib() {
   # Copy the gate python to a pristine dir OUTSIDE the repo and run ALL gate logic from there, so a
@@ -432,6 +443,25 @@ print("cost=$%.2f turns=%s retries=%s subtype=%s"%(d.get("total_cost_usd",0) or 
   # BUG-2: preserve a capability arm's reusable diff (REVERT/WORKER_FAIL) or clear it (kept) — BEFORE
   # the checkpoint mutates branches, same window as emit_arm_record (worker edits still uncommitted).
   manage_capability_wip "$mode" "$id" "$decision" "$base" || true
+
+  # SOUNDNESS SENTINEL gate (broader-validation guard, 2026-08-26): the per-arm FP=0
+  # gate runs on a 1000-task SAMPLE; the full svcomp25 set exposed 6 FP + 1 wrong-TRUE
+  # on classes the sample misses (nonlinear overflow / nondet-pointer fuzz / recursive
+  # heap-alloc termination). Raw-eval those classes every arm; hard-revert a KEEP/
+  # ACCUMULATE that RAISES FP+wrong-TRUE above the frozen baseline. Fail-open.
+  if [ -f "$GATE_LIB/sentinel_baseline.json" ] && [ -f "$REPO_ROOT/tests/benchmarks/svcomp-splits/soundness-sentinel.jsonl" ]; then
+    saf_eval "$REPO_ROOT/tests/benchmarks/svcomp-splits/soundness-sentinel.jsonl" "$wk/sentinel_after.json" >/dev/null 2>&1 || true
+    local _sb _sa
+    _sb="$(py -c "import json;d=json.load(open('$GATE_LIB/sentinel_baseline.json'));print(int(d.get('false_alarms') or 0)+int(d.get('wrong_true') or 0))" 2>/dev/null || echo -1)"
+    _sa="$(py -c "import json;d=json.load(open('$wk/sentinel_after.json'));print(int(d.get('false_alarms') or 0)+int(d.get('wrong_true') or 0))" 2>/dev/null || echo -1)"
+    if [ "${_sb:--1}" -ge 0 ] 2>/dev/null && [ "${_sa:--1}" -ge 0 ] 2>/dev/null && [ "${_sa}" -gt "${_sb}" ] 2>/dev/null; then
+      case "$decision" in
+        KEEP|KEEP_POOL|ACCUMULATE|ACCUMULATE_PLUS)
+          log "SENTINEL: soundness regressed ($_sb -> $_sa FP+wrong-TRUE) — overriding $decision -> REVERT"
+          decision="REVERT"; touch "$STATE_DIR/ALERT_SENTINEL_REGRESSION" ;;
+      esac
+    fi
+  fi
 
   # CHECKPOINT
   case "$decision" in
@@ -819,7 +849,7 @@ main() {
       log "DRY-RUN: one arm, foreground, watched, then STOP"
       run_arm "${1:-}" ;;
     --loop)
-      setup_work_branch; freeze_immutables; init_overall_checkpoint
+      setup_work_branch; freeze_immutables; freeze_sentinel_baseline; init_overall_checkpoint
       local i=0 rc=0
       while [ "$i" -lt "$MAX_ARMS" ]; do
         [ -e "$STATE_DIR/STOP" ] && { log "STOP file present — halting"; break; }

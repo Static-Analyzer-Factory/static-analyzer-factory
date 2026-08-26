@@ -144,3 +144,46 @@ multilib** (for R3) in the submission archive.
 8. No fingerprinting: the confirmer keys on nothing task-specific (name/path/hash/id/function/category).
 
 If any box cannot be ticked → **return UNKNOWN (0)**. A wrong FALSE is −16; a wrong TRUE is −32; an abstain is 0.
+
+---
+
+## SOUNDNESS SENTINEL — full-svcomp25 FP/wrong-TRUE regressions to FIX (added 2026-08-26)
+
+A full svcomp25 run (48,380 tasks) of the loop-enhanced SAF scored a big CONFIRMED
+gain (6,161 → 9,503) **but FAILED soundness: 6 false alarms + 1 wrong-TRUE.** These
+are on tasks OUTSIDE the 1,000-task sample the per-arm gate uses, so the sample's
+`FP=0` gate never saw them. `tests/benchmarks/svcomp-splits/soundness-sentinel.jsonl`
+(the 7 tasks + a sample of each affected cluster) is now raw-evaluated EVERY arm; an
+arm that RAISES its FP+wrong-TRUE is hard-reverted (`ALERT_SENTINEL_REGRESSION`).
+
+**These are HIGH-PRIORITY sound-first fixes. Each must be PRECISE (a targeted abstain
+on the unsound case), NOT a blunt gate that tanks recall. Root causes + specs:**
+
+1. **`fuzz-pointer-sound` (unreach-call) — the blind fuzzer confirms a `reach_error`
+   reached via a nondet value cast to a POINTER.** `aws-c-common/aws_string_new_from_array_harness`
+   does `(void*)__VERIFIER_nondet_ulong()` — a scalar nondet becomes an arbitrary
+   pointer that is dereferenced, so the fuzzer's arbitrary bytes fabricate an invalid
+   pointer and hit `reach_error` on an infeasible path. The driver already NULLs
+   `__VERIFIER_nondet_pointer`, but this bypasses it via an integer→pointer cast.
+   FIX (precise): in `fuzz.rs`/`fuzz_confirm_false`, ABSTAIN when a DEF-USE taint shows
+   a `__VERIFIER_nondet_*` result flowing (through casts) into an `Operation::Cast{kind:
+   IntToPtr}` whose result is `Load`/`Store`-dereferenced. Do NOT blunt-gate on any
+   IntToPtr. (harness-havoc is the eventual recall recovery via symbolic pointers.)
+
+2. **`overflow-nonlinear-sound` (no-overflow) — the UBSan overflow confirmer fires on
+   NONLINEAR (var×var) arithmetic under arbitrary nondet inputs.** `nla-digbench/hard2`,
+   `termination-crafted-lit/…ESOP2008-easy2`, `termination-numeric/twisted`: a nonlinear
+   recurrence overflows only for inputs the real program's (loop-invariant) precondition
+   forbids. FIX (precise): abstain the overflow confirm when the overflowing operation
+   depends on a nonlinear multiply (`Operation::Binary{kind: Mul}` with BOTH operands
+   non-constant) on the reaching path. Not a blunt "any multiply" gate.
+
+3. **`termination-recursion-sound` (termination) — a wrong-TRUE on recursive heap-alloc.**
+   `termination-memory-linkedlists/ll_create_rec-alloca-1`: `program_structurally_terminates`
+   returned TRUE though the recursion/loop can be unbounded (heap/alloca linked-list build).
+   The `(A)` acyclicity/SCC check SHOULD have abstained — so this is a DETECTION MISS.
+   FIX: reproduce SAF on this task, trace why the recursion/non-termination was not caught
+   (promote_module interaction? loop-vs-recursion? ranking-function synthesized wrongly),
+   and abstain. Verdict-only property; abstaining is always sound.
+
+After these land FP=0 on the sentinel, resume the normal lever rotation.
