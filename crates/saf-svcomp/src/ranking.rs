@@ -7075,6 +7075,32 @@ mod tests {
         assert!(!rec_ranked(&self_rec_plain_add(BinaryOp::ICmpNe, 5, 2)));
     }
 
+    #[test]
+    fn ne_guard_plain_add_step_minus_two_recursion_not_ranked() {
+        // f(unsigned x){ if (x != 0) f(x - 2); }  — the SHARPEST soundness edge of the
+        // `[0, 2^w−1]` bit-pattern promotion. The counter *decreases* and the guard is
+        // the same `!= 0` that ranks the `x − 1` case (`ne_guard_plain_add_recursion_is_ranked`),
+        // so a naive "decreasing + `!=`-guarded ⇒ ranks" rule would wrongly accept it.
+        // But it is genuinely NON-TERMINATING: from any ODD `x` the sequence stays odd
+        // (`1 → 2^w−1 → … → 3 → 1`, mod 2^w) and never reaches the even target 0, so no
+        // ranking function strictly decreases on the whole `x ≥ 1` region — at `x = 1`
+        // the defined-wraparound `x − 2` jumps UP to `2^w − 1`. The `!=` split cannot
+        // prune that step (`x = 1` satisfies `x ≠ 0`), so the Farkas synthesis fails and
+        // the ranker MUST abstain. Emitting `true` here would be a −32 wrong-TRUE on
+        // every odd input. Guards the recursion analogue of the sentinel's stale class.
+        assert!(!rec_ranked(&self_rec_plain_add(BinaryOp::ICmpNe, 0, -2)));
+    }
+
+    #[test]
+    fn ne_guard_plain_add_step_minus_three_recursion_not_ranked() {
+        // f(unsigned x){ if (x != 0) f(x - 3); }  — same soundness edge, step −3: the
+        // even target 0 is unreachable from any `x` that is not a multiple of 3 (the
+        // orbit `x, x−3, …` skips 0, wrapping through `2^w−k`), so it is non-terminating
+        // and must abstain. A second decreasing-but-non-unit witness so the boundary is
+        // not accidentally re-opened for one specific step magnitude.
+        assert!(!rec_ranked(&self_rec_plain_add(BinaryOp::ICmpNe, 0, -3)));
+    }
+
     /// `unsigned f(n){ t = n / 1; if (n != 0) f(n - 1); }` — the `udiv` hints `n`
     /// unsigned so it carries the range `[0, 2^32-1]`. Exercises the disjunctive
     /// `!=` split on the recursion model.
