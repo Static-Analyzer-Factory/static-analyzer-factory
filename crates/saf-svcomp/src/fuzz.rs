@@ -131,6 +131,202 @@ pub fn count_scalar_nondet_call_sites(module: &AirModule) -> usize {
     count
 }
 
+/// A cast whose result keeps the SCALAR (integer) taint of its operand: every cast
+/// kind EXCEPT `IntToPtr` (which produces a pointer — handled separately) and the
+/// float-producing casts (a float can no longer index memory as an integer pointer).
+/// `Trunc`/`ZExt`/`SExt`/`Bitcast`/`PtrToInt`/`AddrSpaceCast` keep an int derived from
+/// the nondet bytes. Helper for [`nondet_taints_int_to_ptr_deref`].
+fn cast_keeps_scalar_taint(kind: saf_core::air::CastKind) -> bool {
+    use saf_core::air::CastKind;
+    matches!(
+        kind,
+        CastKind::Trunc
+            | CastKind::ZExt
+            | CastKind::SExt
+            | CastKind::PtrToInt
+            | CastKind::Bitcast
+            | CastKind::AddrSpaceCast
+    )
+}
+
+/// All value inputs of an instruction: its `operands` plus (for `Phi`) the incoming
+/// values, which are carried in the operation rather than in `operands`. Helper for
+/// [`nondet_taints_int_to_ptr_deref`].
+fn instruction_value_inputs(inst: &saf_core::air::Instruction) -> Vec<saf_core::ids::ValueId> {
+    use saf_core::air::Operation;
+    let mut v = inst.operands.clone();
+    if let Operation::Phi { incoming } = &inst.op {
+        v.extend(incoming.iter().map(|(_, val)| *val));
+    }
+    v
+}
+
+/// True iff a DEF-USE taint shows a scalar `__VERIFIER_nondet_*` result flowing
+/// (through value-preserving casts / copies / selects / phis) into an
+/// `Operation::Cast { kind: IntToPtr }` whose resulting pointer is then
+/// dereferenced by a `Load` or `Store`.
+///
+/// # Why the blind fuzzer must ABSTAIN when this holds (soundness sentinel #1)
+///
+/// The byte-stream shim drives every scalar `__VERIFIER_nondet_T()` with arbitrary
+/// input bytes. When such a value is cast straight to a pointer
+/// (`(void*)__VERIFIER_nondet_ulong()`, as in `aws-c-common`'s
+/// `aws_string_new_from_array_harness`) and then dereferenced, the fuzzer can
+/// fabricate an *arbitrary invalid pointer*, dereference it, and reach
+/// `reach_error` on a path the real program never takes — a spurious FALSE
+/// (a full-svcomp25 false alarm). The replay driver already returns `NULL` for
+/// `__VERIFIER_nondet_pointer`, but an integer→pointer cast bypasses that guard.
+/// Reaching the error via such a synthesised pointer deref is not a genuine
+/// property violation, so the fuzz confirmer abstains.
+///
+/// This is a **precise** taint (nondet ⟶ casts ⟶ `IntToPtr` ⟶ deref), NOT a blunt
+/// "the program contains any `inttoptr`" gate — the latter would abstain on every
+/// program that legitimately materialises a pointer from an integer and tank recall.
+/// Recall on genuinely-buggy pointer harnesses is recovered later by symbolic
+/// harness-havoc, not by the blind byte-stream fuzzer.
+///
+/// The analysis is intraprocedural and value-based: the module is `mem2reg`-promoted
+/// before ingestion, so a scalar nondet result flows to the `inttoptr` directly
+/// through SSA values (no intervening `alloca`/`store`/`load`). Being value-based it
+/// naturally stays within a single function. Deterministic (`BTreeSet` ordering,
+/// fixpoint over a fixed instruction list).
+// NOTE: the fixpoint phases (seed the scalar taint, propagate it, seed + propagate
+// the pointer taint, then check the deref) are one cohesive dataflow over a single
+// per-function instruction list; splitting them into separate passes would duplicate
+// the setup and obscure the taint pipeline.
+#[allow(clippy::too_many_lines)]
+#[must_use]
+pub fn nondet_taints_int_to_ptr_deref(module: &AirModule) -> bool {
+    use saf_core::air::{CastKind, Instruction, Operation};
+    use saf_core::ids::ValueId;
+
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        let insts: Vec<&Instruction> = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .collect();
+
+        // Seed the SCALAR taint with the result value of every scalar-integer nondet
+        // call site.
+        let mut scalar: BTreeSet<ValueId> = BTreeSet::new();
+        for inst in &insts {
+            if let Operation::CallDirect { callee } = &inst.op {
+                if let Some(target) = module.function(*callee) {
+                    if SCALAR_NONDET.iter().any(|(name, _)| *name == target.name) {
+                        if let Some(dst) = inst.dst {
+                            scalar.insert(dst);
+                        }
+                    }
+                }
+            }
+        }
+        if scalar.is_empty() {
+            continue;
+        }
+
+        // Fixpoint: propagate the scalar taint through value-preserving casts / copies
+        // / freezes / selects / phis (any tainted input taints the result).
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for inst in &insts {
+                let Some(dst) = inst.dst else { continue };
+                if scalar.contains(&dst) {
+                    continue;
+                }
+                let tainted_in = instruction_value_inputs(inst)
+                    .iter()
+                    .any(|o| scalar.contains(o));
+                if !tainted_in {
+                    continue;
+                }
+                let forwards = match &inst.op {
+                    Operation::Cast { kind, .. } => cast_keeps_scalar_taint(*kind),
+                    Operation::Copy
+                    | Operation::Freeze
+                    | Operation::Select
+                    | Operation::Phi { .. } => true,
+                    _ => false,
+                };
+                if forwards {
+                    scalar.insert(dst);
+                    changed = true;
+                }
+            }
+        }
+
+        // An `IntToPtr` cast whose operand is scalar-tainted yields a TAINTED POINTER.
+        let mut ptr: BTreeSet<ValueId> = BTreeSet::new();
+        for inst in &insts {
+            if let Operation::Cast {
+                kind: CastKind::IntToPtr,
+                ..
+            } = &inst.op
+            {
+                if inst.operands.iter().any(|o| scalar.contains(o)) {
+                    if let Some(dst) = inst.dst {
+                        ptr.insert(dst);
+                    }
+                }
+            }
+        }
+        if ptr.is_empty() {
+            continue;
+        }
+
+        // Fixpoint: propagate the pointer taint through address-preserving ops —
+        // `Gep` (only when the BASE, operand[0], is tainted), pointer-preserving
+        // casts, copies, selects and phis.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for inst in &insts {
+                let Some(dst) = inst.dst else { continue };
+                if ptr.contains(&dst) {
+                    continue;
+                }
+                let forwards = match &inst.op {
+                    Operation::Gep { .. } => inst.operands.first().is_some_and(|o| ptr.contains(o)),
+                    Operation::Cast {
+                        kind: CastKind::Bitcast | CastKind::AddrSpaceCast,
+                        ..
+                    }
+                    | Operation::Copy
+                    | Operation::Freeze
+                    | Operation::Select
+                    | Operation::Phi { .. } => instruction_value_inputs(inst)
+                        .iter()
+                        .any(|o| ptr.contains(o)),
+                    _ => false,
+                };
+                if forwards {
+                    ptr.insert(dst);
+                    changed = true;
+                }
+            }
+        }
+
+        // Abstain iff a tainted pointer is the ADDRESS operand of a load or store
+        // (`Load` operand[0]; `Store` operand[1] — operand[0] is the stored value).
+        for inst in &insts {
+            let deref = match &inst.op {
+                Operation::Load => inst.operands.first().is_some_and(|o| ptr.contains(o)),
+                Operation::Store => inst.operands.get(1).is_some_and(|o| ptr.contains(o)),
+                _ => false,
+            };
+            if deref {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// True iff the program references `__VERIFIER_nondet_bool` (declared or defined).
 ///
 /// Used by the overflow confirmer to decide whether the loop-sustaining bool-decoupling
@@ -1450,5 +1646,265 @@ mod tests {
             block_index: BTreeMap::new(),
         });
         assert!(references_nondet_bool(&m));
+    }
+
+    // --- nondet_taints_int_to_ptr_deref (soundness sentinel #1) ---------------
+
+    /// Build a module: a `__VERIFIER_nondet_ulong` declaration (id 1) + a `main`
+    /// (id 2) whose single block contains `body`. Instruction ValueIds/InstIds are
+    /// the caller's responsibility.
+    fn module_with_body(body: Vec<saf_core::air::Instruction>) -> AirModule {
+        use saf_core::air::{AirBlock, AirFunction};
+        use saf_core::ids::{BlockId, FunctionId};
+        use std::collections::BTreeMap;
+
+        let nondet = AirFunction {
+            id: FunctionId::new(1),
+            name: "__VERIFIER_nondet_ulong".to_string(),
+            params: vec![],
+            blocks: vec![],
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let mut block = AirBlock::new(BlockId::new(10));
+        block.instructions = body;
+        let main = AirFunction {
+            id: FunctionId::new(2),
+            name: "main".to_string(),
+            params: vec![],
+            blocks: vec![block],
+            entry_block: None,
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(nondet);
+        m.functions.push(main);
+        m
+    }
+
+    fn inst(
+        id: u128,
+        op: saf_core::air::Operation,
+        operands: Vec<ValueId>,
+        dst: Option<ValueId>,
+    ) -> saf_core::air::Instruction {
+        use saf_core::ids::InstId;
+        use std::collections::BTreeMap;
+        saf_core::air::Instruction {
+            id: InstId::new(id),
+            op,
+            operands,
+            dst,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn taint_flags_nondet_ulong_cast_to_ptr_then_loaded() {
+        use saf_core::air::{CastKind, Operation};
+        use saf_core::ids::FunctionId;
+        // %v = call nondet_ulong(); %p = inttoptr %v; %x = load %p
+        let v = ValueId::new(100);
+        let p = ValueId::new(101);
+        let x = ValueId::new(102);
+        let body = vec![
+            inst(
+                1,
+                Operation::CallDirect {
+                    callee: FunctionId::new(1),
+                },
+                vec![],
+                Some(v),
+            ),
+            inst(
+                2,
+                Operation::Cast {
+                    kind: CastKind::IntToPtr,
+                    target_bits: None,
+                },
+                vec![v],
+                Some(p),
+            ),
+            inst(3, Operation::Load, vec![p], Some(x)),
+        ];
+        assert!(nondet_taints_int_to_ptr_deref(&module_with_body(body)));
+    }
+
+    #[test]
+    fn taint_flags_through_intermediate_int_cast_and_gep() {
+        use saf_core::air::{CastKind, FieldPath, Operation};
+        use saf_core::ids::FunctionId;
+        // %v = call nondet_ulong(); %w = zext %v; %p = inttoptr %w;
+        // %q = gep %p; store _, %q
+        let v = ValueId::new(100);
+        let w = ValueId::new(101);
+        let p = ValueId::new(102);
+        let q = ValueId::new(103);
+        let val = ValueId::new(104);
+        let body = vec![
+            inst(
+                1,
+                Operation::CallDirect {
+                    callee: FunctionId::new(1),
+                },
+                vec![],
+                Some(v),
+            ),
+            inst(
+                2,
+                Operation::Cast {
+                    kind: CastKind::ZExt,
+                    target_bits: Some(64),
+                },
+                vec![v],
+                Some(w),
+            ),
+            inst(
+                3,
+                Operation::Cast {
+                    kind: CastKind::IntToPtr,
+                    target_bits: None,
+                },
+                vec![w],
+                Some(p),
+            ),
+            inst(
+                4,
+                Operation::Gep {
+                    field_path: FieldPath::default(),
+                },
+                vec![p],
+                Some(q),
+            ),
+            // store value=val to pointer=q (operand[1] is the address)
+            inst(5, Operation::Store, vec![val, q], None),
+        ];
+        assert!(nondet_taints_int_to_ptr_deref(&module_with_body(body)));
+    }
+
+    #[test]
+    fn taint_does_not_flag_inttoptr_from_non_nondet_source() {
+        use saf_core::air::{CastKind, Operation};
+        // A plain `inttoptr` of a constant/param value (NOT nondet-derived) that is
+        // dereferenced must NOT trip the gate — this is the precision requirement
+        // (no blunt any-inttoptr abstain).
+        let c = ValueId::new(200); // some non-nondet value (never defined by a nondet call)
+        let p = ValueId::new(201);
+        let x = ValueId::new(202);
+        let body = vec![
+            inst(
+                1,
+                Operation::Cast {
+                    kind: CastKind::IntToPtr,
+                    target_bits: None,
+                },
+                vec![c],
+                Some(p),
+            ),
+            inst(2, Operation::Load, vec![p], Some(x)),
+        ];
+        assert!(!nondet_taints_int_to_ptr_deref(&module_with_body(body)));
+    }
+
+    #[test]
+    fn taint_does_not_flag_nondet_ptr_that_is_never_dereferenced() {
+        use saf_core::air::{CastKind, Operation};
+        use saf_core::ids::FunctionId;
+        // %v = call nondet_ulong(); %p = inttoptr %v; ret %p  (no load/store)
+        let v = ValueId::new(100);
+        let p = ValueId::new(101);
+        let body = vec![
+            inst(
+                1,
+                Operation::CallDirect {
+                    callee: FunctionId::new(1),
+                },
+                vec![],
+                Some(v),
+            ),
+            inst(
+                2,
+                Operation::Cast {
+                    kind: CastKind::IntToPtr,
+                    target_bits: None,
+                },
+                vec![v],
+                Some(p),
+            ),
+            inst(3, Operation::Ret, vec![p], None),
+        ];
+        assert!(!nondet_taints_int_to_ptr_deref(&module_with_body(body)));
+    }
+
+    #[test]
+    fn taint_does_not_flag_scalar_nondet_used_only_as_integer() {
+        use saf_core::air::{BinaryOp, Operation};
+        use saf_core::ids::FunctionId;
+        // A scalar nondet used purely arithmetically (never cast to a pointer):
+        // the common fuzzable guard — must stay confirmable (no abstain).
+        let v = ValueId::new(100);
+        let k = ValueId::new(101);
+        let cmp = ValueId::new(102);
+        let body = vec![
+            inst(
+                1,
+                Operation::CallDirect {
+                    callee: FunctionId::new(1),
+                },
+                vec![],
+                Some(v),
+            ),
+            inst(
+                2,
+                Operation::BinaryOp {
+                    kind: BinaryOp::ICmpEq,
+                },
+                vec![v, k],
+                Some(cmp),
+            ),
+        ];
+        assert!(!nondet_taints_int_to_ptr_deref(&module_with_body(body)));
+    }
+
+    #[test]
+    fn taint_ignores_nondet_only_as_store_value_not_address() {
+        use saf_core::air::{CastKind, Operation};
+        use saf_core::ids::FunctionId;
+        // %v = call nondet_ulong(); %p = inttoptr %v; store %p -> %dst
+        // Here the tainted pointer is the STORED VALUE (operand[0]), not the address
+        // (operand[1]); no deref of the fabricated pointer occurs, so no abstain.
+        let v = ValueId::new(100);
+        let p = ValueId::new(101);
+        let dst = ValueId::new(102); // a legitimate address (not tainted)
+        let body = vec![
+            inst(
+                1,
+                Operation::CallDirect {
+                    callee: FunctionId::new(1),
+                },
+                vec![],
+                Some(v),
+            ),
+            inst(
+                2,
+                Operation::Cast {
+                    kind: CastKind::IntToPtr,
+                    target_bits: None,
+                },
+                vec![v],
+                Some(p),
+            ),
+            inst(3, Operation::Store, vec![p, dst], None),
+        ];
+        assert!(!nondet_taints_int_to_ptr_deref(&module_with_body(body)));
     }
 }

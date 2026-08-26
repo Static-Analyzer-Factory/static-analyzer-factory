@@ -1670,6 +1670,24 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
         return None;
     }
 
+    // SOUNDNESS SENTINEL #1 (`scripts/loop/confirmer_contract.md`): abstain when a
+    // scalar `__VERIFIER_nondet_*` value is cast to a pointer (`IntToPtr`) and then
+    // dereferenced. The blind byte-stream shim drives that nondet with arbitrary
+    // bytes, so it can fabricate an invalid pointer, dereference it, and reach
+    // `reach_error` on an infeasible path (aws-c-common's
+    // `aws_string_new_from_array_harness` does `(void*)__VERIFIER_nondet_ulong()`) —
+    // a spurious FALSE. The taint is PRECISE (nondet ⟶ casts ⟶ IntToPtr ⟶ deref),
+    // not a blunt any-`inttoptr` gate; symbolic harness-havoc recovers such recall
+    // later. Runs before the (expensive) compile so it costs nothing on the common
+    // path.
+    if fuzz::nondet_taints_int_to_ptr_deref(ctx.module) {
+        eprintln!(
+            "saf verify: blind fuzz abstains — nondet value cast to a dereferenced pointer \
+             (would fabricate an invalid pointer deref) -> unknown"
+        );
+        return None;
+    }
+
     let dir = ctx.tempdir;
     let sentinel = dir.join("saf_fuzz.sentinel");
     let driver_src = dir.join("saf_fuzz_driver.c");
