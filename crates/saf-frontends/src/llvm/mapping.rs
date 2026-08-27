@@ -1916,11 +1916,30 @@ fn collect_call_args(inst: InstructionValue<'_>, ctx: &mut MappingContext<'_>) -
     operands
 }
 
+/// Classify a single GEP index operand into a [`FieldStep`].
+///
+/// `constant` is the sign-extended constant value of the index operand, or
+/// `None` for a runtime (dynamic) index.
+///
+/// A constant index that fits in a `u32` is a struct-field / array-element
+/// descent (`Field`). A *negative* or too-large constant index is **not** a
+/// valid struct-field descent: it is raw pointer arithmetic. The classic case
+/// is the `container_of` idiom — `(char *)ptr - offsetof(T, member)` — which
+/// clang lowers to `getelementptr i8, ptr %p, i64 -N` (pervasive in Linux
+/// kernel / firmware code such as the Intel TDX harnesses). Casting such an
+/// index with `as u32` fabricates a phantom `Field { 4294967295 }` location
+/// that aliases nothing real — a quiet wrong answer. Instead we model it as a
+/// dynamic `Index`, which conservatively collapses to the base object. This
+/// mirrors the `u32::try_from` guard already used on the constant-expression
+/// GEP path in `decompose_constant_gep`.
+fn classify_gep_index(constant: Option<i64>) -> FieldStep {
+    match constant.and_then(|v| u32::try_from(v).ok()) {
+        Some(index) => FieldStep::Field { index },
+        None => FieldStep::Index,
+    }
+}
+
 /// Extract the field path from a GEP instruction.
-// INVARIANT: GEP indices from LLVM are i64; struct field indices fit in u32
-// (compilers limit struct fields far below 2^32). Sign loss is safe because
-// negative struct indices are invalid LLVM IR.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn extract_gep_field_path(inst: InstructionValue<'_>) -> FieldPath {
     let mut steps = Vec::new();
     let num_operands = inst.get_num_operands();
@@ -1929,15 +1948,8 @@ fn extract_gep_field_path(inst: InstructionValue<'_>) -> FieldPath {
     for i in 1..num_operands {
         if let Some(value) = inst.get_operand(i).and_then(operand_as_value) {
             if value.is_int_value() {
-                if let Some(int_val) = value.into_int_value().get_sign_extended_constant() {
-                    // Constant index - it's a field index
-                    steps.push(FieldStep::Field {
-                        index: int_val as u32,
-                    });
-                } else {
-                    // Dynamic index
-                    steps.push(FieldStep::Index);
-                }
+                let constant = value.into_int_value().get_sign_extended_constant();
+                steps.push(classify_gep_index(constant));
             } else {
                 steps.push(FieldStep::Index);
             }
@@ -2238,5 +2250,44 @@ fn resolve_constant_gep_element(
         | Constant::Undef
         | Constant::ZeroInit => Some(current.clone()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod gep_index_tests {
+    use super::classify_gep_index;
+    use saf_core::air::FieldStep;
+
+    #[test]
+    fn small_nonnegative_constant_is_field() {
+        assert_eq!(classify_gep_index(Some(0)), FieldStep::Field { index: 0 });
+        assert_eq!(classify_gep_index(Some(2)), FieldStep::Field { index: 2 });
+        assert_eq!(
+            classify_gep_index(Some(i64::from(u32::MAX))),
+            FieldStep::Field { index: u32::MAX }
+        );
+    }
+
+    #[test]
+    fn negative_constant_is_dynamic_index_not_phantom_field() {
+        // `container_of`: `getelementptr i8, ptr %p, i64 -1` must NOT become a
+        // wrapped `Field { 4294967295 }`.
+        assert_eq!(classify_gep_index(Some(-1)), FieldStep::Index);
+        assert_eq!(classify_gep_index(Some(-8)), FieldStep::Index);
+        assert_eq!(classify_gep_index(Some(i64::MIN)), FieldStep::Index);
+    }
+
+    #[test]
+    fn too_large_constant_is_dynamic_index() {
+        assert_eq!(
+            classify_gep_index(Some(i64::from(u32::MAX) + 1)),
+            FieldStep::Index
+        );
+        assert_eq!(classify_gep_index(Some(i64::MAX)), FieldStep::Index);
+    }
+
+    #[test]
+    fn runtime_index_is_dynamic_index() {
+        assert_eq!(classify_gep_index(None), FieldStep::Index);
     }
 }
