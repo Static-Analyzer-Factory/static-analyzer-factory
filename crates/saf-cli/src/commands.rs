@@ -1258,6 +1258,139 @@ fn conc_target_witness(ctx: &VerifyCtx) -> Option<saf_svcomp::ViolationWitness> 
     build_witness(ctx, saf_svcomp::lower_reach_error_target(ctx.module))
 }
 
+/// BMC lever (`crate::bmc`): fixed-`k` + incremental candidates, each confirmed by
+/// native replay (the sole FALSE arbiter). Returns `Some` only on a replay-confirmed
+/// FALSE. Replay indices are offset by `2 * MAX_REPLAY_CANDIDATES` so its temp files
+/// never collide with the intraprocedural / interprocedural stages regardless of the
+/// order the portfolio router runs the levers in.
+fn bmc_confirm(
+    ctx: &VerifyCtx,
+    config: &saf_svcomp::PropertyAnalysisConfig,
+) -> Option<VerdictOutcome> {
+    use saf_svcomp::Property;
+    let bmc = saf_svcomp::enumerate_bmc_candidates(ctx.module, config, ctx.data_model);
+    if !bmc.is_empty() {
+        eprintln!(
+            "saf verify: BMC enumerated {} candidate(s) (fixed-k + incremental)",
+            bmc.len()
+        );
+    }
+    for (idx, candidate) in bmc.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
+        match replay_confirms_false(
+            ctx.input,
+            ctx.data_model,
+            ctx.stub,
+            ctx.tempdir,
+            ctx.clang,
+            2 * MAX_REPLAY_CANDIDATES + idx,
+            candidate,
+        ) {
+            Ok(true) => {
+                let witness =
+                    build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, candidate));
+                if witness.is_none() {
+                    eprintln!(
+                        "saf verify: FALSE (BMC replay-confirmed) but witness unconstructible -> emitting false without a witness"
+                    );
+                }
+                return Some(VerdictOutcome {
+                    verdict: format!("false({})", Property::UnreachCall.name()),
+                    witness,
+                    graphml: None,
+                });
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("saf verify: BMC replay of candidate {idx} errored: {e:#} -> continue");
+            }
+        }
+    }
+    None
+}
+
+/// SE lever (`crate::se_interp`): forward symbolic execution candidates, each
+/// confirmed by native replay. Replay indices are offset by `3 * MAX_REPLAY_CANDIDATES`.
+fn se_confirm(
+    ctx: &VerifyCtx,
+    config: &saf_svcomp::PropertyAnalysisConfig,
+) -> Option<VerdictOutcome> {
+    use saf_svcomp::Property;
+    let se = saf_svcomp::enumerate_se_candidates(ctx.module, config, ctx.data_model);
+    if !se.is_empty() {
+        eprintln!(
+            "saf verify: SE enumerated {} candidate(s) (forward)",
+            se.len()
+        );
+    }
+    for (idx, candidate) in se.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
+        match replay_confirms_false(
+            ctx.input,
+            ctx.data_model,
+            ctx.stub,
+            ctx.tempdir,
+            ctx.clang,
+            3 * MAX_REPLAY_CANDIDATES + idx,
+            candidate,
+        ) {
+            Ok(true) => {
+                let witness =
+                    build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, candidate));
+                if witness.is_none() {
+                    eprintln!(
+                        "saf verify: FALSE (SE replay-confirmed) but witness unconstructible -> emitting false without a witness"
+                    );
+                }
+                return Some(VerdictOutcome {
+                    verdict: format!("false({})", Property::UnreachCall.name()),
+                    witness,
+                    graphml: None,
+                });
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("saf verify: SE replay of candidate {idx} errored: {e:#} -> continue");
+            }
+        }
+    }
+    None
+}
+
+/// Fuzz lever wrapper: adapt [`fuzz_confirm_false`] (returns a `FalseCandidate`) to
+/// the routed `Option<VerdictOutcome>` shape.
+fn fuzz_confirm(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    use saf_svcomp::Property;
+    let candidate = fuzz_confirm_false(ctx)?;
+    let witness = build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, &candidate));
+    if witness.is_none() {
+        eprintln!(
+            "saf verify: FALSE (fuzz replay-confirmed) but witness unconstructible -> emitting false without a witness"
+        );
+    }
+    Some(VerdictOutcome {
+        verdict: format!("false({})", Property::UnreachCall.name()),
+        witness,
+        graphml: None,
+    })
+}
+
+/// CBMC lever wrapper: adapt [`cbmc_confirm_false`] to the routed
+/// `Option<VerdictOutcome>` shape.
+fn cbmc_confirm(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    use saf_svcomp::Property;
+    let candidate = cbmc_confirm_false(ctx)?;
+    let witness = build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, &candidate));
+    if witness.is_none() {
+        eprintln!(
+            "saf verify: FALSE (CBMC replay-confirmed) but witness unconstructible -> emitting false without a witness"
+        );
+    }
+    Some(VerdictOutcome {
+        verdict: format!("false({})", Property::UnreachCall.name()),
+        witness,
+        graphml: None,
+    })
+}
+
 /// The `unreach-call` FALSE pipeline (plan 192 §1.6 / slice 1c), now emitting a
 /// violation witness alongside each sound FALSE.
 ///
@@ -1424,181 +1557,44 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         }
     }
 
-    // Stage 4b (BMC base case, fixed-k): the Z3 path stages above model each guard
-    // operand as a fresh unconstrained variable, so a guard defined by ARITHMETIC of
-    // the nondet inputs (`y = x*3+7; if (y==100)`) is proposed with the guard operand
-    // pinned but the INPUT `x` left free — the replay then fails. The BMC engine
-    // instead symbolically executes from `main` with every value modelled as a
-    // bitvector of its width, so the Z3 model gives the actual nondet INPUT vector
-    // that makes the arithmetic guard true. Two sub-engines: the acyclic base case
-    // (k = 1) and an INCREMENTAL unwinder that grows the loop bound in ONE persistent
-    // Z3 context, gating each depth's reach_error check with a `check-sat-assuming`
-    // activation literal — so a violation gated behind several loop iterations
-    // (`for(i=0;i<20;i++) s+=x; if(s==60) reach_error();`) is reached an order of
-    // magnitude deeper per solver budget than re-solving whole paths. Candidates go
-    // through the SAME native-replay gate (the sole arbiter), so a spurious/imprecise
-    // model can only ever yield `unknown`. Runs before the blind fuzzer because it
-    // cracks arithmetic guards the fuzzer's blind/CmpLog search cannot (the input is
-    // a preimage of the compared value).
-    let bmc = saf_svcomp::enumerate_bmc_candidates(ctx.module, &config, ctx.data_model);
-    if !bmc.is_empty() {
+    if candidates.is_empty() && interproc.is_empty() {
         eprintln!(
-            "saf verify: BMC enumerated {} candidate(s) (fixed-k + incremental)",
-            bmc.len()
-        );
-    }
-    for (idx, candidate) in bmc.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
-        match replay_confirms_false(
-            ctx.input,
-            ctx.data_model,
-            ctx.stub,
-            ctx.tempdir,
-            ctx.clang,
-            2 * MAX_REPLAY_CANDIDATES + idx,
-            candidate,
-        ) {
-            Ok(true) => {
-                let witness =
-                    build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, candidate));
-                if witness.is_none() {
-                    eprintln!(
-                        "saf verify: FALSE (BMC replay-confirmed) but witness unconstructible -> emitting false without a witness"
-                    );
-                }
-                return VerdictOutcome {
-                    verdict: format!("false({})", Property::UnreachCall.name()),
-                    witness,
-                    graphml: None,
-                };
-            }
-            Ok(false) => {}
-            Err(e) => {
-                eprintln!("saf verify: BMC replay of candidate {idx} errored: {e:#} -> continue");
-            }
-        }
-    }
-
-    // Stage 4c (KLEE-style forward symbolic execution): the fixed-k BMC engine
-    // above only unwinds loops to their acyclic base case (k = 1), so a violation
-    // reachable only after a loop runs a few iterations (`for(i=0;i<4;i++) s+=x;
-    // if(s==40) reach_error();`) is proposed with the accumulator un-grown and the
-    // guard UNSAT. The SE engine forward-executes from the error function's entry,
-    // forking on Z3-feasible branches and unwinding loops to a bounded per-block
-    // visit cap, so the model gives the actual nondet INPUT vector — in execution
-    // order, so per-iteration nondet reads each get their own value. Gated to
-    // functions with a nondet input AND a CFG cycle (the loop-carried class BMC
-    // misses). Candidates go through the SAME native-replay gate (the sole
-    // arbiter), so a spurious/imprecise model can only ever yield `unknown`.
-    let se = saf_svcomp::enumerate_se_candidates(ctx.module, &config, ctx.data_model);
-    if !se.is_empty() {
-        eprintln!(
-            "saf verify: SE enumerated {} candidate(s) (forward)",
-            se.len()
-        );
-    }
-    for (idx, candidate) in se.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
-        match replay_confirms_false(
-            ctx.input,
-            ctx.data_model,
-            ctx.stub,
-            ctx.tempdir,
-            ctx.clang,
-            3 * MAX_REPLAY_CANDIDATES + idx,
-            candidate,
-        ) {
-            Ok(true) => {
-                let witness =
-                    build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, candidate));
-                if witness.is_none() {
-                    eprintln!(
-                        "saf verify: FALSE (SE replay-confirmed) but witness unconstructible -> emitting false without a witness"
-                    );
-                }
-                return VerdictOutcome {
-                    verdict: format!("false({})", Property::UnreachCall.name()),
-                    witness,
-                    graphml: None,
-                };
-            }
-            Ok(false) => {}
-            Err(e) => {
-                eprintln!("saf verify: SE replay of candidate {idx} errored: {e:#} -> continue");
-            }
-        }
-    }
-
-    let total = candidates.len() + interproc.len() + bmc.len() + se.len();
-    if total == 0 {
-        eprintln!(
-            "saf verify: no FALSE candidate proposed (reach_error not proven reachable) -> unknown"
-        );
-    } else {
-        // Candidates were over-approximated as FALSE but did not reproduce under
-        // concrete replay — the soundness filter that keeps false alarms out.
-        eprintln!(
-            "saf verify: {total} candidate(s) enumerated ({} intraproc + {} interproc + {} bmc + {} se); none reproduced reach_error at runtime -> unknown",
-            candidates.len(),
-            interproc.len(),
-            bmc.len(),
-            se.len()
+            "saf verify: no intra/interprocedural FALSE candidate reproduced reach_error -> routing solver portfolio"
         );
     }
 
-    // Stage 5 (blind byte-stream fuzz): the Z3 stages only reach errors whose
-    // guards its linear-arithmetic model can solve; a guard defined by
-    // nonlinear/opaque arithmetic (`if (x*x==...)`, bit tricks, hashed indices)
-    // leaves reach_error un-proposed. An AFL-style blind mutation loop over a
-    // deterministic byte-stream nondet shim (dictionary = the program's own IR
-    // constants) searches for an input that drives the ORIGINAL program into
-    // reach_error natively. A run that drops the sentinel yields a concrete input
-    // sequence, which is RE-CONFIRMED through the same deterministic replay gate
-    // (R6) before any verdict — so the fuzzer can only ever propose, never
-    // manufacture a wrong FALSE. Runs only when the program has scalar nondet
-    // input to fuzz and a reach_error to reach.
-    if let Some(candidate) = fuzz_confirm_false(ctx) {
-        let witness = build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, &candidate));
-        if witness.is_none() {
-            eprintln!(
-                "saf verify: FALSE (fuzz replay-confirmed) but witness unconstructible -> emitting false without a witness"
-            );
-        }
-        return VerdictOutcome {
-            verdict: format!("false({})", Property::UnreachCall.name()),
-            witness,
-            graphml: None,
+    // Stages 4b-6, portfolio-routed (lever `portfolio-select`). The remaining solver
+    // levers — BMC (fixed-k + incremental), forward SE, blind byte-stream fuzz, and
+    // the bit-precise CBMC oracle — historically ran in ONE fixed order on every
+    // task. Instead, extract a few cheap AIR Booleans once and route to a *ranked,
+    // pruned* sequence:
+    //   * a lever whose internal gate cannot fire (no fuzzable nondet -> BMC/fuzz;
+    //     no loop -> SE/CBMC) is dropped, cutting per-task latency (each predicate is
+    //     a superset of the lever's own gate, so a dropped lever would enumerate zero
+    //     candidates — the verdict is provably unchanged);
+    //   * a non-linear nondet guard (`x*y`/`x/y`/... feeding a comparison), which the
+    //     linear/bit-vector Z3 engines stall on but the fuzzer cracks, promotes the
+    //     fuzzer to the front.
+    // Each lever remains its own sound native-replay-gated confirmer, so routing only
+    // ever changes order/latency, never a verdict. The default plan is the historical
+    // [BMC, SE, fuzz, CBMC] order, so the common case is unchanged.
+    let features = saf_svcomp::UnreachFeatures::extract(ctx.module);
+    let plan = saf_svcomp::plan_unreach(features);
+    eprintln!("saf verify: portfolio plan {plan:?} (features {features:?})");
+    for lever in plan {
+        let outcome = match lever {
+            saf_svcomp::Lever::Bmc => bmc_confirm(ctx, &config),
+            saf_svcomp::Lever::Se => se_confirm(ctx, &config),
+            saf_svcomp::Lever::Fuzz => fuzz_confirm(ctx),
+            saf_svcomp::Lever::Cbmc => cbmc_confirm(ctx),
         };
+        if let Some(outcome) = outcome {
+            return outcome;
+        }
     }
 
-    // Stage 6 (CBMC bit-precise oracle): the blind fuzzer and the Z3 stages both
-    // stall on modular bit-vector transition systems (the hardware-verification-bv
-    // btor2c cluster: masked `SORT_n` arithmetic behind a `for(;;)` step loop) —
-    // SAF's linear-integer models over-approximate and blind mutation cannot crack
-    // the deep multi-step guards. The now-provisioned CBMC 6.x is a bit-precise
-    // SAT-backed BMC: unwinding the step loop a fixed `k` times and solving the
-    // resulting propositional formula yields the exact nondet input vector that
-    // reaches reach_error. CBMC is used ONLY as an oracle — the vector it reports is
-    // parsed into a nondet sequence and RE-CONFIRMED through the SAME native-replay
-    // gate (the sole arbiter, R6), so a wrong/over-approximate CBMC model can only
-    // ever yield `unknown`. Gated behind a cheap structural pre-filter (loops
-    // present AND scalar-integer nondet AND no float/pointer nondet) and run LAST,
-    // only when every earlier stage abstained, so its cost is paid rarely. Degrades
-    // to a no-op when the CBMC binary is not provisioned ($SAF_CBMC absent).
-    match cbmc_confirm_false(ctx) {
-        Some(candidate) => {
-            let witness = build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, &candidate));
-            if witness.is_none() {
-                eprintln!(
-                    "saf verify: FALSE (CBMC replay-confirmed) but witness unconstructible -> emitting false without a witness"
-                );
-            }
-            VerdictOutcome {
-                verdict: format!("false({})", Property::UnreachCall.name()),
-                witness,
-                graphml: None,
-            }
-        }
-        None => unknown_outcome(),
-    }
+    eprintln!("saf verify: portfolio exhausted (no lever reproduced reach_error) -> unknown");
+    unknown_outcome()
 }
 
 /// Deterministic cap on blind-fuzz iterations (mutation trials), overridable via

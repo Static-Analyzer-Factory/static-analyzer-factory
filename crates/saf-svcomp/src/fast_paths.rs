@@ -883,6 +883,24 @@ pub fn module_reachable_is_loop_free(module: &AirModule) -> bool {
     reachable_is_loop_free(&cfgs, &reachable)
 }
 
+/// Does **any** defined function in the module contain a CFG loop (back-edge)?
+///
+/// A whole-module over-approximation of loop presence: unlike
+/// [`module_reachable_is_loop_free`], it ignores call-graph reachability, so it
+/// returns `true` whenever *any* function has a loop even if that function is only
+/// reachable through an indirect call the call graph cannot resolve. This makes
+/// `!module_has_any_loop` a **sound** "no loop can possibly execute" test — used by
+/// the portfolio router to prune loop-only levers (SE / CBMC) without risk of
+/// dropping a lever that could still fire via an unresolved indirect edge.
+#[must_use]
+pub fn module_has_any_loop(module: &AirModule) -> bool {
+    module
+        .functions
+        .iter()
+        .filter(|f| !f.is_declaration)
+        .any(|f| cfg_has_loops(&Cfg::build(f)))
+}
+
 /// Is every reachable-from-`main` loop provably **ranked** (or is the sub-program
 /// loop-free)?
 ///
