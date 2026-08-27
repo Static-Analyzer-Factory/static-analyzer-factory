@@ -212,3 +212,28 @@ any arm that raises FP+wrong-TRUE is hard-reverted (ALERT_SENTINEL_REGRESSION). 
 the *levers* only stops the redundant fix-attempts; the *gate* still guards regressions.
 Future arms: do NOT re-investigate these three. Focus on the recall frontier
 (input-synthesis/last-mile + confirmation-gap).
+
+## SENTINEL UPDATE 2026-08-27 — RETIREMENT REVERSED (fresh at-scale run PROVES the bugs are LIVE)
+
+The 2026-08-26 retirement was WRONG. A fresh full-svcomp25 run on HEAD (48,380 tasks,
+completed 2026-08-27) FAILED soundness: FP=7 + wrong-TRUE=1. FIVE of the eight violations
+are EXACTLY the three sentinel targets (all -16/-32):
+  - overflow-nonlinear-sound: no-overflow FP on nla-digbench/hard2,
+    termination-crafted-lit/ChawdharyCookGulwaniSagivYang-ESOP2008-easy2,
+    termination-numeric/twisted.
+  - fuzz-pointer-sound: unreach-call FP on aws-c-common/aws_string_new_from_array_harness
+    (the coverage-guided fuzzer reached reach_error via (void*)__VERIFIER_nondet_ulong()).
+  - termination-recursion-sound: termination WRONG-TRUE on
+    termination-memory-linkedlists/ll_create_rec-alloca-1 (expected FALSE; SAF proves TRUE).
+    [arm-146 "relabeled to TRUE, nothing to fix" was a MISREAD.]
+Plus THREE MORE in the same root class, not yet sentinel-named: unreach-call FP on
+floats-esbmc-regression/nearbyint2, floats-esbmc-regression/rint2 (float nondet) and
+recursified_nla-digbench/recursified_geo1-u (nonlinear). ROOT CLASS = SAF native-replay /
+fuzz confirmation can spuriously reach reach_error when driven by nondet values the real
+program semantics/precondition forbid (pointer / nonlinear-arith / float).
+
+The three levers are UN-PARKED. The fix must be PRECISE (a targeted abstain on the genuinely
+unsound case, NOT a blunt gate — the naive overflow-nonlinear abstain reverted -5/-1). The
+per-arm SAMPLED (1000-task) gate does NOT see these; only a full-reservoir run does — treat
+the soundness-sentinel.jsonl gate as necessary-but-not-sufficient. Do NOT re-retire without a
+full-reservoir FP=0 run confirming the fix.
