@@ -1018,6 +1018,20 @@ fn compile_to_ir_with(
         .arg(stub);
         if let Some(neutralizer) = assert_neutralizer {
             cmd.arg("-include").arg(neutralizer);
+            // Pass-2 only (this path runs solely when pass-1 already FAILED). Predefine
+            // clang's/glibc's max_align_t guard macros so clang does NOT inject its
+            // builtin `max_align_t` typedef. Some SV-COMP tasks (coreutils-v8.31) ship
+            // their own `typedef struct max_align_t max_align_t;`, which otherwise
+            // collides with clang's builtin ("typedef redefinition with different
+            // types") — a HARD error that `-Wno-everything` does not silence. Clang
+            // injects its builtin BEFORE any `-include` header is processed, so a
+            // `#define` in the neutralizer header is too late; a command-line `-D`
+            // predefine is the only thing that precedes the builtin. Zero-regression: a
+            // task that legitimately uses `max_align_t` (via <stddef.h>) and already
+            // compiled never reaches pass-2; a task that reaches pass-2 and truly needs
+            // clang's `max_align_t` simply stays inconclusive (as it already was).
+            cmd.arg("-D__CLANG_MAX_ALIGN_T_DEFINED=1")
+                .arg("-D__DEFINED_max_align_t=1");
         }
         cmd.arg("-I").arg(srcdir).arg(input).arg("-o").arg(&ir);
         cmd
@@ -1741,6 +1755,9 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
             .arg(srcdir)
             .arg(ctx.input)
             .arg(&driver_src)
+            // libm: neural-networks tasks call sqrtf/expf/logf; without -lm the native
+            // replay link fails ("undefined reference to sqrtf") -> Unknown. Always safe.
+            .arg("-lm")
             .arg("-o")
             .arg(&harness)
             .stdout(Stdio::null())
@@ -2293,6 +2310,9 @@ fn conc_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             .arg(&driver_src)
             .arg("-Wl,--wrap=pthread_create,--wrap=pthread_join,--wrap=pthread_exit")
             .arg("-lpthread")
+            // libm: split-symbol amalgamations (seq-mthreaded) may reference math libc
+            // symbols; without -lm the native replay link fails -> Unknown. Always safe.
+            .arg("-lm")
             .arg("-o")
             .arg(&harness)
             .stdout(Stdio::null())
@@ -2519,6 +2539,9 @@ fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             .arg(&driver_src)
             .arg("-Wl,--wrap=pthread_create,--wrap=pthread_join,--wrap=pthread_exit")
             .arg("-lpthread")
+            // libm: split-symbol amalgamations may reference math libc symbols; without
+            // -lm the native replay link fails -> Unknown. Always safe.
+            .arg("-lm")
             .arg("-o")
             .arg(&harness)
             .stdout(Stdio::null())
@@ -2763,6 +2786,9 @@ fn conc_shim_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
 --wrap=pthread_mutex_lock,--wrap=pthread_mutex_unlock,--wrap=pthread_mutex_trylock",
             )
             .arg("-lpthread")
+            // libm: split-symbol amalgamations may reference math libc symbols; without
+            // -lm the native replay link fails -> Unknown. Always safe.
+            .arg("-lm")
             .arg("-o")
             .arg(&harness)
             .stdout(Stdio::null())
@@ -3613,6 +3639,9 @@ fn replay_confirms_false(
             .arg(srcdir)
             .arg(input)
             .arg(&driver_src)
+            // libm: neural-networks tasks call sqrtf/expf/logf; without -lm the native
+            // replay link fails ("undefined reference to sqrtf") -> Unknown. Always safe.
+            .arg("-lm")
             .arg("-o")
             .arg(&harness)
             .stdout(Stdio::null())
@@ -3926,6 +3955,9 @@ fn asan_confirm(
                 .arg(srcdir)
                 .arg(input)
                 .arg(&driver_src)
+                // libm: neural-networks / split-symbol tasks may reference sqrtf/expf/logf;
+                // without -lm the native replay link fails -> inconclusive. Always safe.
+                .arg("-lm")
                 .arg("-o")
                 .arg(&harness)
                 .stdout(Stdio::null())
@@ -4166,6 +4198,9 @@ fn asan_fuzz_pass(
             .arg(srcdir)
             .arg(input)
             .arg(&driver_src)
+            // libm: neural-networks / split-symbol tasks may reference sqrtf/expf/logf;
+            // without -lm the native replay link fails -> inconclusive. Always safe.
+            .arg("-lm")
             .arg("-o")
             .arg(&harness)
             .stdout(Stdio::null())
@@ -5040,6 +5075,9 @@ fn tsan_confirm(
             .arg(srcdir)
             .arg(input)
             .arg(&driver_src)
+            // libm: split-symbol / math-using concurrency tasks may reference libm
+            // symbols; without -lm the native replay link fails -> inconclusive. Safe.
+            .arg("-lm")
             .arg("-o")
             .arg(&harness)
             .stdout(Stdio::null())
@@ -5173,6 +5211,9 @@ fn ubsan_confirm(
             .arg(srcdir)
             .arg(input)
             .arg(&driver_src)
+            // libm: neural-networks / split-symbol tasks may reference sqrtf/expf/logf;
+            // without -lm the native replay link fails -> inconclusive. Always safe.
+            .arg("-lm")
             .arg("-o")
             .arg(&harness)
             .stdout(Stdio::null())
