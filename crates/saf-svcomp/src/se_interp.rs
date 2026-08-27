@@ -416,6 +416,11 @@ struct Interp<'a> {
     con_counter: u32,
     steps: usize,
     solver_calls: usize,
+    /// Coarse abort-prune set: blocks from which a `reach_error` call is still
+    /// CFG-reachable. A fork target outside this set can never reach the error, so
+    /// it is not explored — the bounded budget is spent on error-relevant paths.
+    /// Empty ⇒ prune disabled (defensive: never regresses).
+    error_blocks: BTreeSet<BlockId>,
     /// Feasibility cache keyed on the sorted constraint-id set of a query.
     cache: BTreeMap<Vec<u32>, bool>,
 }
@@ -424,6 +429,7 @@ impl<'a> Interp<'a> {
     fn new(module: &'a AirModule, func: &'a AirFunction, data_model: DataModel) -> Self {
         let block_by_id = func.blocks.iter().map(|b| (b.id, b)).collect();
         let ptr_base = compute_ptr_base(func);
+        let error_blocks = crate::slicing::error_reaching_blocks(func, module);
         Self {
             module,
             data_model,
@@ -433,6 +439,7 @@ impl<'a> Interp<'a> {
             con_counter: 0,
             steps: 0,
             solver_calls: 0,
+            error_blocks,
             cache: BTreeMap::new(),
         }
     }
@@ -697,6 +704,15 @@ impl<'a> Interp<'a> {
 
     // -- Terminator forking ---------------------------------------------
 
+    /// Coarse abort-prune predicate: is a `reach_error` still CFG-reachable from
+    /// `target`? An empty prune set disables the filter (defensive — never
+    /// regresses). Pruning a non-reaching target is sound: no execution through it
+    /// can reach the error, so the path is dead (see
+    /// [`crate::slicing::error_reaching_blocks`]).
+    fn relevant(&self, target: BlockId) -> bool {
+        self.error_blocks.is_empty() || self.error_blocks.contains(&target)
+    }
+
     fn step_terminator(
         &mut self,
         mut state: State,
@@ -706,30 +722,40 @@ impl<'a> Interp<'a> {
     ) {
         match &term.op {
             Operation::Br { target } => {
-                push_succ(state, cur, *target, worklist);
+                if self.relevant(*target) {
+                    push_succ(state, cur, *target, worklist);
+                }
             }
             Operation::CondBr {
                 then_target,
                 else_target,
             } => {
                 if then_target == else_target {
-                    push_succ(state, cur, *then_target, worklist);
+                    if self.relevant(*then_target) {
+                        push_succ(state, cur, *then_target, worklist);
+                    }
                     return;
                 }
                 let Some(&cond) = term.operands.first() else {
                     return;
                 };
-                let then_con = self.cond_con(&mut state, cond, false);
-                if self.feasible(&state, &[then_con.clone()]) {
-                    let mut s = state.clone();
-                    s.constraints.push(then_con);
-                    push_succ(s, cur, *then_target, worklist);
+                // Guard the coarse abort-prune BEFORE the feasibility solve so a
+                // dead successor costs neither a fork nor a solver call.
+                if self.relevant(*then_target) {
+                    let then_con = self.cond_con(&mut state, cond, false);
+                    if self.feasible(&state, &[then_con.clone()]) {
+                        let mut s = state.clone();
+                        s.constraints.push(then_con);
+                        push_succ(s, cur, *then_target, worklist);
+                    }
                 }
-                let else_con = self.cond_con(&mut state, cond, true);
-                if self.feasible(&state, &[else_con.clone()]) {
-                    let mut s = state.clone();
-                    s.constraints.push(else_con);
-                    push_succ(s, cur, *else_target, worklist);
+                if self.relevant(*else_target) {
+                    let else_con = self.cond_con(&mut state, cond, true);
+                    if self.feasible(&state, &[else_con.clone()]) {
+                        let mut s = state.clone();
+                        s.constraints.push(else_con);
+                        push_succ(s, cur, *else_target, worklist);
+                    }
                 }
             }
             Operation::Switch { default, cases } => {
@@ -765,6 +791,11 @@ impl<'a> Interp<'a> {
         }
 
         for t in targets {
+            // Coarse abort-prune: skip a case/default target that can no longer
+            // reach the error (sound; saves the per-target feasibility solve).
+            if !self.relevant(t) {
+                continue;
+            }
             let matching: Vec<i64> = cases
                 .iter()
                 .filter(|(_, tt)| *tt == t)
@@ -1587,6 +1618,31 @@ mod tests {
         assert_eq!(a.len(), b.len());
         assert_eq!(a[0].nondet_sequence, b[0].nondet_sequence);
         assert_eq!(a[0].block_path, b[0].block_path);
+    }
+
+    #[test]
+    fn abort_prune_keeps_error_path_and_drops_dead_sink() {
+        // On the real mem2reg'd loop fixture: the reach_error block (bid 14) and
+        // every block that can flow to it stay in the coarse abort-prune set, while
+        // the non-error `ret` sink (bid 15) is excluded — so the SE fork engine
+        // never wastes its bounded budget on the ret side.
+        let module = build_loop_module(40);
+        let main = module.function_by_name("main").unwrap();
+        let reaching = crate::slicing::error_reaching_blocks(main, &module);
+        assert!(reaching.contains(&bid(14)), "reach_error block kept");
+        assert!(reaching.contains(&bid(13)), "exit block reaches the error");
+        assert!(reaching.contains(&bid(10)), "entry reaches the error");
+        assert!(
+            !reaching.contains(&bid(15)),
+            "the ret sink cannot reach reach_error → pruned"
+        );
+        // And SE still solves the guard (x = 10 ⇒ s = 40) with the prune active.
+        let config = PropertyAnalysisConfig::default();
+        let cands = enumerate_se_candidates(&module, &config, DataModel::LP64);
+        assert!(
+            !cands.is_empty(),
+            "SE must still find the candidate under the abort-prune"
+        );
     }
 
     #[test]

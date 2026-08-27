@@ -30,8 +30,8 @@
 
 use crate::fuzz::{INPUT_LEN, MAX_DICT_ENTRIES, harvest_dictionary};
 use crate::property::{ASSUME_FUNCTIONS, REACH_ERROR_NAMES};
-use saf_core::air::{AirModule, BinaryOp, Constant, Operation};
-use saf_core::ids::{InstId, ValueId};
+use saf_core::air::{AirBlock, AirFunction, AirModule, BinaryOp, Constant, Operation};
+use saf_core::ids::{BlockId, InstId, ValueId};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The result of a backward slice from the `reach_error` criteria.
@@ -244,6 +244,79 @@ pub fn backward_slice(module: &AirModule) -> Slice {
     }
 
     slice
+}
+
+/// Successor blocks of `block`'s terminator (empty for `ret` / `unreachable` /
+/// no terminator). Mirrors the CFG edges an execution can follow out of `block`.
+fn block_successors(block: &AirBlock) -> Vec<BlockId> {
+    match block.terminator().map(|t| &t.op) {
+        Some(Operation::Br { target }) => vec![*target],
+        Some(Operation::CondBr {
+            then_target,
+            else_target,
+        }) => vec![*then_target, *else_target],
+        Some(Operation::Switch { default, cases }) => {
+            let mut out = vec![*default];
+            out.extend(cases.iter().map(|(_, t)| *t));
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The **coarse abort-prune** set: blocks of `func` from which a direct
+/// `reach_error` / `__VERIFIER_error` call site is reachable along CFG successor
+/// edges (back edges included). This is the block-level backward slice from the
+/// `unreach-call` criteria — the executable-slice's "what can still reach the
+/// error" projection.
+///
+/// # Why an engine may soundly ABORT any path leaving this set
+///
+/// If a block `B` is not in the returned set, then no CFG path `B → … → error`
+/// exists, so *no* execution passing through `B` can reach the error — the path
+/// is dead for `unreach-call`. Conversely, every block that lies on a real path
+/// to the error is, by construction, in the set (it reaches the error along that
+/// very path). Therefore dropping a successor outside the set removes only dead
+/// search and can never discard a genuine witness path. A symbolic/BMC engine
+/// bounded by a step/state/solver budget can spend that budget on error-relevant
+/// paths instead, finishing on programs whose error-irrelevant branching would
+/// otherwise exhaust it — a pure scalability multiplier, never a soundness or
+/// recall change (dead subtrees only ever spawn dead subtrees).
+///
+/// Intraprocedural and consistent with the SE lever's error detection (both key
+/// on [`REACH_ERROR_NAMES`] direct calls); an error inside a callee is invisible
+/// here, matching the caller's own direct-call gate.
+#[must_use]
+pub fn error_reaching_blocks(func: &AirFunction, module: &AirModule) -> BTreeSet<BlockId> {
+    let mut preds: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
+    let mut queue: VecDeque<BlockId> = VecDeque::new();
+    let mut reaching: BTreeSet<BlockId> = BTreeSet::new();
+
+    for block in &func.blocks {
+        for succ in block_successors(block) {
+            preds.entry(succ).or_default().push(block.id);
+        }
+        let has_error = block.instructions.iter().any(|i| {
+            matches!(&i.op, Operation::CallDirect { callee }
+                if module
+                    .function(*callee)
+                    .is_some_and(|t| REACH_ERROR_NAMES.contains(&t.name.as_str())))
+        });
+        if has_error && reaching.insert(block.id) {
+            queue.push_back(block.id);
+        }
+    }
+
+    while let Some(b) = queue.pop_front() {
+        if let Some(ps) = preds.get(&b) {
+            for &p in ps {
+                if reaching.insert(p) {
+                    queue.push_back(p);
+                }
+            }
+        }
+    }
+    reaching
 }
 
 /// Build a fuzz dictionary that FRONT-LOADS the slice's guard constants (so they
@@ -469,6 +542,149 @@ mod tests {
             slice.instructions.contains(&InstId::new(100)),
             "icmp sliced"
         );
+    }
+
+    /// CFG: bb0 -CondBr-> bb1(reach_error) / bb2 -Br-> bb3(ret). Only bb0 and bb1
+    /// can reach the error; bb2/bb3 are a dead subtree that a solver may abort.
+    #[test]
+    fn error_reaching_blocks_prunes_dead_subtree() {
+        let reach_id = FunctionId::new(1);
+        let (bb0, bb1, bb2, bb3) = (
+            BlockId::new(20),
+            BlockId::new(21),
+            BlockId::new(22),
+            BlockId::new(23),
+        );
+
+        let term = |id: u128, op: Operation| Instruction {
+            id: InstId::new(id),
+            op,
+            operands: vec![],
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        };
+
+        let mut b0 = AirBlock::new(bb0);
+        b0.instructions = vec![Instruction {
+            id: InstId::new(100),
+            op: Operation::CondBr {
+                then_target: bb1,
+                else_target: bb2,
+            },
+            operands: vec![ValueId::new(9)],
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        }];
+        let mut b1 = AirBlock::new(bb1);
+        b1.instructions = vec![
+            Instruction {
+                id: InstId::new(101),
+                op: Operation::CallDirect { callee: reach_id },
+                operands: vec![],
+                dst: None,
+                span: None,
+                symbol: None,
+                result_type: None,
+                extensions: BTreeMap::new(),
+            },
+            term(102, Operation::Ret),
+        ];
+        let mut b2 = AirBlock::new(bb2);
+        b2.instructions = vec![term(103, Operation::Br { target: bb3 })];
+        let mut b3 = AirBlock::new(bb3);
+        b3.instructions = vec![term(104, Operation::Ret)];
+
+        let func = AirFunction {
+            id: FunctionId::new(2),
+            name: "main".to_string(),
+            params: vec![],
+            blocks: vec![b0, b1, b2, b3],
+            entry_block: Some(bb0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(decl(1, "reach_error"));
+        m.functions.push(func.clone());
+
+        let reaching = error_reaching_blocks(&func, &m);
+        assert!(reaching.contains(&bb0), "entry reaches error");
+        assert!(reaching.contains(&bb1), "error block reaches itself");
+        assert!(!reaching.contains(&bb2), "dead subtree pruned");
+        assert!(!reaching.contains(&bb3), "dead subtree pruned");
+    }
+
+    /// A back edge into the error path must keep the loop body in the reaching set.
+    #[test]
+    fn error_reaching_blocks_follows_back_edges() {
+        let reach_id = FunctionId::new(1);
+        let (bb0, bb1) = (BlockId::new(30), BlockId::new(31));
+        // bb0 -Br-> bb1 ; bb1 -CondBr-> bb0 (back edge) / bb1-self is error.
+        let mut b0 = AirBlock::new(bb0);
+        b0.instructions = vec![Instruction {
+            id: InstId::new(200),
+            op: Operation::Br { target: bb1 },
+            operands: vec![],
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        }];
+        let mut b1 = AirBlock::new(bb1);
+        b1.instructions = vec![
+            Instruction {
+                id: InstId::new(201),
+                op: Operation::CallDirect { callee: reach_id },
+                operands: vec![],
+                dst: None,
+                span: None,
+                symbol: None,
+                result_type: None,
+                extensions: BTreeMap::new(),
+            },
+            Instruction {
+                id: InstId::new(202),
+                op: Operation::CondBr {
+                    then_target: bb0,
+                    else_target: bb1,
+                },
+                operands: vec![ValueId::new(9)],
+                dst: None,
+                span: None,
+                symbol: None,
+                result_type: None,
+                extensions: BTreeMap::new(),
+            },
+        ];
+        let func = AirFunction {
+            id: FunctionId::new(2),
+            name: "main".to_string(),
+            params: vec![],
+            blocks: vec![b0, b1],
+            entry_block: Some(bb0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(decl(1, "reach_error"));
+        m.functions.push(func.clone());
+        let reaching = error_reaching_blocks(&func, &m);
+        assert!(
+            reaching.contains(&bb0),
+            "predecessor of error via back edge"
+        );
+        assert!(reaching.contains(&bb1), "error block");
     }
 
     #[test]
