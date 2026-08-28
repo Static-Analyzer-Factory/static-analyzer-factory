@@ -3,7 +3,7 @@
 //! Given two program points, checks if any feasible CFG path connects them
 //! by enumerating paths and checking Z3 guard feasibility.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use saf_core::air::AirModule;
 use saf_core::ids::{BlockId, FunctionId, ValueId};
@@ -186,12 +186,55 @@ pub fn block_paths_between(
     enumerate_paths(from, to, &cfg, max_paths)
 }
 
+/// The set of blocks from which `to` is reachable along CFG successor edges
+/// (`to` itself included). Computed by a backward BFS over the reverse CFG.
+///
+/// This is the block-level backward slice of `to`: a coarse abort-prune set. Any
+/// simple path `from → … → to` passes exclusively through blocks in this set (each
+/// prefix's remaining suffix witnesses that the prefix's tail reaches `to`), and
+/// no block *outside* it lies on any path to `to`. So restricting a path search to
+/// this set never drops a `from → to` path — it only skips dead subtrees.
+fn blocks_reaching(to: BlockId, cfg: &Cfg) -> BTreeSet<BlockId> {
+    let mut reaching: BTreeSet<BlockId> = BTreeSet::new();
+    let mut queue: VecDeque<BlockId> = VecDeque::new();
+    reaching.insert(to);
+    queue.push_back(to);
+    while let Some(b) = queue.pop_front() {
+        if let Some(preds) = cfg.predecessors.get(&b) {
+            for &p in preds {
+                if reaching.insert(p) {
+                    queue.push_back(p);
+                }
+            }
+        }
+    }
+    reaching
+}
+
 /// Enumerate simple paths from `from` to `to` in a CFG using BFS.
 ///
 /// Returns up to `max_paths` unique paths. Each path is a sequence of `BlockId`.
+///
+/// The BFS frontier is pruned to blocks from which `to` is still reachable (see
+/// [`blocks_reaching`]). This is a **scalability multiplier, not a semantic
+/// change**: the set of simple `from → to` paths — and the BFS order in which they
+/// are discovered — is identical with or without the prune, because every block on
+/// such a path can reach `to` by construction. The prune only stops the queue from
+/// fanning out into error-irrelevant subtrees (whose partial paths never reach `to`
+/// yet can blow up combinatorially — e.g. a diamond chain off to the side), which
+/// on large CFGs is the difference between the enumerator finishing and exhausting
+/// its budget. Callers (BMC base/incremental, the Z3 path checker, R4 interproc
+/// composition) confirm every candidate downstream, so this can only ever change
+/// latency, never a verdict.
 fn enumerate_paths(from: BlockId, to: BlockId, cfg: &Cfg, max_paths: usize) -> Vec<Vec<BlockId>> {
     if from == to {
         return vec![vec![from]];
+    }
+
+    let reaching = blocks_reaching(to, cfg);
+    // If `from` cannot reach `to`, no path exists — skip the search entirely.
+    if !reaching.contains(&from) {
+        return Vec::new();
     }
 
     let mut result = Vec::new();
@@ -209,6 +252,12 @@ fn enumerate_paths(from: BlockId, to: BlockId, cfg: &Cfg, max_paths: usize) -> V
             for &succ in succs {
                 // Avoid cycles: don't revisit blocks in the current path
                 if path.contains(&succ) {
+                    continue;
+                }
+                // Coarse abort-prune: a successor from which `to` is unreachable
+                // can never extend into a `from → to` path, so skip it. Never
+                // drops a real path (every block on one reaches `to`).
+                if !reaching.contains(&succ) {
                     continue;
                 }
 
@@ -418,5 +467,158 @@ mod assume_tests {
             .copied()
             .expect("reachable guarded error path must carry a model value for x");
         assert!(v != 0, "model value {v} must satisfy the guard x != 0");
+    }
+}
+
+#[cfg(test)]
+mod enumerate_prune_tests {
+    use super::{blocks_reaching, enumerate_paths};
+    use crate::cfg::Cfg;
+    use saf_core::ids::{BlockId, FunctionId};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Build a `Cfg` directly from an adjacency list (all fields are public).
+    /// `edges` is `(block, [successors])`; the first block is the entry.
+    fn cfg_from(edges: &[(u128, &[u128])]) -> Cfg {
+        let mut successors: BTreeMap<BlockId, BTreeSet<BlockId>> = BTreeMap::new();
+        let mut predecessors: BTreeMap<BlockId, BTreeSet<BlockId>> = BTreeMap::new();
+        for &(b, _) in edges {
+            successors.entry(BlockId::new(b)).or_default();
+            predecessors.entry(BlockId::new(b)).or_default();
+        }
+        for &(b, succs) in edges {
+            for &s in succs {
+                successors
+                    .entry(BlockId::new(b))
+                    .or_default()
+                    .insert(BlockId::new(s));
+                predecessors
+                    .entry(BlockId::new(s))
+                    .or_default()
+                    .insert(BlockId::new(b));
+            }
+        }
+        let exits = successors
+            .iter()
+            .filter(|(_, s)| s.is_empty())
+            .map(|(b, _)| *b)
+            .collect();
+        Cfg {
+            function: FunctionId::new(1),
+            entry: BlockId::new(edges[0].0),
+            exits,
+            successors,
+            predecessors,
+        }
+    }
+
+    /// Reference enumerator WITHOUT the reaching prune — the original algorithm.
+    /// Used to prove the prune preserves the returned path vector exactly.
+    fn enumerate_unpruned(
+        from: BlockId,
+        to: BlockId,
+        cfg: &Cfg,
+        max_paths: usize,
+    ) -> Vec<Vec<BlockId>> {
+        use std::collections::VecDeque;
+        if from == to {
+            return vec![vec![from]];
+        }
+        let mut result = Vec::new();
+        let mut queue: VecDeque<Vec<BlockId>> = VecDeque::new();
+        queue.push_back(vec![from]);
+        while let Some(path) = queue.pop_front() {
+            if result.len() >= max_paths {
+                break;
+            }
+            let current = *path.last().unwrap();
+            if let Some(succs) = cfg.successors.get(&current) {
+                for &succ in succs {
+                    if path.contains(&succ) {
+                        continue;
+                    }
+                    let mut np = path.clone();
+                    np.push(succ);
+                    if succ == to {
+                        result.push(np);
+                        if result.len() >= max_paths {
+                            break;
+                        }
+                    } else {
+                        queue.push_back(np);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn reaching_set_is_backward_closure() {
+        // 0 -> 1 -> 3(to) ; 0 -> 2 (dead, no edge to 3)
+        let cfg = cfg_from(&[(0, &[1, 2]), (1, &[3]), (2, &[]), (3, &[])]);
+        let reaching = blocks_reaching(BlockId::new(3), &cfg);
+        assert!(reaching.contains(&BlockId::new(3)), "target reaches itself");
+        assert!(reaching.contains(&BlockId::new(1)), "1 -> 3");
+        assert!(reaching.contains(&BlockId::new(0)), "0 -> 1 -> 3");
+        assert!(
+            !reaching.contains(&BlockId::new(2)),
+            "2 cannot reach the target"
+        );
+    }
+
+    #[test]
+    fn prune_preserves_the_path_vector_on_a_diamond() {
+        // Diamond that reconverges before the target, plus a live back path — the
+        // prune must return byte-identically what the unpruned enumerator does.
+        let cfg = cfg_from(&[
+            (0, &[1, 2]),
+            (1, &[3]),
+            (2, &[3]),
+            (3, &[4]),
+            (4, &[]), // to = 4
+        ]);
+        let (from, to) = (BlockId::new(0), BlockId::new(4));
+        for max in [1usize, 2, 4, 8] {
+            assert_eq!(
+                enumerate_paths(from, to, &cfg, max),
+                enumerate_unpruned(from, to, &cfg, max),
+                "pruned enumeration must equal unpruned for max={max}"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_skips_a_dead_subtree() {
+        // 0 -> 1(to). 0 also -> 2, and 2..=9 form an exponential diamond chain that
+        // NEVER reaches 1. The unpruned BFS fans out into 2's subtree; the pruned
+        // one ignores it. Both must return exactly the single real path [0,1].
+        let cfg = cfg_from(&[
+            (0, &[1, 2]),
+            (1, &[]), // to
+            // A side diamond chain rooted at 2, none of which reach 1.
+            (2, &[3, 4]),
+            (3, &[5]),
+            (4, &[5]),
+            (5, &[6, 7]),
+            (6, &[8]),
+            (7, &[8]),
+            (8, &[]),
+        ]);
+        let (from, to) = (BlockId::new(0), BlockId::new(1));
+        let pruned = enumerate_paths(from, to, &cfg, 8);
+        assert_eq!(pruned, vec![vec![BlockId::new(0), BlockId::new(1)]]);
+        assert_eq!(
+            pruned,
+            enumerate_unpruned(from, to, &cfg, 8),
+            "result identical to the unpruned enumerator"
+        );
+    }
+
+    #[test]
+    fn unreachable_target_returns_empty() {
+        // from=0 can only reach 1; to=2 is disconnected.
+        let cfg = cfg_from(&[(0, &[1]), (1, &[]), (2, &[])]);
+        assert!(enumerate_paths(BlockId::new(0), BlockId::new(2), &cfg, 8).is_empty());
     }
 }

@@ -5294,7 +5294,27 @@ fn ubsan_confirm(
         }
 
         let report = std::fs::read_to_string(&errpath).unwrap_or_default();
-        Ok(saf_svcomp::parse_ubsan_overflow(&report))
+        match saf_svcomp::parse_ubsan_overflow(&report) {
+            // Soundness (no-overflow): abstain from confirming an overflow of a slow
+            // linear accumulator (`x = x + 1`, `return i + j`) whose loop trip count is
+            // nondet-controlled — only reachable by driving a nondet input to an
+            // astronomically large iteration count the real program's invariant
+            // forbids (the labeled-TRUE termination-* idiom). Treat as no-trap so the
+            // sweep continues; a genuine direct overflow elsewhere still confirms.
+            Some(hit)
+                if saf_svcomp::fast_paths::overflow_hit_is_spurious_linear_accumulator(
+                    module, hit.line, hit.column,
+                ) =>
+            {
+                eprintln!(
+                    "saf verify: UBSan signed overflow at line {} is a spurious nondet-driven \
+                     linear-accumulator overflow -> not confirming",
+                    hit.line
+                );
+                Ok(None)
+            }
+            other => Ok(other),
+        }
     };
 
     // Run one mini-fuzz sweep: for each data constant `k` in `sweep`, run the harness

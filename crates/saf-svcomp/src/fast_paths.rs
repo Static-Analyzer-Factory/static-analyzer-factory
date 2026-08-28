@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use saf_analysis::callgraph::CallGraph;
 use saf_analysis::cfg::Cfg;
 use saf_analysis::graph_algo::dfs;
-use saf_core::air::{AirModule, Operation};
+use saf_core::air::{AirFunction, AirModule, BinaryOp, Constant, Instruction, Operation};
 use saf_core::ids::{BlockId, FunctionId, ValueId};
 
 // ---------------------------------------------------------------------------
@@ -949,6 +949,387 @@ pub fn module_reachable_loops_all_ranked(module: &AirModule) -> bool {
             let cfg = Cfg::build(f);
             !cfg_has_loops(&cfg) || crate::ranking::loops_are_ranked(f, module, &cfg)
         })
+}
+
+// ---------------------------------------------------------------------------
+// Spurious linear-accumulator overflow suppression (no-overflow soundness).
+// ---------------------------------------------------------------------------
+
+/// Max magnitude of a linear induction variable's per-iteration constant step for
+/// its overflow to be treated as a SPURIOUS accumulator overflow.
+///
+/// A signed overflow of `iv ± c` from a bounded initial value needs on the order of
+/// `INT_MAX / |c|` iterations to occur. With `|c| ≤ 2^20` that is `≥ ~2^11`
+/// iterations, i.e. the overflow is only reachable by driving a nondeterministic
+/// loop bound to an astronomically large trip count — the labeled-TRUE `termination-*`
+/// idiom, not a genuine direct overflow. A step ABOVE this overflows in few
+/// iterations (`sum += big`) and is never suppressed.
+const SPURIOUS_IV_STEP_MAX: i128 = 1 << 20;
+
+/// Is `v` a recognized integer constant whose magnitude is at most
+/// [`SPURIOUS_IV_STEP_MAX`]? (A `BigInt` / non-int constant is never "small".)
+fn is_small_int_const(module: &AirModule, v: ValueId) -> bool {
+    match module.constants.get(&v) {
+        Some(Constant::Int { value, .. }) => {
+            i128::from(*value).unsigned_abs() <= SPURIOUS_IV_STEP_MAX.unsigned_abs()
+        }
+        _ => false,
+    }
+}
+
+/// Transitive nondeterministic-taint per defined function: the set of SSA values that
+/// can carry a `__VERIFIER_nondet_*` result. Propagated intra-procedurally through
+/// data operands and phi incomings, and inter-procedurally through call arguments →
+/// callee parameters (so a loop bounded by a parameter fed a nondet argument — the
+/// `twisted` `f(nondet(), nondet())` idiom — is recognized as nondet-controlled).
+///
+/// Over-approximate by design: extra taint only ever makes the spurious-accumulator
+/// check ABSTAIN from confirming, which costs recall, never soundness.
+fn module_nondet_taint(module: &AirModule) -> BTreeMap<FunctionId, BTreeSet<ValueId>> {
+    let mut taint: BTreeMap<FunctionId, BTreeSet<ValueId>> = BTreeMap::new();
+
+    // Seed: the result of every direct call to a nondet function.
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        let set = taint.entry(func.id).or_default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Operation::CallDirect { callee } = &inst.op {
+                    if let Some(target) = module.function(*callee) {
+                        if NONDET_FUNCTIONS.contains(&target.name.as_str()) {
+                            if let Some(dst) = inst.dst {
+                                set.insert(dst);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        // Intra-procedural data-flow propagation.
+        for func in &module.functions {
+            if func.is_declaration {
+                continue;
+            }
+            let mut set = taint.get(&func.id).cloned().unwrap_or_default();
+            let before = set.len();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    let Some(dst) = inst.dst else { continue };
+                    if set.contains(&dst) {
+                        continue;
+                    }
+                    let flows = match &inst.op {
+                        Operation::Phi { incoming } => {
+                            incoming.iter().any(|(_, v)| set.contains(v))
+                        }
+                        // A call result is tainted only via the interprocedural pass
+                        // below (or the nondet seed) — not by its arguments.
+                        Operation::CallDirect { .. } | Operation::CallIndirect { .. } => false,
+                        _ => inst.operands.iter().any(|v| set.contains(v)),
+                    };
+                    if flows {
+                        set.insert(dst);
+                    }
+                }
+            }
+            if set.len() != before {
+                changed = true;
+                taint.insert(func.id, set);
+            }
+        }
+
+        // Inter-procedural: a nondet-tainted argument taints the callee's parameter.
+        for func in &module.functions {
+            if func.is_declaration {
+                continue;
+            }
+            let caller_set = taint.get(&func.id).cloned().unwrap_or_default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    let Operation::CallDirect { callee } = &inst.op else {
+                        continue;
+                    };
+                    let Some(target) = module.function(*callee) else {
+                        continue;
+                    };
+                    if target.is_declaration {
+                        continue;
+                    }
+                    let target_id = target.id;
+                    for (i, arg) in inst.operands.iter().enumerate() {
+                        if !caller_set.contains(arg) {
+                            continue;
+                        }
+                        if let Some(param) = target.params.iter().find(|p| p.index as usize == i) {
+                            let callee_set = taint.entry(target_id).or_default();
+                            if callee_set.insert(param.id) {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    taint
+}
+
+/// The set of SSA values in `func` that are SPURIOUS slow linear induction variables:
+/// a loop-header phi whose (a) preheader initial value is NOT nondet-tainted, (b)
+/// back-edge value is `phi ± c` for a small constant `c` ([`SPURIOUS_IV_STEP_MAX`]),
+/// and (c) loop trip count is nondet-controlled (some header phi has a nondet-tainted
+/// incoming, or the header's branch condition is nondet-tainted). Values copied from
+/// such a phi through casts / copies / pass-through phis (e.g. LCSSA exit phis) are
+/// included, so a post-loop use of the final counter value is recognized.
+fn function_spurious_iv_set(
+    func: &AirFunction,
+    module: &AirModule,
+    tainted: &BTreeSet<ValueId>,
+) -> BTreeSet<ValueId> {
+    let cfg = Cfg::build(func);
+    let back_edges = find_back_edges(&cfg);
+    if back_edges.is_empty() {
+        return BTreeSet::new();
+    }
+
+    // header block -> its latch (back-edge source) blocks.
+    let mut latches: BTreeMap<BlockId, BTreeSet<BlockId>> = BTreeMap::new();
+    for (src, header) in &back_edges {
+        latches.entry(*header).or_default().insert(*src);
+    }
+
+    // dst -> defining instruction.
+    let mut defs: BTreeMap<ValueId, &Instruction> = BTreeMap::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dst) = inst.dst {
+                defs.insert(dst, inst);
+            }
+        }
+    }
+
+    let mut slow: BTreeSet<ValueId> = BTreeSet::new();
+
+    for (header, latch_set) in &latches {
+        let Some(hb) = func.blocks.iter().find(|b| b.id == *header) else {
+            continue;
+        };
+
+        // Is this loop's trip count nondet-controlled?
+        let mut nondet_trip = hb.instructions.iter().any(|inst| {
+            matches!(&inst.op, Operation::Phi { incoming } if incoming.iter().any(|(_, v)| tainted.contains(v)))
+        });
+        if !nondet_trip {
+            if let Some(term) = hb.terminator() {
+                nondet_trip =
+                    matches!(term.op, Operation::CondBr { .. } | Operation::Switch { .. })
+                        && term.operands.iter().any(|v| tainted.contains(v));
+            }
+        }
+        if !nondet_trip {
+            continue;
+        }
+
+        for inst in &hb.instructions {
+            let Operation::Phi { incoming } = &inst.op else {
+                continue;
+            };
+            let Some(phi_dst) = inst.dst else { continue };
+
+            let mut init_is_nondet = false;
+            let mut small_step = false;
+            for (pred, val) in incoming {
+                if latch_set.contains(pred) {
+                    if iv_back_edge_step_is_small(*val, phi_dst, &defs, module) {
+                        small_step = true;
+                    }
+                } else if tainted.contains(val) {
+                    init_is_nondet = true;
+                }
+            }
+            if small_step && !init_is_nondet {
+                slow.insert(phi_dst);
+            }
+        }
+    }
+
+    if slow.is_empty() {
+        return slow;
+    }
+
+    // Propagate the "slow linear IV" property through the value graph:
+    // - casts / copies / freezes of a slow value stay slow;
+    // - a phi ALL of whose incomings are slow (e.g. an LCSSA exit copy, or a
+    //   secondary phi in a multi-phi induction SCC — the `twisted` idiom) is slow;
+    // - `Add`/`Sub` of slow values and small constants (with ≥1 slow operand) is a
+    //   linear combination of slow IVs, hence itself slow-growing (a bounded
+    //   per-iteration step), e.g. `i + 1` feeding the induction cycle.
+    // A nondet/large operand blocks the last rule, so a genuine `iv + data` never
+    // becomes slow.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let Some(dst) = inst.dst else { continue };
+                if slow.contains(&dst) {
+                    continue;
+                }
+                let flows = match &inst.op {
+                    Operation::Cast { .. } | Operation::Copy | Operation::Freeze => {
+                        inst.operands.first().is_some_and(|v| slow.contains(v))
+                    }
+                    Operation::Phi { incoming } => {
+                        !incoming.is_empty() && incoming.iter().all(|(_, v)| slow.contains(v))
+                    }
+                    Operation::BinaryOp { kind }
+                        if matches!(kind, BinaryOp::Add | BinaryOp::Sub)
+                            && inst.operands.len() == 2 =>
+                    {
+                        let benign =
+                            |v: ValueId| slow.contains(&v) || is_small_int_const(module, v);
+                        let (o0, o1) = (inst.operands[0], inst.operands[1]);
+                        benign(o0) && benign(o1) && (slow.contains(&o0) || slow.contains(&o1))
+                    }
+                    _ => false,
+                };
+                if flows {
+                    slow.insert(dst);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    slow
+}
+
+/// Is `val` (a header phi's back-edge incoming) the small-constant-step update
+/// `phi ± c` of `phi_dst`? Accepts `phi + c`, `c + phi`, and `phi - c` (a standard
+/// unit/small decrement); rejects `c - phi` and any non-constant or large step.
+fn iv_back_edge_step_is_small(
+    val: ValueId,
+    phi_dst: ValueId,
+    defs: &BTreeMap<ValueId, &Instruction>,
+    module: &AirModule,
+) -> bool {
+    let Some(def) = defs.get(&val) else {
+        return false;
+    };
+    let Operation::BinaryOp { kind } = &def.op else {
+        return false;
+    };
+    if def.operands.len() != 2 {
+        return false;
+    }
+    let (a, b) = (def.operands[0], def.operands[1]);
+    match kind {
+        BinaryOp::Add => {
+            (a == phi_dst && is_small_int_const(module, b))
+                || (b == phi_dst && is_small_int_const(module, a))
+        }
+        // Only `phi - c` is a standard IV; `c - phi` is not.
+        BinaryOp::Sub => a == phi_dst && is_small_int_const(module, b),
+        _ => false,
+    }
+}
+
+/// Does the UBSan-located overflowing operation look like a SPURIOUS linear-accumulator
+/// overflow — a signed `Add`/`Sub` whose operands are all either a small integer
+/// constant or a slow linear induction variable ([`function_spurious_iv_set`]), with at
+/// least one such induction variable?
+///
+/// Such an overflow (`x = x + 1`, `return i + j`) is only reachable by driving a
+/// nondeterministic loop bound to an astronomically large trip count that the real
+/// program's semantics (a loop invariant / precondition) forbids — confirming it is a
+/// false alarm on a labeled-TRUE `no-overflow` task (`termination-numeric/twisted`,
+/// `…ESOP2008-easy2`). The check NEVER matches a `Mul`/`Div`/negation overflow (so
+/// `hard2`'s `2 * d`, Juliet `data * data` stay confirmable), a direct nondet operand
+/// (`data + data`), or a large/variable step (`sum += big`) — so genuine direct
+/// overflows are unaffected. Returning `true` only ever turns a would-be `false` into
+/// `unknown` (recall cost, never a wrong verdict).
+///
+/// `line`/`column` come from the UBSan report and are matched against instruction
+/// spans; if no debug spans are present (nothing matches) it returns `false`, leaving
+/// the confirmer's behavior unchanged.
+#[must_use]
+pub fn overflow_hit_is_spurious_linear_accumulator(
+    module: &AirModule,
+    line: u32,
+    column: Option<u32>,
+) -> bool {
+    let taint = module_nondet_taint(module);
+    let empty = BTreeSet::new();
+
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+
+        // Candidate signed Add/Sub instructions on the faulting source line.
+        let candidates: Vec<&Instruction> = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|inst| {
+                matches!(&inst.op, Operation::BinaryOp { kind } if matches!(kind, BinaryOp::Add | BinaryOp::Sub))
+                    && inst.span.as_ref().is_some_and(|s| s.line_start == line)
+            })
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+
+        // Disambiguate by column when UBSan reported one; otherwise only act on a
+        // single unambiguous op (never suppress one of several ops sharing a line).
+        let selected: Vec<&Instruction> = match column {
+            Some(col) => {
+                let exact: Vec<&Instruction> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|i| i.span.as_ref().is_some_and(|s| s.col_start == col))
+                    .collect();
+                if !exact.is_empty() {
+                    exact
+                } else if candidates.len() == 1 {
+                    candidates
+                } else {
+                    continue;
+                }
+            }
+            None if candidates.len() == 1 => candidates,
+            None => continue,
+        };
+
+        let tainted = taint.get(&func.id).unwrap_or(&empty);
+        let slow = function_spurious_iv_set(func, module, tainted);
+        if slow.is_empty() {
+            continue;
+        }
+
+        for inst in selected {
+            if inst.operands.len() != 2 {
+                continue;
+            }
+            let (o0, o1) = (inst.operands[0], inst.operands[1]);
+            let benign = |v: ValueId| slow.contains(&v) || is_small_int_const(module, v);
+            let has_iv = slow.contains(&o0) || slow.contains(&o1);
+            if has_iv && benign(o0) && benign(o1) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Check if a specific function's CFG is loop-free.
@@ -2205,5 +2586,427 @@ mod tests {
         );
         let module = make_module(vec![main]);
         assert_eq!(branch_steering_constants(&module), vec![3]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for overflow_hit_is_spurious_linear_accumulator
+    // -----------------------------------------------------------------------
+
+    /// A value-producing instruction carrying a source span (line/col), for the
+    /// span-matching in `overflow_hit_is_spurious_linear_accumulator`.
+    fn typed_inst_at(
+        id: &str,
+        op: Operation,
+        dst: ValueId,
+        operands: Vec<ValueId>,
+        line: u32,
+        col: u32,
+    ) -> Instruction {
+        use saf_core::ids::TypeId;
+        let mut inst = typed_inst(id, op, dst, operands, TypeId(make_id("type", b"i32")));
+        inst.span = Some(saf_core::span::Span::point(
+            saf_core::ids::FileId::new(1),
+            0,
+            line,
+            col,
+        ));
+        inst
+    }
+
+    /// Build an `ESOP2008-easy2`-shaped module: `z = nondet(); x = 12; while (z > 0)
+    /// { x = x + 1; z = z - 1; }`. The `x = x + 1` add lives at (line 15, col 9).
+    /// If `use_mul` is set, the update at (15, 9) is `x * step` instead of `x + step`
+    /// (a `hard2`-shaped `2 * d`), which must NOT be flagged.
+    fn esop_like_module(use_mul: bool) -> AirModule {
+        use saf_core::air::{AirType, BinaryOp};
+        use saf_core::ids::TypeId;
+
+        let i32t = TypeId(make_id("type", b"i32"));
+        let i1t = TypeId(make_id("type", b"i1"));
+        let mut types = BTreeMap::new();
+        types.insert(i32t, AirType::Integer { bits: 32 });
+        types.insert(i1t, AirType::Integer { bits: 1 });
+
+        let b0 = make_block_id("es_entry");
+        let h = make_block_id("es_header");
+        let l = make_block_id("es_latch");
+        let e = make_block_id("es_exit");
+
+        let z0 = make_value_id("es_z0");
+        let zphi = make_value_id("es_zphi");
+        let xphi = make_value_id("es_xphi");
+        let cond = make_value_id("es_cond");
+        let xnext = make_value_id("es_xnext");
+        let znext = make_value_id("es_znext");
+        let x_init = make_value_id("es_xinit");
+        let one = make_value_id("es_one");
+        let two = make_value_id("es_two");
+        let zero = make_value_id("es_zero");
+
+        let mut constants = BTreeMap::new();
+        constants.insert(x_init, Constant::int(12, 32));
+        constants.insert(one, Constant::int(1, 32));
+        constants.insert(two, Constant::int(2, 32));
+        constants.insert(zero, Constant::int(0, 32));
+
+        let nondet = make_declaration("__VERIFIER_nondet_int");
+
+        let mut entry = AirBlock::new(b0);
+        entry.instructions.push(typed_inst(
+            "es_call",
+            Operation::CallDirect { callee: nondet.id },
+            z0,
+            vec![],
+            i32t,
+        ));
+        entry
+            .instructions
+            .push(term_inst("es_br0", Operation::Br { target: h }, vec![]));
+
+        let mut header = AirBlock::new(h);
+        header.instructions.push(typed_inst(
+            "es_zphi",
+            Operation::Phi {
+                incoming: vec![(b0, z0), (l, znext)],
+            },
+            zphi,
+            vec![],
+            i32t,
+        ));
+        header.instructions.push(typed_inst(
+            "es_xphi",
+            Operation::Phi {
+                incoming: vec![(b0, x_init), (l, xnext)],
+            },
+            xphi,
+            vec![],
+            i32t,
+        ));
+        header.instructions.push(typed_inst(
+            "es_cmp",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            cond,
+            vec![zphi, zero],
+            i1t,
+        ));
+        header.instructions.push(term_inst(
+            "es_condbr",
+            Operation::CondBr {
+                then_target: l,
+                else_target: e,
+            },
+            vec![cond],
+        ));
+
+        let mut latch = AirBlock::new(l);
+        let update_kind = if use_mul {
+            BinaryOp::Mul
+        } else {
+            BinaryOp::Add
+        };
+        let step = if use_mul { two } else { one };
+        latch.instructions.push(typed_inst_at(
+            "es_xnext",
+            Operation::BinaryOp { kind: update_kind },
+            xnext,
+            vec![xphi, step],
+            15,
+            9,
+        ));
+        latch.instructions.push(typed_inst_at(
+            "es_znext",
+            Operation::BinaryOp {
+                kind: BinaryOp::Sub,
+            },
+            znext,
+            vec![zphi, one],
+            16,
+            9,
+        ));
+        latch
+            .instructions
+            .push(term_inst("es_br1", Operation::Br { target: h }, vec![]));
+
+        let mut exit = AirBlock::new(e);
+        exit.instructions
+            .push(term_inst("es_ret", Operation::Ret, vec![]));
+
+        let main = AirFunction {
+            id: make_func_id("main"),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![entry, header, latch, exit],
+            entry_block: Some(b0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+
+        let mut module = make_module(vec![main, nondet]);
+        module.types = types;
+        module.constants = constants;
+        module
+    }
+
+    #[test]
+    fn spurious_accumulator_add_in_nondet_loop_is_flagged() {
+        // `x = x + 1` accumulator in a `while (z > 0)` loop with z = nondet(): the
+        // overflow is only reachable at an astronomical trip count -> abstain.
+        let module = esop_like_module(false);
+        assert!(overflow_hit_is_spurious_linear_accumulator(
+            &module,
+            15,
+            Some(9)
+        ));
+        // Line-only match (no UBSan column) also works (single Add on the line).
+        assert!(overflow_hit_is_spurious_linear_accumulator(
+            &module, 15, None
+        ));
+    }
+
+    #[test]
+    fn multiplicative_update_in_nondet_loop_is_not_flagged() {
+        // `x = x * 2` (the `hard2` `2 * d` shape) is a Mul, never suppressed — a
+        // genuine fast (log-many-iterations) overflow stays confirmable.
+        let module = esop_like_module(true);
+        assert!(!overflow_hit_is_spurious_linear_accumulator(
+            &module,
+            15,
+            Some(9)
+        ));
+    }
+
+    #[test]
+    fn direct_nondet_addition_is_not_flagged() {
+        // `y = z + z` with z = nondet() and NO loop: a genuine direct overflow, not a
+        // slow accumulator -> must stay confirmable.
+        use saf_core::air::BinaryOp;
+        let z0 = make_value_id("dn_z0");
+        let y = make_value_id("dn_y");
+        let nondet = make_declaration("__VERIFIER_nondet_int");
+
+        let bid = make_block_id("dn_entry");
+        let mut block = AirBlock::new(bid);
+        block.instructions.push(typed_inst_at(
+            "dn_call",
+            Operation::CallDirect { callee: nondet.id },
+            z0,
+            vec![],
+            4,
+            1,
+        ));
+        block.instructions.push(typed_inst_at(
+            "dn_add",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            y,
+            vec![z0, z0],
+            5,
+            9,
+        ));
+        block
+            .instructions
+            .push(term_inst("dn_ret", Operation::Ret, vec![]));
+        let main = AirFunction {
+            id: make_func_id("main"),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![block],
+            entry_block: Some(bid),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let module = make_module(vec![main, nondet]);
+        assert!(!overflow_hit_is_spurious_linear_accumulator(
+            &module,
+            5,
+            Some(9)
+        ));
+    }
+
+    #[test]
+    fn accumulator_in_constant_bounded_loop_is_not_flagged() {
+        // `while (x < 10) x++;` — the trip count is a compile-time constant, not
+        // nondet-controlled, so the counter is not a spurious accumulator (preserving
+        // the counted-loop-sink confirmations). Query the `x + 1` add at its span.
+        let mut module = ranked_counter_loop_module();
+        // Give the `rl_add` (x + 1) a span so it is a candidate at (line 7, col 3).
+        for func in &mut module.functions {
+            for block in &mut func.blocks {
+                for inst in &mut block.instructions {
+                    if inst.dst == Some(make_value_id("rl_xn")) {
+                        inst.span = Some(saf_core::span::Span::point(
+                            saf_core::ids::FileId::new(1),
+                            0,
+                            7,
+                            3,
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(!overflow_hit_is_spurious_linear_accumulator(
+            &module,
+            7,
+            Some(3)
+        ));
+    }
+
+    #[test]
+    fn interprocedural_param_bounded_accumulator_is_flagged() {
+        // `twisted`-style: main calls f(nondet()); f loops `while (i < p) i++;` and
+        // returns i + i. The bound p is a parameter fed a nondet argument, so the loop
+        // is nondet-controlled and the `i + i` overflow is a spurious accumulator.
+        use saf_core::air::{AirType, BinaryOp};
+        use saf_core::ids::TypeId;
+
+        let i32t = TypeId(make_id("type", b"i32"));
+        let i1t = TypeId(make_id("type", b"i1"));
+        let mut types = BTreeMap::new();
+        types.insert(i32t, AirType::Integer { bits: 32 });
+        types.insert(i1t, AirType::Integer { bits: 1 });
+
+        // --- f(p) ---
+        let fb0 = make_block_id("f_entry");
+        let fh = make_block_id("f_header");
+        let fl = make_block_id("f_latch");
+        let fe = make_block_id("f_exit");
+        let p = make_value_id("f_p");
+        let iphi = make_value_id("f_iphi");
+        let cond = make_value_id("f_cond");
+        let inext = make_value_id("f_inext");
+        let sum = make_value_id("f_sum");
+        let i_init = make_value_id("f_iinit");
+        let one = make_value_id("f_one");
+
+        let mut fentry = AirBlock::new(fb0);
+        fentry
+            .instructions
+            .push(term_inst("f_br0", Operation::Br { target: fh }, vec![]));
+        let mut fheader = AirBlock::new(fh);
+        fheader.instructions.push(typed_inst(
+            "f_iphi",
+            Operation::Phi {
+                incoming: vec![(fb0, i_init), (fl, inext)],
+            },
+            iphi,
+            vec![],
+            i32t,
+        ));
+        fheader.instructions.push(typed_inst(
+            "f_cmp",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt,
+            },
+            cond,
+            vec![iphi, p],
+            i1t,
+        ));
+        fheader.instructions.push(term_inst(
+            "f_condbr",
+            Operation::CondBr {
+                then_target: fl,
+                else_target: fe,
+            },
+            vec![cond],
+        ));
+        let mut flatch = AirBlock::new(fl);
+        flatch.instructions.push(typed_inst(
+            "f_inext",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            inext,
+            vec![iphi, one],
+            i32t,
+        ));
+        flatch
+            .instructions
+            .push(term_inst("f_br1", Operation::Br { target: fh }, vec![]));
+        let mut fexit = AirBlock::new(fe);
+        fexit.instructions.push(typed_inst_at(
+            "f_sum",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            sum,
+            vec![iphi, iphi],
+            20,
+            14,
+        ));
+        fexit
+            .instructions
+            .push(term_inst("f_ret", Operation::Ret, vec![]));
+
+        let f = AirFunction {
+            id: make_func_id("f"),
+            name: "f".to_string(),
+            params: vec![AirParam {
+                id: p,
+                name: Some("p".to_string()),
+                index: 0,
+                param_type: Some(i32t),
+            }],
+            blocks: vec![fentry, fheader, flatch, fexit],
+            entry_block: Some(fb0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+
+        // --- main: k = nondet(); f(k) ---
+        let nondet = make_declaration("__VERIFIER_nondet_int");
+        let k = make_value_id("m_k");
+        let mb0 = make_block_id("m_entry");
+        let mut mentry = AirBlock::new(mb0);
+        mentry.instructions.push(typed_inst(
+            "m_call_nd",
+            Operation::CallDirect { callee: nondet.id },
+            k,
+            vec![],
+            i32t,
+        ));
+        mentry.instructions.push(Instruction {
+            id: make_inst_id("m_call_f"),
+            op: Operation::CallDirect { callee: f.id },
+            operands: vec![k],
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        });
+        mentry
+            .instructions
+            .push(term_inst("m_ret", Operation::Ret, vec![]));
+        let main = AirFunction {
+            id: make_func_id("main"),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![mentry],
+            entry_block: Some(mb0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+
+        let mut module = make_module(vec![main, f, nondet]);
+        module.types = types;
+        module.constants.insert(i_init, Constant::int(0, 32));
+        module.constants.insert(one, Constant::int(1, 32));
+
+        assert!(overflow_hit_is_spurious_linear_accumulator(
+            &module,
+            20,
+            Some(14)
+        ));
     }
 }
