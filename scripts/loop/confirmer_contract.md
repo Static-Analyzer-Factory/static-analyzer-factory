@@ -237,3 +237,15 @@ unsound case, NOT a blunt gate — the naive overflow-nonlinear abstain reverted
 per-arm SAMPLED (1000-task) gate does NOT see these; only a full-reservoir run does — treat
 the soundness-sentinel.jsonl gate as necessary-but-not-sufficient. Do NOT re-retire without a
 full-reservoir FP=0 run confirming the fix.
+
+## SENTINEL UPDATE 2026-08-27b — 3 levers TEMPORARILY parked (coordination, NOT a clean claim)
+
+The 3 sentinel levels are re-parked with reason `coord-direct-fix-inflight`. This is PURELY
+scheduling coordination: a PRECISE direct fix for all 8 full-run violations (see 2026-08-27
+note above) is being developed + validated off-loop (cd-vm-14 ~/saf-head) and will be landed
+on this branch. Parking prevents the loop from burning arms re-deriving the same fix and from
+editing fuzz.rs/overflow.rs/termination.rs in ways that would conflict with that landing. The
+bugs ARE live (this is NOT a verified-clean claim). The soundness-sentinel.jsonl GATE stays
+fully armed meanwhile, so no arm can newly worsen FP/wT. AFTER the direct fix lands and a
+full-reservoir run confirms FP=0: any mechanism the direct fix did NOT cover gets its lever
+UN-PARKED so the loop finishes it; fully-fixed mechanisms stay parked (nothing left to do).
