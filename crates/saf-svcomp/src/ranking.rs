@@ -1178,55 +1178,24 @@ fn arg_is_nonneg(arg: ValueId, caller: &AirFunction, module: &AirModule) -> bool
     false
 }
 
-/// Given a signed integer comparison of `arg` against the constant `0` used as a
-/// `CondBr` condition, return the successor edge target on which `arg >= 0` is
-/// *guaranteed* (or `None` for a non-signed / non-order predicate). `arg_is_lhs`
-/// says whether `arg` is the comparison's left operand (else it is the right, and
-/// the predicate is swapped to the equivalent `arg <p> 0` form).
-fn signed_cmp_nonneg_edge(
-    pred: BinaryOp,
-    arg_is_lhs: bool,
-    then_target: BlockId,
-    else_target: BlockId,
-) -> Option<BlockId> {
-    use BinaryOp::{ICmpSge, ICmpSgt, ICmpSle, ICmpSlt};
-    // Normalize to `arg <p> 0`: swap the predicate when `arg` is the right operand
-    // (`k <pred> arg` ⟺ `arg <swap(pred)> k`).
-    let p = if arg_is_lhs {
-        pred
-    } else {
-        match pred {
-            ICmpSge => ICmpSle,
-            ICmpSle => ICmpSge,
-            ICmpSgt => ICmpSlt,
-            ICmpSlt => ICmpSgt,
-            other => other,
-        }
-    };
-    match p {
-        // `arg >= 0` / `arg > 0`: the THEN edge is entered only when `arg >= 0`.
-        ICmpSge | ICmpSgt => Some(then_target),
-        // `arg < 0` / `arg <= 0`: the ELSE edge is `!(arg<0)` ⇒ `arg>=0`
-        // (resp. `!(arg<=0)` ⇒ `arg>0`).
-        ICmpSlt | ICmpSle => Some(else_target),
-        _ => None,
-    }
-}
-
 /// Is call argument `arg` (fed at a call in block `call_block` of `caller`)
 /// provably **non-negative** because a *dominating signed guard* `arg >= 0` gates
-/// the call — e.g. an early `if (arg < 0) return;`?
+/// the call — e.g. an early `if (arg < 0) return;` or the `main`-guards-`nondet`
+/// idiom `if (n < 1 || n > K) return;` (whose `n < 1` half establishes `n >= 1`)?
 ///
-/// Sound sufficient condition: some block `g` in `caller` ends in a
-/// `CondBr` whose condition is a signed integer comparison of the *exact* value
-/// `arg` against the constant `0`, and the successor edge that is taken **only
-/// when `arg >= 0`** ([`signed_cmp_nonneg_edge`]) leads to a block `t` such that
-/// (a) `g` is `t`'s **sole predecessor** — so control reaches `t` only by taking
-/// that `arg >= 0` edge — and (b) `t` **dominates** `call_block` — so every path
-/// to the call passes through `t`. Together these establish `arg >= 0` on entry to
-/// the call. Because `arg` is matched by identity in both the guard and the call,
-/// in the mem2reg-promoted SSA the ranking analysis consumes it is the *same*
-/// value at both sites (never reassigned between them), so the fact is preserved.
+/// Sound sufficient condition: some block `g` in `caller` ends in a `CondBr` whose
+/// condition is a signed integer comparison of the *exact* value `arg` against a
+/// *constant* `c`, and the successor edge that is taken **only when `arg >= 0`**
+/// ([`signed_cmp_const_nonneg_edge`], which recognizes every constant bound that
+/// implies it — e.g. `arg >= 1`, `arg > 5`, `arg < 1`-false) leads to a block `t`
+/// such that (a) `g` is `t`'s **sole predecessor** — so control reaches `t` only
+/// by taking that `arg >= 0` edge — and (b) `t` **dominates** `call_block` — so
+/// every path to the call passes through `t`. Together these establish `arg >= 0`
+/// on entry to the call. Because `arg` is matched by identity in both the guard and
+/// the call, in the mem2reg-promoted SSA the ranking analysis consumes it is the
+/// *same* value at both sites (never reassigned between them), so the fact is
+/// preserved. This mirrors [`value_dominating_nonneg`] (the loop-entry analogue)
+/// exactly, differing only in the dominated use point (`call_block` vs a header).
 ///
 /// Fails closed (returns `false`) on anything it cannot match — including
 /// un-promoted IR where the guard and the call load distinct SSA temporaries, so
@@ -1246,11 +1215,10 @@ fn arg_is_guarded_nonneg(
             }
         }
     }
-    let is_zero = |v: ValueId| {
-        matches!(
-            module.constants.get(&v),
-            Some(Constant::Int { value: 0, .. } | Constant::ZeroInit)
-        )
+    let const_int = |x: ValueId| match module.constants.get(&x) {
+        Some(Constant::Int { value, .. }) => Some(i128::from(*value)),
+        Some(Constant::ZeroInit) => Some(0),
+        _ => None,
     };
     let cfg = Cfg::build(caller);
     let idom = compute_dominators(&cfg);
@@ -1280,14 +1248,20 @@ fn arg_is_guarded_nonneg(
         let (Some(&lo), Some(&ro)) = (ops.first(), ops.get(1)) else {
             continue;
         };
-        // Exactly one operand is `arg`, the other the constant `0`.
-        let arg_is_lhs = lo == arg && is_zero(ro);
-        let arg_is_rhs = ro == arg && is_zero(lo);
-        if !(arg_is_lhs || arg_is_rhs) {
+        // Exactly one operand is `arg`, the other a constant `c`; the guard's
+        // `arg >= 0` edge is recognized for any constant that implies it (e.g.
+        // `arg < 1` false ⇒ `arg >= 1 >= 0`).
+        let (arg_is_lhs, c) = if lo == arg {
+            let Some(c) = const_int(ro) else { continue };
+            (true, c)
+        } else if ro == arg {
+            let Some(c) = const_int(lo) else { continue };
+            (false, c)
+        } else {
             continue;
-        }
+        };
         let Some(nonneg_target) =
-            signed_cmp_nonneg_edge(*kind, arg_is_lhs, *then_target, *else_target)
+            signed_cmp_const_nonneg_edge(*kind, arg_is_lhs, c, *then_target, *else_target)
         else {
             continue;
         };
@@ -1311,6 +1285,8 @@ fn arg_is_guarded_nonneg(
 /// [`signed_cmp_nonneg_edge`] (which fixes `c = 0`) to any constant, recognizing the
 /// canonical `v >= 0` forms `sge v, 0`, `sgt v, -1`, `slt v, 0`, `sle v, -1`
 /// (and rhs duals) that `-O0`+instcombine emits for `if (v < 0) …` / `if (v >= 0)`.
+/// The `c = 0` case is the plain `arg >= 0` guard; a positive `c` is the
+/// `main`-guards-`nondet` lower-bound idiom (`if (n < 1) return;` ⇒ `n >= 1`).
 fn signed_cmp_const_nonneg_edge(
     pred: BinaryOp,
     v_is_lhs: bool,
@@ -7506,15 +7482,22 @@ mod tests {
         assert!(!region_is_infeasible(&nonempty, &universe));
     }
 
-    /// Build a caller `void caller() { int x = nondet_int(); [if (x < 0) return;]
-    /// callee(x); }`. When `guarded`, an early `x < 0` return dominates the call so
-    /// `x >= 0` holds at it; otherwise the call is unguarded.
-    fn guard_caller(guarded: bool) -> (AirModule, ValueId, BlockId) {
+    /// Build a caller `void caller() { int x = nondet_int(); [if (x < bound)
+    /// return;] callee(x); }`. When `guarded`, an early `x < bound` return dominates
+    /// the call, so `x >= bound` holds at it; for any `bound >= 0` that establishes
+    /// `x >= 0`. Otherwise the call is unguarded.
+    fn guard_caller(guarded: bool, bound: i64) -> (AirModule, ValueId, BlockId) {
         let i32t = tid("i32");
         let i1t = tid("i1");
         let mut constants = BTreeMap::new();
         let zero = vid("gc_zero");
-        constants.insert(zero, Constant::Int { value: 0, bits: 32 });
+        constants.insert(
+            zero,
+            Constant::Int {
+                value: bound,
+                bits: 32,
+            },
+        );
 
         let callee_id = FunctionId(make_id("func", b"callee"));
         let x = vid("gc_x");
@@ -7591,16 +7574,27 @@ mod tests {
 
     #[test]
     fn arg_is_guarded_nonneg_recognizes_early_return_guard() {
-        let (m, x, call_blk) = guard_caller(true);
+        let (m, x, call_blk) = guard_caller(true, 0);
         let caller = &m.functions[0];
         assert!(arg_is_guarded_nonneg(x, caller, call_blk, &m));
     }
 
     #[test]
     fn arg_is_guarded_nonneg_rejects_unguarded_call() {
-        let (m, x, call_blk) = guard_caller(false);
+        let (m, x, call_blk) = guard_caller(false, 0);
         let caller = &m.functions[0];
         assert!(!arg_is_guarded_nonneg(x, caller, call_blk, &m));
+    }
+
+    #[test]
+    fn arg_is_guarded_nonneg_recognizes_positive_constant_lower_bound() {
+        // `if (x < 1) return;` establishes `x >= 1 >= 0` at the call — the
+        // `main`-guards-`nondet` lower-bound idiom (`if (n < 1 || n > K) return;`).
+        // The old `c == 0`-only matcher missed this; the generalized constant-bound
+        // matcher recognizes it. Sound: `x >= 1` genuinely implies `x >= 0`.
+        let (m, x, call_blk) = guard_caller(true, 1);
+        let caller = &m.functions[0];
+        assert!(arg_is_guarded_nonneg(x, caller, call_blk, &m));
     }
 
     /// Build an `EvenOdd`-shaped SCC: two mutually-recursive members, each
