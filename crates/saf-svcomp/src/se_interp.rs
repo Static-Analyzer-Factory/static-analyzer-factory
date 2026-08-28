@@ -908,6 +908,7 @@ impl<'a> Interp<'a> {
             nondet_sequence.push(NondetCall {
                 func_name: name.clone(),
                 value,
+                call_inst: None,
             });
         }
         Some(FalseCandidate {
@@ -1228,6 +1229,7 @@ impl<'a> Interp<'a> {
             out.push(NondetCall {
                 func_name: name.clone(),
                 value,
+                call_inst: None,
             });
         }
         if out.is_empty() {
@@ -1709,6 +1711,7 @@ mod tests {
         let seq = vec![NondetCall {
             func_name: "__VERIFIER_nondet_int".to_string(),
             value: 0,
+            call_inst: None,
         }];
         let flips = enumerate_concolic_flip_seeds(&module, &seq, DataModel::LP64);
         assert!(
@@ -1725,6 +1728,7 @@ mod tests {
         let seq = vec![NondetCall {
             func_name: "__VERIFIER_nondet_int".to_string(),
             value: 0,
+            call_inst: None,
         }];
         let a = enumerate_concolic_flip_seeds(&module, &seq, DataModel::LP64);
         let b = enumerate_concolic_flip_seeds(&module, &seq, DataModel::LP64);
@@ -1745,6 +1749,7 @@ mod tests {
         let seq = vec![NondetCall {
             func_name: "__VERIFIER_nondet_int".to_string(),
             value: 0,
+            call_inst: None,
         }];
         let flips = enumerate_concolic_flip_seeds(&module, &seq, DataModel::LP64);
         assert!(

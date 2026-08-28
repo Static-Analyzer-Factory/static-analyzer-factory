@@ -1849,6 +1849,14 @@ pub struct NondetCall {
     /// The value the replay harness returns for this call: the Z3 model value,
     /// or `0` when the model does not constrain it.
     pub value: i64,
+    /// The `CallDirect` instruction of this nondet read, when the sequence was
+    /// resolved from an AIR path (Z3 / interprocedural enumeration). `None` when
+    /// the sequence came from a source that carries no AIR identity (fuzz / CBMC
+    /// trace parsing). Used by `witness_lower` to place a `function_return`
+    /// waypoint (`\result == value`) at the call site, pinning the input for
+    /// execution-based validators (`cpa-witness2test`). Never affects the FALSE
+    /// verdict — it is witness-fidelity only.
+    pub call_inst: Option<InstId>,
 }
 
 /// An over-approximate FALSE *candidate* for the unreach-call property: a
@@ -2223,6 +2231,7 @@ fn resolve_nondet_sequence_interproc(
             seq.push(NondetCall {
                 func_name: name.to_string(),
                 value,
+                call_inst: Some(inst.id),
             });
         }
     }
@@ -2856,10 +2865,12 @@ mod enumerate_tests {
                 NondetCall {
                     func_name: "__VERIFIER_nondet_int".into(),
                     value: 7,
+                    call_inst: Some(InstId::new(1)),
                 },
                 NondetCall {
                     func_name: "__VERIFIER_nondet_int".into(),
                     value: 9,
+                    call_inst: Some(InstId::new(4)),
                 },
             ]
         );
@@ -2915,14 +2926,17 @@ mod enumerate_tests {
                 NondetCall {
                     func_name: "__VERIFIER_nondet_int".into(),
                     value: 7,
+                    call_inst: Some(InstId::new(1)),
                 },
                 NondetCall {
                     func_name: "__VERIFIER_nondet_uint".into(),
                     value: 0,
+                    call_inst: Some(InstId::new(4)),
                 },
                 NondetCall {
                     func_name: "__VERIFIER_nondet_int".into(),
                     value: 9,
+                    call_inst: Some(InstId::new(5)),
                 },
             ]
         );

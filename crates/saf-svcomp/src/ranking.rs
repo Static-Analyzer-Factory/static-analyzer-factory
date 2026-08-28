@@ -2241,15 +2241,16 @@ const PER_FRAME_ALLOCATOR_CALLS: &[&str] = &[
 /// only is precise: a recursion that merely calls a helper which allocates off the
 /// recursive path is not a per-frame build.
 fn function_allocates_per_frame(func: &AirFunction, module: &AirModule) -> bool {
-    func.blocks.iter().flat_map(|b| &b.instructions).any(|inst| {
-        match &inst.op {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|inst| match &inst.op {
             Operation::HeapAlloc { .. } | Operation::Alloca { .. } => true,
             Operation::CallDirect { callee } => module
                 .function(*callee)
                 .is_some_and(|f| PER_FRAME_ALLOCATOR_CALLS.contains(&f.name.as_str())),
             _ => false,
-        }
-    })
+        })
 }
 
 /// Build the recursion [`MultiPathModel`] for a self-recursive function, or `None`

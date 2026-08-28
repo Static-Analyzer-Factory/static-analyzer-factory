@@ -247,6 +247,7 @@ pub fn parse_cbmc_trace(trace: &str, line_map: &BTreeMap<u32, NondetSite>) -> Ve
         seq.push(NondetCall {
             func_name: site.func_name.clone(),
             value,
+            call_inst: None,
         });
     }
     seq

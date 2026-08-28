@@ -934,9 +934,10 @@ mod tests {
                 continue;
             }
             for block in &mut func.blocks {
-                let calls_self = block.instructions.iter().any(|i| {
-                    matches!(&i.op, Operation::CallDirect { callee } if *callee == f_id)
-                });
+                let calls_self = block
+                    .instructions
+                    .iter()
+                    .any(|i| matches!(&i.op, Operation::CallDirect { callee } if *callee == f_id));
                 if calls_self {
                     block.instructions.insert(
                         0,

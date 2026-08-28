@@ -854,6 +854,7 @@ pub fn parse_fuzz_log(log: &str) -> Vec<NondetCall> {
         seq.push(NondetCall {
             func_name: name.to_string(),
             value,
+            call_inst: None,
         });
     }
     seq
@@ -1436,10 +1437,12 @@ mod tests {
             NondetCall {
                 func_name: "__VERIFIER_nondet_u32".to_string(),
                 value: 0x0102_0304,
+                call_inst: None,
             },
             NondetCall {
                 func_name: "__VERIFIER_nondet_u8".to_string(),
                 value: 0xAB,
+                call_inst: None,
             },
         ];
         let bytes = nondet_seq_to_input(&seq, DataModel::LP64);
@@ -1863,10 +1866,12 @@ mod tests {
             NondetCall {
                 func_name: "__VERIFIER_nondet_int".to_string(),
                 value: 42,
+                call_inst: None,
             },
             NondetCall {
                 func_name: "__VERIFIER_nondet_short".to_string(),
                 value: -1,
+                call_inst: None,
             },
         ];
         let buf = nondet_seq_to_input(&seq, DataModel::LP64);
@@ -1885,10 +1890,12 @@ mod tests {
             NondetCall {
                 func_name: "__VERIFIER_nondet_float".to_string(), // width 0 -> skipped
                 value: 5,
+                call_inst: None,
             },
             NondetCall {
                 func_name: "__VERIFIER_nondet_int".to_string(),
                 value: 7,
+                call_inst: None,
             },
         ];
         let a = nondet_seq_to_input(&seq, DataModel::LP64);

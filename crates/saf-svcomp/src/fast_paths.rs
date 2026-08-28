@@ -1247,11 +1247,10 @@ fn iv_back_edge_step_is_small(
             (a == phi_dst && is_small_int_const(module, b))
                 || (b == phi_dst && is_small_int_const(module, a))
         }
-        // Only `phi - c` is a standard IV; `c - phi` is not.
-        BinaryOp::Sub => a == phi_dst && is_small_int_const(module, b),
-        // Geometric `phi << c` (a small constant left shift = doubling family); the
-        // shift amount is the second operand and must be a small positive constant.
-        BinaryOp::Shl => a == phi_dst && is_small_int_const(module, b),
+        // Only `phi - c` is a standard IV (`c - phi` is not), and geometric
+        // `phi << c` (a small constant left shift = doubling family): in both the
+        // updated value must be the first operand and the constant the second.
+        BinaryOp::Sub | BinaryOp::Shl => a == phi_dst && is_small_int_const(module, b),
         _ => false,
     }
 }

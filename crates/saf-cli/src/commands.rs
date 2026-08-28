@@ -6193,6 +6193,7 @@ mod verify_tests {
             nondet_sequence: vec![saf_svcomp::NondetCall {
                 func_name: "__VERIFIER_nondet_u32".to_string(),
                 value: 777,
+                call_inst: None,
             }],
         };
         let sentinel = std::path::Path::new("/tmp/s.sentinel");

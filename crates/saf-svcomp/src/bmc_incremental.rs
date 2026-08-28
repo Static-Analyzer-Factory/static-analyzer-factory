@@ -421,6 +421,7 @@ fn run_incremental(
                             seq.push(NondetCall {
                                 func_name: name.clone(),
                                 value,
+                                call_inst: None,
                             });
                         }
                         return Some(FalseCandidate {
