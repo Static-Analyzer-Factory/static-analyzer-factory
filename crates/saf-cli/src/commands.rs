@@ -1676,7 +1676,7 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
     // a reach_error site.
     let error_sites = saf_svcomp::reach_error_call_sites(ctx.module);
     let &reach_error_inst = error_sites.first()?;
-    if !fuzz::references_scalar_nondet(ctx.module) {
+    if !fuzz::references_fuzzable_nondet(ctx.module) {
         return None;
     }
 
@@ -1801,6 +1801,14 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
     let mut dict = saf_svcomp::slicing::slice_directed_dictionary(ctx.module, &slice);
     let mut corpus = fuzz::seed_corpus(&dict);
     corpus.extend(saf_svcomp::slicing::sequence_seeds(&slice.guard_constants));
+    // Float steering: when the program reads a `__VERIFIER_nondet_float/_double`,
+    // tile interesting + slice-harvested float boundary constants into the corpus.
+    // A blind byte mutation essentially never produces an in-range float, so without
+    // these seeds the entire narrow-guard float class is unreachable. Empty for
+    // integer-only programs, so this never regresses them.
+    if fuzz::references_float_nondet(ctx.module) {
+        corpus.extend(fuzz::float_seed_corpus(&slice.guard_floats));
+    }
     // Fixed seed -> the whole search (and therefore the verdict) is reproducible.
     let mut rng = fuzz::XorShift64::new(0x5AF3_C0DE);
     let per_run = replay_timeout();
@@ -3501,14 +3509,71 @@ fn push_extended_and_pointer_replay_defs(s: &mut String, candidate: &saf_svcomp:
     );
 }
 
+/// Emit the float/double nondet replay definitions.
+///
+/// The fuzz shim logged each `__VERIFIER_nondet_float/_double()` as the IEEE-754 BIT
+/// PATTERN of the value it consumed (a signed `long long`). Here we replay that exact
+/// pattern back — `memcpy` the low 32 bits into a `float` (resp. the full 64 bits into
+/// a `double`) so the ORIGINAL program re-executes on the identical value, bit-for-bit
+/// (R6). When the candidate recorded NO float sequence (e.g. an integer-only fuzz hit,
+/// or any Z3/BMC path — none model floats), both fall back to a `0`-returning stub, so
+/// nothing that previously replayed can regress.
+fn push_float_replay_defs(s: &mut String, candidate: &saf_svcomp::FalseCandidate) {
+    use std::fmt::Write as _;
+
+    let bits_of = |fname: &str| -> Vec<i64> {
+        candidate
+            .nondet_sequence
+            .iter()
+            .filter(|n| n.func_name == fname)
+            .map(|n| n.value)
+            .collect()
+    };
+
+    let floats = bits_of("__VERIFIER_nondet_float");
+    if floats.is_empty() {
+        s.push_str("float __VERIFIER_nondet_float(void) { return 0.0f; }\n");
+    } else {
+        let elems = floats
+            .iter()
+            .map(|v| format!("{v}LL"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(s, "static long long __saf_farr[] = {{ {elems} }};");
+        let _ = writeln!(s, "static unsigned long __saf_fn = {};", floats.len());
+        s.push_str("static unsigned long __saf_fi = 0;\n");
+        s.push_str(
+            "float __VERIFIER_nondet_float(void) { unsigned int __b = (unsigned int)(unsigned long long)((__saf_fi < __saf_fn) ? __saf_farr[__saf_fi++] : 0LL); float __f; memcpy(&__f, &__b, sizeof(__f)); return __f; }\n",
+        );
+    }
+
+    let doubles = bits_of("__VERIFIER_nondet_double");
+    if doubles.is_empty() {
+        s.push_str("double __VERIFIER_nondet_double(void) { return 0.0; }\n");
+    } else {
+        let elems = doubles
+            .iter()
+            .map(|v| format!("{v}LL"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(s, "static long long __saf_darr[] = {{ {elems} }};");
+        let _ = writeln!(s, "static unsigned long __saf_dn = {};", doubles.len());
+        s.push_str("static unsigned long __saf_di = 0;\n");
+        s.push_str(
+            "double __VERIFIER_nondet_double(void) { unsigned long long __b = (unsigned long long)((__saf_di < __saf_dn) ? __saf_darr[__saf_di++] : 0LL); double __d; memcpy(&__d, &__b, sizeof(__d)); return __d; }\n",
+        );
+    }
+}
+
 /// Build the replay driver C source for `candidate`.
 ///
 /// It defines every SV-COMP special function the program may reference (so the
 /// native link succeeds): the scalar-integer nondet generators replay the model
 /// sequence (a per-function counter over a fixed array; exhausted ⇒ `0`); the
 /// fixed-width typedef family and the lazy-init nondet pointer are emitted by
-/// [`push_extended_and_pointer_replay_defs`]; float/double nondet return `0`;
-/// `__VERIFIER_assume` blocks assumed-false paths at runtime (so an assume-pruned
+/// [`push_extended_and_pointer_replay_defs`]; float/double nondet replay their
+/// recorded IEEE-754 bit patterns via [`push_float_replay_defs`] (or return `0` when
+/// none were recorded); `__VERIFIER_assume` blocks assumed-false paths at runtime (so an assume-pruned
 /// error can never be a false confirmation); and `reach_error`/`__VERIFIER_error`
 /// drop the sentinel file and `_exit`.
 fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) -> String {
@@ -3524,6 +3589,7 @@ fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) ->
     s.push_str("#include <stddef.h>\n");
     s.push_str("#include <stdio.h>\n");
     s.push_str("#include <stdlib.h>\n");
+    s.push_str("#include <string.h>\n");
     s.push_str("extern void _exit(int) __attribute__((noreturn));\n");
 
     for (fname, cty) in SCALAR_NONDET {
@@ -3560,8 +3626,7 @@ fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) ->
 
     push_extended_and_pointer_replay_defs(&mut s, candidate);
 
-    s.push_str("float __VERIFIER_nondet_float(void) { return 0.0f; }\n");
-    s.push_str("double __VERIFIER_nondet_double(void) { return 0.0; }\n");
+    push_float_replay_defs(&mut s, candidate);
     s.push_str("void __VERIFIER_atomic_begin(void) { }\n");
     s.push_str("void __VERIFIER_atomic_end(void) { }\n");
 

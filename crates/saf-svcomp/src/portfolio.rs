@@ -69,7 +69,13 @@ impl Lever {
     #[must_use]
     fn applicable(self, f: UnreachFeatures) -> bool {
         match self {
-            Lever::Bmc | Lever::Fuzz => f.fuzzable_nondet,
+            // The blind fuzzer now also drives float/double nondet, so it applies
+            // whenever ANY fuzzable nondet is present. BMC/SE/CBMC are integer
+            // (bitvector) solvers with no float model, so they stay gated on an
+            // integer nondet input — a float-only program yields no candidates from
+            // them, so pruning them is verdict-preserving.
+            Lever::Fuzz => f.fuzzable_nondet || f.float_nondet,
+            Lever::Bmc => f.fuzzable_nondet,
             Lever::Se | Lever::Cbmc => f.fuzzable_nondet && f.has_loop,
         }
     }
@@ -77,6 +83,9 @@ impl Lever {
 
 /// Cheap, deterministic AIR Booleans describing an `unreach-call` task, used to
 /// route it to a [`Lever`] plan. Extracted once per task in [`UnreachFeatures::extract`].
+// Four independent, orthogonal routing predicates — a flat struct is the clearest
+// representation; a state machine / enum would obscure them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UnreachFeatures {
     /// The program references a `__VERIFIER_nondet_*` input the byte-stream shim
@@ -84,6 +93,11 @@ pub struct UnreachFeatures {
     /// is a single deterministic path the earlier must-reach / replay stages
     /// already cover, so every solver lever is a no-op.
     pub fuzzable_nondet: bool,
+    /// The program references a float/double `__VERIFIER_nondet_*` the byte-stream
+    /// shim now drives ([`crate::fuzz::references_float_nondet`]). Enables the blind
+    /// fuzzer on the `floats-*` / `nla-digbench`(double) class the integer solvers
+    /// cannot touch, WITHOUT enabling those (float-blind) integer solvers.
+    pub float_nondet: bool,
     /// Some defined function contains a CFG back-edge (a loop). Uses the
     /// whole-module [`crate::fast_paths::module_has_any_loop`] (NOT the
     /// reachability-scoped check) so that pruning the loop-only levers is sound
@@ -103,6 +117,7 @@ impl UnreachFeatures {
     pub fn extract(module: &AirModule) -> Self {
         Self {
             fuzzable_nondet: crate::fuzz::references_scalar_nondet(module),
+            float_nondet: crate::fuzz::references_float_nondet(module),
             has_loop: crate::fast_paths::module_has_any_loop(module),
             nonlinear_nondet_guard: has_nonlinear_nondet_guard(module),
         }
@@ -345,6 +360,7 @@ mod tests {
     fn default_plan_is_the_historical_order() {
         let f = UnreachFeatures {
             fuzzable_nondet: true,
+            float_nondet: false,
             has_loop: true,
             nonlinear_nondet_guard: false,
         };
@@ -358,6 +374,7 @@ mod tests {
     fn loop_free_prunes_se_and_cbmc() {
         let f = UnreachFeatures {
             fuzzable_nondet: true,
+            float_nondet: false,
             has_loop: false,
             nonlinear_nondet_guard: false,
         };
@@ -369,6 +386,7 @@ mod tests {
     fn no_nondet_prunes_every_solver_lever() {
         let f = UnreachFeatures {
             fuzzable_nondet: false,
+            float_nondet: false,
             has_loop: true,
             nonlinear_nondet_guard: false,
         };
@@ -376,9 +394,23 @@ mod tests {
     }
 
     #[test]
+    fn float_only_nondet_enables_only_the_fuzzer() {
+        // A `floats-*` task: no integer nondet, but a float nondet the shim drives.
+        // Only the (now float-aware) fuzzer applies; the integer solvers are pruned.
+        let f = UnreachFeatures {
+            fuzzable_nondet: false,
+            float_nondet: true,
+            has_loop: true,
+            nonlinear_nondet_guard: false,
+        };
+        assert_eq!(plan_unreach(f), vec![Lever::Fuzz]);
+    }
+
+    #[test]
     fn nonlinear_guard_promotes_fuzz_to_front() {
         let f = UnreachFeatures {
             fuzzable_nondet: true,
+            float_nondet: false,
             has_loop: true,
             nonlinear_nondet_guard: true,
         };
@@ -392,6 +424,7 @@ mod tests {
     fn nonlinear_promotion_still_prunes_loop_free() {
         let f = UnreachFeatures {
             fuzzable_nondet: true,
+            float_nondet: false,
             has_loop: false,
             nonlinear_nondet_guard: true,
         };
@@ -403,6 +436,7 @@ mod tests {
     fn plan_is_deterministic() {
         let f = UnreachFeatures {
             fuzzable_nondet: true,
+            float_nondet: false,
             has_loop: true,
             nonlinear_nondet_guard: true,
         };

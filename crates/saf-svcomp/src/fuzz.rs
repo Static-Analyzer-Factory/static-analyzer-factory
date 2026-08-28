@@ -127,6 +127,20 @@ pub const NONDET_OBJ_SIZE: usize = 4096;
 /// inside the driver body (it references `__saf_take`/`__saf_note`).
 const FUZZ_NONDET_POINTER_C: &str = "void* __VERIFIER_nondet_pointer(void) { unsigned long long __s = __saf_take(1); __saf_note(\"__VERIFIER_nondet_pointer\", (long long)__s); return (__s & 1ULL) ? calloc(1, 4096) : (void*)0; }\n";
 
+/// Byte-stream `__VERIFIER_nondet_float` / `_double` definitions. Each consumes
+/// `sizeof(T)` little-endian bytes, reinterprets them as the float via `memcpy`
+/// (no strict-aliasing UB), logs the raw bit pattern (so replay is bit-exact —
+/// R6), and returns the value. Emitted inside the driver body (references
+/// `__saf_take` / `__saf_note`; `string.h` is already included).
+const FUZZ_NONDET_FLOAT_C: &str = concat!(
+    "float __VERIFIER_nondet_float(void) { unsigned int __b = (unsigned int)__saf_take(sizeof(float)); ",
+    "float __f; memcpy(&__f, &__b, sizeof(__f)); ",
+    "__saf_note(\"__VERIFIER_nondet_float\", (long long)(unsigned long long)__b); return __f; }\n",
+    "double __VERIFIER_nondet_double(void) { unsigned long long __b = __saf_take(sizeof(double)); ",
+    "double __d; memcpy(&__d, &__b, sizeof(__d)); ",
+    "__saf_note(\"__VERIFIER_nondet_double\", (long long)__b); return __d; }\n",
+);
+
 /// Classic AFL "interesting" integer values (8/16/32-bit boundary and near-boundary
 /// constants). Used both as a fixed part of the mutation dictionary and as the seed
 /// of the harvested dictionary so a guard like `if (nondet()==INT_MAX)` is reachable
@@ -156,6 +170,28 @@ pub const INTERESTING_VALUES: &[i64] = &[
     -2_147_483_648,
 ];
 
+/// "Interesting" floating-point values seeded into the FLOAT byte-stream fuzz
+/// corpus (as both `f32` and `f64` bit-pattern tiles). A random `u32`/`u64`
+/// reinterpreted as a float is almost always a huge magnitude, subnormal, NaN, or
+/// infinity — so blind byte mutation essentially never lands the small in-range
+/// values that guard-narrow float tasks (`assume(x > -0.8 && x < 0.8)`,
+/// `if (!(x < 0.1)) reach_error()`) require. These small-magnitude and boundary
+/// values give the fuzzer a productive starting point; the program's own float
+/// constants (harvested by the backward slice, see
+/// [`crate::slicing::Slice::guard_floats`]) are added on top per task.
+pub const INTERESTING_FLOATS: &[f64] = &[
+    0.0, 1.0, -1.0, 0.5, -0.5, 0.25, -0.25, 0.75, -0.75, 0.1, -0.1, 0.9, -0.9, 2.0, -2.0, 10.0,
+    -10.0, 100.0, -100.0, 1e6, -1e6,
+];
+
+/// True iff `name` is a float/double nondet generator the byte-stream shim now
+/// drives (consumes `sizeof(T)` bytes → reinterprets as the float → logs the
+/// IEEE-754 bit pattern so the value-sequence replay reconstructs it bit-for-bit).
+#[must_use]
+pub fn is_float_nondet(name: &str) -> bool {
+    name == "__VERIFIER_nondet_float" || name == "__VERIFIER_nondet_double"
+}
+
 /// True iff the byte-stream shim drives `name`: the standard scalar-integer family
 /// ([`SCALAR_NONDET`]), the fixed-width typedef family ([`EXTENDED_NONDET`]), or the
 /// lazy-init nondet pointer (whose NULL/object selector is fuzzed).
@@ -173,6 +209,25 @@ pub fn is_fuzzable_nondet(name: &str) -> bool {
 #[must_use]
 pub fn references_scalar_nondet(module: &AirModule) -> bool {
     module.functions.iter().any(|f| is_fuzzable_nondet(&f.name))
+}
+
+/// True iff the program references a float/double nondet input the byte-stream
+/// shim can now drive ([`is_float_nondet`]). A mere declaration counts.
+#[must_use]
+pub fn references_float_nondet(module: &AirModule) -> bool {
+    module.functions.iter().any(|f| is_float_nondet(&f.name))
+}
+
+/// True iff the program references ANY nondet input the byte-stream shim can drive
+/// — scalar-integer / typedef / pointer ([`references_scalar_nondet`]) OR
+/// float/double ([`references_float_nondet`]). This is the gate the blind fuzzer
+/// keys on: without any fuzzable nondet, the single deterministic path is already
+/// covered by the earlier stages, so the fuzzer is a no-op. Float/double programs
+/// were previously excluded (the shim returned a fixed `0.0`), leaving the entire
+/// `floats-*` / `nla-digbench`(double) class unreachable by the portfolio.
+#[must_use]
+pub fn references_fuzzable_nondet(module: &AirModule) -> bool {
+    references_scalar_nondet(module) || references_float_nondet(module)
 }
 
 /// Number of scalar-integer `__VERIFIER_nondet_*` CALL SITES in the module's
@@ -636,8 +691,12 @@ pub fn synthesize_bytestream_driver(sentinel_c_literal: &str) -> String {
     // choice (R6), letting a harness that takes a nondet struct/array pointer run past
     // the pointer instead of bailing at a NULL check.
     s.push_str(FUZZ_NONDET_POINTER_C);
-    s.push_str("float __VERIFIER_nondet_float(void) { return 0.0f; }\n");
-    s.push_str("double __VERIFIER_nondet_double(void) { return 0.0; }\n");
+    // Float/double nondet: consume `sizeof(T)` bytes from the stream, reinterpret
+    // as the float, and LOG THE IEEE-754 BIT PATTERN (not the value) so the
+    // value-sequence replay driver reconstructs the identical bits (R6). Logging
+    // the pattern as a signed `long long` round-trips exactly through the i64 the
+    // fuzz log carries.
+    s.push_str(FUZZ_NONDET_FLOAT_C);
     s.push_str("void __VERIFIER_atomic_begin(void) { }\n");
     s.push_str("void __VERIFIER_atomic_end(void) { }\n");
 
@@ -892,7 +951,11 @@ pub fn nondet_width(name: &str, dm: DataModel) -> usize {
         | "__VERIFIER_nondet_uint"
         | "__VERIFIER_nondet_u32"
         | "__VERIFIER_nondet_s32"
-        | "__VERIFIER_nondet_unsigned" => 4,
+        | "__VERIFIER_nondet_unsigned"
+        // Float/double consume sizeof(T) bytes; the logged NondetCall value is the
+        // IEEE-754 bit pattern, so laying its low `width` little-endian bytes
+        // reproduces the exact float bytes the shim consumed.
+        | "__VERIFIER_nondet_float" => 4,
         "__VERIFIER_nondet_long" | "__VERIFIER_nondet_ulong" | "__VERIFIER_nondet_size_t" => {
             long_bytes
         }
@@ -900,7 +963,8 @@ pub fn nondet_width(name: &str, dm: DataModel) -> usize {
         | "__VERIFIER_nondet_ulonglong"
         | "__VERIFIER_nondet_u64"
         | "__VERIFIER_nondet_s64"
-        | "__VERIFIER_nondet_loff_t" => 8,
+        | "__VERIFIER_nondet_loff_t"
+        | "__VERIFIER_nondet_double" => 8,
         _ => 0,
     }
 }
@@ -1181,6 +1245,64 @@ pub fn seed_corpus(dict: &[i64]) -> Vec<Vec<u8>> {
             *slot = b;
         }
         corpus.push(buf);
+    }
+    corpus
+}
+
+/// Cap on the number of distinct float values tiled into the seed corpus (each
+/// yields one `f32`-width and one `f64`-width seed). Keeps the verbatim-seed phase
+/// bounded within the fuzz budget.
+const MAX_FLOAT_SEEDS: usize = 48;
+
+/// Build the FLOAT seed corpus: for each interesting / slice-harvested float value,
+/// two buffers that tile the value's IEEE-754 bytes across the whole input — one at
+/// `f32` (4-byte) stride, one at `f64` (8-byte) stride — so a program reading a
+/// `__VERIFIER_nondet_float()` or `_double()` at any aligned offset observes that
+/// value immediately, without the blind fuzzer having to stumble onto an in-range
+/// float by mutating raw bytes (which it essentially never does).
+///
+/// `extra` is the backward slice's `guard_floats` (the program's own float boundary
+/// constants); each is added verbatim AND nudged toward zero (`* 0.9`) so a STRICT
+/// boundary guard such as `x > -0.8` — which a tiled `-0.8` would fail — is still
+/// covered from the inside. Deterministic; deduplicated on `(width, bit-pattern)`.
+/// These only steer the search; native replay of the ORIGINAL program stays the sole
+/// FALSE arbiter (R6), so an ill-fitting seed simply fails to reach and is discarded.
+#[must_use]
+pub fn float_seed_corpus(extra: &[f64]) -> Vec<Vec<u8>> {
+    // Ordered value list: interesting values first, then slice guards (+ inward
+    // nudges), deduplicated on the f64 bit pattern.
+    let mut values: Vec<f64> = Vec::new();
+    let mut seen_val: BTreeSet<u64> = BTreeSet::new();
+    let push_val = |v: f64, values: &mut Vec<f64>, seen: &mut BTreeSet<u64>| {
+        if v.is_finite() && seen.insert(v.to_bits()) && values.len() < MAX_FLOAT_SEEDS {
+            values.push(v);
+        }
+    };
+    for &v in INTERESTING_FLOATS {
+        push_val(v, &mut values, &mut seen_val);
+    }
+    for &g in extra {
+        push_val(g, &mut values, &mut seen_val);
+        push_val(g * 0.9, &mut values, &mut seen_val);
+    }
+
+    let mut corpus: Vec<Vec<u8>> = Vec::new();
+    let mut seen_buf: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let tile = |bytes: &[u8], corpus: &mut Vec<Vec<u8>>, seen: &mut BTreeSet<Vec<u8>>| {
+        let w = bytes.len();
+        let mut buf = vec![0u8; INPUT_LEN];
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = bytes[i % w];
+        }
+        if seen.insert(buf.clone()) {
+            corpus.push(buf);
+        }
+    };
+    for &v in &values {
+        #[allow(clippy::cast_possible_truncation)]
+        let as_f32 = v as f32;
+        tile(&as_f32.to_le_bytes(), &mut corpus, &mut seen_buf);
+        tile(&v.to_le_bytes(), &mut corpus, &mut seen_buf);
     }
     corpus
 }
@@ -1485,6 +1607,77 @@ mod tests {
         assert!(parse_fuzz_log("printf hello\n").is_empty());
         assert!(parse_fuzz_log("__VERIFIER_nondet_int notanumber\n").is_empty());
         assert!(parse_fuzz_log("").is_empty());
+    }
+
+    #[test]
+    fn float_nondet_detection_and_gating() {
+        use saf_core::air::AirFunction;
+        use saf_core::ids::FunctionId;
+        use std::collections::BTreeMap;
+        let decl = |id: u128, name: &str| AirFunction {
+            id: FunctionId::new(id),
+            name: name.to_string(),
+            params: vec![],
+            blocks: vec![],
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        assert!(is_float_nondet("__VERIFIER_nondet_float"));
+        assert!(is_float_nondet("__VERIFIER_nondet_double"));
+        assert!(!is_float_nondet("__VERIFIER_nondet_int"));
+
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(decl(1, "__VERIFIER_nondet_double"));
+        assert!(references_float_nondet(&m));
+        assert!(!references_scalar_nondet(&m), "double is not a scalar-int");
+        assert!(
+            references_fuzzable_nondet(&m),
+            "float/double is now fuzzable"
+        );
+    }
+
+    #[test]
+    fn float_seed_corpus_tiles_interesting_and_slice_floats() {
+        // Interesting floats alone produce seeds even with no slice guards.
+        let base = float_seed_corpus(&[]);
+        assert!(!base.is_empty());
+        assert!(base.iter().all(|b| b.len() == INPUT_LEN));
+
+        // -0.75f tiled at f32 stride: the 4-byte pattern repeats from offset 0, so a
+        // `__VERIFIER_nondet_float()` read at offset 0 reconstructs exactly -0.75.
+        let want = (-0.75f32).to_le_bytes();
+        assert!(
+            base.iter().any(|b| b[0..4] == want && b[4..8] == want),
+            "an f32 -0.75 tile must be present"
+        );
+
+        // A slice-harvested boundary (e.g. -0.8) is added AND nudged inward (*0.9).
+        let with_guard = float_seed_corpus(&[-0.8]);
+        let nudged = (-0.8f64 * 0.9) as f32;
+        assert!(
+            with_guard.iter().any(|b| b[0..4] == nudged.to_le_bytes()),
+            "the inward-nudged guard float must be tiled"
+        );
+        // Deterministic.
+        assert_eq!(float_seed_corpus(&[-0.8]), with_guard);
+    }
+
+    #[test]
+    fn bytestream_driver_drives_float_and_double() {
+        let src = synthesize_bytestream_driver("/tmp/x");
+        assert!(
+            src.contains("float __VERIFIER_nondet_float(void)") && src.contains("memcpy(&__f"),
+            "float shim must consume bytes + memcpy"
+        );
+        assert!(
+            src.contains("double __VERIFIER_nondet_double(void)") && src.contains("memcpy(&__d"),
+            "double shim must consume bytes + memcpy"
+        );
+        // No longer the fixed-0 stub.
+        assert!(!src.contains("return 0.0f; }"));
     }
 
     #[test]
@@ -1856,8 +2049,11 @@ mod tests {
             nondet_width("__VERIFIER_nondet_longlong", DataModel::ILP32),
             8
         );
-        // Non-driven names consume nothing.
-        assert_eq!(nondet_width("__VERIFIER_nondet_float", DataModel::LP64), 0);
+        // Float/double are now byte-stream driven (sizeof(T)).
+        assert_eq!(nondet_width("__VERIFIER_nondet_float", DataModel::LP64), 4);
+        assert_eq!(nondet_width("__VERIFIER_nondet_double", DataModel::LP64), 8);
+        // A name the shim does not drive consumes nothing.
+        assert_eq!(nondet_width("some_unknown_fn", DataModel::LP64), 0);
     }
 
     #[test]
@@ -1888,7 +2084,7 @@ mod tests {
     fn nondet_seq_to_input_is_deterministic_and_skips_undriven() {
         let seq = vec![
             NondetCall {
-                func_name: "__VERIFIER_nondet_float".to_string(), // width 0 -> skipped
+                func_name: "some_unknown_fn".to_string(), // width 0 -> skipped
                 value: 5,
                 call_inst: None,
             },

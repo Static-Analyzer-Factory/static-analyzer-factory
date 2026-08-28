@@ -35,7 +35,9 @@ use saf_core::ids::{BlockId, InstId, ValueId};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The result of a backward slice from the `reach_error` criteria.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+// `guard_floats: Vec<f64>` precludes `Eq` (f64 is only `PartialEq`); the slice is
+// compared structurally only in tests, where `PartialEq` suffices.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Slice {
     /// Instructions that (transitively) influence whether a criterion is
     /// reached, by data or control dependence. Deterministic ([`BTreeSet`]).
@@ -45,6 +47,14 @@ pub struct Slice {
     /// first) and deduplicated. These are the values a nondet input must match
     /// to cross a guard on the path to the error.
     pub guard_constants: Vec<i64>,
+    /// Floating-point constants that appear in comparisons / arithmetic
+    /// controlling the criteria (the `-0.8`, `0.1` boundaries of a
+    /// `assume(x > -0.8 && x < 0.8); if (!(g(x) < 0.1)) reach_error();` guard),
+    /// ordered nearest-the-error first and deduplicated by IEEE-754 bit pattern.
+    /// These steer the FLOAT byte-stream fuzzer toward the narrow in-range inputs
+    /// a blind random float almost never lands on (a random `u32`/`u64`
+    /// reinterpreted as a float is overwhelmingly a huge magnitude / NaN / inf).
+    pub guard_floats: Vec<f64>,
 }
 
 /// A per-module index used during slicing: the defining instruction of every
@@ -80,6 +90,15 @@ fn const_int(module: &AirModule, v: ValueId) -> Option<i64> {
     match module.constants.get(&v) {
         Some(Constant::Int { value, .. }) => Some(*value),
         Some(Constant::BigInt { value, .. }) => value.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// Look up the floating-point value of a value id if it is a module float
+/// constant (stored as `f64`; lossless for `f32` sources — see [`Constant::Float`]).
+fn const_float(module: &AirModule, v: ValueId) -> Option<f64> {
+    match module.constants.get(&v) {
+        Some(Constant::Float { value, .. }) => Some(*value),
         _ => None,
     }
 }
@@ -190,6 +209,15 @@ pub fn backward_slice(module: &AirModule) -> Slice {
             slice.guard_constants.push(v);
         }
     };
+    // Float guards are deduplicated on the IEEE-754 bit pattern (`f64` is not
+    // `Ord`/`Eq`-hashable; two syntactically distinct writes of the same value
+    // share a pattern and must collapse to one steering constant).
+    let mut float_seen: BTreeSet<u64> = BTreeSet::new();
+    let record_float = |slice: &mut Slice, seen: &mut BTreeSet<u64>, v: f64| {
+        if seen.insert(v.to_bits()) {
+            slice.guard_floats.push(v);
+        }
+    };
 
     // Backward closure over data dependences.
     while let Some(val) = queue.pop_front() {
@@ -208,6 +236,9 @@ pub fn backward_slice(module: &AirModule) -> Slice {
         // are recorded roughly nearest-the-error first.
         let icmp_kind = is_icmp(&inst.op);
         for &op in &inst.operands {
+            if let Some(f) = const_float(module, op) {
+                record_float(&mut slice, &mut float_seen, f);
+            }
             if let Some(k) = const_int(module, op) {
                 record_guard(&mut slice, &mut guard_seen, k);
                 // For a STRICT comparison the value that crosses the guard is one
@@ -544,6 +575,84 @@ mod tests {
         );
     }
 
+    /// `main` computes `cmp = fcmp(x, 0.8)` then branches to `reach_error()`; the
+    /// slice must harvest the FLOAT guard constant `0.8`.
+    #[test]
+    fn slice_harvests_the_float_guard_constant() {
+        let reach_id = FunctionId::new(1);
+        let x = ValueId::new(10);
+        let bound = ValueId::new(11);
+        let cmp = ValueId::new(12);
+
+        let fcmp = Instruction {
+            id: InstId::new(100),
+            op: Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt, // op kind is irrelevant to float harvesting
+            },
+            operands: vec![x, bound],
+            dst: Some(cmp),
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        };
+        let condbr = Instruction {
+            id: InstId::new(101),
+            op: Operation::CondBr {
+                then_target: BlockId::new(21),
+                else_target: BlockId::new(22),
+            },
+            operands: vec![cmp],
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        };
+        let call = Instruction {
+            id: InstId::new(102),
+            op: Operation::CallDirect { callee: reach_id },
+            operands: vec![],
+            dst: None,
+            span: None,
+            symbol: None,
+            result_type: None,
+            extensions: BTreeMap::new(),
+        };
+        let mut block = AirBlock::new(BlockId::new(20));
+        block.instructions = vec![fcmp, condbr, call];
+
+        let main = AirFunction {
+            id: FunctionId::new(2),
+            name: "main".to_string(),
+            params: vec![],
+            blocks: vec![block],
+            entry_block: Some(BlockId::new(20)),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(decl(1, "reach_error"));
+        m.functions.push(main);
+        m.constants.insert(
+            bound,
+            Constant::Float {
+                value: 0.8,
+                bits: 64,
+            },
+        );
+
+        let slice = backward_slice(&m);
+        assert!(
+            slice.guard_floats.iter().any(|f| (*f - 0.8).abs() < 1e-12),
+            "float guard 0.8 must be harvested, got {:?}",
+            slice.guard_floats
+        );
+    }
+
     /// CFG: bb0 -CondBr-> bb1(reach_error) / bb2 -Br-> bb3(ret). Only bb0 and bb1
     /// can reach the error; bb2/bb3 are a dead subtree that a solver may abort.
     #[test]
@@ -695,6 +804,7 @@ mod tests {
         let slice = Slice {
             instructions: BTreeSet::new(),
             guard_constants: vec![777, 888],
+            guard_floats: vec![],
         };
         let dict = slice_directed_dictionary(&m, &slice);
         assert_eq!(dict[0], 777, "guard constant first");
