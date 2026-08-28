@@ -22,7 +22,7 @@
 //!   narrower than memsafety's R1: an overflow inside a genuine program helper (even a
 //!   `printLine`) IS a real `no-overflow` violation and is NOT rejected.
 
-use crate::witness_yaml::{Action, SourceWaypoint, WaypointKind};
+use crate::witness_yaml::{Action, Constraint, SourceWaypoint, WaypointKind};
 
 /// A confirmed UBSan signed-integer-overflow violation: the program-source location
 /// of the overflowing operation (the witness target). `no-overflow` has no
@@ -87,11 +87,70 @@ pub fn overflow_verdict() -> String {
     "false(no-overflow)".to_string()
 }
 
+/// One nondet-input binding used to ENRICH an overflow violation witness: on the
+/// execution that reproduced the trap, the source variable `lhs` at `file:line`
+/// held the concrete `value`. The witness lowerer turns each of these into a
+/// `c_expression` assumption waypoint (`lhs == value`) placed BEFORE the target.
+///
+/// Populated by the confirmer from the winning mini-fuzz constant (which every
+/// scalar-integer `__VERIFIER_nondet_*` on the reaching path returned) — it is
+/// the concrete counterexample input the validator needs to replay the path to
+/// the overflow, which a bare target waypoint does not carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NondetAssume {
+    /// Basename of the source file the read appears in (the task's `input_files`).
+    pub file: String,
+    /// 1-based source line of the `lhs = __VERIFIER_nondet_*()` read.
+    pub line: u32,
+    /// The assigned variable (a plain C identifier).
+    pub lhs: String,
+    /// The concrete (type-cast) value the nondet returned on the trapping run.
+    pub value: i64,
+}
+
 /// Lower a confirmed hit to a target-only YAML-2.0 violation witness: a single
 /// `target` waypoint at the overflowing operation's source line.
 #[must_use]
 pub fn lower_overflow_hit(hit: &OverflowHit) -> Vec<SourceWaypoint> {
-    vec![SourceWaypoint {
+    lower_overflow_hit_enriched(hit, &[])
+}
+
+/// Lower a confirmed hit to an ENRICHED YAML-2.0 violation witness: one
+/// `assumption` waypoint per reaching nondet read (each binding a nondet input
+/// to the concrete value that reproduced the overflow), in source order,
+/// followed by the `target` waypoint at the overflowing operation.
+///
+/// With `assumes` empty this is byte-identical to [`lower_overflow_hit`] (a
+/// bare target), so a task the confirmer cannot supply inputs for is unchanged.
+///
+/// **Soundness:** this is output-only and verdict-neutral — the verdict is
+/// already `false(no-overflow)` (UBSan is the sole arbiter). Enrichment can only
+/// turn a validator's `confirmed 0 -> +1`; a malformed enrichment can at worst
+/// drop an already-confirmed witness, which the confirmed-score gate reverts. The
+/// assumptions are TRUE of the witnessed execution (the shim returned that exact
+/// value for every scalar nondet), so they never misdirect the validator.
+#[must_use]
+pub fn lower_overflow_hit_enriched(
+    hit: &OverflowHit,
+    assumes: &[NondetAssume],
+) -> Vec<SourceWaypoint> {
+    let mut wps: Vec<SourceWaypoint> = assumes
+        .iter()
+        .map(|a| SourceWaypoint {
+            kind: WaypointKind::Assumption,
+            action: Action::Follow,
+            file_name: a.file.clone(),
+            line: a.line,
+            // The read line carries no reliable column for the lhs; omit it.
+            column: None,
+            function: None,
+            constraint: Some(Constraint {
+                format: Some("c_expression".to_string()),
+                value: format!("{} == {}", a.lhs, a.value),
+            }),
+        })
+        .collect();
+    wps.push(SourceWaypoint {
         kind: WaypointKind::Target,
         action: Action::Follow,
         file_name: hit.file.clone(),
@@ -99,7 +158,8 @@ pub fn lower_overflow_hit(hit: &OverflowHit) -> Vec<SourceWaypoint> {
         column: hit.column,
         function: None,
         constraint: None,
-    }]
+    });
+    wps
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +384,81 @@ add.c:2: runtime error: signed integer overflow: 2147483647 + 1 cannot be repres
     #[test]
     fn verdict_string_is_false_no_overflow() {
         assert_eq!(overflow_verdict(), "false(no-overflow)");
+    }
+
+    #[test]
+    fn enriched_lowering_prepends_assumption_waypoints_before_the_target() {
+        let hit = OverflowHit {
+            file: "t.c".to_string(),
+            line: 20,
+            column: Some(9),
+        };
+        let assumes = vec![
+            NondetAssume {
+                file: "t.c".to_string(),
+                line: 5,
+                lhs: "x".to_string(),
+                value: 2147483647,
+            },
+            NondetAssume {
+                file: "t.c".to_string(),
+                line: 6,
+                lhs: "y".to_string(),
+                value: -3,
+            },
+        ];
+        let wps = lower_overflow_hit_enriched(&hit, &assumes);
+        // Two assumptions then the target.
+        assert_eq!(wps.len(), 3);
+        assert!(matches!(wps[0].kind, WaypointKind::Assumption));
+        assert_eq!(wps[0].line, 5);
+        assert_eq!(
+            wps[0].constraint.as_ref().map(|c| c.value.as_str()),
+            Some("x == 2147483647")
+        );
+        assert_eq!(
+            wps[0].constraint.as_ref().and_then(|c| c.format.as_deref()),
+            Some("c_expression")
+        );
+        assert!(matches!(wps[1].kind, WaypointKind::Assumption));
+        assert_eq!(
+            wps[1].constraint.as_ref().map(|c| c.value.as_str()),
+            Some("y == -3")
+        );
+        // Target last, at the fault, no constraint (format requirement).
+        assert!(matches!(wps[2].kind, WaypointKind::Target));
+        assert_eq!(wps[2].line, 20);
+        assert!(wps[2].constraint.is_none());
+
+        // The enriched witness assembles into a well-formed YAML-2.0 document.
+        let meta = WitnessMeta {
+            producer_version: "0.1.0".to_string(),
+            specification: "CHECK( init(main()), LTL(G ! overflow) )".to_string(),
+            data_model: DataModel::LP64,
+            language: Language::C,
+            input_file: PathBuf::from("/nonexistent/t.c"),
+        };
+        let yaml = ViolationWitness::assemble(&meta, &wps)
+            .expect("assemble")
+            .to_yaml_string()
+            .expect("serialize");
+        assert!(yaml.contains("type: assumption"), "{yaml}");
+        assert!(yaml.contains("type: target"), "{yaml}");
+        assert!(yaml.contains("value: x == 2147483647"), "{yaml}");
+        assert!(yaml.contains("format: c_expression"), "{yaml}");
+    }
+
+    #[test]
+    fn enriched_lowering_with_no_assumes_equals_target_only() {
+        let hit = OverflowHit {
+            file: "t.c".to_string(),
+            line: 42,
+            column: Some(7),
+        };
+        assert_eq!(
+            lower_overflow_hit_enriched(&hit, &[]),
+            lower_overflow_hit(&hit)
+        );
     }
 
     #[test]

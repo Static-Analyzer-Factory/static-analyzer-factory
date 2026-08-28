@@ -54,7 +54,10 @@ pub use conc_shim::{
 pub use memsafety::{
     AsanHit, asan_class_to_subproperty, lower_memsafety_hit, memsafety_verdict, parse_asan_report,
 };
-pub use overflow::{OverflowHit, lower_overflow_hit, overflow_verdict, parse_ubsan_overflow};
+pub use overflow::{
+    NondetAssume, OverflowHit, lower_overflow_hit, lower_overflow_hit_enriched, overflow_verdict,
+    parse_ubsan_overflow,
+};
 pub use portfolio::{Lever, UnreachFeatures, plan_unreach};
 pub use property::{
     AnalysisContext, FalseCandidate, NondetCall, PropertyAnalysisConfig, PropertyResult,

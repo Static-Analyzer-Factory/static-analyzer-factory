@@ -112,7 +112,7 @@ pub struct Constraint {
 }
 
 /// A source-level waypoint: property-agnostic input to [`ViolationWitness::assemble`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceWaypoint {
     /// The requirement type.
     pub kind: WaypointKind,

@@ -4392,6 +4392,292 @@ fn asan_threshold_argv_sweep(
     Ok(None)
 }
 
+/// Upper bound on how many nondet-input assumptions an overflow witness carries.
+/// A handful of on-path bindings is what a validator needs to replay the
+/// counterexample; a program with MANY nondet reads (e.g. a 45-read CIL driver)
+/// has most of them off the reaching path, and emitting a `follow` assumption at
+/// an unexecuted read would make the witness unfollowable — so above this bound we
+/// fall back to the target-only witness (never a wrong assumption).
+const OVERFLOW_WITNESS_MAX_ASSUMES: usize = 4;
+
+/// The C control-flow keywords that end `main`'s unconditional straight-line
+/// prefix (see [`main_unconditional_prefix_lines`]).
+const PREFIX_ENDING_CONTROL: [&str; 9] = [
+    "if", "for", "while", "do", "switch", "goto", "case", "else", "return",
+];
+
+/// True iff `s` is a plain C identifier (`[A-Za-z_][A-Za-z0-9_]*`) — safe to place
+/// verbatim in an assumption's `c_expression` (`lhs == V`). Rejects `a[i]`,
+/// `p->x`, casts, etc., whose value need not equal the raw nondet return.
+fn is_plain_c_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// True iff `line` is a C preprocessor line-marker directive — either `#line N`
+/// or a GNU `# N "file"` marker — which remaps subsequent physical lines to
+/// logical source coordinates (so physical-line witness waypoints would miss).
+fn is_line_marker_directive(line: &str) -> bool {
+    let t = line.trim_start();
+    if let Some(rest) = t.strip_prefix('#') {
+        let rest = rest.trim_start();
+        return rest.starts_with("line") || rest.starts_with(|c: char| c.is_ascii_digit());
+    }
+    false
+}
+
+/// The concrete value a scalar-*signed*-integer `__VERIFIER_nondet_*` returned
+/// under the uniform mini-fuzz constant `k`, modelling the replay driver EXACTLY:
+/// `(cty)(long)atol("<k>")`. Returns `None` for unsigned / bool / float / unknown
+/// generators (left unconstrained — a plain decimal `lhs == V` is only unambiguous
+/// C for a signed value, and unsigned witnesses risk a wrong literal).
+///
+/// Two width-dependent steps, in the driver's order — getting either wrong emits a
+/// FALSE assumption that describes an infeasible path and fails validation:
+/// 1. **`atol` → `long`**: glibc's `atol`/`strtol` **saturates** an out-of-range
+///    decimal to `LONG_MAX`/`LONG_MIN`. Under ILP32 (`-m32`) `long` is 32-bit, so a
+///    sweep constant like `2^31` becomes `INT_MAX` (2147483647) — NOT a wrapped
+///    `INT_MIN`. (This is exactly why `2^31` traps `x+y` as `INT_MAX + INT_MAX`.)
+/// 2. **`(cty)` cast**: a C cast to the narrower target type **wraps** two's
+///    complement (`(char)200 == -56`).
+fn signed_nondet_cast(func_name: &str, k: i64, data_model: saf_svcomp::DataModel) -> Option<i64> {
+    let long_bits: u32 = match data_model {
+        saf_svcomp::DataModel::ILP32 => 32,
+        saf_svcomp::DataModel::LP64 => 64,
+    };
+    let type_bits = match func_name {
+        "__VERIFIER_nondet_int" => 32,
+        "__VERIFIER_nondet_long" => long_bits,
+        "__VERIFIER_nondet_longlong" => 64,
+        "__VERIFIER_nondet_short" => 16,
+        // Plain `char` is signed under the x86-64 Linux ABI clang compiles for.
+        "__VERIFIER_nondet_char" => 8,
+        _ => return None, // unsigned / bool / size_t / float / pointer: skip
+    };
+    // Step 1: `atol` saturates the decimal into the platform `long` range.
+    let atol_long = saturate_to_signed_width(k, long_bits);
+    // Step 2: the C cast to the target type wraps.
+    Some(wrap_to_signed_width(atol_long, type_bits))
+}
+
+/// Clamp `k` into the signed range of a `bits`-wide integer (`bits` ∈ {32,64}),
+/// modelling glibc `atol`/`strtol` overflow saturation to `LONG_MAX`/`LONG_MIN`.
+fn saturate_to_signed_width(k: i64, bits: u32) -> i64 {
+    if bits >= 64 {
+        return k;
+    }
+    let max = (1i64 << (bits - 1)) - 1;
+    let min = -(1i64 << (bits - 1));
+    k.clamp(min, max)
+}
+
+/// Reduce `k` into the signed two's-complement range of a `bits`-wide integer
+/// (`bits` ∈ {8,16,32,64}), matching a C cast of `k` to that type.
+fn wrap_to_signed_width(k: i64, bits: u32) -> i64 {
+    if bits >= 64 {
+        return k;
+    }
+    let modulus: i128 = 1i128 << bits;
+    let mut r = i128::from(k) % modulus;
+    if r < 0 {
+        r += modulus;
+    }
+    if r >= modulus / 2 {
+        r -= modulus;
+    }
+    // INVARIANT: r is now in [-2^(bits-1), 2^(bits-1)) with bits <= 32, so it fits i64.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        r as i64
+    }
+}
+
+/// The set of source lines in `main`'s **unconditional straight-line prefix** —
+/// the run of statements from `main`'s opening brace up to (but not including) the
+/// first control-flow construct (`if`/`for`/`while`/`do`/`switch`/`goto`/`case`/
+/// `else`/`return`, or a `?:`/`&&`/`||`). Every statement in this prefix executes
+/// exactly once on EVERY run that enters `main`, so a nondet read here is provably
+/// on the reaching path and its `follow` assumption can never describe an
+/// infeasible path (unlike a read inside a loop/branch whose entry guard the bound
+/// value may contradict — which would make the enriched witness unfollowable and
+/// DROP an otherwise-confirmed target witness).
+///
+/// Deliberately conservative: reads in helper functions, inside loops/branches, or
+/// after the first control token are excluded (they fall back to a target-only
+/// witness). A best-effort textual scan — good enough because it only ever *omits*
+/// bindings, never fabricates a wrong one.
+fn main_unconditional_prefix_lines(source: &str) -> std::collections::BTreeSet<u32> {
+    let mut safe = std::collections::BTreeSet::new();
+    // Locate `main` as a whole word, then its body's opening brace (no braces occur
+    // in a `main(...)` parameter list, so the first `{` after it opens the body).
+    let Some(main_pos) = find_word(source, "main") else {
+        return safe;
+    };
+    let Some(brace_rel) = source[main_pos..].find('{') else {
+        return safe;
+    };
+    let body_start = main_pos + brace_rel + 1;
+    #[allow(clippy::cast_possible_truncation)]
+    let mut line = 1 + source[..body_start].bytes().filter(|&b| b == b'\n').count() as u32;
+
+    let rest = &source.as_bytes()[body_start..];
+    let mut depth = 1i32;
+    let mut i = 0usize;
+    let mut stop = false;
+    while i < rest.len() {
+        let c = rest[i];
+        match c {
+            b'\n' => {
+                line += 1;
+                i += 1;
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break; // end of main's body
+                }
+                i += 1;
+            }
+            b'?' => {
+                stop = true;
+                break;
+            }
+            b'&' if rest.get(i + 1) == Some(&b'&') => {
+                stop = true;
+                break;
+            }
+            b'|' if rest.get(i + 1) == Some(&b'|') => {
+                stop = true;
+                break;
+            }
+            _ if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < rest.len() && (rest[i].is_ascii_alphanumeric() || rest[i] == b'_') {
+                    i += 1;
+                }
+                if PREFIX_ENDING_CONTROL.contains(&&source[body_start + start..body_start + i]) {
+                    stop = true;
+                    break;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+        safe.insert(line);
+    }
+    // Exclude the line the first control token sits on — a read after that token on
+    // the same line (`if (c) x = nondet();`) is NOT unconditional.
+    if stop {
+        safe.remove(&line);
+    }
+    safe
+}
+
+/// The first whole-word occurrence of `word` in `s` (byte offset), or `None`.
+/// Whole-word = not flanked by identifier characters (so `main` does not match
+/// `domain`).
+fn find_word(s: &str, word: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(word) {
+        let pos = from + rel;
+        let before_ok = pos == 0 || !is_ident_byte(bytes[pos - 1]);
+        let after = pos + word.len();
+        let after_ok = after >= bytes.len() || !is_ident_byte(bytes[after]);
+        if before_ok && after_ok {
+            return Some(pos);
+        }
+        from = pos + 1;
+    }
+    None
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Build the nondet-input assumptions that enrich an overflow violation witness,
+/// from the uniform winning mini-fuzz constant `k` (every scalar-integer nondet on
+/// the reaching path returned `(type)k`). For each SIMPLE signed-integer
+/// `__VERIFIER_nondet_*` read in `main`'s unconditional straight-line prefix, bind
+/// its assigned variable to that concrete value — the counterexample input a bare
+/// target waypoint omits and CPAchecker/Witch3 cannot otherwise replay.
+///
+/// Returns empty (⇒ target-only witness, unchanged behavior) whenever inputs
+/// cannot be cleanly and safely attributed. Each guard only costs witness fidelity,
+/// never soundness (the verdict is already UBSan-confirmed `false`) — and, crucially,
+/// never drops an already-confirmed target witness (a `follow` assumption is only
+/// emitted for a read that provably executes on every run):
+/// - **`k != 0`** — a non-zero winning constant means the specific input drove the
+///   trap. A zero-input (direct) overflow that traps at the sweep's first constant
+///   validates target-only already; enriching it risks an off-path incidental read.
+/// - **[`main_unconditional_prefix_lines`]** — the read must be in `main`'s
+///   straight-line prefix, so its `follow` assumption cannot describe an infeasible
+///   path (the failure mode that would unfollow — and drop — the witness).
+/// - **line `<` fault line** — never bind a read after the faulting operation.
+/// - **signed types, simple non-compound reads, identifier lhs** — so `lhs == V`
+///   is exact, unambiguous C (`x = nondet();`, not `a[i] = nondet()%5;`).
+/// - **at most [`OVERFLOW_WITNESS_MAX_ASSUMES`]** bindings.
+fn overflow_nondet_assumes(
+    ctx: &VerifyCtx,
+    hit: &saf_svcomp::OverflowHit,
+    k: i64,
+) -> Vec<saf_svcomp::NondetAssume> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let Ok(source) = std::fs::read_to_string(ctx.input) else {
+        return Vec::new();
+    };
+    // Enrichment lines are physical lines of `ctx.input`; if the file carries
+    // line-marker directives (`#line`/`# N "f"`) the validator remaps lines and a
+    // physical-line assumption would miss — bail to target-only. (SV-COMP `.i`
+    // tasks ship these stripped, so this rarely costs recall.)
+    if source.lines().any(is_line_marker_directive) {
+        return Vec::new();
+    }
+    let prefix = main_unconditional_prefix_lines(&source);
+    let file = ctx
+        .input
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("input.c")
+        .to_string();
+
+    let mut assumes = Vec::new();
+    for (line, site) in saf_svcomp::nondet_line_map(&source) {
+        if line >= hit.line
+            || !prefix.contains(&line)
+            || site.compound
+            || !is_plain_c_identifier(&site.lhs)
+        {
+            continue;
+        }
+        let Some(value) = signed_nondet_cast(&site.func_name, k, ctx.data_model) else {
+            continue;
+        };
+        assumes.push(saf_svcomp::NondetAssume {
+            file: file.clone(),
+            line,
+            lhs: site.lhs,
+            value,
+        });
+    }
+    if assumes.is_empty() || assumes.len() > OVERFLOW_WITNESS_MAX_ASSUMES {
+        return Vec::new();
+    }
+    assumes
+}
+
 /// The `no-overflow` FALSE pipeline (plan 199, R6): confirmer-first, propose-free.
 /// Mirrors [`memsafety_strategy`], swapping the arbiter ASan→UBSan. No sub-property,
 /// so the verdict is always `false(no-overflow)` (no classifier).
@@ -4404,8 +4690,19 @@ fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         ctx.tempdir,
         ctx.clang,
     ) {
-        Ok(Some(hit)) => {
-            let witness = build_witness(ctx, Some(saf_svcomp::lower_overflow_hit(&hit)));
+        Ok(Some((hit, winning_const))) => {
+            // Enrich the witness with the concrete nondet inputs that reproduced the
+            // trap (turns a validator's `confirmed 0 -> +1` on the input-driven
+            // overflow reservoir a bare target waypoint cannot replay). Output-only and
+            // verdict-neutral (UBSan already decided `false`); falls back to the
+            // target-only witness whenever inputs cannot be cleanly attributed.
+            let assumes = winning_const
+                .map(|k| overflow_nondet_assumes(ctx, &hit, k))
+                .unwrap_or_default();
+            let witness = build_witness(
+                ctx,
+                Some(saf_svcomp::lower_overflow_hit_enriched(&hit, &assumes)),
+            );
             if witness.is_none() {
                 eprintln!(
                     "saf verify: FALSE (UBSan signed-overflow) but witness unconstructible -> emitting false without a witness"
@@ -5172,7 +5469,7 @@ fn ubsan_confirm(
     stub: &Path,
     dir: &Path,
     clang: &str,
-) -> anyhow::Result<Option<saf_svcomp::OverflowHit>> {
+) -> anyhow::Result<Option<(saf_svcomp::OverflowHit, Option<i64>)>> {
     use anyhow::Context;
     use std::process::{Command, Stdio};
 
@@ -5327,25 +5624,27 @@ fn ubsan_confirm(
 
     // Run one mini-fuzz sweep: for each data constant `k` in `sweep`, run the harness
     // with `SAF_NONDET_CONST=k` (and, when `bool_const` is set, `SAF_BOOL_CONST` too),
-    // returning the first constant that reproduces a signed overflow.
+    // returning the first constant that reproduces a signed overflow — paired with that
+    // winning `k` so the caller can enrich the witness with the concrete nondet inputs
+    // (every scalar-integer nondet on the reaching path returned `(type)k`).
     let run_sweep = |sweep: &[i64],
                      bool_const: Option<&str>|
-     -> anyhow::Result<Option<saf_svcomp::OverflowHit>> {
+     -> anyhow::Result<Option<(saf_svcomp::OverflowHit, i64)>> {
         for &k in sweep {
             let mut env: Vec<(&str, String)> = vec![("SAF_NONDET_CONST", k.to_string())];
             if let Some(bc) = bool_const {
                 env.push(("SAF_BOOL_CONST", bc.to_string()));
             }
             if let Some(hit) = run_child(&env, timeout)? {
-                return Ok(Some(hit)); // first constant that reproduces an overflow wins
+                return Ok(Some((hit, k))); // first constant that reproduces an overflow wins
             }
         }
         Ok(None)
     };
 
     // Primary sweep: nondet_bool tracks SAF_NONDET_CONST (the committed behaviour).
-    if let Some(hit) = run_sweep(&candidates, None)? {
-        return Ok(Some(hit));
+    if let Some((hit, k)) = run_sweep(&candidates, None)? {
+        return Ok(Some((hit, Some(k))));
     }
 
     // Loop-sustaining bool pass: when the program has a `__VERIFIER_nondet_bool()`
@@ -5357,8 +5656,8 @@ fn ubsan_confirm(
     // re-triggers on the ORIGINAL program per R6). Gated on the presence of nondet_bool
     // so the extra native runs never touch a program that cannot benefit.
     if saf_svcomp::fuzz::references_nondet_bool(module) {
-        if let Some(hit) = run_sweep(OVERFLOW_BOOL_SWEEP, Some("1"))? {
-            return Ok(Some(hit));
+        if let Some((hit, k)) = run_sweep(OVERFLOW_BOOL_SWEEP, Some("1"))? {
+            return Ok(Some((hit, Some(k))));
         }
     }
 
@@ -5395,7 +5694,11 @@ fn ubsan_confirm(
                         ("SAF_BASE_VAL", base.to_string()),
                     ];
                     if let Some(hit) = run_child(&env, pos_timeout)? {
-                        return Ok(Some(hit));
+                        // The positional pass gives DIFFERENT values per call site (by
+                        // execution order, not source line), so there is no clean
+                        // source-line->value map to enrich with; emit a target-only
+                        // witness (`None`) rather than risk a wrong assumption.
+                        return Ok(Some((hit, None)));
                     }
                 }
             }
@@ -6498,6 +6801,309 @@ mod verify_tests {
             "LONG_MAX under LP64"
         );
         assert!(lp64.len() > ilp32.len());
+    }
+
+    #[test]
+    fn wrap_to_signed_width_matches_c_casts() {
+        // 32-bit: INT_MAX+1 wraps to INT_MIN; in-range values are unchanged.
+        assert_eq!(wrap_to_signed_width(2_147_483_647, 32), 2_147_483_647);
+        assert_eq!(wrap_to_signed_width(2_147_483_648, 32), -2_147_483_648);
+        assert_eq!(wrap_to_signed_width(-3, 32), -3);
+        // 8-bit signed char: 200 -> -56, 127 stays, 128 -> -128.
+        assert_eq!(wrap_to_signed_width(200, 8), -56);
+        assert_eq!(wrap_to_signed_width(127, 8), 127);
+        assert_eq!(wrap_to_signed_width(128, 8), -128);
+        // 16-bit short: 40000 -> 40000-65536.
+        assert_eq!(wrap_to_signed_width(40_000, 16), 40_000 - 65_536);
+        // 64-bit: identity.
+        assert_eq!(wrap_to_signed_width(i64::MAX, 64), i64::MAX);
+        assert_eq!(wrap_to_signed_width(-42, 64), -42);
+    }
+
+    #[test]
+    fn signed_nondet_cast_only_signed_types() {
+        use saf_svcomp::DataModel::{ILP32, LP64};
+        // int is 32-bit under both models.
+        assert_eq!(
+            signed_nondet_cast("__VERIFIER_nondet_int", 5, LP64),
+            Some(5)
+        );
+        assert_eq!(
+            signed_nondet_cast("__VERIFIER_nondet_int", 2_147_483_648, LP64),
+            Some(-2_147_483_648)
+        );
+        // long holds 2^31 under LP64 (fits, no wrap).
+        assert_eq!(
+            signed_nondet_cast("__VERIFIER_nondet_long", 2_147_483_648, LP64),
+            Some(2_147_483_648)
+        );
+        // Under ILP32 `long`/`atol` is 32-bit, so atol SATURATES 2^31 to LONG_MAX =
+        // INT_MAX (2147483647) — it does NOT wrap to INT_MIN. This is the driver-model
+        // fix: `2^31` traps `x+y` as `INT_MAX + INT_MAX`, so the bound value must be
+        // INT_MAX, else the enriched witness describes an infeasible path.
+        assert_eq!(
+            signed_nondet_cast("__VERIFIER_nondet_long", 2_147_483_648, ILP32),
+            Some(2_147_483_647)
+        );
+        assert_eq!(
+            signed_nondet_cast("__VERIFIER_nondet_int", 2_147_483_648, ILP32),
+            Some(2_147_483_647)
+        );
+        // But under LP64 `long` holds 2^31, so the `(int)` cast wraps it to INT_MIN.
+        assert_eq!(
+            signed_nondet_cast("__VERIFIER_nondet_int", 2_147_483_648, LP64),
+            Some(-2_147_483_648)
+        );
+        // char/short are signed and narrow; an in-range value's cast wraps, not saturates.
+        assert_eq!(
+            signed_nondet_cast("__VERIFIER_nondet_char", 200, LP64),
+            Some(-56)
+        );
+        // Unsigned / bool / size_t / float are skipped (None).
+        assert_eq!(signed_nondet_cast("__VERIFIER_nondet_uint", 5, LP64), None);
+        assert_eq!(signed_nondet_cast("__VERIFIER_nondet_ulong", 5, LP64), None);
+        assert_eq!(signed_nondet_cast("__VERIFIER_nondet_bool", 1, LP64), None);
+        assert_eq!(
+            signed_nondet_cast("__VERIFIER_nondet_size_t", 5, LP64),
+            None
+        );
+    }
+
+    #[test]
+    fn is_plain_c_identifier_accepts_only_identifiers() {
+        assert!(is_plain_c_identifier("x"));
+        assert!(is_plain_c_identifier("_tmp1"));
+        assert!(is_plain_c_identifier("myVar_2"));
+        assert!(!is_plain_c_identifier("a[i]"));
+        assert!(!is_plain_c_identifier("p->x"));
+        assert!(!is_plain_c_identifier("2bad"));
+        assert!(!is_plain_c_identifier(""));
+        assert!(!is_plain_c_identifier("a b"));
+    }
+
+    #[test]
+    fn is_line_marker_directive_detects_markers() {
+        assert!(is_line_marker_directive("#line 5 \"a.c\""));
+        assert!(is_line_marker_directive("# 12 \"a.c\""));
+        assert!(is_line_marker_directive("   # 1 \"x\""));
+        // Ordinary preprocessor directives are NOT line markers.
+        assert!(!is_line_marker_directive("#include <stdio.h>"));
+        assert!(!is_line_marker_directive("#define X 1"));
+        assert!(!is_line_marker_directive("int x = 0;"));
+    }
+
+    #[test]
+    fn overflow_nondet_assumes_binds_reaching_signed_reads() {
+        use saf_svcomp::{DataModel, Language, WitnessMeta};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("t.c");
+        // One int read (bound), one uint read (skipped: unsigned), one read AFTER the
+        // fault (skipped: not on the reaching path), and the fault at line 6.
+        std::fs::write(
+            &src,
+            "int main() {\n\
+             \x20 int x = __VERIFIER_nondet_int();\n\
+             \x20 unsigned u = __VERIFIER_nondet_uint();\n\
+             \x20 int r = x + 2147483647;\n\
+             \x20 int y = __VERIFIER_nondet_int();\n\
+             \x20 return r + y;\n\
+             }\n",
+        )
+        .expect("write src");
+        let module = AirModule::new(ModuleId(make_id("module", b"assumes")));
+        let meta = WitnessMeta {
+            producer_version: "0".to_string(),
+            specification: "SPEC".to_string(),
+            data_model: DataModel::LP64,
+            language: Language::C,
+            input_file: src.clone(),
+        };
+        let ctx = VerifyCtx {
+            input: &src,
+            data_model: DataModel::LP64,
+            module: &module,
+            meta: &meta,
+            stub: Path::new("/dev/null"),
+            tempdir: dir.path(),
+            clang: "clang",
+        };
+        let hit = saf_svcomp::OverflowHit {
+            file: "t.c".to_string(),
+            line: 4,
+            column: Some(11),
+        };
+        // Winning constant 7 (non-zero): the int read at line 2 binds to `x == 7`.
+        let assumes = overflow_nondet_assumes(&ctx, &hit, 7);
+        assert_eq!(assumes.len(), 1, "only the reaching signed int read binds");
+        assert_eq!(assumes[0].lhs, "x");
+        assert_eq!(assumes[0].line, 2);
+        assert_eq!(assumes[0].value, 7);
+        assert_eq!(assumes[0].file, "t.c");
+
+        // k == 0 (direct/zero-input overflow) -> no enrichment (target-only).
+        assert!(overflow_nondet_assumes(&ctx, &hit, 0).is_empty());
+    }
+
+    #[test]
+    fn main_prefix_stops_at_first_control_construct() {
+        let src = "int main() {\n\
+                   \x20 int x = 1;\n\
+                   \x20 int y = 2;\n\
+                   \x20 while (x) { int z = 3; }\n\
+                   \x20 int w = 4;\n\
+                   }\n";
+        let p = main_unconditional_prefix_lines(src);
+        // Lines 2,3 (before `while`) are unconditional; line 4 (the `while`) and
+        // everything after (loop body line 4, `w` line 5) are excluded.
+        assert!(p.contains(&2));
+        assert!(p.contains(&3));
+        assert!(!p.contains(&4), "the control line is excluded");
+        assert!(!p.contains(&5), "post-loop code is not in the prefix");
+    }
+
+    #[test]
+    fn find_word_is_whole_word() {
+        assert_eq!(find_word("int main() {}", "main"), Some(4));
+        assert_eq!(find_word("x main y", "main"), Some(2));
+        // `main` embedded in a larger identifier is NOT a whole word.
+        assert_eq!(find_word("int domain() {}", "main"), None);
+        assert_eq!(find_word("int main_helper() {}", "main"), None);
+        assert_eq!(find_word("no function here", "main"), None);
+    }
+
+    #[test]
+    fn overflow_nondet_assumes_skips_reads_inside_loops() {
+        // Regression guard: a nondet read INSIDE a loop whose entry guard the bound
+        // value would contradict must NOT be bound (else the `follow` assumption
+        // describes an infeasible path and DROPS an otherwise-confirmed witness —
+        // the memsafety-ext2/complex_data_creation failure mode).
+        use saf_svcomp::{DataModel, Language, WitnessMeta};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("loopread.c");
+        // Mirrors memsafety-ext2/complex_data_creation: a nondet read at the top of
+        // main (line 2, unconditional), a SECOND read inside a loop (line 4) whose
+        // entry guard INT_MIN fails, then the overflow AFTER the loop (line 7). Under
+        // INT_MIN the loop is never entered, so line 4 never executes.
+        std::fs::write(
+            &src,
+            "int main() {\n\
+             \x20 int userInput = __VERIFIER_nondet_int();\n\
+             \x20 while (userInput < 200 && userInput > -200) {\n\
+             \x20   userInput = __VERIFIER_nondet_int();\n\
+             \x20 }\n\
+             \x20 int base = __VERIFIER_nondet_int();\n\
+             \x20 int r = base + base;\n\
+             \x20 return r;\n\
+             }\n",
+        )
+        .expect("write");
+        let module = AirModule::new(ModuleId(make_id("module", b"loopread")));
+        let meta = WitnessMeta {
+            producer_version: "0".to_string(),
+            specification: "SPEC".to_string(),
+            data_model: DataModel::LP64,
+            language: Language::C,
+            input_file: src.clone(),
+        };
+        let ctx = VerifyCtx {
+            input: &src,
+            data_model: DataModel::LP64,
+            module: &module,
+            meta: &meta,
+            stub: Path::new("/dev/null"),
+            tempdir: dir.path(),
+            clang: "clang",
+        };
+        // Fault at line 7 (`base + base`, after the loop). Only the line-2
+        // unconditional read may bind; the line-4 in-loop read (never executed under
+        // INT_MIN) and the line-6 read (after the loop / not in main's prefix) must
+        // both be excluded — binding an unexecuted read would unfollow the witness.
+        let hit = saf_svcomp::OverflowHit {
+            file: "loopread.c".to_string(),
+            line: 7,
+            column: None,
+        };
+        let assumes = overflow_nondet_assumes(&ctx, &hit, -2_147_483_648);
+        assert!(
+            assumes.iter().all(|a| a.line == 2),
+            "only the unconditional line-2 read may bind: {assumes:?}"
+        );
+        assert!(
+            assumes.iter().any(|a| a.line == 2),
+            "the unconditional prefix read should still bind"
+        );
+    }
+
+    #[test]
+    fn overflow_nondet_assumes_bails_on_line_markers_and_overflow_cap() {
+        use saf_svcomp::{DataModel, Language, WitnessMeta};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let module = AirModule::new(ModuleId(make_id("module", b"assumes2")));
+
+        // A file carrying a `# N "file"` line marker -> physical lines are unreliable,
+        // so we bail to target-only even though there is a reaching read.
+        let src = dir.path().join("m.c");
+        std::fs::write(
+            &src,
+            "# 1 \"m.c\"\n\
+             int main() {\n\
+             \x20 int x = __VERIFIER_nondet_int();\n\
+             \x20 return x + 2147483647;\n\
+             }\n",
+        )
+        .expect("write");
+        let meta = WitnessMeta {
+            producer_version: "0".to_string(),
+            specification: "SPEC".to_string(),
+            data_model: DataModel::LP64,
+            language: Language::C,
+            input_file: src.clone(),
+        };
+        let ctx = VerifyCtx {
+            input: &src,
+            data_model: DataModel::LP64,
+            module: &module,
+            meta: &meta,
+            stub: Path::new("/dev/null"),
+            tempdir: dir.path(),
+            clang: "clang",
+        };
+        let hit = saf_svcomp::OverflowHit {
+            file: "m.c".to_string(),
+            line: 4,
+            column: None,
+        };
+        assert!(
+            overflow_nondet_assumes(&ctx, &hit, 3).is_empty(),
+            "line-marker files bail to target-only"
+        );
+
+        // More than OVERFLOW_WITNESS_MAX_ASSUMES reaching reads -> bail to target-only.
+        let mut many = String::from("int main() {\n");
+        for i in 0..(OVERFLOW_WITNESS_MAX_ASSUMES + 1) {
+            many.push_str(&format!("  int v{i} = __VERIFIER_nondet_int();\n"));
+        }
+        many.push_str("  return 2147483647 + 1;\n}\n");
+        let src2 = dir.path().join("many.c");
+        std::fs::write(&src2, &many).expect("write2");
+        let meta2 = WitnessMeta {
+            input_file: src2.clone(),
+            ..meta.clone()
+        };
+        let ctx2 = VerifyCtx {
+            input: &src2,
+            meta: &meta2,
+            ..ctx
+        };
+        let hit2 = saf_svcomp::OverflowHit {
+            file: "many.c".to_string(),
+            line: (OVERFLOW_WITNESS_MAX_ASSUMES + 3) as u32,
+            column: None,
+        };
+        assert!(
+            overflow_nondet_assumes(&ctx2, &hit2, 9).is_empty(),
+            "too many reaching reads bail to target-only"
+        );
     }
 
     #[test]
