@@ -1013,7 +1013,7 @@ fn compile_to_ir_with(
             "-Wno-everything",
         ])
         .args(extra_clang_args)
-        .arg(data_model.clang_flag())
+        .args(data_model.clang_flags())
         .arg("-include")
         .arg(stub);
         if let Some(neutralizer) = assert_neutralizer {
@@ -1733,6 +1733,14 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
             "-Wno-everything",
             "-fsanitize=signed-integer-overflow",
             "-fsanitize-trap=signed-integer-overflow",
+            // Allocation-failure prune (soundness sentinel: aws-c-common). The
+            // driver's `__wrap_malloc/calloc/realloc` (see `fuzz::ALLOC_PRUNE_WRAP_C`)
+            // model SV-COMP's unbounded-memory `malloc` so a concrete OOM on a
+            // nondet-driven huge allocation size prunes the run instead of fabricating
+            // a wrong FALSE.
+            "-Wl,--wrap=malloc",
+            "-Wl,--wrap=calloc",
+            "-Wl,--wrap=realloc",
         ]);
         if cov {
             // Standalone SanitizerCoverage: 8-bit edge counters (coverage map) + a PC
@@ -1741,7 +1749,7 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
             // signal — see `fuzz::CoverageMap` / `fuzz::merge_cmplog`.
             cmd.arg("-fsanitize-coverage=inline-8bit-counters,pc-table,trace-cmp");
         }
-        cmd.arg(ctx.data_model.clang_flag())
+        cmd.args(ctx.data_model.clang_flags())
             .arg("-include")
             .arg(ctx.stub);
         if let Some(n) = neutralizer {
@@ -2294,7 +2302,7 @@ fn conc_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             "-fsanitize=signed-integer-overflow",
             "-fsanitize-trap=signed-integer-overflow",
         ]);
-        cmd.arg(ctx.data_model.clang_flag())
+        cmd.args(ctx.data_model.clang_flags())
             .arg("-include")
             .arg(ctx.stub);
         if let Some(n) = neutralizer {
@@ -2523,7 +2531,7 @@ fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             "-fsanitize=signed-integer-overflow",
             "-fsanitize-trap=signed-integer-overflow",
         ]);
-        cmd.arg(ctx.data_model.clang_flag())
+        cmd.args(ctx.data_model.clang_flags())
             .arg("-include")
             .arg(ctx.stub);
         if let Some(n) = neutralizer {
@@ -2767,7 +2775,7 @@ fn conc_shim_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
                 "-sanitizer-coverage-trace-stores=1",
             ]);
         }
-        cmd.arg(ctx.data_model.clang_flag())
+        cmd.args(ctx.data_model.clang_flags())
             .arg("-include")
             .arg(ctx.stub);
         if let Some(n) = neutralizer {
@@ -3625,7 +3633,7 @@ fn replay_confirms_false(
             "-fsanitize=signed-integer-overflow",
             "-fsanitize-trap=signed-integer-overflow",
         ])
-        .arg(data_model.clang_flag())
+        .args(data_model.clang_flags())
         .arg("-include")
         .arg(stub);
         if let Some(n) = neutralizer {
@@ -3943,7 +3951,7 @@ fn asan_confirm(
                 // memory). R1/R2 in `parse_asan_report` still gate the report.
                 cmd.arg("-ftrivial-auto-var-init=pattern");
             }
-            cmd.arg(data_model.clang_flag()).arg("-include").arg(stub);
+            cmd.args(data_model.clang_flags()).arg("-include").arg(stub);
             if let Some(neutralizer) = assert_neutralizer {
                 cmd.arg("-include").arg(neutralizer);
             }
@@ -4186,7 +4194,7 @@ fn asan_fuzz_pass(
             "-Wl,--wrap=rand",
             "-Wl,--wrap=srand",
         ]);
-        cmd.arg(data_model.clang_flag()).arg("-include").arg(stub);
+        cmd.args(data_model.clang_flags()).arg("-include").arg(stub);
         if let Some(n) = neutralizer {
             cmd.arg("-include").arg(n);
         }
@@ -5197,7 +5205,7 @@ fn ubsan_confirm(
             "-Wl,--wrap=rand",
             "-Wl,--wrap=srand",
         ])
-        .arg(data_model.clang_flag())
+        .args(data_model.clang_flags())
         .arg("-include")
         .arg(stub);
         if let Some(neutralizer) = assert_neutralizer {

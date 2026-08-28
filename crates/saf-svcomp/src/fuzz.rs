@@ -657,8 +657,49 @@ pub fn synthesize_bytestream_driver(sentinel_c_literal: &str) -> String {
         "__attribute__((noreturn)) void __assert_fail(const char* a, const char* b, unsigned int c, const char* d) { (void)a; (void)b; (void)c; (void)d; __saf_hit(); }\n",
     );
 
+    // Allocation-failure PRUNE (soundness sentinel: aws-c-common). See
+    // `ALLOC_PRUNE_WRAP_C` — model SV-COMP's unbounded-memory `malloc` semantics so a
+    // concrete OOM on a nondet-driven huge size never fabricates a wrong FALSE.
+    s.push_str(ALLOC_PRUNE_WRAP_C);
+
     s
 }
+
+/// Linker-`--wrap` interceptors for `malloc`/`calloc`/`realloc` that PRUNE the run on a
+/// concrete allocation failure — the fix for the `aws-c-common` soundness-sentinel FP.
+///
+/// # The unsoundness this closes
+///
+/// SV-COMP's memory model treats `malloc` as drawing from **unbounded** memory: an
+/// allocation of any *representable* size succeeds (a program observes a NULL return
+/// only where it explicitly models one, e.g. `nondet_bool() ? NULL : malloc(...)`).
+/// The `aws-c-common` CBMC proof harnesses rely on this — `bounded_malloc(size)` merely
+/// `assume`s `size` is within a huge bound and returns `malloc(size)`, taking success
+/// for granted. Under **concrete native replay**, though, the blind fuzzer can drive
+/// that size nondet to hundreds of GB, so the REAL `malloc` returns NULL, and a later
+/// NULL-consistency assertion (`aws_string_new_from_array_harness`'s
+/// `assert(!a == !b)`, with `a` a live string and `b` the failed allocation) trips
+/// `reach_error` on a path SV-COMP deems infeasible — a wrong `false(unreach-call)`.
+///
+/// # Why pruning is sound
+///
+/// `__wrap_malloc` calls `__real_malloc`; on a NULL result for a **nonzero** request it
+/// `_exit(0)`s WITHOUT dropping the sentinel — i.e. it treats the run as an infeasible
+/// path (the SV-COMP model would have allocated), exactly like an
+/// `__VERIFIER_assume(0)`. It never confirms anything, so it cannot manufacture a
+/// FALSE; it only removes OOM-only reaches. Programs that legitimately branch on a NULL
+/// return get that NULL from an explicit model (a literal `NULL`, not a *failed*
+/// `malloc`) — a small concrete `malloc` there succeeds regardless — so no genuine
+/// NULL-handling FALSE is lost. `calloc`/`realloc` are wrapped identically; a `malloc(0)`
+/// / `realloc(p,0)` implementation-defined NULL is passed through unchanged (size 0 is
+/// not an OOM).
+pub const ALLOC_PRUNE_WRAP_C: &str = "\
+extern void* __real_malloc(size_t);\n\
+extern void* __real_calloc(size_t, size_t);\n\
+extern void* __real_realloc(void*, size_t);\n\
+void* __wrap_malloc(size_t n) { void* p = __real_malloc(n); if (!p && n) _exit(0); return p; }\n\
+void* __wrap_calloc(size_t a, size_t b) { void* p = __real_calloc(a, b); if (!p && a && b) _exit(0); return p; }\n\
+void* __wrap_realloc(void* q, size_t n) { void* p = __real_realloc(q, n); if (!p && n) _exit(0); return p; }\n";
 
 /// Generate the C source of a byte-stream nondet shim for the **`valid-memsafety`
 /// ASan confirmer** (lever `mem-fuzz-covguided`).

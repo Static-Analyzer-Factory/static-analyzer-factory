@@ -1213,9 +1213,18 @@ fn function_spurious_iv_set(
     slow
 }
 
-/// Is `val` (a header phi's back-edge incoming) the small-constant-step update
-/// `phi ± c` of `phi_dst`? Accepts `phi + c`, `c + phi`, and `phi - c` (a standard
-/// unit/small decrement); rejects `c - phi` and any non-constant or large step.
+/// Is `val` (a header phi's back-edge incoming) a **bounded-per-iteration** update of
+/// `phi_dst` — either a small-constant additive step (`phi ± c`) or a
+/// small-constant multiplicative/geometric step (`phi × c`, `c × phi`, `phi << c`)?
+///
+/// Accepts `phi + c`, `c + phi`, `phi - c` (standard linear IVs), and `phi * c`,
+/// `c * phi`, `phi << c` (a doubling / geometric IV such as `nla-digbench/hard2`'s
+/// `d = 2 * d; p = 2 * p;`). Rejects `c - phi`, `c / phi`, a non-constant step, and a
+/// large-constant step. A geometric IV grows only when the loop iterates, so — like a
+/// linear IV — its overflow is reached solely by *driving the loop's own nondet trip
+/// count*, the labeled-TRUE `no-overflow` idiom (see
+/// [`overflow_hit_is_spurious_linear_accumulator`]). Marking it here only ever turns a
+/// would-be `false(no-overflow)` into `unknown`, never a wrong verdict.
 fn iv_back_edge_step_is_small(
     val: ValueId,
     phi_dst: ValueId,
@@ -1233,12 +1242,16 @@ fn iv_back_edge_step_is_small(
     }
     let (a, b) = (def.operands[0], def.operands[1]);
     match kind {
-        BinaryOp::Add => {
+        BinaryOp::Add | BinaryOp::Mul => {
+            // Additive `phi + c` / `c + phi`, OR geometric `phi * c` / `c * phi`.
             (a == phi_dst && is_small_int_const(module, b))
                 || (b == phi_dst && is_small_int_const(module, a))
         }
         // Only `phi - c` is a standard IV; `c - phi` is not.
         BinaryOp::Sub => a == phi_dst && is_small_int_const(module, b),
+        // Geometric `phi << c` (a small constant left shift = doubling family); the
+        // shift amount is the second operand and must be a small positive constant.
+        BinaryOp::Shl => a == phi_dst && is_small_int_const(module, b),
         _ => false,
     }
 }
@@ -1248,15 +1261,17 @@ fn iv_back_edge_step_is_small(
 /// constant or a slow linear induction variable ([`function_spurious_iv_set`]), with at
 /// least one such induction variable?
 ///
-/// Such an overflow (`x = x + 1`, `return i + j`) is only reachable by driving a
-/// nondeterministic loop bound to an astronomically large trip count that the real
-/// program's semantics (a loop invariant / precondition) forbids — confirming it is a
-/// false alarm on a labeled-TRUE `no-overflow` task (`termination-numeric/twisted`,
-/// `…ESOP2008-easy2`). The check NEVER matches a `Mul`/`Div`/negation overflow (so
-/// `hard2`'s `2 * d`, Juliet `data * data` stay confirmable), a direct nondet operand
-/// (`data + data`), or a large/variable step (`sum += big`) — so genuine direct
-/// overflows are unaffected. Returning `true` only ever turns a would-be `false` into
-/// `unknown` (recall cost, never a wrong verdict).
+/// Such an overflow (`x = x + 1`, `return i + j`, or a geometric `d = 2 * d`) is only
+/// reachable by driving a nondeterministic loop trip count large — an execution the
+/// real program's semantics (a loop invariant / precondition) forbids — confirming it
+/// is a false alarm on a labeled-TRUE `no-overflow` task (`termination-numeric/twisted`,
+/// `…ESOP2008-easy2`, `nla-digbench/hard2`). It matches an `Add`/`Sub` linear
+/// accumulator AND a `Mul`/`Shl` GEOMETRIC induction variable, but ONLY when the IV
+/// operand is a bounded-growth spurious IV ([`function_spurious_iv_set`]) and the other
+/// operand is a small constant. It NEVER matches a direct nondet-operand nonlinear
+/// overflow (`data * data`, `x * y`, `data + data`) or a large/variable step
+/// (`sum += big`) — so genuine direct overflows stay confirmable. Returning `true` only
+/// ever turns a would-be `false` into `unknown` (recall cost, never a wrong verdict).
 ///
 /// `line`/`column` come from the UBSan report and are matched against instruction
 /// spans; if no debug spans are present (nothing matches) it returns `false`, leaving
@@ -1275,13 +1290,20 @@ pub fn overflow_hit_is_spurious_linear_accumulator(
             continue;
         }
 
-        // Candidate signed Add/Sub instructions on the faulting source line.
+        // Candidate signed Add/Sub/Mul/Shl instructions on the faulting source line.
+        // Mul/Shl cover a GEOMETRIC induction variable (`d = 2 * d`, `p = p << 1`)
+        // whose overflow — like an additive accumulator's — is reachable only by
+        // driving the loop's own nondet trip count (`nla-digbench/hard2`). The
+        // operand check below still requires the IV operand to be a bounded-growth
+        // spurious IV and the other operand a small constant, so a genuine direct
+        // nonlinear overflow (`data * data`, `x * y` with non-IV operands) never
+        // matches — no blunt "any multiply" abstain.
         let candidates: Vec<&Instruction> = func
             .blocks
             .iter()
             .flat_map(|b| &b.instructions)
             .filter(|inst| {
-                matches!(&inst.op, Operation::BinaryOp { kind } if matches!(kind, BinaryOp::Add | BinaryOp::Sub))
+                matches!(&inst.op, Operation::BinaryOp { kind } if matches!(kind, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Shl))
                     && inst.span.as_ref().is_some_and(|s| s.line_start == line)
             })
             .collect();
@@ -2768,13 +2790,72 @@ mod tests {
     }
 
     #[test]
-    fn multiplicative_update_in_nondet_loop_is_not_flagged() {
-        // `x = x * 2` (the `hard2` `2 * d` shape) is a Mul, never suppressed — a
-        // genuine fast (log-many-iterations) overflow stays confirmable.
+    fn geometric_update_in_nondet_loop_is_flagged() {
+        // `x = x * 2` (the `nla-digbench/hard2` `d = 2 * d` shape) is a GEOMETRIC
+        // induction variable in a nondet-trip (`while (z > 0)`, z = nondet()) loop:
+        // its overflow is reached only by driving the loop's nondet trip count, the
+        // labeled-TRUE `no-overflow` idiom -> abstain (turns a would-be false alarm
+        // into unknown). `x` (init 12, step `x * 2`) is a bounded-growth spurious IV
+        // and `2` is a small constant, so the Mul is suppressed.
         let module = esop_like_module(true);
-        assert!(!overflow_hit_is_spurious_linear_accumulator(
+        assert!(overflow_hit_is_spurious_linear_accumulator(
             &module,
             15,
+            Some(9)
+        ));
+        assert!(overflow_hit_is_spurious_linear_accumulator(
+            &module, 15, None
+        ));
+    }
+
+    #[test]
+    fn direct_nondet_multiply_is_not_flagged() {
+        // `y = z * z` with z = nondet() and NO loop: a genuine direct nonlinear
+        // overflow (neither operand a bounded-growth IV) -> must stay confirmable
+        // (guards the -5-recall over-abstain the naive "any multiply" gate caused).
+        use saf_core::air::BinaryOp;
+        let z0 = make_value_id("dm_z0");
+        let y = make_value_id("dm_y");
+        let nondet = make_declaration("__VERIFIER_nondet_int");
+
+        let bid = make_block_id("dm_entry");
+        let mut block = AirBlock::new(bid);
+        block.instructions.push(typed_inst_at(
+            "dm_call",
+            Operation::CallDirect { callee: nondet.id },
+            z0,
+            vec![],
+            4,
+            1,
+        ));
+        block.instructions.push(typed_inst_at(
+            "dm_mul",
+            Operation::BinaryOp {
+                kind: BinaryOp::Mul,
+            },
+            y,
+            vec![z0, z0],
+            5,
+            9,
+        ));
+        block
+            .instructions
+            .push(term_inst("dm_ret", Operation::Ret, vec![]));
+        let main = AirFunction {
+            id: make_func_id("main"),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![block],
+            entry_block: Some(bid),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let module = make_module(vec![main, nondet]);
+        assert!(!overflow_hit_is_spurious_linear_accumulator(
+            &module,
+            5,
             Some(9)
         ));
     }

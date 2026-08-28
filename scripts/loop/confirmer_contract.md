@@ -249,3 +249,30 @@ bugs ARE live (this is NOT a verified-clean claim). The soundness-sentinel.jsonl
 fully armed meanwhile, so no arm can newly worsen FP/wT. AFTER the direct fix lands and a
 full-reservoir run confirms FP=0: any mechanism the direct fix did NOT cover gets its lever
 UN-PARKED so the loop finishes it; fully-fixed mechanisms stay parked (nothing left to do).
+
+## SENTINEL UPDATE 2026-08-28 — direct precise soundness fix LANDED; sentinel labels corrected
+
+The precise guards for the full-run soundness violations are LANDED (this commit), verified on
+cd-vm-14: 5 genuine FPs + the wrong-TRUE eliminated (all abstain to `unknown`), recall preserved
+52/52 (OVERFLOW/POINTER/FLOAT/TERM_REC), build clean, 391 tests pass. Mechanisms fixed precisely:
+  - overflow geometric-IV in nondet loop (hard2, ESOP2008-easy2, twisted) — extends the linear-
+    accumulator guard to phi*c / phi<<c IVs; direct `data*data` nonlinear overflow untouched.
+  - aws_string_new_from_array: fuzzer drove alloc_size to ~171GB; real malloc returns NULL which
+    SV-COMP models as succeeding -> assert fires. Fix = __wrap_malloc/calloc/realloc prune the run
+    on concrete OOM (models unbounded memory). (NOT the IntToPtr-taint path.)
+  - floats nearbyint2/rint2: ILP32 x87 80-bit excess precision; clang_flags adds -msse2 -mfpmath=sse
+    for ILP32 -> IEEE-754. A correctness fix, not an abstain (buggy float tasks still confirm).
+  - ll_create_rec-alloca-1 wrong-TRUE: a per-frame-allocating recursion may earn its base-case lower
+    bound only from a genuine entry guarantee, not the register bit pattern (alloca-1 FALSE abstains;
+    alloca-2 & id_b3_o5-2 TRUE still rank).
+
+TWO NON-BUGS corrected here (verified against the canonical .yml):
+  - recursified_nla-digbench/recursified_geo1-u: canonical yml says unreach-call expected=FALSE, so
+    SAF's false(unreach-call) is CORRECT (+1), NOT an FP. The fresh-run eval MISLABELED it True (it
+    read the no-overflow verdict). No SAF fix; sentinel label corrected true->false.
+  - nla-digbench/hard2: canonical yml says no-overflow expected=TRUE; sentinel had it false. Corrected.
+
+The 3 sentinel LEVERS stay PARKED: their targets are now fixed by this direct patch. Do NOT un-park
+unless a full-reservoir re-run reveals a NEW instance this patch missed. A full 48k re-run to confirm
+genuine FP=0 is pending (note: the recursified_geo1-u eval mislabel may still surface as a spurious
+FP=1 in the raw scorer count — cross-check any residual FP against the canonical yml).

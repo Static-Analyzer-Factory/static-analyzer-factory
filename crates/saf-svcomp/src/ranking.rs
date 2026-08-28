@@ -2209,6 +2209,49 @@ pub fn recursion_is_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg) ->
     }
 }
 
+/// Non-builtin heap allocators the frontend may model as a direct `CallDirect`
+/// (rather than a first-class [`Operation::HeapAlloc`]) — matched as a fallback in
+/// [`function_allocates_per_frame`].
+const PER_FRAME_ALLOCATOR_CALLS: &[&str] = &[
+    "malloc",
+    "calloc",
+    "realloc",
+    "aligned_alloc",
+    "valloc",
+    "alloca",
+    "__builtin_alloca",
+];
+
+/// Does `func` (a recursion-cycle member) allocate memory PER recursive frame —
+/// i.e. build an unbounded dynamic data structure?
+///
+/// A recursion that mallocs/allocas each frame builds a structure whose depth equals
+/// the (nondeterministic) entry value; SV-COMP labels such a build non-terminating
+/// when the entry is not provably bounded/non-negative
+/// (`termination-memory-linkedlists/ll_create_rec-alloca-1`). The termination-recursion
+/// soundness sentinel uses this to decide whether the recursion parameter may earn a
+/// bit-pattern lower bound (see `build_recursion_model`).
+///
+/// The LLVM frontend lowers `malloc`/`calloc`/`realloc`/`new` to the first-class
+/// [`Operation::HeapAlloc`] and a stack `alloca` to [`Operation::Alloca`] — NOT a
+/// `CallDirect` — so those are the primary matches. (Only the module is promoted
+/// before ranking; `mem2reg` removes *scalar* allocas, so any surviving `Alloca` is a
+/// genuine array/VLA/escaping allocation.) A `CallDirect` to a named allocator is
+/// matched as a fallback for frontends that keep it a call. Scanning `func`'s own body
+/// only is precise: a recursion that merely calls a helper which allocates off the
+/// recursive path is not a per-frame build.
+fn function_allocates_per_frame(func: &AirFunction, module: &AirModule) -> bool {
+    func.blocks.iter().flat_map(|b| &b.instructions).any(|inst| {
+        match &inst.op {
+            Operation::HeapAlloc { .. } | Operation::Alloca { .. } => true,
+            Operation::CallDirect { callee } => module
+                .function(*callee)
+                .is_some_and(|f| PER_FRAME_ALLOCATOR_CALLS.contains(&f.name.as_str())),
+            _ => false,
+        }
+    })
+}
+
 /// Build the recursion [`MultiPathModel`] for a self-recursive function, or `None`
 /// (⇒ abstain) when the shape is unsupported (looping body, no integer parameter,
 /// too many entry→call paths, or a non-affine ranking-relevant argument).
@@ -2393,7 +2436,32 @@ fn build_recursion_model(
     // via the well-defined unsigned decrement — rank: the `!=` split's negative half
     // becomes infeasible and `x − 1` stays in range. A signed `sub nsw x, 1` counter
     // stays `Unknown` (ineligible) ⇒ abstains, as it must.
-    let ineligible = bitpattern_ineligible_leaves(func, &defs, &header_phis, module);
+    //
+    // SOUNDNESS SENTINEL (termination-recursion, wrong-`true`): a recursion that
+    // ALLOCATES memory per frame (`malloc`/`calloc`/`realloc`/`alloca`, i.e. a
+    // recursive dynamic-data-structure build) must NOT earn the recursion base case
+    // from its parameter's REGISTER BIT PATTERN — only from a genuine ENTRY
+    // guarantee. For such a function the recursion depth = the entry value, and an
+    // unbounded per-frame allocation over that depth is exactly what SV-COMP labels
+    // non-terminating (`termination-memory-linkedlists/ll_create_rec-alloca-1`:
+    // `new_ll(int n = nondet_int())` → `unsigned n` with only an `n==0` guard). The
+    // `[0, 2^w−1]` bit pattern would rank it ⇒ a −32 wrong-`true`. So when the
+    // function allocates per frame, its RANKING PARAMETERS (`param_ids`) are excluded
+    // from the promotion; they may then become `Unsigned` ONLY via
+    // `scc_positions_unsigned_by_entry` (already applied above) — a genuine unsigned
+    // *source* or a dominating `≥ 0` guard at every external call site. This
+    // precisely separates the three sibling shapes:
+    //   * `ll_create_rec-alloca-1` (alloc ∧ raw signed entry) → abstain  [FALSE]
+    //   * `ll_create_rec-alloca-2` (alloc ∧ `if (n < 0) return` guard)  → rank [TRUE]
+    //   * `recursive-simple/id_b3_o5-2` (NO alloc ∧ raw signed entry)   → rank [TRUE]
+    // A pure-arithmetic unsigned-wraparound recursion (no allocation) keeps its
+    // bit-pattern bound and still ranks, so this costs no arithmetic-recursion recall.
+    // Excluding params can only turn a would-be `true` into `unknown` (sound:
+    // abstaining is always sound for a verdict-only property).
+    let mut ineligible = bitpattern_ineligible_leaves(func, &defs, &header_phis, module);
+    if function_allocates_per_frame(func, module) {
+        ineligible.extend(param_ids.iter().copied());
+    }
     promote_bitpattern_unsigned(&mut signs, &universe, &ineligible);
 
     // Type bounds: parameters use their `AirParam` type; every other integer leaf

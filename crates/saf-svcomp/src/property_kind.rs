@@ -156,6 +156,28 @@ impl DataModel {
             Self::LP64 => "-m64",
         }
     }
+
+    /// Clang flags for a native-replay compile of this data model.
+    ///
+    /// LP64 is just `-m64`. **ILP32 additionally forces SSE floating point**
+    /// (`-msse2 -mfpmath=sse`): the default `-m32` code generator emits x87 FPU
+    /// instructions whose **80-bit extended-precision** intermediates make
+    /// `double`/`float` arithmetic diverge from the IEEE-754 single/double semantics
+    /// SV-COMP (and the LP64 build) assume. That excess precision spuriously fails
+    /// floating-point equality assertions during native replay, fabricating a wrong
+    /// `false(unreach-call)` on labeled-TRUE FP tasks
+    /// (`floats-esbmc-regression/nearbyint2`, `rint2`). Pinning SSE makes the ILP32
+    /// replay evaluate `double`/`float` at their true IEEE widths, matching the
+    /// reference semantics — a soundness fix, not an abstain, so genuinely-buggy FP
+    /// tasks still confirm. SSE2 is universally available on the x86-64 host that
+    /// runs `-m32`, so this never fails to compile.
+    #[must_use]
+    pub fn clang_flags(&self) -> &'static [&'static str] {
+        match self {
+            Self::ILP32 => &["-m32", "-msse2", "-mfpmath=sse"],
+            Self::LP64 => &["-m64"],
+        }
+    }
 }
 
 #[cfg(test)]

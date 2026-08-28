@@ -897,6 +897,58 @@ mod tests {
         m
     }
 
+    /// Like [`self_rec_program_cmp`] but main feeds the recursion from an UNSIGNED
+    /// nondet source (`__VERIFIER_nondet_uint()`) instead of a signed one, so the
+    /// entry value is a genuine `[0, 2^w−1]` guarantee (`arg_is_nonneg`). This is the
+    /// `ll_create_rec-alloca-2`-style RECALL case: the recursion parameter earns its
+    /// unsigned range from the entry (not the register bit pattern) and must still
+    /// rank. Built by renaming the entry nondet declaration; the callee is referenced
+    /// by id, and `arg_is_nonneg` keys on the function *name*, so the rename suffices.
+    fn self_rec_program_unsigned_entry(
+        cmp: saf_core::air::BinaryOp,
+        bound: i64,
+        step: i64,
+    ) -> AirModule {
+        let mut m = self_rec_program_cmp(cmp, bound, step, false);
+        for f in &mut m.functions {
+            if f.name == "__VERIFIER_nondet_int" && f.is_declaration {
+                f.name = "__VERIFIER_nondet_uint".to_string();
+            }
+        }
+        m
+    }
+
+    /// Inject a per-frame `malloc()` call into the recursive function `f` of a module
+    /// built by [`self_rec_program_cmp`], modelling the `ll_create_rec-alloca-*`
+    /// dynamic-data-structure build. The recursion parameter then earns its unsigned
+    /// range ONLY from a genuine entry guarantee (not the register bit pattern), so an
+    /// unguarded signed-nondet entry abstains while a guarded / unsigned-source entry
+    /// still ranks. Adds a `malloc` declaration and a call to it in `f`'s recursive
+    /// block.
+    fn add_per_frame_malloc(mut m: AirModule) -> AirModule {
+        let malloc_id = make_func_id("malloc");
+        // f's recursive block is the one that calls f itself; insert a malloc call.
+        let f_id = make_func_id("f");
+        for func in &mut m.functions {
+            if func.id != f_id {
+                continue;
+            }
+            for block in &mut func.blocks {
+                let calls_self = block.instructions.iter().any(|i| {
+                    matches!(&i.op, Operation::CallDirect { callee } if *callee == f_id)
+                });
+                if calls_self {
+                    block.instructions.insert(
+                        0,
+                        inst("f_malloc", Operation::CallDirect { callee: malloc_id }),
+                    );
+                }
+            }
+        }
+        m.functions.push(declaration("malloc"));
+        m
+    }
+
     #[test]
     fn ranked_self_recursion_terminates() {
         // main → f, f(n){ if (n>0) f(n-1); } — recursion ranked by f = n ⇒ TRUE.
@@ -914,17 +966,23 @@ mod tests {
     //
     // `termination-memory-linkedlists/ll_create_rec-alloca-*` build a linked list
     // by recursion: `T* new_ll(N n){ if (n == 0) return NULL; ...; new_ll(n-1); }`.
-    // The soundness hinge is the SIGNEDNESS of `n` (an `!=` guard, unlike `> 0`,
-    // does NOT bound `n` below):
-    //   * SIGNED `int n` entered from an unguarded `nondet_int()` (alloca-3,
-    //     expected NON-terminating): a negative `n` never reaches `0`, so the
-    //     recursion diverges — `program_structurally_terminates` MUST abstain. The
-    //     `nsw` decrement keeps `n` ineligible for the unsigned bit-pattern bound,
-    //     so no bogus ranking function is synthesized. (This is the wrong-TRUE the
-    //     soundness sentinel guards against — a regression here is a −32.)
-    //   * DEFINED-WRAPAROUND / unsigned `n` (alloca-1, expected terminating): the
-    //     plain (non-`nsw`) decrement earns the `[0, 2^w−1]` bit-pattern bound, the
-    //     `!=` split proves `n − 1` never underflows, and `f = n` ranks ⇒ TRUE.
+    // The soundness hinge is whether the recursion parameter is provably
+    // non-negative AT ENTRY (the recursion depth = the entry magnitude); an `!=`/`==`
+    // guard, unlike `> 0`, does NOT bound `n` below on its own:
+    //   * `alloca-1` (expected NON-terminating, a −32 if proven `true`): the
+    //     recursion parameter is fed by an UNGUARDED signed `nondet_int()` (the
+    //     `unsigned int` parameter type is only a register bit-pattern, not an entry
+    //     guarantee). `program_structurally_terminates` MUST abstain — the recursion
+    //     parameter is now EXCLUDED from the `[0, 2^w−1]` bit-pattern promotion (see
+    //     `ranking::build_recursion_model`), so no lower bound is manufactured and
+    //     `n − 1` under `n != 0` cannot be proven not to underflow ⇒ unranked ⇒
+    //     abstain. This holds whether the decrement is `nsw` (signed) or plain
+    //     (defined-wraparound): the SIGNEDNESS of the STEP is not what saves it —
+    //     the missing ENTRY non-negativity is.
+    //   * `alloca-2` (expected terminating): main adds `if (n < 0) return; new_ll(n)`,
+    //     a dominating `≥ 0` guard, so `scc_positions_unsigned_by_entry` gives the
+    //     parameter its sound unsigned range from the ENTRY guarantee, the `!=` split
+    //     proves `n − 1` never underflows, and `f = n` ranks ⇒ TRUE (recall kept).
 
     #[test]
     fn ne_guarded_signed_recursion_abstains() {
@@ -937,12 +995,48 @@ mod tests {
     }
 
     #[test]
-    fn ne_guarded_wraparound_recursion_terminates() {
-        // f(unsigned n){ if (n != 0) f(n - 1); } — a plain (defined-wraparound)
-        // decrement guarded by `!=`. It terminates for every input (unsigned `n`
-        // strictly decreases to 0), so `f = n` ranks ⇒ TRUE. Pins the terminating
-        // `ll_create_rec-alloca-1` recall so future ranking tuning cannot silently
-        // over-tighten the sentinel guard above into a recall loss.
+    fn ne_guarded_unguarded_entry_alloc_recursion_abstains() {
+        // f(unsigned n){ malloc(); if (n != 0) f(n - 1); } entered as `f(nondet_int())`
+        // with NO `if (n < 0) return` guard — the `ll_create_rec-alloca-1` shape
+        // SV-COMP labels NON-terminating. The per-frame `malloc()` makes it a dynamic
+        // build; with no entry non-negativity the recursion parameter must NOT earn the
+        // `[0, 2^w−1]` bit-pattern lower bound, so the recursion ABSTAINS. Regression
+        // pin for the termination-recursion soundness sentinel: a proven `true` here is
+        // a −32.
+        let m = add_per_frame_malloc(self_rec_program_cmp(
+            saf_core::air::BinaryOp::ICmpNe,
+            0,
+            -1,
+            false,
+        ));
+        assert!(!program_structurally_terminates(&m));
+    }
+
+    #[test]
+    fn ne_guarded_alloc_recursion_with_unsigned_source_terminates() {
+        // f(unsigned n){ malloc(); if (n != 0) f(n - 1); } entered from an UNSIGNED
+        // nondet source (`__VERIFIER_nondet_uint()`) — the `ll_create_rec-alloca-2`
+        // idiom (a genuine `[0, 2^w−1]` entry guarantee, here via the source rather
+        // than an `if (n < 0) return` guard). Even though it allocates per frame,
+        // `scc_positions_unsigned_by_entry` supplies the sound unsigned range from the
+        // ENTRY, the `!=` split proves `n − 1` never underflows, and `f = n` ranks ⇒
+        // TRUE. Pins the RECALL the sentinel guard must not over-tighten.
+        let m = add_per_frame_malloc(self_rec_program_unsigned_entry(
+            saf_core::air::BinaryOp::ICmpNe,
+            0,
+            -1,
+        ));
+        assert!(program_structurally_terminates(&m));
+    }
+
+    #[test]
+    fn ne_guarded_pure_arithmetic_unguarded_entry_recursion_terminates() {
+        // f(unsigned n){ if (n != 0) f(n - 1); } entered as `f(nondet_int())` with NO
+        // guard and NO per-frame allocation — the pure-arithmetic
+        // `recursive-simple/id_b3_o5-2` shape, which SV-COMP labels TERMINATING (finite
+        // unsigned countdown). Without allocation the parameter keeps its bit-pattern
+        // bound and `f = n` ranks ⇒ TRUE. Pins that the allocation gate does NOT
+        // over-abstain ordinary unsigned-wraparound arithmetic recursion.
         let m = self_rec_program_cmp(saf_core::air::BinaryOp::ICmpNe, 0, -1, false);
         assert!(program_structurally_terminates(&m));
     }
