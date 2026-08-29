@@ -15,9 +15,19 @@
 //!
 //! # What the slice is used for (and why it stays SOUND)
 //!
-//! The slice never changes what confirms a verdict. Its two products —
-//! [`slice_directed_dictionary`] (a fuzz dictionary that front-loads the guard
-//! constants so they survive the size cap and are tried first) and
+//! A refinement on top of the raw guard set is the **input→error chop**
+//! ([`Slice::input_guard_constants`]): a forward data-dependence taint from the
+//! scalar `__VERIFIER_nondet_*` sources, intersected with the backward error slice,
+//! isolates exactly the constants a nondet INPUT can be steered to match (the input
+//! *alphabet*, `if (input == 5)`). On a large state machine this is a small, high-
+//! value subset of the guard constants — the rest compare against internal state no
+//! input can directly satisfy — so front-loading the chop keeps the reachable
+//! alphabet ahead of the dictionary cap and gives the sequence-seed generator the
+//! true event alphabet to lay as a chain.
+//!
+//! The slice never changes what confirms a verdict. Its products —
+//! [`slice_directed_dictionary`] (a fuzz dictionary that front-loads the chop then
+//! the guard constants so they survive the size cap and are tried first) and
 //! [`sequence_seeds`] (byte buffers that lay distinct guard constants at
 //! consecutive nondet-read offsets, so a *chain* of distinct-valued guards is
 //! satisfied in a single input that single-value tiling cannot build) — only
@@ -28,7 +38,7 @@
 //! whole-module harvest, so wiring this in can only ever *add* reach, never
 //! regress a previously-confirmed task or manufacture a wrong FALSE.
 
-use crate::fuzz::{INPUT_LEN, MAX_DICT_ENTRIES, harvest_dictionary};
+use crate::fuzz::{INPUT_LEN, MAX_DICT_ENTRIES, XorShift64, harvest_dictionary};
 use crate::property::{ASSUME_FUNCTIONS, REACH_ERROR_NAMES};
 use saf_core::air::{AirBlock, AirFunction, AirModule, BinaryOp, Constant, Operation};
 use saf_core::ids::{BlockId, InstId, ValueId};
@@ -55,6 +65,36 @@ pub struct Slice {
     /// a blind random float almost never lands on (a random `u32`/`u64`
     /// reinterpreted as a float is overwhelmingly a huge magnitude / NaN / inf).
     pub guard_floats: Vec<f64>,
+    /// The **input→error chop**: integer constants compared against a value that
+    /// is (transitively) data-dependent on a scalar `__VERIFIER_nondet_*` read AND
+    /// whose comparison is error-relevant (in [`Slice::instructions`]). These are
+    /// the constants a nondet INPUT can actually be steered to match — the input
+    /// *alphabet* of the program (`if (input == 5)`, `switch (nondet()) { case 7: }`).
+    ///
+    /// A [`Slice::guard_constants`] entry is any constant on any error-relevant
+    /// comparison, which on a large state machine mixes the controllable input
+    /// alphabet in with hundreds of constants compared against internal state
+    /// (`if (a29 == 5)`) that no input can directly satisfy. Front-loading the chop
+    /// puts the values the fuzzer can actually reach a guard with first (surviving
+    /// the dictionary cap) and gives the sequence-seed generator the true input
+    /// alphabet to lay as a chain. Ordered by first appearance in a deterministic
+    /// module walk and deduplicated. Empty when the program has no scalar nondet
+    /// source, so wiring it in never changes an input-free program's search.
+    pub input_guard_constants: Vec<i64>,
+    /// The **input event alphabet**: the bare set of constants an input-tainted
+    /// value is directly *equality*-compared against (`input == 5`, `input != 3`)
+    /// or matched by a `switch (input)` case — WITHOUT the ±1 strict-crossing
+    /// expansion that [`Slice::input_guard_constants`] carries. For an event-driven
+    /// state machine (RERS/`eca-*`) whose driver validates every read against a
+    /// fixed symbol set (`if (input != 1 && … && input != 7) return;`) this is
+    /// exactly the set of *valid event codes*: any other value halts the driver on
+    /// the first read, so a blind byte fuzzer — which essentially never produces a
+    /// 4-byte value inside `{1..7}` — cannot walk the automaton at all. Saturating
+    /// the whole input buffer with symbols drawn from THIS set (see
+    /// [`alphabet_walk_seeds`]) gives the fuzzer long *valid* event sequences to
+    /// mutate. Ordered by first appearance and deduplicated; empty when the program
+    /// has no scalar nondet source, so it never perturbs an input-free search.
+    pub input_alphabet: Vec<i64>,
 }
 
 /// A per-module index used during slicing: the defining instruction of every
@@ -122,6 +162,81 @@ fn is_icmp(op: &Operation) -> Option<BinaryOp> {
         .then_some(*kind),
         _ => None,
     }
+}
+
+/// Whether `name` is a scalar-INTEGER `__VERIFIER_nondet_*` read — a taint source
+/// for the forward input slice. Float / double / pointer nondet are excluded: their
+/// comparison constants are steered by the dedicated float pipeline / pointer shim,
+/// not the integer dictionary, so mixing them into the integer chop would be noise.
+fn is_int_nondet(name: &str) -> bool {
+    name.starts_with("__VERIFIER_nondet_")
+        && !name.ends_with("_float")
+        && !name.ends_with("_double")
+        && !name.ends_with("_pointer")
+}
+
+/// Forward data-dependence taint from every scalar-integer `__VERIFIER_nondet_*`
+/// result, over the SSA def-use graph. A value is tainted if it is such a result
+/// or is produced by a value op (arithmetic / cast / copy / phi / select / gep …)
+/// that uses a tainted operand. Propagation STOPS at comparisons (`icmp`): an
+/// `icmp`'s result is a boolean condition, not an input value whose alphabet we are
+/// tracking. Deterministic ([`BTreeSet`] / [`VecDeque`] worklist).
+///
+/// This is the *forward* half of the input→error chop; intersecting the tainted set
+/// with the backward error slice isolates the constants an input can be steered to
+/// match. Being an over-approximation is harmless — the chop only orders steering
+/// constants and native replay on the ORIGINAL program stays the sole arbiter (R6).
+fn nondet_tainted_values(module: &AirModule, du: &DefUse) -> BTreeSet<ValueId> {
+    // Forward use-map: value -> instructions that read it as an operand.
+    let mut uses: BTreeMap<ValueId, Vec<InstId>> = BTreeMap::new();
+    for func in &module.functions {
+        for block in &func.blocks {
+            for i in &block.instructions {
+                for &op in &i.operands {
+                    uses.entry(op).or_default().push(i.id);
+                }
+            }
+        }
+    }
+
+    let mut tainted: BTreeSet<ValueId> = BTreeSet::new();
+    let mut queue: VecDeque<ValueId> = VecDeque::new();
+    // Seeds: dsts of scalar-integer nondet calls.
+    for func in &module.functions {
+        for block in &func.blocks {
+            for i in &block.instructions {
+                if let Operation::CallDirect { callee } = &i.op {
+                    if let (Some(dst), Some(t)) = (i.dst, module.function(*callee)) {
+                        if is_int_nondet(&t.name) && tainted.insert(dst) {
+                            queue.push_back(dst);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    while let Some(v) = queue.pop_front() {
+        let Some(consumers) = uses.get(&v) else {
+            continue;
+        };
+        for &uid in consumers {
+            let Some(inst) = du.inst.get(&uid) else {
+                continue;
+            };
+            // Stop at comparisons — the taint we care about is the input VALUE, not
+            // the boolean it feeds into.
+            if is_icmp(&inst.op).is_some() {
+                continue;
+            }
+            if let Some(dst) = inst.dst {
+                if tainted.insert(dst) {
+                    queue.push_back(dst);
+                }
+            }
+        }
+    }
+    tainted
 }
 
 /// Whether a comparison is strict (`<`, `>`, `!=`), so that the *crossing* value
@@ -274,7 +389,91 @@ pub fn backward_slice(module: &AirModule) -> Slice {
         }
     }
 
+    // Input→error chop: the constants an actual nondet INPUT can be steered to
+    // match (see [`harvest_input_chop`]).
+    harvest_input_chop(module, &du, &mut slice);
+
     slice
+}
+
+/// Populate [`Slice::input_guard_constants`] — the input→error chop. Forward-taint
+/// from the scalar-integer nondet sources, then harvest the constant operand of
+/// every error-relevant comparison whose OTHER operand is tainted (and every case
+/// value of a switch on a tainted discriminant). These front-load the dictionary
+/// and drive the sequence-seed chain ahead of the non-input state constants that
+/// dominate a large automaton's guard set. No-op when the program has no scalar
+/// nondet source, so the refinement never perturbs an input-free search.
+fn harvest_input_chop(module: &AirModule, du: &DefUse, slice: &mut Slice) {
+    let tainted = nondet_tainted_values(module, du);
+    if tainted.is_empty() {
+        return;
+    }
+    let mut input_seen: BTreeSet<i64> = BTreeSet::new();
+    let mut record_input = |slice: &mut Slice, v: i64| {
+        if input_seen.insert(v) {
+            slice.input_guard_constants.push(v);
+        }
+    };
+    // The bare event alphabet (no ±1 expansion): a slot value that halts the driver
+    // must never appear in a saturation seed, so the ±1 neighbours are excluded here.
+    let mut alpha_seen: BTreeSet<i64> = BTreeSet::new();
+    let mut record_alpha = |slice: &mut Slice, v: i64| {
+        if alpha_seen.insert(v) {
+            slice.input_alphabet.push(v);
+        }
+    };
+    for func in &module.functions {
+        for block in &func.blocks {
+            for i in &block.instructions {
+                match &i.op {
+                    // A comparison against a tainted operand: the constant is the
+                    // value the input must reach. Gate on error-relevance (in the
+                    // backward slice) so dead-code comparisons don't pollute the
+                    // alphabet.
+                    Operation::BinaryOp { .. }
+                        if is_icmp(&i.op).is_some()
+                            && slice.instructions.contains(&i.id)
+                            && i.operands.iter().any(|op| tainted.contains(op)) =>
+                    {
+                        let kind = is_icmp(&i.op);
+                        // Equality/disequality comparisons pin the input to (or away
+                        // from) an EXACT event code — the bare constant is a valid
+                        // alphabet symbol. Ordering comparisons (`<`, `>`) do not name
+                        // a single symbol, so they seed only the steering set.
+                        let is_eq = matches!(kind, Some(BinaryOp::ICmpEq | BinaryOp::ICmpNe));
+                        for &op in &i.operands {
+                            let Some(k) = const_int(module, op) else {
+                                continue;
+                            };
+                            record_input(slice, k);
+                            if is_eq {
+                                record_alpha(slice, k);
+                            }
+                            if kind.is_some_and(is_strict) {
+                                if let Some(up) = k.checked_add(1) {
+                                    record_input(slice, up);
+                                }
+                                if let Some(dn) = k.checked_sub(1) {
+                                    record_input(slice, dn);
+                                }
+                            }
+                        }
+                    }
+                    // A switch on a tainted discriminant: each case value is a
+                    // controllable input target and a valid alphabet symbol.
+                    Operation::Switch { cases, .. }
+                        if i.operands.iter().any(|op| tainted.contains(op)) =>
+                    {
+                        for (case_val, _) in cases {
+                            record_input(slice, *case_val);
+                            record_alpha(slice, *case_val);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 /// Successor blocks of `block`'s terminator (empty for `ret` / `unreachable` /
@@ -359,6 +558,16 @@ pub fn error_reaching_blocks(func: &AirFunction, module: &AirModule) -> BTreeSet
 pub fn slice_directed_dictionary(module: &AirModule, slice: &Slice) -> Vec<i64> {
     let mut out: Vec<i64> = Vec::with_capacity(MAX_DICT_ENTRIES);
     let mut seen: BTreeSet<i64> = BTreeSet::new();
+    // The input→error chop first: the values an input can actually be steered to
+    // match survive the cap and are tried before the (much larger) full guard set.
+    for &g in &slice.input_guard_constants {
+        if out.len() >= MAX_DICT_ENTRIES {
+            break;
+        }
+        if seen.insert(g) {
+            out.push(g);
+        }
+    }
     for &g in &slice.guard_constants {
         if out.len() >= MAX_DICT_ENTRIES {
             break;
@@ -474,6 +683,106 @@ pub fn sequence_seeds(guard_constants: &[i64]) -> Vec<Vec<u8>> {
     seeds
 }
 
+/// Cap on the number of alphabet-saturation walk seeds produced (bounds the extra
+/// native runs added at the start of the fuzz budget).
+const MAX_WALK_SEEDS: usize = 24;
+
+/// Number of distinct deterministic pseudo-random walks generated over the event
+/// alphabet (each at the two most common read widths).
+const NUM_RANDOM_WALKS: usize = 10;
+
+/// Build **input-alphabet saturation seeds** for an input-driven state machine.
+///
+/// `alphabet` is the [`Slice::input_alphabet`] — the set of valid event codes a
+/// nondet input is equality-compared against. An event-driven driver (RERS /
+/// `eca-*`) reads one input per loop iteration and *halts on the first out-of-
+/// alphabet value* (`if (input != 1 && … && input != 7) return;`), so the automaton
+/// is only walked by a stream of valid symbols. A blind byte fuzzer essentially
+/// never produces a 4-byte value inside a 7-element set, so it stalls at the first
+/// read; the tiled single-value seeds ([`crate::fuzz::seed_corpus`]) only ever feed
+/// ONE symbol at every read (a constant walk), and [`sequence_seeds`] lays a short
+/// distinct-valued prefix then zeros (an out-of-alphabet value that halts the
+/// driver). Neither can build a LONG *varied* valid sequence.
+///
+/// This fills the WHOLE [`INPUT_LEN`] buffer with symbols drawn from the alphabet,
+/// at the common integer read widths, in two families:
+/// - **cyclic tilings** (`1,2,…,k,1,2,…`) at 1-, 2-, and 4-byte strides — a
+///   deterministic round-robin walk that covers every symbol evenly;
+/// - **deterministic pseudo-random walks** (fixed-seed [`XorShift64`]) that assign
+///   an independent alphabet symbol to every read slot — a diverse population of
+///   valid event sequences for the mutator to refine (its dictionary-window
+///   operator, front-loaded with the same alphabet, keeps mutants in-alphabet).
+///
+/// Returns empty when the alphabet has fewer than two distinct symbols (a single
+/// symbol is already covered by constant tiling) — so an input-free or single-guard
+/// program gets no extra seeds. Purely steers the blind search; native replay on the
+/// ORIGINAL program stays the sole FALSE arbiter (**R6**), so a seed that fails to
+/// reach is simply discarded and this can only ADD reach, never a wrong FALSE.
+#[must_use]
+pub fn alphabet_walk_seeds(alphabet: &[i64]) -> Vec<Vec<u8>> {
+    // Distinct symbols, order-preserving (nearest-error first).
+    let mut syms: Vec<i64> = Vec::new();
+    let mut seen_s: BTreeSet<i64> = BTreeSet::new();
+    for &a in alphabet {
+        if seen_s.insert(a) {
+            syms.push(a);
+        }
+    }
+    if syms.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut seeds: Vec<Vec<u8>> = Vec::new();
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let add = |seeds: &mut Vec<Vec<u8>>, seen: &mut BTreeSet<Vec<u8>>, buf: Vec<u8>| {
+        if seeds.len() < MAX_WALK_SEEDS && seen.insert(buf.clone()) {
+            seeds.push(buf);
+        }
+    };
+    // Write `val` little-endian into `buf` at `slot`-th `width`-byte read offset.
+    let put = |buf: &mut [u8], slot: usize, width: usize, val: i64| {
+        #[allow(clippy::cast_sign_loss)]
+        let bits = val as u64;
+        for b in 0..width {
+            let off = slot * width + b;
+            if off < buf.len() {
+                #[allow(clippy::cast_possible_truncation)]
+                let byte = (bits >> (8 * b)) as u8;
+                buf[off] = byte;
+            }
+        }
+    };
+
+    // Cyclic round-robin tilings across the whole buffer.
+    for &width in &[1usize, 2, 4] {
+        let mut buf = vec![0u8; INPUT_LEN];
+        let slots = INPUT_LEN / width;
+        for slot in 0..slots {
+            put(&mut buf, slot, width, syms[slot % syms.len()]);
+        }
+        add(&mut seeds, &mut seen, buf);
+    }
+
+    // Deterministic pseudo-random walks: every read slot gets an independent symbol.
+    // Width 4 is the dominant `int` read width; a couple of width-1 walks cover
+    // `char`-driven machines. Fixed seeds keep the corpus byte-identical run to run.
+    for w in 0..NUM_RANDOM_WALKS {
+        let widths: &[usize] = if w < 2 { &[4, 1] } else { &[4] };
+        for &width in widths {
+            #[allow(clippy::cast_possible_truncation)]
+            let rng_seed = 0x5AF3_A1FA_0000_u64 ^ ((w as u64) << 8) ^ (width as u64);
+            let mut rng = XorShift64::new(rng_seed);
+            let mut buf = vec![0u8; INPUT_LEN];
+            let slots = INPUT_LEN / width;
+            for slot in 0..slots {
+                put(&mut buf, slot, width, syms[rng.below(syms.len())]);
+            }
+            add(&mut seeds, &mut seen, buf);
+        }
+    }
+    seeds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,6 +881,361 @@ mod tests {
         assert!(
             slice.instructions.contains(&InstId::new(100)),
             "icmp sliced"
+        );
+    }
+
+    /// `input = nondet(); if (input == 7) reach_error();` with an UNRELATED
+    /// `if (g == 5)` guard where `g` is not input-derived. The input→error chop
+    /// must contain the input-compared `7` but NOT the state-compared `5`, while
+    /// the raw guard set contains both.
+    #[test]
+    fn chop_isolates_the_input_alphabet() {
+        let reach_id = FunctionId::new(1);
+        let nondet_id = FunctionId::new(3);
+        let input = ValueId::new(10);
+        let seven = ValueId::new(11);
+        let cmp_in = ValueId::new(12);
+        let g = ValueId::new(13); // an un-tainted state value (a fn param).
+        let five = ValueId::new(14);
+        let cmp_st = ValueId::new(15);
+
+        let mk =
+            |id: u128, op: Operation, operands: Vec<ValueId>, dst: Option<ValueId>| Instruction {
+                id: InstId::new(id),
+                op,
+                operands,
+                dst,
+                span: None,
+                symbol: None,
+                result_type: None,
+                extensions: BTreeMap::new(),
+            };
+
+        // input = __VERIFIER_nondet_int()
+        let call_nd = mk(
+            99,
+            Operation::CallDirect { callee: nondet_id },
+            vec![],
+            Some(input),
+        );
+        // cmp_in = icmp eq input, 7
+        let icmp_in = mk(
+            100,
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpEq,
+            },
+            vec![input, seven],
+            Some(cmp_in),
+        );
+        // cmp_st = icmp eq g, 5   (g is a param, not input-tainted)
+        let icmp_st = mk(
+            101,
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpEq,
+            },
+            vec![g, five],
+            Some(cmp_st),
+        );
+        let condbr = mk(
+            102,
+            Operation::CondBr {
+                then_target: BlockId::new(21),
+                else_target: BlockId::new(22),
+            },
+            vec![cmp_in],
+            None,
+        );
+        let condbr2 = mk(
+            103,
+            Operation::CondBr {
+                then_target: BlockId::new(21),
+                else_target: BlockId::new(22),
+            },
+            vec![cmp_st],
+            None,
+        );
+        let call_err = mk(
+            104,
+            Operation::CallDirect { callee: reach_id },
+            vec![],
+            None,
+        );
+
+        let mut block = AirBlock::new(BlockId::new(20));
+        block.instructions = vec![call_nd, icmp_in, icmp_st, condbr, condbr2, call_err];
+
+        let main = AirFunction {
+            id: FunctionId::new(2),
+            name: "main".to_string(),
+            params: vec![],
+            blocks: vec![block],
+            entry_block: Some(BlockId::new(20)),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(decl(1, "reach_error"));
+        m.functions.push(main);
+        m.functions.push(decl(3, "__VERIFIER_nondet_int"));
+        m.constants.insert(seven, Constant::int(7, 32));
+        m.constants.insert(five, Constant::int(5, 32));
+
+        let slice = backward_slice(&m);
+        assert!(
+            slice.input_guard_constants.contains(&7),
+            "input-compared constant 7 is in the chop, got {:?}",
+            slice.input_guard_constants
+        );
+        assert!(
+            !slice.input_guard_constants.contains(&5),
+            "state-compared constant 5 must NOT be in the chop, got {:?}",
+            slice.input_guard_constants
+        );
+        // The raw guard set is unrefined and still contains both.
+        assert!(slice.guard_constants.contains(&7));
+        assert!(slice.guard_constants.contains(&5));
+        // The bare event alphabet mirrors the chop: the input-compared 7, not 5.
+        assert!(
+            slice.input_alphabet.contains(&7),
+            "input-compared 7 is in the alphabet, got {:?}",
+            slice.input_alphabet
+        );
+        assert!(
+            !slice.input_alphabet.contains(&5),
+            "state-compared 5 must NOT be in the alphabet, got {:?}",
+            slice.input_alphabet
+        );
+    }
+
+    /// A strict `!=` disequality against a tainted input contributes the bare symbol
+    /// to the alphabet but NOT its ±1 neighbours (a neighbour would halt a driver
+    /// that validates the read against the exact symbol set). The steering
+    /// `input_guard_constants` still carries the neighbours.
+    #[test]
+    fn alphabet_excludes_strict_neighbours() {
+        let reach_id = FunctionId::new(1);
+        let nondet_id = FunctionId::new(3);
+        let input = ValueId::new(10);
+        let five = ValueId::new(11);
+        let cmp = ValueId::new(12);
+
+        let mk =
+            |id: u128, op: Operation, operands: Vec<ValueId>, dst: Option<ValueId>| Instruction {
+                id: InstId::new(id),
+                op,
+                operands,
+                dst,
+                span: None,
+                symbol: None,
+                result_type: None,
+                extensions: BTreeMap::new(),
+            };
+        let call_nd = mk(
+            99,
+            Operation::CallDirect { callee: nondet_id },
+            vec![],
+            Some(input),
+        );
+        // cmp = icmp ne input, 5   (strict disequality)
+        let icmp = mk(
+            100,
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpNe,
+            },
+            vec![input, five],
+            Some(cmp),
+        );
+        let condbr = mk(
+            101,
+            Operation::CondBr {
+                then_target: BlockId::new(21),
+                else_target: BlockId::new(22),
+            },
+            vec![cmp],
+            None,
+        );
+        let call_err = mk(
+            102,
+            Operation::CallDirect { callee: reach_id },
+            vec![],
+            None,
+        );
+        let mut block = AirBlock::new(BlockId::new(20));
+        block.instructions = vec![call_nd, icmp, condbr, call_err];
+        let main = AirFunction {
+            id: FunctionId::new(2),
+            name: "main".to_string(),
+            params: vec![],
+            blocks: vec![block],
+            entry_block: Some(BlockId::new(20)),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(decl(1, "reach_error"));
+        m.functions.push(main);
+        m.functions.push(decl(3, "__VERIFIER_nondet_int"));
+        m.constants.insert(five, Constant::int(5, 32));
+
+        let slice = backward_slice(&m);
+        assert!(
+            slice.input_alphabet.contains(&5),
+            "bare symbol 5 in the alphabet, got {:?}",
+            slice.input_alphabet
+        );
+        assert!(
+            !slice.input_alphabet.contains(&4) && !slice.input_alphabet.contains(&6),
+            "±1 neighbours must NOT be in the alphabet, got {:?}",
+            slice.input_alphabet
+        );
+        // But the steering set keeps the neighbours for the strict crossing.
+        assert!(slice.input_guard_constants.contains(&4));
+        assert!(slice.input_guard_constants.contains(&6));
+    }
+
+    #[test]
+    fn alphabet_walk_seeds_saturate_the_buffer_with_valid_symbols() {
+        // A 3-symbol alphabet {1,2,3}: every produced seed must be full-length and
+        // contain ONLY alphabet symbols at 4-byte read slots (so a driver that halts
+        // on an out-of-alphabet read is never halted by our saturation seed).
+        let seeds = alphabet_walk_seeds(&[1, 2, 3]);
+        assert!(
+            !seeds.is_empty(),
+            "a multi-symbol alphabet yields walk seeds"
+        );
+        assert!(seeds.len() <= MAX_WALK_SEEDS, "seed count bounded");
+        // The width-4 cyclic tiling: slots 0,1,2,3,... = 1,2,3,1,...
+        let cyclic4 = {
+            let mut b = vec![0u8; INPUT_LEN];
+            for slot in 0..(INPUT_LEN / 4) {
+                let v = [1u32, 2, 3][slot % 3];
+                b[slot * 4..slot * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            b
+        };
+        assert!(
+            seeds.contains(&cyclic4),
+            "the width-4 cyclic round-robin tiling must be present"
+        );
+        assert!(seeds.iter().all(|s| s.len() == INPUT_LEN));
+    }
+
+    #[test]
+    fn alphabet_walk_seeds_need_two_symbols_and_are_deterministic() {
+        assert!(alphabet_walk_seeds(&[]).is_empty());
+        assert!(
+            alphabet_walk_seeds(&[7]).is_empty(),
+            "a single symbol is already covered by constant tiling"
+        );
+        let a = alphabet_walk_seeds(&[1, 2, 3, 4, 5, 6, 7]);
+        let b = alphabet_walk_seeds(&[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(a, b, "deterministic");
+    }
+
+    /// The chop propagates through arithmetic: `input = nondet(); y = input + 3;
+    /// if (y == 100) reach_error();` — `y` is input-tainted, so `100` is in the chop.
+    #[test]
+    fn chop_follows_arithmetic_taint() {
+        let reach_id = FunctionId::new(1);
+        let nondet_id = FunctionId::new(3);
+        let input = ValueId::new(10);
+        let three = ValueId::new(11);
+        let y = ValueId::new(12);
+        let hundred = ValueId::new(13);
+        let cmp = ValueId::new(14);
+
+        let mk =
+            |id: u128, op: Operation, operands: Vec<ValueId>, dst: Option<ValueId>| Instruction {
+                id: InstId::new(id),
+                op,
+                operands,
+                dst,
+                span: None,
+                symbol: None,
+                result_type: None,
+                extensions: BTreeMap::new(),
+            };
+        let call_nd = mk(
+            99,
+            Operation::CallDirect { callee: nondet_id },
+            vec![],
+            Some(input),
+        );
+        let add = mk(
+            100,
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            vec![input, three],
+            Some(y),
+        );
+        let icmp = mk(
+            101,
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpEq,
+            },
+            vec![y, hundred],
+            Some(cmp),
+        );
+        let condbr = mk(
+            102,
+            Operation::CondBr {
+                then_target: BlockId::new(21),
+                else_target: BlockId::new(22),
+            },
+            vec![cmp],
+            None,
+        );
+        let call_err = mk(
+            103,
+            Operation::CallDirect { callee: reach_id },
+            vec![],
+            None,
+        );
+        let mut block = AirBlock::new(BlockId::new(20));
+        block.instructions = vec![call_nd, add, icmp, condbr, call_err];
+        let main = AirFunction {
+            id: FunctionId::new(2),
+            name: "main".to_string(),
+            params: vec![],
+            blocks: vec![block],
+            entry_block: Some(BlockId::new(20)),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(decl(1, "reach_error"));
+        m.functions.push(main);
+        m.functions.push(decl(3, "__VERIFIER_nondet_int"));
+        m.constants.insert(three, Constant::int(3, 32));
+        m.constants.insert(hundred, Constant::int(100, 32));
+
+        let slice = backward_slice(&m);
+        assert!(
+            slice.input_guard_constants.contains(&100),
+            "arithmetic-tainted comparison constant 100 must be in the chop, got {:?}",
+            slice.input_guard_constants
+        );
+    }
+
+    /// A program with no scalar nondet source has an empty chop, and the dictionary
+    /// it produces is unchanged — the refinement never perturbs an input-free search.
+    #[test]
+    fn no_nondet_source_leaves_chop_empty() {
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(decl(1, "reach_error"));
+        m.constants.insert(ValueId::new(1), Constant::int(4242, 32));
+        let slice = backward_slice(&m);
+        assert!(
+            slice.input_guard_constants.is_empty(),
+            "no nondet source => empty chop"
         );
     }
 
@@ -805,10 +1469,13 @@ mod tests {
             instructions: BTreeSet::new(),
             guard_constants: vec![777, 888],
             guard_floats: vec![],
+            input_guard_constants: vec![555],
+            input_alphabet: vec![555],
         };
         let dict = slice_directed_dictionary(&m, &slice);
-        assert_eq!(dict[0], 777, "guard constant first");
-        assert_eq!(dict[1], 888, "guard constant second");
+        assert_eq!(dict[0], 555, "input-chop constant is front-loaded first");
+        assert_eq!(dict[1], 777, "guard constant next");
+        assert_eq!(dict[2], 888, "guard constant next");
         assert!(dict.contains(&4242), "module constant still present");
         // No duplicates.
         let mut sorted = dict.clone();

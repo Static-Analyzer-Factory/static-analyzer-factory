@@ -1800,7 +1800,21 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
     let slice = saf_svcomp::slicing::backward_slice(ctx.module);
     let mut dict = saf_svcomp::slicing::slice_directed_dictionary(ctx.module, &slice);
     let mut corpus = fuzz::seed_corpus(&dict);
+    // Lay the INPUT ALPHABET (the nondet→error chop) as a distinct-value chain
+    // first — for an input-driven state machine this is the sequence of event codes
+    // that walks the automaton to the error — then the broader guard set.
+    corpus.extend(saf_svcomp::slicing::sequence_seeds(
+        &slice.input_guard_constants,
+    ));
     corpus.extend(saf_svcomp::slicing::sequence_seeds(&slice.guard_constants));
+    // Input-driven state machines (RERS / `eca-*`): saturate the whole input buffer
+    // with LONG valid event sequences drawn from the input alphabet. The driver halts
+    // on the first out-of-alphabet read, so a blind byte fuzzer never walks the
+    // automaton; these seeds hand it valid walks to mutate. Empty for programs whose
+    // input is not equality-matched against a fixed symbol set, so no regression.
+    corpus.extend(saf_svcomp::slicing::alphabet_walk_seeds(
+        &slice.input_alphabet,
+    ));
     // Float steering: when the program reads a `__VERIFIER_nondet_float/_double`,
     // tile interesting + slice-harvested float boundary constants into the corpus.
     // A blind byte mutation essentially never produces an in-range float, so without
@@ -4294,7 +4308,17 @@ fn asan_fuzz_pass(
     let slice = saf_svcomp::slicing::backward_slice(module);
     let dict = saf_svcomp::slicing::slice_directed_dictionary(module, &slice);
     let mut corpus = fuzz::seed_corpus(&dict);
+    // Input-alphabet (nondet→error chop) chain first, then the broader guard set.
+    corpus.extend(saf_svcomp::slicing::sequence_seeds(
+        &slice.input_guard_constants,
+    ));
     corpus.extend(saf_svcomp::slicing::sequence_seeds(&slice.guard_constants));
+    // Input-alphabet saturation walks for event-driven state machines (see the
+    // unreach-call fuzz path). Empty unless the input is equality-matched against a
+    // fixed symbol set, so this never perturbs a non-state-machine memsafety search.
+    corpus.extend(saf_svcomp::slicing::alphabet_walk_seeds(
+        &slice.input_alphabet,
+    ));
     // Fixed seed -> the whole search (and therefore the verdict) is reproducible.
     let mut rng = fuzz::XorShift64::new(0x5AF3_C0DE);
     let per_run = memsafety_replay_timeout();
