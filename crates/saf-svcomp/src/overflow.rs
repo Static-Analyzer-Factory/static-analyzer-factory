@@ -129,6 +129,25 @@ pub fn lower_overflow_hit(hit: &OverflowHit) -> Vec<SourceWaypoint> {
 /// drop an already-confirmed witness, which the confirmed-score gate reverts. The
 /// assumptions are TRUE of the witnessed execution (the shim returned that exact
 /// value for every scalar nondet), so they never misdirect the validator.
+///
+/// **Enrichment ceiling (measured, CPAchecker 4.2.2 `violation-witness-validation`).**
+/// A local sweep validating hand-built witnesses for representative shallow
+/// overflows (guarded add, `x*x`, two-nondet multiply, doubly-nested guards, an
+/// opaque `x ^ K` guard, and a reassigned-source variable) found that a **bare
+/// `target` waypoint already CONFIRMS** every one of them — CPAchecker's
+/// analysis-based validation re-derives the reaching path itself whenever it can
+/// reach the overflow at all. Adding these `assumption` waypoints was
+/// confirmation-neutral (never flipped a NOT_CONFIRMED to CONFIRMED, never dropped
+/// a CONFIRMED). Adding `branching` waypoints, by contrast, **DROPPED** a
+/// previously-confirmed nested-guard witness (CONFIRMED -> NOT_CONFIRMED): a
+/// column-less `branching` follow over-constrains the guided analysis for the
+/// no-overflow property. The residual confirmation gap is loop overflows that
+/// need more unrolling than the validator's budget, which no waypoint content can
+/// close. Consequently `assumption` waypoints are the *maximum* safe enrichment on
+/// the overflow path — this lowering deliberately emits only `Assumption` +
+/// `Target` and NEVER a `Branching`/`FunctionReturn` waypoint (enforced by
+/// [`tests::enriched_lowering_emits_only_assumption_and_target`]). A future arm
+/// must not "enrich" this path with branch waypoints.
 #[must_use]
 pub fn lower_overflow_hit_enriched(
     hit: &OverflowHit,
@@ -446,6 +465,56 @@ add.c:2: runtime error: signed integer overflow: 2147483647 + 1 cannot be repres
         assert!(yaml.contains("type: target"), "{yaml}");
         assert!(yaml.contains("value: x == 2147483647"), "{yaml}");
         assert!(yaml.contains("format: c_expression"), "{yaml}");
+    }
+
+    #[test]
+    fn enriched_lowering_emits_only_assumption_and_target() {
+        // Contract (measured against CPAchecker 4.2.2 violation-witness-validation):
+        // `branching` waypoints DROP a previously-confirmed no-overflow witness, so the
+        // overflow lowering must never emit one. `function_return`/`function_enter` are
+        // likewise not part of this path. Guard every shape — several assumptions, a
+        // single one, and none — so a future arm that adds a harmful waypoint kind here
+        // (the arm-159 regression class) trips this test.
+        let hit = OverflowHit {
+            file: "t.c".to_string(),
+            line: 30,
+            column: Some(11),
+        };
+        let assume = |line: u32, lhs: &str, value: i64| NondetAssume {
+            file: "t.c".to_string(),
+            line,
+            lhs: lhs.to_string(),
+            value,
+        };
+        for assumes in [
+            vec![
+                assume(5, "a", 50000),
+                assume(6, "b", 50000),
+                assume(7, "c", 2147483647),
+            ],
+            vec![assume(5, "x", -2147483648)],
+            vec![],
+        ] {
+            let wps = lower_overflow_hit_enriched(&hit, &assumes);
+            // Only Assumption (all but the last) and a single trailing Target.
+            let (target, leading) = wps.split_last().expect("at least the target");
+            assert!(
+                matches!(target.kind, WaypointKind::Target),
+                "the witness must end in a target"
+            );
+            assert!(
+                leading
+                    .iter()
+                    .all(|w| matches!(w.kind, WaypointKind::Assumption)),
+                "the overflow path must emit ONLY assumption waypoints before the target — \
+                 never branching/function_return (they break CPAchecker no-overflow validation)"
+            );
+            assert_eq!(
+                leading.len(),
+                assumes.len(),
+                "one assumption per supplied nondet binding"
+            );
+        }
     }
 
     #[test]
