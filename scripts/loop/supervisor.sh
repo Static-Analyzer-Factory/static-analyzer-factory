@@ -123,6 +123,24 @@ heal_splits() {
   log "heal_splits: regen produced no/empty split — splits UNCHANGED (fail-safe)"
   rm -rf "$tmp"; return 1
 }
+# --- disk_guard: keep the cargo target cache from filling the box. The 'debug/' profile (from cargo
+# nextest) accumulates ~10x stale deps over a campaign (observed 189G); the loop's own eval builds only
+# --release (kept warm), so reclaiming debug/ is cheap-to-rebuild and never touches the eval path. Cheap:
+# the per-arm call is just a `df` until disk passes 75%, then it does the (container) size-check/reclaim.
+: "${SAF_DISK_MAX_PCT:=85}"; : "${SAF_TARGET_DEBUG_MAX_GB:=45}"
+_dev1() { docker compose -f "$REPO_ROOT/docker-compose.yml" run --rm -T -e SKIP_MATURIN_BUILD=1 dev sh -c "$1"; }
+disk_guard() {
+  command -v docker >/dev/null 2>&1 || return 0
+  local pct; pct="$(df -P /var/lib/docker 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')"; pct="${pct:-0}"
+  [ "$pct" -lt 75 ] && return 0
+  local dgb; dgb="$(_dev1 'du -sBG /workspace/target/debug 2>/dev/null | cut -f1 | tr -dc 0-9' 2>/dev/null)"; dgb="${dgb:-0}"
+  if [ "$pct" -ge "$SAF_DISK_MAX_PCT" ] || [ "$dgb" -ge "$SAF_TARGET_DEBUG_MAX_GB" ]; then
+    log "disk_guard: docker root ${pct}% / target-debug ${dgb}G >= thresholds — reclaiming (keep release/)"
+    _dev1 'rm -rf /workspace/target/debug/deps /workspace/target/debug/incremental /workspace/target/debug/build /workspace/target/nextest 2>/dev/null; true' >/dev/null 2>&1 || true
+    docker image prune -f >/dev/null 2>&1 || true; docker container prune -f >/dev/null 2>&1 || true
+    log "disk_guard: reclaim done — docker root now $(df -P /var/lib/docker 2>/dev/null | awk 'NR==2{print $5}')"
+  fi
+}
 freeze_immutables() {
   mkdir -p "$(dirname "$IMMUTABLE_MANIFEST")"
   log "freezing immutables -> $IMMUTABLE_MANIFEST"
@@ -897,6 +915,7 @@ main() {
       local i=0 rc=0
       while [ "$i" -lt "$MAX_ARMS" ]; do
         [ -e "$STATE_DIR/STOP" ] && { log "STOP file present — halting"; break; }
+        disk_guard || true
         rc=0; run_arm || rc=$?
         [ "$rc" -eq 10 ] && { log "no active levers remain — campaign complete"; break; }
         i=$((i+1))
