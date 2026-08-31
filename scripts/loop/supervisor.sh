@@ -99,6 +99,30 @@ assert_clean_tree() {
 }
 
 # ----------------------------------------------------------------------------- immutable freeze + check
+# heal_splits — self-heal the gitignored, DETERMINISTIC canonical eval split if an arm modified it.
+# The split files (train/val/holdout.jsonl + .set) are gitignored, so a tamper-revert (git) CANNOT
+# restore them; without this the loop dead-locks on REJECT_TAMPER forever (incident 2026-08-31).
+# `svcomp_split.py --group-depth 2 --holdout-frac 0.2 --seed 0` is byte-reproducible, so when the
+# split is already canonical this is a no-op. FAIL-SAFE: skips under stubs, skips if sv-benchmarks is
+# absent, regenerates into a temp dir and replaces ONLY on a sane (>1000-line) result — never blanks
+# the split. soundness-sentinel.jsonl (git-tracked) is left untouched. Returns 0 on ok/no-op, 1 on fail.
+heal_splits() {
+  [ -n "${SAF_LOOP_STUBS:-}" ] && return 0
+  [ -d "$REPO_ROOT/tests/benchmarks/sv-benchmarks/c" ] || { log "heal_splits: sv-benchmarks absent — skip"; return 0; }
+  local sd="$REPO_ROOT/tests/benchmarks/svcomp-splits" tmp="$REPO_ROOT/_heal_split_tmp"
+  rm -rf "$tmp"
+  docker compose -f "$REPO_ROOT/docker-compose.yml" run --rm -T -e SKIP_MATURIN_BUILD=1 dev \
+    sh -c 'python3 scripts/svcomp_split.py --group-depth 2 --holdout-frac 0.2 --seed 0 --out-dir /workspace/_heal_split_tmp' >/dev/null 2>&1 || true
+  if [ -f "$tmp/train.jsonl" ] && [ "$(wc -l < "$tmp/train.jsonl" 2>/dev/null || echo 0)" -gt 1000 ]; then
+    chmod -R u+w "$sd" 2>/dev/null || true
+    find "$sd" -maxdepth 1 -type f ! -name soundness-sentinel.jsonl -delete 2>/dev/null || true
+    cp -f "$tmp"/* "$sd"/ 2>/dev/null || true
+    log "heal_splits: canonical split ensured (train=$(wc -l < "$sd/train.jsonl" 2>/dev/null))"
+    rm -rf "$tmp"; return 0
+  fi
+  log "heal_splits: regen produced no/empty split — splits UNCHANGED (fail-safe)"
+  rm -rf "$tmp"; return 1
+}
 freeze_immutables() {
   mkdir -p "$(dirname "$IMMUTABLE_MANIFEST")"
   log "freezing immutables -> $IMMUTABLE_MANIFEST"
@@ -477,7 +501,17 @@ print("cost=$%.2f turns=%s retries=%s subtype=%s"%(d.get("total_cost_usd",0) or 
       journal_perproperty "$checkpoint_before" "$checkpoint_after" ;;
     REJECT_TAMPER|REJECT_HOLDOUT)
       log "SECURITY: $decision on arm $n — reverting + alerting"
-      revert_arm "$branch"; journal "$n" "$id" "$mode" "$decision" "" ; touch "$STATE_DIR/ALERT_$decision" ;;
+      revert_arm "$branch"; journal "$n" "$id" "$mode" "$decision" "" ; touch "$STATE_DIR/ALERT_$decision"
+      # SELF-HEAL (incident 2026-08-31): if the tamper is ONLY gitignored split-file drift (which the
+      # git revert above CANNOT restore), regenerate the canonical split + re-freeze so the NEXT arm is
+      # not cascaded into REJECT_TAMPER. Scorer/scripts/gate tampering is NOT auto-healed (hard reject).
+      if [ "$decision" = REJECT_TAMPER ]; then
+        _hv="$(immutable_violations)"
+        if [ -n "$_hv" ] && ! printf '%s\n' "$_hv" | grep -qvE 'tests/benchmarks/svcomp-splits/(train|val|holdout)\.jsonl$'; then
+          log "self-heal: tamper is split-drift only — regenerating canonical split + re-freezing"
+          { heal_splits && freeze_immutables; } || true
+        fi
+      fi ;;
     *)
       revert_arm "$branch"; journal "$n" "$id" "$mode" "REVERT" "" ;;
   esac
@@ -845,11 +879,11 @@ main() {
   case "$mode" in
     --baseline) freeze_immutables; cmd_baseline ;;
     --once)
-      setup_work_branch; freeze_immutables    # freeze from the clean work-branch baseline
+      setup_work_branch; heal_splits || true; freeze_immutables    # freeze from the clean work-branch baseline
       log "DRY-RUN: one arm, foreground, watched, then STOP"
       run_arm "${1:-}" ;;
     --loop)
-      setup_work_branch; freeze_immutables; freeze_sentinel_baseline; init_overall_checkpoint
+      setup_work_branch; heal_splits || true; freeze_immutables; freeze_sentinel_baseline; init_overall_checkpoint
       local i=0 rc=0
       while [ "$i" -lt "$MAX_ARMS" ]; do
         [ -e "$STATE_DIR/STOP" ] && { log "STOP file present — halting"; break; }
