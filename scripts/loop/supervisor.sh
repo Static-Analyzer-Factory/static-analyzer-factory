@@ -159,7 +159,17 @@ freeze_sentinel_baseline() {
   local sm="$REPO_ROOT/tests/benchmarks/svcomp-splits/soundness-sentinel.jsonl"
   [ -f "$sm" ] || { log "no soundness-sentinel manifest — skipping baseline"; return 0; }
   log "freezing soundness-sentinel baseline (raw FP+wrong-TRUE)"
-  saf_eval "$sm" "$GATE_LIB/sentinel_baseline.json" >/dev/null 2>&1 || log "WARN: sentinel baseline eval failed; gate check disabled this run"
+  # saf_eval runs IN-CONTAINER and only path-translates outputs UNDER $REPO_ROOT; $GATE_LIB is OUTSIDE
+  # the repo, so a direct -o to it hits FileNotFoundError in the container and SILENTLY disabled the
+  # sentinel gate on every restart. Write to a translatable STATE_DIR path, then promote to the pristine
+  # gate dir (host cp; a worker on its arm branch still cannot reach $GATE_LIB).
+  local tmp="$STATE_DIR/sentinel_baseline.json"
+  if saf_eval "$sm" "$tmp" >/dev/null 2>&1 && [ -s "$tmp" ]; then
+    cp -f "$tmp" "$GATE_LIB/sentinel_baseline.json"
+    log "soundness-sentinel baseline frozen -> $GATE_LIB/sentinel_baseline.json"
+  else
+    log "WARN: sentinel baseline eval failed; gate check disabled this run"
+  fi
 }
 snapshot_gate_lib() {
   # Copy the gate python to a pristine dir OUTSIDE the repo and run ALL gate logic from there, so a
