@@ -1563,6 +1563,65 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         );
     }
 
+    // Stage 4c (sound, cheap): fully-deterministic (input-free) programs. A program
+    // with NO fuzzable nondet input has a single fixed execution, so ONE concrete
+    // native run is ground truth — it confirms reaches that the over-approximate
+    // candidate enumeration / SE / BMC can wrongly PRUNE. The canonical miss is an
+    // unsigned-vs-signed comparison such as `1u < -1`, which a signed-modelled
+    // analysis evaluates as false and drops the error path (so no candidate is ever
+    // enumerated to replay), yet the real C semantics take it. The blind fuzzer,
+    // which would otherwise catch this by running the program, is gated OFF for
+    // input-free programs (`references_fuzzable_nondet` is false), leaving this class
+    // uncovered. The concurrency gate above already returned for any thread-spawning
+    // program, so this native run is schedule-independent; a deep / non-terminating
+    // deterministic program simply times out in `replay_confirms_false` -> abstain.
+    // Runs ONLY after every candidate-based stage failed, so the tasks those stages
+    // already confirm keep their exact path (zero regression). The native run is the
+    // sole arbiter of FALSE — a safe program never drops the sentinel — and the
+    // signed-overflow trap + timeout keep it fail-closed, so it can only ever ADD a
+    // sound confirmation, never a wrong verdict.
+    if !saf_svcomp::fuzz::references_fuzzable_nondet(ctx.module) {
+        if let Some(&reach_error_inst) = saf_svcomp::reach_error_call_sites(ctx.module).first() {
+            let candidate = saf_svcomp::FalseCandidate {
+                reach_error_inst,
+                block_path: Vec::new(),
+                assignments: std::collections::BTreeMap::new(),
+                nondet_sequence: Vec::new(),
+            };
+            match replay_confirms_false(
+                ctx.input,
+                ctx.data_model,
+                ctx.stub,
+                ctx.tempdir,
+                ctx.clang,
+                DETERMINISTIC_REPLAY_IDX,
+                &candidate,
+            ) {
+                Ok(true) => {
+                    let witness =
+                        build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, &candidate));
+                    if witness.is_none() {
+                        eprintln!(
+                            "saf verify: FALSE (deterministic native run) but witness unconstructible -> emitting false without a witness"
+                        );
+                    }
+                    eprintln!(
+                        "saf verify: deterministic native run reached reach_error -> false(unreach-call)"
+                    );
+                    return VerdictOutcome {
+                        verdict: format!("false({})", Property::UnreachCall.name()),
+                        witness,
+                        graphml: None,
+                    };
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("saf verify: deterministic native run errored: {e:#} -> continue");
+                }
+            }
+        }
+    }
+
     // Stages 4b-6, portfolio-routed (lever `portfolio-select`). The remaining solver
     // levers — BMC (fixed-k + incremental), forward SE, blind byte-stream fuzz, and
     // the bit-precise CBMC oracle — historically ran in ONE fixed order on every
@@ -3179,6 +3238,11 @@ const OVERFLOW_CONSTS: &[i64] = &[
 /// compile+run time; a real violation almost always surfaces in the first
 /// candidate. Dropped candidates are logged implicitly by not confirming.
 const MAX_REPLAY_CANDIDATES: usize = 16;
+
+/// Replay index reserved for the deterministic (input-free) native-run confirmer
+/// (Stage 4c in [`unreach_strategy`]). Placed far above every candidate/fuzz index
+/// (`2 * MAX_REPLAY_CANDIDATES + fuzz-trial`) so its temp files never collide.
+const DETERMINISTIC_REPLAY_IDX: usize = 1_000_000;
 
 /// Cap on the overflow confirmer's candidate list. Larger than
 /// [`MAX_REPLAY_CANDIDATES`] because the overflow sweep layers three sources —
@@ -6544,6 +6608,35 @@ mod verify_tests {
         assert!(body.contains("#ifdef __VERIFIER_assert"), "{body}");
         // Deterministic path/name so a second `-include` is stable across runs.
         assert!(p.ends_with("saf_undef_assert.h"), "{}", p.display());
+    }
+
+    #[test]
+    fn deterministic_replay_driver_defines_error_sinks_and_no_nondet_values() {
+        // The Stage-4c deterministic (input-free) confirmer replays through
+        // `synthesize_driver` with an EMPTY nondet sequence. That driver must still
+        // (a) override the error sinks so a real reach drops the sentinel, and
+        // (b) emit each nondet stub with a zero-length value table (a `__saf_n_* = 0`
+        // count gate) so the single deterministic execution is faithful. It must NOT
+        // pin any nondet value, since an input-free program has none to reconstruct.
+        let sentinel = std::path::Path::new("/tmp/saf_det.sentinel");
+        let candidate = saf_svcomp::FalseCandidate {
+            reach_error_inst: saf_core::ids::InstId::new(1),
+            block_path: Vec::new(),
+            assignments: std::collections::BTreeMap::new(),
+            nondet_sequence: Vec::new(),
+        };
+        let src = synthesize_driver(&candidate, sentinel);
+        // Error sinks present (the sole evidence of a violation).
+        assert!(src.contains("reach_error"), "{src}");
+        assert!(src.contains("__VERIFIER_error"), "{src}");
+        assert!(src.contains("__assert_fail"), "{src}");
+        // Assumptions honoured as a hard path filter (R4).
+        assert!(src.contains("__VERIFIER_assume"), "{src}");
+        // Empty sequence -> every scalar nondet count gate is zero (no pinned values).
+        assert!(src.contains("__saf_n_int = 0"), "{src}");
+        // Reserved replay index sits far above the candidate/fuzz index range so its
+        // temp files never collide.
+        assert!(DETERMINISTIC_REPLAY_IDX > 2 * MAX_REPLAY_CANDIDATES + 100_000);
     }
 
     #[test]
