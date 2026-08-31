@@ -1908,6 +1908,24 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
     let mut stuck = 0usize;
     let mut concolic_runs = 0usize;
     let mut plateau_seq: Vec<saf_svcomp::NondetCall> = Vec::new();
+    // AFLGo-style directed power schedule (lever `fuzz-covguided`). `progress[k]` is a
+    // source-level distance-to-target proxy for corpus entry `k`: how many of the
+    // backward-slice on-path guard constants that entry's run compared against
+    // (`fuzz::cmplog_progress`). As the campaign cools, `fuzz::select_base`
+    // concentrates mutation energy on the highest-progress (deepest) seeds so a
+    // multi-stage guard chain is cracked stage by stage instead of the search
+    // scattering across shallow seeds. `progress_targets` unions the input→error chop
+    // and the broader on-path guard set; empty ⇒ every progress is 0 ⇒ `select_base`
+    // degrades to the recency bias (no regression). Purely a search heuristic — native
+    // replay (R6) stays the sole FALSE arbiter — and it only steers the
+    // coverage-instrumented path (the blind fallback keeps `below_biased_high`).
+    let progress_targets: std::collections::BTreeSet<i64> = slice
+        .input_guard_constants
+        .iter()
+        .chain(slice.guard_constants.iter())
+        .copied()
+        .collect();
+    let mut progress: Vec<usize> = vec![0; corpus.len()];
 
     // Trial 0..N: the seed corpus first (its entries are tried verbatim before any
     // mutation), then mutations of corpus entries. A run that consumes MORE nondet
@@ -1927,10 +1945,19 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
             // of execs instead of draining a huge FIFO of stale candidates first.
             cand
         } else {
-            // Frontier-biased energy: favour the most-recently-added (deepest /
-            // newest-coverage) corpus entries as mutation bases.
-            let base = &corpus[rng.below_biased_high(corpus.len())];
-            fuzz::mutate(&mut rng, base, &dict)
+            // Energy assignment. Coverage-instrumented: AFLGo annealed directed
+            // schedule — favour the seeds closest to the target as the campaign cools
+            // (temperature 1→0 over the trial budget), falling back to the recency
+            // bias while hot. Blind fallback: the unchanged recency/frontier bias
+            // (byte-identical to prior behaviour — the extra anneal draw is skipped).
+            let base_idx = if cov_enabled {
+                #[allow(clippy::cast_precision_loss)]
+                let temp = 1.0 - (i as f64) / (total as f64);
+                fuzz::select_base(&mut rng, &progress, temp)
+            } else {
+                rng.below_biased_high(corpus.len())
+            };
+            fuzz::mutate(&mut rng, &corpus[base_idx], &dict)
         };
 
         if std::fs::write(&input_path, &input).is_err() {
@@ -2002,9 +2029,14 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
             // future mutations past magic-value guards). Without instrumentation, fall
             // back to the original depth (nondet-log-line-count) heuristic.
             if cov_enabled {
-                if let Ok(cl) = std::fs::read_to_string(&cmplog_path) {
+                // Read the CmpLog dump once: it both grows the steering dictionary and
+                // yields this run's directed-schedule progress (distinct on-path guard
+                // constants compared against).
+                let cl = std::fs::read_to_string(&cmplog_path).unwrap_or_default();
+                if !cl.is_empty() {
                     fuzz::merge_cmplog(&mut dict, &cl, MAX_MERGED_DICT);
                 }
+                let run_progress = fuzz::cmplog_progress(&cl, &progress_targets);
                 let novel = std::fs::read(&cov_path).is_ok_and(|raw| cov.fold(&raw));
                 // Only EXPAND the search from inputs that reached somewhere new: keep
                 // them as mutation bases, and grow the Redqueen frontier from them
@@ -2023,6 +2055,8 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
                     }
                     if i >= corpus.len() && corpus.len() < MAX_FUZZ_CORPUS {
                         corpus.push(input.clone());
+                        // Keep the directed-schedule score aligned with the corpus.
+                        progress.push(run_progress);
                     }
                     if let Ok(dump) = std::fs::read_to_string(&i2s_path) {
                         let pairs = fuzz::parse_i2s(&dump);
@@ -2076,6 +2110,9 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
                 if depth > max_depth && corpus.len() < MAX_FUZZ_CORPUS {
                     max_depth = depth;
                     corpus.push(input);
+                    // Keep `progress` length-aligned with `corpus` (the blind path has
+                    // no CmpLog, so every entry scores 0 and `select_base` is unused).
+                    progress.push(0);
                 }
             }
         }

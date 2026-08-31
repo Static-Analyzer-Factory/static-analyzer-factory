@@ -1052,6 +1052,57 @@ impl XorShift64 {
     }
 }
 
+/// Number of recency-biased candidates sampled per exploitation tournament in
+/// [`select_base`]. Small so exploitation stays cheap and never fully abandons the
+/// coverage frontier (a larger pool would collapse onto a single deep seed).
+const SELECT_TOURNAMENT: usize = 3;
+
+/// AFLGo-style annealed *directed power schedule*: choose which corpus entry to mutate
+/// next, given a per-entry "closeness to the target" score and a simulated-annealing
+/// temperature.
+///
+/// `progress[i]` is a source-level distance proxy for corpus entry `i` — how many
+/// backward-slice guard constants that entry's run satisfied ([`cmplog_progress`]);
+/// higher = deeper toward `reach_error`. `temp` in `[0.0, 1.0]` is the annealing
+/// temperature, cooled from `1.0` (pure exploration) at the campaign start to `0.0`
+/// (pure exploitation) at the end.
+///
+/// With probability `temp` the pick is the unchanged recency/frontier bias
+/// ([`XorShift64::below_biased_high`] — favour the newest corpus entries, i.e. the
+/// coverage frontier). With probability `1 - temp` it runs a small tournament and
+/// returns the highest-`progress` entry (ties broken toward the most recent), so as
+/// the campaign cools, mutation energy concentrates on the seeds closest to the
+/// target — the AFLGo directed-scheduling idea adapted to a static-slice distance.
+///
+/// Purely a search heuristic — native replay (R6) stays the sole FALSE arbiter — and
+/// deterministic in `rng` (integer-quantised annealing draw, no floats compared).
+#[must_use]
+pub fn select_base(rng: &mut XorShift64, progress: &[usize], temp: f64) -> usize {
+    let n = progress.len();
+    if n == 0 {
+        return 0;
+    }
+    // Recency-biased explorer pick (the unchanged baseline behaviour).
+    let explore = rng.below_biased_high(n);
+    // Integer-quantised annealing draw (1024 buckets) — no float comparison, so the
+    // schedule is byte-identical across platforms.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let temp_q = (temp.clamp(0.0, 1.0) * 1024.0) as u64;
+    if (rng.next_u64() & 1023) < temp_q {
+        return explore;
+    }
+    // Exploitation: tournament of a few recency-biased candidates; keep the one that
+    // progressed furthest toward the target (tie -> most recent / highest index).
+    let mut best = explore;
+    for _ in 0..SELECT_TOURNAMENT {
+        let c = rng.below_biased_high(n);
+        if progress[c] > progress[best] || (progress[c] == progress[best] && c > best) {
+            best = c;
+        }
+    }
+    best
+}
+
 // ---------------------------------------------------------------------------
 // Edge-coverage feedback (SanitizerCoverage inline-8bit-counters).
 // ---------------------------------------------------------------------------
@@ -1151,6 +1202,41 @@ pub fn merge_cmplog(dict: &mut Vec<i64>, cmplog: &str, cap: usize) -> usize {
     }
     *dict = v;
     added
+}
+
+/// Count how many DISTINCT `targets` constants (the backward slice's on-path guard
+/// constants) appeared as a comparison operand in this run's CmpLog `dump`.
+///
+/// A cheap source-level *distance-to-target* proxy for the AFLGo directed power
+/// schedule ([`select_base`]): a run that compared its values against more of the
+/// guard constants lying on the path to `reach_error` has progressed further toward
+/// it. Operands are parsed exactly as [`merge_cmplog`] does (unsigned decimal,
+/// reinterpreted as `i64`, with a signed-decimal fallback). Purely a search signal —
+/// never the verdict — and deterministic (a pure function of its inputs).
+#[must_use]
+pub fn cmplog_progress(dump: &str, targets: &BTreeSet<i64>) -> usize {
+    if targets.is_empty() {
+        return 0;
+    }
+    let mut hit: BTreeSet<i64> = BTreeSet::new();
+    for line in dump.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        let v = if let Ok(u) = t.parse::<u64>() {
+            u as i64
+        } else if let Ok(v) = t.parse::<i64>() {
+            v
+        } else {
+            continue;
+        };
+        if targets.contains(&v) {
+            hit.insert(v);
+        }
+    }
+    hit.len()
 }
 
 /// Produce a mutated copy of `input` (length preserved) by applying a random stack
@@ -1678,6 +1764,67 @@ mod tests {
         );
         // No longer the fixed-0 stub.
         assert!(!src.contains("return 0.0f; }"));
+    }
+
+    #[test]
+    fn cmplog_progress_counts_distinct_on_path_targets() {
+        let targets: BTreeSet<i64> = [500i64, 42, -7].into_iter().collect();
+        // Two of the three targets appear (one twice -> deduped); 999 is off-path.
+        let dump = "500\n999\n42\n500\n";
+        assert_eq!(cmplog_progress(dump, &targets), 2);
+        // A large unsigned magic value reinterpreted as i64 still matches a negative
+        // target with the same little-endian bit pattern.
+        let neg = (-7i64) as u64;
+        let dump2 = format!("{neg}\n");
+        assert_eq!(cmplog_progress(&dump2, &targets), 1);
+        // Empty target set (empty slice) -> always 0, so the schedule degrades to the
+        // recency bias with no regression.
+        assert_eq!(cmplog_progress(dump, &BTreeSet::new()), 0);
+        assert_eq!(cmplog_progress("", &targets), 0);
+    }
+
+    #[test]
+    fn select_base_hot_is_pure_recency_bias() {
+        // At temperature 1.0 the pick is exactly the recency-biased explorer draw.
+        let progress = vec![0usize; 6];
+        let mut r1 = XorShift64::new(99);
+        let mut r2 = XorShift64::new(99);
+        let want = r2.below_biased_high(progress.len());
+        assert_eq!(select_base(&mut r1, &progress, 1.0), want);
+    }
+
+    #[test]
+    fn select_base_cold_never_regresses_below_the_explorer() {
+        // At temperature 0.0 exploitation runs a tournament seeded from the explorer
+        // pick and only ever upgrades to a >= progress entry — it can never choose a
+        // shallower seed than the explorer would have.
+        let progress = vec![0usize, 1, 0, 9, 0, 2];
+        for seed in 1..200u64 {
+            let mut r1 = XorShift64::new(seed);
+            let mut r2 = r1.clone();
+            let explore = r2.below_biased_high(progress.len());
+            let idx = select_base(&mut r1, &progress, 0.0);
+            assert!(idx < progress.len(), "valid index");
+            assert!(
+                progress[idx] >= progress[explore],
+                "exploitation must not regress below the explorer pick"
+            );
+        }
+    }
+
+    #[test]
+    fn select_base_is_deterministic_and_handles_empty() {
+        assert_eq!(select_base(&mut XorShift64::new(1), &[], 0.5), 0);
+        let progress = vec![0usize, 3, 1, 4];
+        let mut a = XorShift64::new(2024);
+        let mut b = XorShift64::new(2024);
+        for _ in 0..500 {
+            assert_eq!(
+                select_base(&mut a, &progress, 0.4),
+                select_base(&mut b, &progress, 0.4),
+                "same seed -> identical directed pick"
+            );
+        }
     }
 
     #[test]
