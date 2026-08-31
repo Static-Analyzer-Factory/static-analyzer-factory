@@ -169,7 +169,94 @@ pub fn enumerate_bmc_candidates(
         module, config, data_model,
     ));
 
+    // Interprocedural assert-wrapper base case: a `reach_error` behind an
+    // `__VERIFIER_assert(cond)`-style wrapper is invisible to the intraprocedural
+    // enumeration above (the wrapper has no nondet input, the nondet-owning caller
+    // has no `reach_error`). Root the fixed-k search at the caller and constrain the
+    // wrapper argument to its failing (`== 0`) value; the caller's own nondet →
+    // arithmetic → cond flow is then a normal BMC query. Candidates go through the
+    // SAME native-replay gate. See [`crate::assert_site`].
+    candidates.extend(enumerate_assert_wrapper_candidates(module, data_model));
+
     candidates
+}
+
+/// Max caller functions rooted per module for the interprocedural assert-wrapper
+/// base case (bounds cost on pathological inputs).
+const BMC_MAX_ASSERT_SITES: usize = 3;
+
+/// Enumerate fixed-k FALSE candidates for interprocedural assert-wrapper sites
+/// ([`crate::assert_site::virtual_assert_sites`]): for each `W(arg)` call whose
+/// argument depends (through caller arithmetic) on a scalar-int nondet input, root
+/// the acyclic path BMC at the caller, reach the call block, and additionally
+/// require `arg == 0` (the wrapper's failing branch). The caller's loop-carried
+/// cases are left to [`crate::bmc_incremental`]'s assert-wrapper path.
+fn enumerate_assert_wrapper_candidates(
+    module: &AirModule,
+    data_model: DataModel,
+) -> Vec<FalseCandidate> {
+    let mut out = Vec::new();
+    let mut done = 0usize;
+    for site in crate::assert_site::virtual_assert_sites(module) {
+        if done >= BMC_MAX_ASSERT_SITES {
+            break;
+        }
+        let Some(caller) = module.function(site.caller) else {
+            continue;
+        };
+        if caller.is_declaration {
+            continue;
+        }
+        // Gate: the wrapper argument must depend on a scalar-int nondet input read
+        // in the caller (otherwise there is nothing to pin, and a paramless /
+        // constant assert is already covered by must-reach / the guard engine).
+        if !value_depends_on_nondet(site.guard_arg, caller, module) {
+            continue;
+        }
+        // Cost-gate (mandatory): abstain on the Z3-stall classes (nonlinear integer
+        // / float guard) so the query stays in the fast linear-BV fragment; the
+        // blind fuzzer owns that class. Sound (recall-only).
+        if crate::portfolio::nondet_guard_is_bmc_hostile(caller, module) {
+            continue;
+        }
+        let Some(entry) = caller
+            .entry_block
+            .or_else(|| caller.blocks.first().map(|b| b.id))
+        else {
+            continue;
+        };
+        done += 1;
+
+        let paths = block_paths_between(entry, site.call_block, site.caller, module, BMC_MAX_PATHS);
+        for path in &paths {
+            if let Some(assignments) =
+                solve_path_with_target(caller, module, path, data_model, Some(site.guard_arg))
+            {
+                let nondet_sequence =
+                    resolve_nondet_sequence(module, site.caller, path, &assignments);
+                out.push(FalseCandidate {
+                    reach_error_inst: site.reach_error_inst,
+                    block_path: path.clone(),
+                    assignments,
+                    nondet_sequence,
+                });
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// True iff `vid` transitively depends on a scalar-int `__VERIFIER_nondet_*` result
+/// read in `func` (the caller). Used to gate the interprocedural assert-wrapper BMC
+/// so it only fires when the wrapper argument is actually driven by a pinnable input.
+fn value_depends_on_nondet(vid: ValueId, func: &AirFunction, module: &AirModule) -> bool {
+    let (def_map, nondet_dsts) = build_indexes(func, module);
+    if nondet_dsts.is_empty() {
+        return false;
+    }
+    let mut memo = BTreeMap::new();
+    plain_dep(vid, &def_map, &nondet_dsts, &mut memo, 0)
 }
 
 /// The `reach_error` / `__VERIFIER_error` call sites as `(func, block, inst)`.
@@ -488,6 +575,21 @@ fn solve_path(
     path: &[BlockId],
     data_model: DataModel,
 ) -> Option<BTreeMap<ValueId, i64>> {
+    solve_path_with_target(func, module, path, data_model, None)
+}
+
+/// As [`solve_path`], but when `target_zero` is `Some(v)` an extra constraint
+/// `enc(v) == 0` is asserted after the whole path is encoded. This models an
+/// interprocedural **assert-wrapper** target ([`crate::assert_site`]): reaching the
+/// wrapper call with a zero/false argument is exactly the wrapper's `reach_error`,
+/// so the caller's own arithmetic/nondet along `path` must satisfy `v == 0`.
+fn solve_path_with_target(
+    func: &AirFunction,
+    module: &AirModule,
+    path: &[BlockId],
+    data_model: DataModel,
+    target_zero: Option<ValueId>,
+) -> Option<BTreeMap<ValueId, i64>> {
     let solver = new_solver();
     let mut enc = Encoder::new(module, data_model, &solver);
 
@@ -503,6 +605,11 @@ fn solve_path(
             }
             enc.define(inst, prev);
         }
+    }
+
+    if let Some(v) = target_zero {
+        let bv = enc.enc(v);
+        solver.assert(ssa_encode::eq(&bv, &Encoder::zero()));
     }
 
     match solver.check() {
@@ -1254,6 +1361,160 @@ mod tests {
         let seq = &cands[0].nondet_sequence;
         assert_eq!(seq.len(), 1);
         assert_eq!(seq[0].value, 32, "f(x)=x*3+7==103 → x==32");
+    }
+
+    /// `void W(int cond){ if(!cond){reach_error();} }` in the `icmp ne cond,0 ->
+    /// br(ok,err)` polarity used by clang for `if(!cond)`.
+    fn assert_wrapper(w_id: FunctionId, err_id: FunctionId, zero: ValueId) -> AirFunction {
+        let (entry, ok_bb, err_bb) = (bid(20), bid(21), bid(22));
+        let cond = vid(300);
+        let tobool = vid(301);
+        let entry_insts = vec![
+            binop(40, BinaryOp::ICmpNe, cond, zero, tobool),
+            Instruction::new(
+                iid(41),
+                Operation::CondBr {
+                    then_target: ok_bb,
+                    else_target: err_bb,
+                },
+            )
+            .with_operands(vec![tobool]),
+        ];
+        AirFunction {
+            id: w_id,
+            name: "__VERIFIER_assert".into(),
+            params: vec![AirParam::new(cond, 0)],
+            blocks: vec![
+                blk(entry, entry_insts),
+                blk(ok_bb, vec![Instruction::new(iid(42), Operation::Ret)]),
+                blk(
+                    err_bb,
+                    vec![
+                        Instruction::new(iid(43), Operation::CallDirect { callee: err_id }),
+                        Instruction::new(iid(44), Operation::Ret),
+                    ],
+                ),
+            ],
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn interproc_assert_wrapper_recovers_input_preimage() {
+        // int x = nondet();
+        // __VERIFIER_assert(x*3+7 != 100);   // fails when x*3+7==100 -> x==31.
+        // reach_error lives inside __VERIFIER_assert; the nondet + arithmetic live in
+        // main. Only the interprocedural assert-wrapper BMC roots at main.
+        let (main_id, nd_id, err_id, w_id) = (fid(1), fid(2), fid(3), fid(4));
+        let call_bb = bid(10);
+        let (x, three, mul, seven, add, hundred, cnd, zero) = (
+            vid(100),
+            vid(101),
+            vid(102),
+            vid(103),
+            vid(104),
+            vid(105),
+            vid(106),
+            vid(107),
+        );
+        let insts = vec![
+            Instruction::new(iid(1), Operation::CallDirect { callee: nd_id }).with_dst(x),
+            binop(2, BinaryOp::Mul, x, three, mul),
+            binop(3, BinaryOp::Add, mul, seven, add),
+            binop(4, BinaryOp::ICmpNe, add, hundred, cnd),
+            Instruction::new(iid(5), Operation::CallDirect { callee: w_id })
+                .with_operands(vec![cnd]),
+            Instruction::new(iid(6), Operation::Ret),
+        ];
+        let main = func(main_id, "main", vec![blk(call_bb, insts)], call_bb);
+        let mut module = AirModule::new(ModuleId::new(1));
+        module
+            .constants
+            .insert(three, Constant::Int { value: 3, bits: 32 });
+        module
+            .constants
+            .insert(seven, Constant::Int { value: 7, bits: 32 });
+        module.constants.insert(
+            hundred,
+            Constant::Int {
+                value: 100,
+                bits: 32,
+            },
+        );
+        module
+            .constants
+            .insert(zero, Constant::Int { value: 0, bits: 32 });
+        module.functions.push(main);
+        module.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
+        module.functions.push(decl(err_id, "reach_error"));
+        module.functions.push(assert_wrapper(w_id, err_id, zero));
+
+        let config = PropertyAnalysisConfig::default();
+        let cands = enumerate_bmc_candidates(&module, &config, DataModel::LP64);
+        assert_eq!(cands.len(), 1, "expected one assert-wrapper BMC candidate");
+        let seq = &cands[0].nondet_sequence;
+        assert_eq!(seq.len(), 1);
+        assert_eq!(seq[0].value, 31, "x*3+7==100 -> x==31");
+        assert_eq!(
+            cands[0].reach_error_inst,
+            iid(43),
+            "witness anchored at the wrapper's reach_error"
+        );
+    }
+
+    #[test]
+    fn interproc_assert_wrapper_unsat_yields_no_candidate() {
+        // __VERIFIER_assert(x*3+7 != 101): x*3+7==101 has no integer solution -> none.
+        let (main_id, nd_id, err_id, w_id) = (fid(1), fid(2), fid(3), fid(4));
+        let call_bb = bid(10);
+        let (x, three, mul, seven, add, tgt, cnd, zero) = (
+            vid(100),
+            vid(101),
+            vid(102),
+            vid(103),
+            vid(104),
+            vid(105),
+            vid(106),
+            vid(107),
+        );
+        let insts = vec![
+            Instruction::new(iid(1), Operation::CallDirect { callee: nd_id }).with_dst(x),
+            binop(2, BinaryOp::Mul, x, three, mul),
+            binop(3, BinaryOp::Add, mul, seven, add),
+            binop(4, BinaryOp::ICmpNe, add, tgt, cnd),
+            Instruction::new(iid(5), Operation::CallDirect { callee: w_id })
+                .with_operands(vec![cnd]),
+            Instruction::new(iid(6), Operation::Ret),
+        ];
+        let main = func(main_id, "main", vec![blk(call_bb, insts)], call_bb);
+        let mut module = AirModule::new(ModuleId::new(1));
+        module
+            .constants
+            .insert(three, Constant::Int { value: 3, bits: 32 });
+        module
+            .constants
+            .insert(seven, Constant::Int { value: 7, bits: 32 });
+        module.constants.insert(
+            tgt,
+            Constant::Int {
+                value: 101,
+                bits: 32,
+            },
+        );
+        module
+            .constants
+            .insert(zero, Constant::Int { value: 0, bits: 32 });
+        module.functions.push(main);
+        module.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
+        module.functions.push(decl(err_id, "reach_error"));
+        module.functions.push(assert_wrapper(w_id, err_id, zero));
+        let config = PropertyAnalysisConfig::default();
+        let cands = enumerate_bmc_candidates(&module, &config, DataModel::LP64);
+        assert!(cands.is_empty(), "x*3+7==101 unsat -> no candidate");
     }
 
     #[test]

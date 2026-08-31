@@ -120,14 +120,78 @@ pub fn enumerate_incremental_candidates(
             continue;
         };
         sites_done += 1;
-        if let Some(cand) =
-            run_incremental(func, module, data_model, &info, error_block, error_inst)
-        {
+        if let Some(cand) = run_incremental(
+            func,
+            module,
+            data_model,
+            &info,
+            error_block,
+            error_inst,
+            None,
+        ) {
             out.push(cand);
         }
     }
 
+    // Interprocedural assert-wrapper loops: a `reach_error` behind an
+    // `__VERIFIER_assert(cond)`-style wrapper whose failing condition is decided by
+    // a loop-carried accumulator in the caller (e.g. `while(...){...} assert(P);`).
+    // The intraprocedural pass above never roots at the caller (it has no
+    // `reach_error`), so unwind the CALLER's loop toward the wrapper call block and
+    // require the argument to hit its failing (`== 0`) value at the exit. Candidates
+    // go through the SAME native-replay gate. See [`crate::assert_site`].
+    out.extend(enumerate_incremental_assert_candidates(module, data_model));
+
     let _ = config; // config timeouts are advisory; the engine uses its own caps.
+    out
+}
+
+/// Max caller functions unwound per module for the interprocedural assert-wrapper
+/// loop case (bounds cost).
+const INC_MAX_ASSERT_SITES: usize = 2;
+
+/// Enumerate incremental-BMC FALSE candidates for interprocedural assert-wrapper
+/// sites whose failing condition is loop-carried in the caller. For each `W(arg)`
+/// site whose caller has a scalar-int nondet input and a CFG cycle, unwind the
+/// caller's loop toward the wrapper call block and require `arg == 0` at the exit.
+fn enumerate_incremental_assert_candidates(
+    module: &AirModule,
+    data_model: DataModel,
+) -> Vec<FalseCandidate> {
+    let mut out = Vec::new();
+    let mut done = 0usize;
+    let mut rooted: BTreeSet<FunctionId> = BTreeSet::new();
+    for site in crate::assert_site::virtual_assert_sites(module) {
+        if done >= INC_MAX_ASSERT_SITES {
+            break;
+        }
+        let Some(caller) = module.function(site.caller) else {
+            continue;
+        };
+        if caller.is_declaration || !incremental_gate(caller, module) {
+            continue;
+        }
+        // One unwinding per caller function is enough to seed a replay; further
+        // wrapper calls in the same caller only add solver cost.
+        if !rooted.insert(site.caller) {
+            continue;
+        }
+        let Some(info) = find_target_loop(caller, module, site.call_block) else {
+            continue;
+        };
+        done += 1;
+        if let Some(cand) = run_incremental(
+            caller,
+            module,
+            data_model,
+            &info,
+            site.call_block,
+            site.reach_error_inst,
+            Some(site.guard_arg),
+        ) {
+            out.push(cand);
+        }
+    }
     out
 }
 
@@ -376,6 +440,7 @@ fn run_incremental(
     info: &LoopInfo,
     error_block: BlockId,
     error_inst: InstId,
+    target_zero: Option<ValueId>,
 ) -> Option<FalseCandidate> {
     let block_by_id: BTreeMap<BlockId, &AirBlock> = func.blocks.iter().map(|b| (b.id, b)).collect();
     let solver = new_solver();
@@ -411,6 +476,13 @@ fn run_incremental(
             let saved = enc.snapshot();
             enc.begin_buffer();
             enc.encode_exit(header_block, exit_path, error_block, &block_by_id);
+            // Interprocedural assert-wrapper target: reaching the wrapper call with a
+            // zero/false argument IS the wrapper's reach_error, so require it here.
+            if let Some(g) = target_zero {
+                let bv = enc.enc(g);
+                let c = ssa_encode::eq(&bv, &BV::from_i64(0, BV_WIDTH));
+                enc.assert_c(c);
+            }
             let buf = enc.end_buffer();
             let exit_nondet: Vec<(BV, String)> = enc.nondet[saved.nondet_len..].to_vec();
 
@@ -1177,6 +1249,188 @@ mod tests {
             cands.is_empty(),
             "20*x == 61 has no integer solution → no candidate"
         );
+    }
+
+    /// `void __VERIFIER_assert(int cond){ if(!cond){reach_error();} }` (icmp-ne
+    /// polarity) plus a `main` accumulating `s += x` over `bound` iterations then
+    /// calling `__VERIFIER_assert(s != target)` — so the wrapper fails (arg == 0)
+    /// exactly when `s == bound*x == target`. reach_error lives in the wrapper; the
+    /// loop + nondet live in main.
+    fn build_loop_assert_module(bound: i64, target: i64) -> AirModule {
+        use saf_core::air::AirParam;
+        let (main_id, nd_id, err_id, w_id) = (fid(1), fid(2), fid(3), fid(4));
+        let (entry, header, body, exit, call_bb) = (bid(10), bid(11), bid(12), bid(13), bid(14));
+        let (went, wok, werr) = (bid(20), bid(21), bid(22));
+
+        let x = vid(100);
+        let zero = vid(101);
+        let bnd = vid(102);
+        let one = vid(103);
+        let tgt = vid(104);
+        let i_phi = vid(110);
+        let s_phi = vid(111);
+        let s_next = vid(112);
+        let i_next = vid(113);
+        let icmp_lt = vid(114);
+        let cnd = vid(115);
+        let wcond = vid(300);
+        let wzero = vid(301);
+        let wtobool = vid(302);
+
+        let entry_insts = vec![
+            Instruction::new(iid(1), Operation::CallDirect { callee: nd_id }).with_dst(x),
+            Instruction::new(iid(2), Operation::Br { target: header }),
+        ];
+        let header_insts = vec![
+            Instruction::new(
+                iid(3),
+                Operation::Phi {
+                    incoming: vec![(entry, zero), (body, i_next)],
+                },
+            )
+            .with_dst(i_phi),
+            Instruction::new(
+                iid(4),
+                Operation::Phi {
+                    incoming: vec![(entry, zero), (body, s_next)],
+                },
+            )
+            .with_dst(s_phi),
+            binop(5, BinaryOp::ICmpSlt, i_phi, bnd, icmp_lt),
+            Instruction::new(
+                iid(6),
+                Operation::CondBr {
+                    then_target: body,
+                    else_target: exit,
+                },
+            )
+            .with_operands(vec![icmp_lt]),
+        ];
+        let body_insts = vec![
+            binop(7, BinaryOp::Add, s_phi, x, s_next),
+            binop(8, BinaryOp::Add, i_phi, one, i_next),
+            Instruction::new(iid(9), Operation::Br { target: header }),
+        ];
+        // exit: c = (s != target); br call_bb
+        let exit_insts = vec![
+            binop(10, BinaryOp::ICmpNe, s_phi, tgt, cnd),
+            Instruction::new(iid(11), Operation::Br { target: call_bb }),
+        ];
+        let call_insts = vec![
+            Instruction::new(iid(12), Operation::CallDirect { callee: w_id })
+                .with_operands(vec![cnd]),
+            Instruction::new(iid(13), Operation::Ret),
+        ];
+
+        let main = func(
+            main_id,
+            "main",
+            vec![
+                blk(entry, entry_insts),
+                blk(header, header_insts),
+                blk(body, body_insts),
+                blk(exit, exit_insts),
+                blk(call_bb, call_insts),
+            ],
+            entry,
+        );
+
+        let wrapper = AirFunction {
+            id: w_id,
+            name: "__VERIFIER_assert".into(),
+            params: vec![AirParam::new(wcond, 0)],
+            blocks: vec![
+                blk(
+                    went,
+                    vec![
+                        binop(40, BinaryOp::ICmpNe, wcond, wzero, wtobool),
+                        Instruction::new(
+                            iid(41),
+                            Operation::CondBr {
+                                then_target: wok,
+                                else_target: werr,
+                            },
+                        )
+                        .with_operands(vec![wtobool]),
+                    ],
+                ),
+                blk(wok, vec![Instruction::new(iid(42), Operation::Ret)]),
+                blk(
+                    werr,
+                    vec![
+                        Instruction::new(iid(43), Operation::CallDirect { callee: err_id }),
+                        Instruction::new(iid(44), Operation::Ret),
+                    ],
+                ),
+            ],
+            entry_block: Some(went),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+
+        let mut module = AirModule::new(ModuleId::new(1));
+        module
+            .constants
+            .insert(zero, Constant::Int { value: 0, bits: 32 });
+        module.constants.insert(
+            bnd,
+            Constant::Int {
+                value: bound,
+                bits: 32,
+            },
+        );
+        module
+            .constants
+            .insert(one, Constant::Int { value: 1, bits: 32 });
+        module.constants.insert(
+            tgt,
+            Constant::Int {
+                value: target,
+                bits: 32,
+            },
+        );
+        module
+            .constants
+            .insert(wzero, Constant::Int { value: 0, bits: 32 });
+        module.functions.push(main);
+        module.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
+        module.functions.push(decl(err_id, "reach_error"));
+        module.functions.push(wrapper);
+        module
+    }
+
+    #[test]
+    fn solves_interproc_assert_wrapper_deep_loop() {
+        // s == 20*x == 60 -> x == 3, with reach_error behind __VERIFIER_assert in a
+        // separate function. Only the interprocedural assert-wrapper unwinding, rooted
+        // at main, reaches it.
+        let module = build_loop_assert_module(20, 60);
+        let config = PropertyAnalysisConfig::default();
+        let cands = enumerate_incremental_candidates(&module, &config, DataModel::LP64);
+        assert_eq!(
+            cands.len(),
+            1,
+            "expected one assert-wrapper incremental candidate"
+        );
+        let seq = &cands[0].nondet_sequence;
+        assert_eq!(seq.len(), 1);
+        assert_eq!(seq[0].value, 3, "20*x == 60 -> x == 3");
+        assert_eq!(
+            cands[0].reach_error_inst,
+            iid(43),
+            "witness anchored at the wrapper's reach_error"
+        );
+    }
+
+    #[test]
+    fn interproc_assert_wrapper_unsat_deep_loop_yields_none() {
+        // 20*x == 61 has no integer solution -> no candidate.
+        let module = build_loop_assert_module(20, 61);
+        let config = PropertyAnalysisConfig::default();
+        let cands = enumerate_incremental_candidates(&module, &config, DataModel::LP64);
+        assert!(cands.is_empty(), "20*x == 61 unsat -> no candidate");
     }
 
     #[test]

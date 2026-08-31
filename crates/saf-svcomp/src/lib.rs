@@ -13,6 +13,7 @@
 //! (see plan 192).
 #![allow(clippy::doc_markdown)]
 
+pub mod assert_site;
 pub mod bmc;
 pub mod bmc_incremental;
 pub mod cbmc;
