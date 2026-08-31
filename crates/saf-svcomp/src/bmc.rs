@@ -75,6 +75,19 @@ const BMC_MAX_SITES: usize = 3;
 /// Max def-chain recursion depth for the gate / encoder (bounds cost).
 const MAX_DEPTH: usize = 128;
 
+/// Max nesting depth for straight-line callee inlining in the path encoder. A
+/// pure helper `f(nondet())` compared in a caller guard is inlined so the guard
+/// becomes a constraint over the real input; depth `2` also covers a helper that
+/// itself calls one more straight-line helper. Bounds cost / recursion.
+const MAX_INLINE_DEPTH: usize = 2;
+
+/// Max instruction count of an inlinable helper body (bounds per-call cost).
+const MAX_INLINE_INSTS: usize = 64;
+
+/// Max blocks walked while inlining one straight-line helper body (also guards
+/// against an unconditional-branch self-loop).
+const MAX_INLINE_BLOCKS: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -109,6 +122,15 @@ pub fn enumerate_bmc_candidates(
         // Gate: only pay the solver cost when arithmetic sits between a nondet
         // input and a branch guard — the class the guard engine misses.
         if !nondet_flows_through_arith_to_guard(func, module) {
+            continue;
+        }
+        // Cost-gate (mandatory): abstain on the Z3-stall classes — a non-linear
+        // integer guard (symbolic×symbolic multiply / symbolic divisor / shift) or a
+        // float guard — so every BMC query stays in the fast linear-integer BV
+        // fragment. Sound (recall-only); the blind fuzzer is routed ahead of BMC for
+        // exactly this class, so it keeps first crack. See
+        // [`crate::portfolio::nondet_guard_is_bmc_hostile`].
+        if crate::portfolio::nondet_guard_is_bmc_hostile(func, module) {
             continue;
         }
         let Some(entry) = func
@@ -197,6 +219,71 @@ fn is_arith_binop(kind: BinaryOp) -> bool {
     )
 }
 
+/// True iff `f` is a **pure straight-line helper** the path encoder may inline:
+/// a defined function whose body is a single acyclic path (no conditional
+/// branches / switches), returns a value, is small, and calls **no** nondet
+/// function (so every `__VERIFIER_nondet_*` read stays on the caller's path and
+/// its model read-back order is preserved) and is not self-recursive.
+///
+/// Inlining such a helper is sound: it only makes the callee's arithmetic precise
+/// (was havoc). A wrong model still fails native replay → `unknown`.
+fn is_inlinable_helper(f: &AirFunction, module: &AirModule) -> bool {
+    if f.is_declaration {
+        return false;
+    }
+    let mut count = 0usize;
+    let mut has_value_ret = false;
+    for block in &f.blocks {
+        for inst in &block.instructions {
+            count += 1;
+            if count > MAX_INLINE_INSTS {
+                return false;
+            }
+            match &inst.op {
+                // Internal control flow is out of scope for the single-path inliner.
+                Operation::CondBr { .. } | Operation::Switch { .. } => return false,
+                Operation::Ret => {
+                    if !inst.operands.is_empty() {
+                        has_value_ret = true;
+                    }
+                }
+                Operation::CallDirect { callee } => {
+                    // Self-recursion, or a nondet read that would escape the
+                    // caller's ordered nondet sequence → do not inline.
+                    if *callee == f.id {
+                        return false;
+                    }
+                    if module
+                        .function(*callee)
+                        .is_some_and(|c| is_scalar_integer_nondet(&c.name))
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    has_value_ret
+}
+
+/// True iff `callee` is an inlinable helper whose body performs at least one
+/// integer arithmetic op — i.e. inlining it can turn a nondet argument into a
+/// non-trivial constraint on the caller's guard. Used by the arithmetic gate so
+/// BMC fires on `if (f(nondet()) == C)` where the arithmetic lives inside `f`.
+fn callee_is_inlinable_arith(callee: FunctionId, module: &AirModule) -> bool {
+    let Some(f) = module.function(callee) else {
+        return false;
+    };
+    if !is_inlinable_helper(f, module) {
+        return false;
+    }
+    f.blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|inst| matches!(&inst.op, Operation::BinaryOp { kind } if is_arith_binop(*kind)))
+}
+
 /// Index `dst ValueId → defining Instruction` and the set of scalar-int nondet
 /// call result values, for `func`.
 fn build_indexes<'a>(
@@ -259,6 +346,7 @@ fn nondet_flows_through_arith_to_guard(func: &AirFunction, module: &AirModule) -
             *cond,
             &def_map,
             &nondet_dsts,
+            module,
             &mut memo_plain,
             &mut memo_arith,
             0,
@@ -301,6 +389,7 @@ fn arith_between(
     vid: ValueId,
     def_map: &BTreeMap<ValueId, &saf_core::air::Instruction>,
     nondet_dsts: &BTreeSet<ValueId>,
+    module: &AirModule,
     memo_plain: &mut BTreeMap<ValueId, bool>,
     memo_arith: &mut BTreeMap<ValueId, bool>,
     depth: usize,
@@ -322,19 +411,63 @@ fn arith_between(
                 .iter()
                 .any(|&o| plain_dep(o, def_map, nondet_dsts, memo_plain, depth + 1))
                 || inst.operands.iter().any(|&o| {
-                    arith_between(o, def_map, nondet_dsts, memo_plain, memo_arith, depth + 1)
+                    arith_between(
+                        o,
+                        def_map,
+                        nondet_dsts,
+                        module,
+                        memo_plain,
+                        memo_arith,
+                        depth + 1,
+                    )
                 })
         } else {
             // Comparison: recurse (the arithmetic must be deeper).
-            inst.operands
-                .iter()
-                .any(|&o| arith_between(o, def_map, nondet_dsts, memo_plain, memo_arith, depth + 1))
+            inst.operands.iter().any(|&o| {
+                arith_between(
+                    o,
+                    def_map,
+                    nondet_dsts,
+                    module,
+                    memo_plain,
+                    memo_arith,
+                    depth + 1,
+                )
+            })
         }
+    } else if let Operation::CallDirect { callee } = &inst.op {
+        // A call to a pure straight-line helper that the encoder inlines: the
+        // arithmetic lives inside the callee, so the call itself satisfies the
+        // "through ≥1 arithmetic op" requirement as soon as an argument depends
+        // on a nondet input. An *opaque* (non-inlinable) call is havoc in the
+        // model — nondet cannot flow through it to the guard — so it is NOT a
+        // gate hit (avoids a wasted solve on a value BMC cannot constrain).
+        callee_is_inlinable_arith(*callee, module)
+            && inst.operands.iter().any(|&o| {
+                plain_dep(o, def_map, nondet_dsts, memo_plain, depth + 1)
+                    || arith_between(
+                        o,
+                        def_map,
+                        nondet_dsts,
+                        module,
+                        memo_plain,
+                        memo_arith,
+                        depth + 1,
+                    )
+            })
     } else {
         // Cast/Copy/Phi/Select/… — pass through, arithmetic must be deeper.
-        inst.operands
-            .iter()
-            .any(|&o| arith_between(o, def_map, nondet_dsts, memo_plain, memo_arith, depth + 1))
+        inst.operands.iter().any(|&o| {
+            arith_between(
+                o,
+                def_map,
+                nondet_dsts,
+                module,
+                memo_plain,
+                memo_arith,
+                depth + 1,
+            )
+        })
     };
     memo_arith.insert(vid, result);
     result
@@ -410,6 +543,8 @@ struct Encoder<'a> {
     nondet_bvs: BTreeMap<ValueId, BV>,
     /// Counter for fresh havoc/nondet symbol names (deterministic).
     counter: usize,
+    /// Current straight-line callee-inlining nesting depth (bounds recursion).
+    inline_depth: usize,
 }
 
 impl<'a> Encoder<'a> {
@@ -421,6 +556,7 @@ impl<'a> Encoder<'a> {
             cache: BTreeMap::new(),
             nondet_bvs: BTreeMap::new(),
             counter: 0,
+            inline_depth: 0,
         }
     }
 
@@ -512,10 +648,75 @@ impl<'a> Encoder<'a> {
                         return self.fresh_nondet(inst.dst, &name);
                     }
                 }
-                self.fresh("h")
+                // Inline a pure straight-line helper so a nondet input flowing
+                // through it reaches the guard as a real constraint (else havoc).
+                self.try_inline(*callee, &inst.operands)
+                    .unwrap_or_else(|| self.fresh("h"))
             }
             _ => self.fresh("h"),
         }
+    }
+
+    /// Inline a direct call to a pure straight-line helper (see
+    /// [`is_inlinable_helper`]), binding its parameters to the encoded argument
+    /// bitvectors and returning the encoded return value. `None` when the callee
+    /// is not inlinable or the inlining depth cap is hit — the caller then havocs
+    /// the result (sound: an un-modelled call can only cost recall).
+    fn try_inline(&mut self, callee: FunctionId, args: &[ValueId]) -> Option<BV> {
+        if self.inline_depth >= MAX_INLINE_DEPTH {
+            return None;
+        }
+        let f = self.module.function(callee)?;
+        if !is_inlinable_helper(f, self.module) {
+            return None;
+        }
+        // Bind each parameter to its argument, encoded in the CURRENT scope
+        // (arguments are caller SSA values / constants, already resolvable).
+        let bindings: Vec<(ValueId, BV)> = f
+            .params
+            .iter()
+            .zip(args.iter())
+            .map(|(p, &a)| (p.id, self.enc(a)))
+            .collect();
+        for (pid, bv) in bindings {
+            self.cache.insert(pid, bv);
+        }
+        self.inline_depth += 1;
+        let ret = self.encode_straightline_body(f);
+        self.inline_depth -= 1;
+        ret
+    }
+
+    /// Walk the single acyclic path (entry → `Ret`, following unconditional
+    /// branches) of an inlinable helper body, encoding each SSA definition into
+    /// the shared cache and honouring `__VERIFIER_assume`. Returns the encoded
+    /// return-value bitvector (a void return encodes as zero — the arithmetic
+    /// gate only inlines calls whose result feeds a guard, so this is unused).
+    fn encode_straightline_body(&mut self, f: &AirFunction) -> Option<BV> {
+        let mut cur = f.entry_block.or_else(|| f.blocks.first().map(|b| b.id))?;
+        let mut prev: Option<BlockId> = None;
+        for _ in 0..MAX_INLINE_BLOCKS {
+            let block = f.blocks.iter().find(|b| b.id == cur)?;
+            let mut next: Option<BlockId> = None;
+            for inst in &block.instructions {
+                match &inst.op {
+                    Operation::Ret => {
+                        return Some(match inst.operands.first() {
+                            Some(&o) => self.enc(o),
+                            None => Self::zero(),
+                        });
+                    }
+                    Operation::Br { target } => {
+                        next = Some(*target);
+                        break;
+                    }
+                    _ => self.define(inst, prev),
+                }
+            }
+            prev = Some(cur);
+            cur = next?;
+        }
+        None
     }
 
     /// A fresh nondet input bitvector constrained to the declared type's range
@@ -609,7 +810,7 @@ impl<'a> Encoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use saf_core::air::{AirBlock, CastKind, Instruction};
+    use saf_core::air::{AirBlock, AirParam, CastKind, Instruction};
     use saf_core::ids::{InstId, ModuleId};
 
     fn fid(n: u128) -> FunctionId {
@@ -894,5 +1095,250 @@ mod tests {
         let cands = enumerate_bmc_candidates(&module, &config, DataModel::LP64);
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].nondet_sequence[0].value, 42, "x*2 == 84 → x == 42");
+    }
+
+    #[test]
+    fn cost_gate_abstains_on_symbolic_multiply() {
+        // x = nondet(); y = nondet(); p = x*y; if (p == 6) reach_error();
+        // A symbolic×symbolic multiply is the Z3-stall class — the mandatory BMC
+        // cost-gate must abstain (the blind fuzzer owns it), so NO candidate.
+        let (main_id, nd_id, err_id) = (fid(1), fid(2), fid(3));
+        let (entry, err_bb, exit_bb) = (bid(10), bid(11), bid(12));
+        let (x, y, p, tgt, cmp) = (vid(100), vid(101), vid(102), vid(103), vid(104));
+        let insts = vec![
+            Instruction::new(iid(1), Operation::CallDirect { callee: nd_id }).with_dst(x),
+            Instruction::new(iid(2), Operation::CallDirect { callee: nd_id }).with_dst(y),
+            binop(3, BinaryOp::Mul, x, y, p),
+            binop(4, BinaryOp::ICmpEq, p, tgt, cmp),
+            Instruction::new(
+                iid(5),
+                Operation::CondBr {
+                    then_target: err_bb,
+                    else_target: exit_bb,
+                },
+            )
+            .with_operands(vec![cmp]),
+        ];
+        let main = func(
+            main_id,
+            "main",
+            vec![
+                blk(entry, insts),
+                blk(
+                    err_bb,
+                    vec![
+                        Instruction::new(iid(6), Operation::CallDirect { callee: err_id }),
+                        Instruction::new(iid(7), Operation::Ret),
+                    ],
+                ),
+                blk(exit_bb, vec![Instruction::new(iid(8), Operation::Ret)]),
+            ],
+            entry,
+        );
+        let mut module = AirModule::new(ModuleId::new(1));
+        module
+            .constants
+            .insert(tgt, Constant::Int { value: 6, bits: 32 });
+        module.functions.push(main);
+        module.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
+        module.functions.push(decl(err_id, "reach_error"));
+        let config = PropertyAnalysisConfig::default();
+        let cands = enumerate_bmc_candidates(&module, &config, DataModel::LP64);
+        assert!(
+            cands.is_empty(),
+            "symbolic×symbolic multiply guard must be skipped by the BMC cost-gate"
+        );
+    }
+
+    /// A pure straight-line helper `f(z) { return z*mul + add; }` with parameter
+    /// value id `z` and the two constants held in `module.constants`.
+    fn affine_helper(
+        id: FunctionId,
+        z: ValueId,
+        mul_c: ValueId,
+        add_c: ValueId,
+        mul_v: ValueId,
+        ret_v: ValueId,
+    ) -> AirFunction {
+        let body = bid(200);
+        let insts = vec![
+            binop(50, BinaryOp::Mul, z, mul_c, mul_v),
+            binop(51, BinaryOp::Add, mul_v, add_c, ret_v),
+            Instruction::new(iid(52), Operation::Ret).with_operands(vec![ret_v]),
+        ];
+        AirFunction {
+            id,
+            name: "f".into(),
+            params: vec![AirParam::new(z, 0)],
+            blocks: vec![blk(body, insts)],
+            entry_block: Some(body),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn inlines_affine_helper_to_recover_input_preimage() {
+        // int x = nondet();
+        // if (f(x) == 103) reach_error();   with f(z)=z*3+7  → x == 32.
+        // The arithmetic lives INSIDE the helper (havoc without inlining), so the
+        // guard engine and a non-inlining BMC both miss it.
+        let (main_id, nd_id, err_id, f_id) = (fid(1), fid(2), fid(3), fid(4));
+        let (entry, err_bb, exit_bb) = (bid(10), bid(11), bid(12));
+        let (x, r, tgt, cmp) = (vid(100), vid(101), vid(102), vid(103));
+        let (z, mul_c, add_c, mul_v, ret_v) = (vid(200), vid(201), vid(202), vid(203), vid(204));
+
+        let insts = vec![
+            Instruction::new(iid(1), Operation::CallDirect { callee: nd_id }).with_dst(x),
+            Instruction::new(iid(2), Operation::CallDirect { callee: f_id })
+                .with_operands(vec![x])
+                .with_dst(r),
+            binop(3, BinaryOp::ICmpEq, r, tgt, cmp),
+            Instruction::new(
+                iid(4),
+                Operation::CondBr {
+                    then_target: err_bb,
+                    else_target: exit_bb,
+                },
+            )
+            .with_operands(vec![cmp]),
+        ];
+        let main = func(
+            main_id,
+            "main",
+            vec![
+                blk(entry, insts),
+                blk(
+                    err_bb,
+                    vec![
+                        Instruction::new(iid(6), Operation::CallDirect { callee: err_id }),
+                        Instruction::new(iid(7), Operation::Ret),
+                    ],
+                ),
+                blk(exit_bb, vec![Instruction::new(iid(8), Operation::Ret)]),
+            ],
+            entry,
+        );
+        let mut module = AirModule::new(ModuleId::new(1));
+        module.constants.insert(
+            tgt,
+            Constant::Int {
+                value: 103,
+                bits: 32,
+            },
+        );
+        module
+            .constants
+            .insert(mul_c, Constant::Int { value: 3, bits: 32 });
+        module
+            .constants
+            .insert(add_c, Constant::Int { value: 7, bits: 32 });
+        module.functions.push(main);
+        module.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
+        module.functions.push(decl(err_id, "reach_error"));
+        module
+            .functions
+            .push(affine_helper(f_id, z, mul_c, add_c, mul_v, ret_v));
+
+        let f = module.function(main_id).unwrap();
+        assert!(
+            nondet_flows_through_arith_to_guard(f, &module),
+            "f(nondet())==C must trip the arithmetic gate via the inlinable helper"
+        );
+
+        let config = PropertyAnalysisConfig::default();
+        let cands = enumerate_bmc_candidates(&module, &config, DataModel::LP64);
+        assert_eq!(cands.len(), 1, "expected one inlined-helper BMC candidate");
+        let seq = &cands[0].nondet_sequence;
+        assert_eq!(seq.len(), 1);
+        assert_eq!(seq[0].value, 32, "f(x)=x*3+7==103 → x==32");
+    }
+
+    #[test]
+    fn opaque_helper_call_does_not_trip_the_gate() {
+        // Same shape but the helper has a conditional branch (NOT straight-line),
+        // so it is not inlinable → the call is opaque → the gate must NOT fire
+        // (a havoc'd result cannot be constrained to the guard).
+        let (main_id, nd_id, err_id, g_id) = (fid(1), fid(2), fid(3), fid(4));
+        let (entry, err_bb, exit_bb) = (bid(10), bid(11), bid(12));
+        let (x, r, tgt, cmp) = (vid(100), vid(101), vid(102), vid(103));
+        let (z, gcmp) = (vid(200), vid(205));
+        let (gb0, gb1, gb2) = (bid(210), bid(211), bid(212));
+
+        // g(z){ if (z) return z; else return z; } — has a CondBr → not inlinable.
+        let g = AirFunction {
+            id: g_id,
+            name: "g".into(),
+            params: vec![AirParam::new(z, 0)],
+            blocks: vec![
+                blk(
+                    gb0,
+                    vec![
+                        binop(60, BinaryOp::ICmpNe, z, z, gcmp),
+                        Instruction::new(
+                            iid(61),
+                            Operation::CondBr {
+                                then_target: gb1,
+                                else_target: gb2,
+                            },
+                        )
+                        .with_operands(vec![gcmp]),
+                    ],
+                ),
+                blk(
+                    gb1,
+                    vec![Instruction::new(iid(62), Operation::Ret).with_operands(vec![z])],
+                ),
+                blk(
+                    gb2,
+                    vec![Instruction::new(iid(63), Operation::Ret).with_operands(vec![z])],
+                ),
+            ],
+            entry_block: Some(gb0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        };
+        let insts = vec![
+            Instruction::new(iid(1), Operation::CallDirect { callee: nd_id }).with_dst(x),
+            Instruction::new(iid(2), Operation::CallDirect { callee: g_id })
+                .with_operands(vec![x])
+                .with_dst(r),
+            binop(3, BinaryOp::ICmpEq, r, tgt, cmp),
+            Instruction::new(
+                iid(4),
+                Operation::CondBr {
+                    then_target: err_bb,
+                    else_target: exit_bb,
+                },
+            )
+            .with_operands(vec![cmp]),
+        ];
+        let main = func(
+            main_id,
+            "main",
+            vec![
+                blk(entry, insts),
+                blk(err_bb, vec![Instruction::new(iid(6), Operation::Ret)]),
+                blk(exit_bb, vec![Instruction::new(iid(8), Operation::Ret)]),
+            ],
+            entry,
+        );
+        let mut module = AirModule::new(ModuleId::new(1));
+        module
+            .constants
+            .insert(tgt, Constant::Int { value: 5, bits: 32 });
+        module.functions.push(main);
+        module.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
+        module.functions.push(decl(err_id, "reach_error"));
+        module.functions.push(g);
+        let f = module.function(main_id).unwrap();
+        assert!(
+            !nondet_flows_through_arith_to_guard(f, &module),
+            "an opaque (non-straight-line) helper call must NOT trip the arithmetic gate"
+        );
     }
 }

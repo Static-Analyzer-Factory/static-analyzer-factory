@@ -208,6 +208,92 @@ fn function_has_nonlinear_nondet_guard(func: &AirFunction, module: &AirModule) -
     false
 }
 
+/// True iff `kind` is a floating-point arithmetic or comparison op — a value the
+/// integer bitvector BMC encoder cannot model (it substitutes a fresh havoc), so a
+/// nondet→guard flow through it yields only spurious models that never replay.
+fn is_float_op(kind: BinaryOp) -> bool {
+    matches!(
+        kind,
+        BinaryOp::FAdd
+            | BinaryOp::FSub
+            | BinaryOp::FMul
+            | BinaryOp::FDiv
+            | BinaryOp::FRem
+            | BinaryOp::FCmpOeq
+            | BinaryOp::FCmpOne
+            | BinaryOp::FCmpOgt
+            | BinaryOp::FCmpOge
+            | BinaryOp::FCmpOlt
+            | BinaryOp::FCmpOle
+    )
+}
+
+/// True iff the nondet→guard dataflow inside `func` is **hostile** to the
+/// linear-integer bitvector BMC engines ([`crate::bmc`] fixed-k and
+/// [`crate::bmc_incremental`]): some nondet-tainted value feeds a comparison guard
+/// through either
+///
+/// - a **non-linear integer** op (a symbolic×symbolic `Mul`, or a symbolic
+///   divisor/remainder/shift-amount) — where QF_BV solving stalls (bit-blasted
+///   multiplication is NP-hard; unwinding a loop over it compounds the blow-up); or
+/// - a **floating-point** op — which the integer bitvector encoder does not model
+///   (it havocs the value), so any model it proposes is spurious and fails replay.
+///
+/// The BMC engines abstain on this class so their (early, cost-bounded) Z3 queries
+/// stay in the fast linear-integer fragment. This is the mandatory BMC cost-gate:
+///
+/// - **Sound** — it only *drops* candidates. A skipped candidate can turn a FALSE
+///   into `unknown`, never a wrong verdict; the native-replay gate remains the sole
+///   FALSE arbiter for every candidate that *is* emitted.
+/// - **Recall-preserving in practice** — the blind fuzzer (which cracks exactly these
+///   non-linear / float guards with its dictionary + `CmpLog`) is routed *ahead of*
+///   the BMC engines for the same class ([`has_nonlinear_nondet_guard`] /
+///   [`UnreachFeatures::float_nondet`]), so it gets first crack; abstaining here only
+///   stops the BMC engines from *also* grinding on a task the fuzzer already owns.
+#[must_use]
+pub(crate) fn nondet_guard_is_bmc_hostile(func: &AirFunction, module: &AirModule) -> bool {
+    let tainted = nondet_taint(func, module);
+    if tainted.is_empty() {
+        return false;
+    }
+    let feeds_cmp = feeds_comparison(func);
+    if feeds_cmp.is_empty() {
+        return false;
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Operation::BinaryOp { kind } = &inst.op else {
+                continue;
+            };
+            let Some(dst) = inst.dst else { continue };
+            if !feeds_cmp.contains(&dst) {
+                continue;
+            }
+            let is_tainted = |i: usize| inst.operands.get(i).is_some_and(|v| tainted.contains(v));
+            let hostile = match kind {
+                // nondet * nondet — a genuine quadratic (a `nondet*const` scaled
+                // linear term stays fast, so is NOT hostile).
+                BinaryOp::Mul => is_tainted(0) && is_tainted(1),
+                // variable divisor / remainder / shift amount (operand[1]).
+                BinaryOp::UDiv
+                | BinaryOp::SDiv
+                | BinaryOp::URem
+                | BinaryOp::SRem
+                | BinaryOp::Shl
+                | BinaryOp::LShr
+                | BinaryOp::AShr => is_tainted(1),
+                // Any float op over a tainted operand — unmodelled by the BV encoder.
+                k if is_float_op(*k) => is_tainted(0) || is_tainted(1),
+                _ => false,
+            };
+            if hostile {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Value-producing operations through which integer taint propagates (SSA
 /// data-flow). Memory ops (`Load`/`Store`/`Gep`) are intentionally excluded — after
 /// mem2reg most values are SSA registers, and skipping memory keeps the taint (and
@@ -601,5 +687,91 @@ mod tests {
             &[tgt],
         );
         assert!(!has_nonlinear_nondet_guard(&m));
+    }
+
+    // ----- nondet_guard_is_bmc_hostile: BMC cost-gate ---------------------
+
+    #[test]
+    fn bmc_hostile_on_symbolic_multiply() {
+        // x = nondet(); y = nondet(); p = x*y; c = (p == 49);  -> Z3-stall class.
+        let (x, y, p, c, tgt) = (vid(1), vid(2), vid(3), vid(4), vid(5));
+        let m = module_with(
+            vec![
+                nondet(1, x),
+                nondet(2, y),
+                binop(3, BinaryOp::Mul, x, y, p),
+                binop(4, BinaryOp::ICmpEq, p, tgt, c),
+            ],
+            &[tgt],
+        );
+        assert!(nondet_guard_is_bmc_hostile(m.function(fid(1)).unwrap(), &m));
+    }
+
+    #[test]
+    fn bmc_hostile_on_variable_shift() {
+        // x = nondet(); y = nondet(); s = x << y; c = (s == 8);
+        let (x, y, s, c, tgt) = (vid(1), vid(2), vid(3), vid(4), vid(5));
+        let m = module_with(
+            vec![
+                nondet(1, x),
+                nondet(2, y),
+                binop(3, BinaryOp::Shl, x, y, s),
+                binop(4, BinaryOp::ICmpEq, s, tgt, c),
+            ],
+            &[tgt],
+        );
+        assert!(nondet_guard_is_bmc_hostile(m.function(fid(1)).unwrap(), &m));
+    }
+
+    #[test]
+    fn bmc_hostile_on_float_guard() {
+        // x = nondet(); p = x *. x (float); c = (p ==. tgt) — unmodelled by the BV
+        // encoder, so BMC must abstain.
+        let (x, p, c, tgt) = (vid(1), vid(3), vid(4), vid(5));
+        let m = module_with(
+            vec![
+                nondet(1, x),
+                binop(3, BinaryOp::FMul, x, x, p),
+                binop(4, BinaryOp::FCmpOeq, p, tgt, c),
+            ],
+            &[tgt],
+        );
+        assert!(nondet_guard_is_bmc_hostile(m.function(fid(1)).unwrap(), &m));
+    }
+
+    #[test]
+    fn bmc_not_hostile_on_linear_integer_guard() {
+        // x = nondet(); s = x*const + const feeding a guard — BMC's fast sweet spot,
+        // so NOT hostile (it must still run).
+        let (x, k, mul, add, c, tgt) = (vid(1), vid(9), vid(3), vid(6), vid(4), vid(5));
+        let m = module_with(
+            vec![
+                nondet(1, x),
+                binop(3, BinaryOp::Mul, x, k, mul), // nondet * const = linear
+                binop(6, BinaryOp::Add, mul, k, add),
+                binop(4, BinaryOp::ICmpEq, add, tgt, c),
+            ],
+            &[k, tgt],
+        );
+        assert!(!nondet_guard_is_bmc_hostile(
+            m.function(fid(1)).unwrap(),
+            &m
+        ));
+    }
+
+    #[test]
+    fn bmc_not_hostile_without_nondet() {
+        let (a, b, p, c, tgt) = (vid(1), vid(2), vid(3), vid(4), vid(5));
+        let m = module_with(
+            vec![
+                binop(3, BinaryOp::Mul, a, b, p),
+                binop(4, BinaryOp::ICmpEq, p, tgt, c),
+            ],
+            &[tgt],
+        );
+        assert!(!nondet_guard_is_bmc_hostile(
+            m.function(fid(1)).unwrap(),
+            &m
+        ));
     }
 }

@@ -157,6 +157,12 @@ fn error_call_sites(module: &AirModule) -> Vec<(FunctionId, BlockId, InstId)> {
 /// Gate: a scalar-int nondet input **and** a CFG cycle — the loop-carried class the
 /// acyclic BMC base case cannot handle. Acyclic functions are left to the cheaper
 /// guard / fixed-k stages, so skipping them keeps per-task cost bounded.
+///
+/// Additionally abstains (cost-gate, mandatory) when the nondet→guard flow is
+/// hostile to the linear-integer BV encoder — a non-linear integer guard or a float
+/// guard — because unwinding a loop over a symbolic multiply compounds the QF_BV
+/// blow-up and can stall Z3 across depths. Sound (recall-only) and cost-reducing; the
+/// blind fuzzer owns that class. See [`crate::portfolio::nondet_guard_is_bmc_hostile`].
 fn incremental_gate(func: &AirFunction, module: &AirModule) -> bool {
     let has_nondet = func
         .blocks
@@ -168,7 +174,9 @@ fn incremental_gate(func: &AirFunction, module: &AirModule) -> bool {
                     .function(*callee)
                     .is_some_and(|f| is_scalar_integer_nondet(&f.name)))
         });
-    has_nondet && !back_edges(func).is_empty()
+    has_nondet
+        && !back_edges(func).is_empty()
+        && !crate::portfolio::nondet_guard_is_bmc_hostile(func, module)
 }
 
 // ---------------------------------------------------------------------------
