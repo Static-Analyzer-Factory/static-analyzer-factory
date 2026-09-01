@@ -5669,15 +5669,63 @@ fn tsan_out_of_scope(source: &str) -> Option<&'static str> {
     if source.contains("#pragma omp") {
         return Some("OpenMP");
     }
-    if source.contains("memory_order_relaxed")
-        || source.contains("memory_order_consume")
-        || source.contains("memory_order_acquire")
-        || source.contains("memory_order_release")
-        || source.contains("memory_order_acq_rel")
-    {
+    if uses_weak_memory_order(source) {
         return Some("relaxed-memory atomics");
     }
     None
+}
+
+/// Does `source` actually USE a weaker-than-`seq_cst` C11 memory order (as an
+/// operand of an atomic operation), as opposed to merely DEFINING the
+/// `<stdatomic.h>` `memory_order` enum?
+///
+/// Every preprocessed `.i` that includes `<stdatomic.h>` contains the enum
+/// definition `memory_order_relaxed = 0, memory_order_consume = 1, …`, so a blunt
+/// substring match spuriously flags programs that only use `SEQ_CST` atomics — a
+/// plain `=` on an `_Atomic` object, or `atomic_load`/`atomic_store` without an
+/// `_explicit` order — which are fully sequentially consistent and therefore
+/// faithful under SC replay (SC executions are a subset of every weaker model's, so
+/// a `reach_error` an SC run hits is a genuine violation regardless). We flag only
+/// occurrences of a WEAK-order constant that are NOT the enum definition: an
+/// enumerator is uniquely written `memory_order_xxx = <n>` (the constant immediately
+/// left of an `=`), while any other whole-identifier occurrence is an argument to an
+/// atomic operation (e.g. `atomic_store_explicit(&x, v, memory_order_relaxed)`).
+/// `memory_order_seq_cst` is never treated as weak.
+fn uses_weak_memory_order(source: &str) -> bool {
+    const WEAK: &[&str] = &[
+        "memory_order_relaxed",
+        "memory_order_consume",
+        "memory_order_acquire",
+        "memory_order_release",
+        "memory_order_acq_rel",
+    ];
+    for &c in WEAK {
+        let mut i = 0;
+        while let Some(off) = source[i..].find(c) {
+            let start = i + off;
+            let after = start + c.len();
+            // Whole-identifier match: neither neighbour may continue the identifier
+            // (guards against a longer identifier that merely contains `c`).
+            let next_is_ident = source[after..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+            let prev_is_ident = source[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+            if !next_is_ident && !prev_is_ident {
+                // The enum definition is `memory_order_relaxed = 0,`; a constant on
+                // the left of `=` is that definition. Anything else is a genuine
+                // weak-order use (you cannot assign to an enumerator).
+                if !source[after..].trim_start().starts_with('=') {
+                    return true;
+                }
+            }
+            i = after;
+        }
+    }
+    false
 }
 
 /// Collect the full identifiers of every custom whole-function atomic the source
@@ -7786,6 +7834,29 @@ void worker(void) { __VERIFIER_atomic_inc(&g); __VERIFIER_atomic_acquire(); }
             tsan_out_of_scope("atomic_load_explicit(&x, memory_order_acquire)"),
             Some("relaxed-memory atomics")
         );
+    }
+
+    #[test]
+    fn stdatomic_enum_definition_is_not_a_weak_order_use() {
+        // The `<stdatomic.h>` enum DEFINITION appears in every preprocessed `.i`
+        // that includes it; it must NOT be mistaken for a weak-order use. A program
+        // that only uses SEQ_CST atomics (plain `=` on an `_Atomic`) is SC-faithful.
+        let enum_def = "typedef enum {\n  memory_order_relaxed = 0,\n  \
+                        memory_order_consume = 1,\n  memory_order_acquire = 2,\n  \
+                        memory_order_release = 3,\n  memory_order_acq_rel = 4,\n  \
+                        memory_order_seq_cst = 5\n} memory_order;";
+        assert!(!uses_weak_memory_order(enum_def));
+        assert_eq!(tsan_out_of_scope(enum_def), None);
+        // The full enum PLUS a program that only does seq_cst atomics via `=`.
+        let seq_cst_prog = format!("{enum_def}\natomic_int limit;\nvoid f(){{ limit = 2; }}\n");
+        assert_eq!(tsan_out_of_scope(&seq_cst_prog), None);
+        // But a genuine weak-order USE alongside the enum is still out of scope.
+        let weak_use = format!(
+            "{enum_def}\nvoid f(){{ atomic_store_explicit(&x, 1, memory_order_relaxed); }}\n"
+        );
+        assert_eq!(tsan_out_of_scope(&weak_use), Some("relaxed-memory atomics"));
+        // A no-order-suffix seq_cst helper stays in scope.
+        assert_eq!(tsan_out_of_scope("atomic_store(&x, 1);"), None);
     }
 
     #[test]
