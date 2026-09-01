@@ -615,6 +615,61 @@ fn push_bytestream_nondet_defs(s: &mut String, table: &[(&str, &str)], weak: boo
     }
 }
 
+/// Emit JUST the byte-stream nondet-input core: the input buffer + `__saf_take`
+/// (consume `sizeof(T)` little-endian bytes from `$SAF_FUZZ_INPUT`) + `__saf_note`
+/// (append `"<name> <value>\n"` to `$SAF_FUZZ_LOG`) + the full nondet family
+/// (scalar-integer strong, fixed-width typedef weak, pointer, float/double).
+///
+/// This is the reusable heart of [`synthesize_bytestream_driver`] with NONE of the
+/// error sinks / `__VERIFIER_assume` / `__VERIFIER_atomic` / allocation-prune / and
+/// SanitizerCoverage callbacks — so a driver that must define those itself (e.g. the
+/// concurrency-fuzz driver [`crate::conc_fuzz::synthesize_conc_fuzz_driver`], which
+/// layers a pthread scheduler on top) can inject the identical in-range nondet
+/// semantics without a symbol clash. Requires the caller's translation unit to have
+/// already `#include`d `<stddef.h>`, `<stdio.h>`, `<stdlib.h>`, and `<string.h>`.
+///
+/// Keeping this in ONE place means every FALSE-emitting engine drives nondet with
+/// byte-identical semantics ([`SCALAR_NONDET`] widths, R5), so a value discovered by
+/// one path re-confirms through any other (R6).
+#[must_use]
+pub fn bytestream_nondet_shim_c() -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "static unsigned char __saf_buf[{INPUT_LEN}];");
+    s.push_str("static size_t __saf_len = 0;\n");
+    s.push_str("static size_t __saf_pos = 0;\n");
+    s.push_str("static FILE* __saf_log = 0;\n");
+    s.push_str("static int __saf_ready = 0;\n");
+    s.push_str(
+        "static void __saf_init(void) {\n\
+         \x20 if (__saf_ready) return;\n\
+         \x20 __saf_ready = 1;\n\
+         \x20 const char* ip = getenv(\"SAF_FUZZ_INPUT\");\n\
+         \x20 if (ip) { FILE* f = fopen(ip, \"rb\"); if (f) { __saf_len = fread(__saf_buf, 1, sizeof(__saf_buf), f); fclose(f); } }\n\
+         \x20 const char* lp = getenv(\"SAF_FUZZ_LOG\");\n\
+         \x20 if (lp) __saf_log = fopen(lp, \"w\");\n\
+         }\n",
+    );
+    s.push_str(
+        "static unsigned long long __saf_take(size_t n) {\n\
+         \x20 __saf_init();\n\
+         \x20 unsigned long long v = 0; size_t i;\n\
+         \x20 for (i = 0; i < n; i++) { unsigned char b = (__saf_pos < __saf_len) ? __saf_buf[__saf_pos] : 0; __saf_pos++; v |= ((unsigned long long)b) << (8 * i); }\n\
+         \x20 return v;\n\
+         }\n",
+    );
+    s.push_str(
+        "static void __saf_note(const char* name, long long val) {\n\
+         \x20 if (__saf_log) { fprintf(__saf_log, \"%s %lld\\n\", name, val); fflush(__saf_log); }\n\
+         }\n",
+    );
+    push_bytestream_nondet_defs(&mut s, SCALAR_NONDET, false);
+    push_bytestream_nondet_defs(&mut s, EXTENDED_NONDET, true);
+    s.push_str(FUZZ_NONDET_POINTER_C);
+    s.push_str(FUZZ_NONDET_FLOAT_C);
+    s
+}
+
 /// Generate the C source of the byte-stream nondet shim + error sentinel driver.
 ///
 /// Each scalar-integer `__VERIFIER_nondet_T()` consumes `sizeof(T)` little-endian
