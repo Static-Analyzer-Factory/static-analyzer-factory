@@ -84,15 +84,40 @@ pub const SHIM_MAX_STEP: i64 = 24;
 /// reader grabs the lock in the gap" bugs this engine targets.
 pub const SHIM_CBOUND: u32 = 2;
 
-/// A single bounded-preemption schedule: the (up to two) global yield-point indices at which
-/// the running thread is forcibly preempted. `p2 < 0` means a `c=1` (single-preemption)
-/// schedule. Maps to the `SAF_SHIM_P1` / `SAF_SHIM_P2` environment integers the driver reads.
+/// Uniform round-robin **run-lengths** `L` tried before the bounded-preemption index sweep.
+///
+/// This is a small, sound realization of a **lazy round-robin sequentialization** (the
+/// Lazy-CSeq / bLMP family, Inverso–Tomasco–Fischer–La Torre–Parlato): instead of choosing
+/// *which* couple of global yield points to preempt at (the `c<=2` index sweep below — which
+/// can perform at most two context switches and so cannot reproduce a bug that needs many
+/// alternations), a periodic schedule preempts the running thread to the next runnable thread
+/// (round-robin) **every `L` yield points**. `L = 1` is strict fine-grained alternation among
+/// runnable threads at every shared access / sync point — the schedule the classic
+/// producer/consumer and "two workers alternate to reach a joint invariant" bugs need but that
+/// no bounded-preemption or whole-thread engine here explores. `L = 2` / `L = 3` are coarser
+/// lazy round-robins. This is an under-approximation: enlarging or refining `L` only ever adds
+/// recall — a periodic schedule is still one legal SC interleaving, so soundness is unaffected.
+pub const SHIM_PERIODS: &[i64] = &[1, 2, 3];
+
+/// A single shim schedule.
+///
+/// Two mutually-exclusive modes, distinguished by `period`:
+/// - `period > 0` — **periodic round-robin** (lazy-CSeq run-length `L = period`): the running
+///   thread is preempted to the next runnable thread every `period` global yield points;
+///   `p1` / `p2` are ignored.
+/// - `period <= 0` — **bounded-preemption index** schedule: the running thread is preempted at
+///   the (up to two) global yield-point indices `p1` / `p2` (`p2 < 0` ⇒ a single preemption).
+///
+/// Maps to the `SAF_SHIM_P1` / `SAF_SHIM_P2` / `SAF_SHIM_PERIOD` environment integers the
+/// driver reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShimPlan {
-    /// First (or only) preemption index.
+    /// First (or only) preemption index (index mode only).
     pub p1: i64,
-    /// Second preemption index, or `-1` for a `c=1` schedule.
+    /// Second preemption index, or `-1` for a `c=1` schedule (index mode only).
     pub p2: i64,
+    /// Round-robin run-length `L` (`> 0` ⇒ periodic mode); `-1` ⇒ index mode.
+    pub period: i64,
 }
 
 impl ShimPlan {
@@ -108,10 +133,18 @@ impl ShimPlan {
         self.p2.to_string()
     }
 
+    /// The `SAF_SHIM_PERIOD` value the driver reads (`-1` ⇒ index mode, no periodic preemption).
+    #[must_use]
+    pub fn period_env(self) -> String {
+        self.period.to_string()
+    }
+
     /// A short, stable label for diagnostics / the GraphML witness.
     #[must_use]
     pub fn label(self) -> String {
-        if self.p2 < 0 {
+        if self.period > 0 {
+            format!("shim:rr:{}", self.period)
+        } else if self.p2 < 0 {
             format!("shim:c1:{}", self.p1)
         } else {
             format!("shim:c2:{},{}", self.p1, self.p2)
@@ -119,19 +152,33 @@ impl ShimPlan {
     }
 }
 
-/// The bounded-preemption schedules tried, in deterministic search order: every `c=1` schedule
-/// (`p1 = 0..=SHIM_MAX_STEP`) first, then every `c=2` pair (`p1 < p2 <= SHIM_MAX_STEP`) ordered
-/// by `p1` then `p2` — small (early) preemptions first, which is where these bugs live.
+/// The shim schedules tried, in deterministic search order: the periodic lazy round-robins
+/// (`L ∈ SHIM_PERIODS`, fine-grained first) — a cheap handful that reach the many-alternation
+/// bugs the index sweep cannot — then every `c=1` schedule (`p1 = 0..=SHIM_MAX_STEP`), then
+/// every `c=2` pair (`p1 < p2 <= SHIM_MAX_STEP`) ordered by `p1` then `p2` (small/early
+/// preemptions first, where these bugs live).
 #[must_use]
 pub fn shim_preemption_plans() -> Vec<ShimPlan> {
     let mut v = Vec::new();
+    // Periodic lazy round-robins first (only a few, and they catch the fine-grained class).
+    for &period in SHIM_PERIODS {
+        v.push(ShimPlan {
+            p1: -1,
+            p2: -1,
+            period,
+        });
+    }
     for p1 in 0..=SHIM_MAX_STEP {
-        v.push(ShimPlan { p1, p2: -1 });
+        v.push(ShimPlan {
+            p1,
+            p2: -1,
+            period: -1,
+        });
     }
     if SHIM_CBOUND >= 2 {
         for p1 in 0..=SHIM_MAX_STEP {
             for p2 in (p1 + 1)..=SHIM_MAX_STEP {
-                v.push(ShimPlan { p1, p2 });
+                v.push(ShimPlan { p1, p2, period: -1 });
             }
         }
     }
@@ -258,12 +305,15 @@ pub fn synthesize_conc_shim_driver(sentinel_c_literal: &str) -> String {
     s.push_str("static int   __saf_mtx_n=0;\n");
     s.push_str("static long  __saf_step=0;\n");
     s.push_str("static long  __saf_p1=-1, __saf_p2=-1;\n");
+    // Periodic round-robin run-length L (lazy-CSeq mode); <=0 => index mode (p1/p2).
+    s.push_str("static long  __saf_period=-1;\n");
     s.push_str("static _Thread_local int __saf_tid=0;\n");
 
     s.push_str(
         "NS __attribute__((constructor)) static void __saf_init(void){\n\
          \x20 const char* a=getenv(\"SAF_SHIM_P1\"); __saf_p1 = a?strtol(a,0,10):-1;\n\
          \x20 const char* b=getenv(\"SAF_SHIM_P2\"); __saf_p2 = b?strtol(b,0,10):-1;\n\
+         \x20 const char* pr=getenv(\"SAF_SHIM_PERIOD\"); __saf_period = pr?strtol(pr,0,10):-1;\n\
          \x20 __saf_state[0]=ST_RUN; __saf_cur=0; __saf_nthreads=1; __saf_tid=0;\n\
          \x20 char probe; __saf_stack_hi[0]=(uintptr_t)&probe;\n\
          }\n",
@@ -314,7 +364,9 @@ pub fn synthesize_conc_shim_driver(sentinel_c_literal: &str) -> String {
          \x20 if(__saf_in_atomic[me]>0) return;\n\
          \x20 __real_pthread_mutex_lock(&__saf_m);\n\
          \x20 long k=__saf_step++;\n\
-         \x20 if(k==__saf_p1 || k==__saf_p2){\n\
+         \x20 int preempt = (__saf_period>0) ? (((k+1) % __saf_period)==0)\n\
+         \x20                                 : (k==__saf_p1 || k==__saf_p2);\n\
+         \x20 if(preempt){\n\
          \x20   int nxt=__saf_next_parked(me);\n\
          \x20   if(nxt>=0){ __saf_state[me]=ST_PARKED; __saf_run(nxt, me); __saf_state[me]=ST_RUN; }\n\
          \x20 }\n\
@@ -564,36 +616,65 @@ mod tests {
     }
 
     #[test]
-    fn plans_sweep_c1_then_c2_and_are_unique() {
+    fn plans_sweep_periodic_then_c1_then_c2_and_are_unique() {
         let plans = shim_preemption_plans();
-        // Every c=1 schedule comes first, in ascending p1.
-        let c1: Vec<_> = plans.iter().take_while(|p| p.p2 < 0).collect();
+        // The periodic lazy round-robins come first, in SHIM_PERIODS order.
+        let periodic: Vec<_> = plans.iter().take_while(|p| p.period > 0).collect();
+        assert_eq!(periodic.len(), SHIM_PERIODS.len());
+        for (p, &period) in periodic.iter().zip(SHIM_PERIODS) {
+            assert_eq!(p.period, period);
+            assert_eq!(p.p1, -1);
+            assert_eq!(p.p2, -1);
+        }
+        // Then every c=1 schedule, in ascending p1 (index mode ⇒ period == -1).
+        let index: Vec<_> = plans.iter().skip(periodic.len()).collect();
+        let c1: Vec<_> = index.iter().take_while(|p| p.p2 < 0).collect();
         assert_eq!(c1.len(), (SHIM_MAX_STEP + 1) as usize);
         for (i, p) in c1.iter().enumerate() {
             assert_eq!(p.p1, i as i64);
             assert_eq!(p.p2, -1);
+            assert_eq!(p.period, -1);
         }
         // The rest are c=2 pairs with p1 < p2.
-        for p in plans.iter().skip(c1.len()) {
+        for p in index.iter().skip(c1.len()) {
             assert!(p.p2 > p.p1 && p.p1 >= 0);
+            assert_eq!(p.period, -1);
         }
-        // All (p1,p2) pairs are unique.
-        let mut pairs: Vec<(i64, i64)> = plans.iter().map(|p| (p.p1, p.p2)).collect();
-        pairs.sort_unstable();
-        let n = pairs.len();
-        pairs.dedup();
-        assert_eq!(pairs.len(), n);
+        // All (p1,p2,period) triples are unique.
+        let mut triples: Vec<(i64, i64, i64)> =
+            plans.iter().map(|p| (p.p1, p.p2, p.period)).collect();
+        triples.sort_unstable();
+        let n = triples.len();
+        triples.dedup();
+        assert_eq!(triples.len(), n);
     }
 
     #[test]
     fn plan_labels_and_env_are_stable() {
-        let a = ShimPlan { p1: 0, p2: -1 };
+        let a = ShimPlan {
+            p1: 0,
+            p2: -1,
+            period: -1,
+        };
         assert_eq!(a.label(), "shim:c1:0");
         assert_eq!(a.p1_env(), "0");
         assert_eq!(a.p2_env(), "-1");
-        let b = ShimPlan { p1: 0, p2: 4 };
+        assert_eq!(a.period_env(), "-1");
+        let b = ShimPlan {
+            p1: 0,
+            p2: 4,
+            period: -1,
+        };
         assert_eq!(b.label(), "shim:c2:0,4");
         assert_eq!(b.p2_env(), "4");
+        // Periodic lazy round-robin schedule.
+        let c = ShimPlan {
+            p1: -1,
+            p2: -1,
+            period: 1,
+        };
+        assert_eq!(c.label(), "shim:rr:1");
+        assert_eq!(c.period_env(), "1");
     }
 
     #[test]
@@ -614,6 +695,9 @@ mod tests {
         assert!(d.contains("ST_BLOCKED_LOCK"));
         assert!(d.contains("SAF_SHIM_P1"));
         assert!(d.contains("SAF_SHIM_P2"));
+        // Periodic lazy round-robin (run-length L) mode.
+        assert!(d.contains("SAF_SHIM_PERIOD"));
+        assert!(d.contains("__saf_period"));
         // Shared-access scheduling points (SanitizerCoverage load/store callbacks).
         assert!(d.contains("__sanitizer_cov_load4"));
         assert!(d.contains("__sanitizer_cov_store8"));
