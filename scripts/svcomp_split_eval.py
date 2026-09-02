@@ -58,6 +58,14 @@ VERDICT_RE = re.compile(r"^(true|false\(([a-z0-9-]+)\)|unknown)$")
 TRUE_WITNESS_NOT_REQUIRED = {
     "termination", "valid-memsafety", "valid-memcleanup", "no-data-race",
 }
+# FALSE is scored on the verdict alone for these properties. SV-COMP 2024+
+# EXCLUDES no-data-race from violation-witness validation (there is no agreed
+# data-race witness format or validator), so a no-data-race FALSE needs no
+# confirmed witness. NOTE: memsafety / overflow / unreach FALSE DO require a
+# confirmed witness, so this set is intentionally NOT TRUE_WITNESS_NOT_REQUIRED.
+FALSE_WITNESS_NOT_REQUIRED = {
+    "no-data-race",
+}
 SCORE = {"TrueCorrect": 2, "FalseCorrect": 1, "TrueIncorrect": -32,
          "FalseIncorrect": -16, "Unknown": 0}
 
@@ -238,6 +246,8 @@ def raw_outcome(kind: str, expected: bool) -> str:
 def confirmed_score(outcome: str, prop: str, witness_status: str | None) -> int:
     """Official-style points: gate positive credit on confirmation; penalties stand."""
     if outcome == "FalseCorrect":
+        if prop in FALSE_WITNESS_NOT_REQUIRED:
+            return 1
         return 1 if witness_status == "CONFIRMED" else 0
     if outcome == "TrueCorrect":
         if prop in TRUE_WITNESS_NOT_REQUIRED:
