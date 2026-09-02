@@ -169,25 +169,53 @@ def assign_groups(
 
 # ============================== enumeration / IO ===============================
 def parse_task_yaml(text: str):
-    """Yield (property_name, expected_bool, subproperty|None) per property block."""
+    """Yield (property_name, expected_bool, subproperty|None) per property block.
+
+    SV-COMP 2.0 ymls list each property as a ``- `` item carrying ``property_file:``
+    and (optionally) ``expected_verdict:`` / ``subproperty:`` in EITHER order.
+    Parse per list item so a property's verdict is never taken from an adjacent
+    item. The old forward-only ``range(i, i+5)`` scan mislabeled multi-property
+    ymls whose ``expected_verdict`` precedes ``property_file`` (it grabbed the next
+    block's verdict, e.g. geo1-u unreach-call:false took no-overflow:true)."""
     lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if "property_file:" not in line:
+    in_props = False
+    cur = None
+    results = []
+
+    def flush():
+        if cur is not None and "name" in cur:
+            results.append((cur["name"], cur.get("exp"), cur.get("sub")))
+
+    for line in lines:
+        if re.match(r"^\s*properties:\s*$", line):
+            in_props = True
+            continue
+        if not in_props:
+            continue
+        stripped = line.lstrip()
+        # Skip YAML comments: SV-COMP ymls comment out inactive properties and
+        # comments can sit between list items — never parse or break on them.
+        if stripped.startswith("#"):
+            continue
+        # A non-indented line that is not a list item ends the properties block.
+        if line and not line[0].isspace() and not stripped.startswith("-"):
+            break
+        if re.match(r"^\s*-\s", line):
+            flush()
+            cur = {}
+        if cur is None:
             continue
         m = PROP_RE.search(line)
-        if not m:
-            continue
-        name = m.group(1)
-        exp = None
-        sub = None
-        for j in range(i, min(i + 5, len(lines))):
-            me = EXP_RE.search(lines[j])
-            if me and exp is None:
-                exp = me.group(1) == "true"
-            ms = SUB_RE.search(lines[j])
-            if ms and sub is None:
-                sub = ms.group(1)
-        yield name, exp, sub
+        if "property_file:" in line and m:
+            cur["name"] = m.group(1)
+        me = EXP_RE.search(line)
+        if me and "exp" not in cur:
+            cur["exp"] = me.group(1) == "true"
+        ms = SUB_RE.search(line)
+        if ms and "sub" not in cur:
+            cur["sub"] = ms.group(1)
+    flush()
+    yield from results
 
 
 def collect_tasks(c_dir: Path, properties: set[str], group_depth: int) -> list[dict]:
