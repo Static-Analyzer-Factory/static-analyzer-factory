@@ -2801,8 +2801,7 @@ fn run_conc_shim_plan(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .env("SAF_SHIM_P1", plan.p1_env())
-        .env("SAF_SHIM_P2", plan.p2_env())
-        .env("SAF_SHIM_PERIOD", plan.period_env());
+        .env("SAF_SHIM_P2", plan.p2_env());
     let mut child = harden_replay_spawn(&mut cmd)
         .spawn()
         .with_context(|| "spawning concurrency shim harness")?;
