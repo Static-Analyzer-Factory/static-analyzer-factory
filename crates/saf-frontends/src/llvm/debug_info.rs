@@ -247,8 +247,11 @@ pub fn extract_local_variable_names(module_ir: &str) -> LocalVarNameMap {
             continue;
         };
 
-        // Try to parse dbg.declare (old-style or new-style)
-        if let Some((reg_name, meta_id)) = parse_dbg_declare(trimmed) {
+        // Try to parse dbg.declare (pre-mem2reg allocas) or dbg.value (promoted
+        // SSA values after mem2reg — the loop-header phis we need to name).
+        if let Some((reg_name, meta_id)) =
+            parse_dbg_declare(trimmed).or_else(|| parse_dbg_value(trimmed))
+        {
             if let Some(var_name) = metadata_names.get(&meta_id) {
                 result
                     .entry(func_name.clone())
@@ -313,66 +316,56 @@ fn parse_function_define(line: &str) -> Option<String> {
 ///
 /// Returns `(register_name, metadata_id)` on success, e.g. `("%2", "!18")`.
 fn parse_dbg_declare(line: &str) -> Option<(String, String)> {
-    if line.contains("@llvm.dbg.declare(") {
-        parse_old_style_dbg_declare(line)
-    } else if line.contains("#dbg_declare(") {
-        parse_new_style_dbg_declare(line)
+    let start = if let Some(p) = line.find("@llvm.dbg.declare(") {
+        p + "@llvm.dbg.declare(".len()
+    } else if let Some(p) = line.find("#dbg_declare(") {
+        p + "#dbg_declare(".len()
     } else {
-        None
-    }
+        return None;
+    };
+    extract_reg_and_meta(&line[start..])
 }
 
-/// Parse old-style `llvm.dbg.declare` intrinsic call.
+/// Parse a `dbg.value` intrinsic (old-style or new-style) to extract the
+/// register name being described and the `DILocalVariable` metadata reference.
 ///
-/// Format: `call void @llvm.dbg.declare(metadata ptr %reg, metadata !N, ...)`
-/// Also handles: `call void @llvm.dbg.declare(metadata %reg, metadata !N, ...)`
-fn parse_old_style_dbg_declare(line: &str) -> Option<(String, String)> {
-    let marker = "@llvm.dbg.declare(";
-    let start = line.find(marker)? + marker.len();
-    let args = &line[start..];
+/// `mem2reg` replaces alloca `dbg.declare`s with `dbg.value`s attached to the
+/// promoted SSA values (including loop-header phis), so parsing these recovers
+/// the C name of a post-`mem2reg` loop variable — which `dbg.declare` alone
+/// cannot after promotion.
+///
+/// Old-style: `tail call void @llvm.dbg.value(metadata i32 %.0, metadata !53, ...)`
+/// New-style: `#dbg_value(i32 %.0, !53, !DIExpression(), !55)`
+///
+/// Constant / `undef` / `poison` descriptions (no `%` register operand) return
+/// `None`: they describe a dead or literal value, not a named SSA register.
+fn parse_dbg_value(line: &str) -> Option<(String, String)> {
+    let start = if let Some(p) = line.find("@llvm.dbg.value(") {
+        p + "@llvm.dbg.value(".len()
+    } else if let Some(p) = line.find("#dbg_value(") {
+        p + "#dbg_value(".len()
+    } else {
+        return None;
+    };
+    extract_reg_and_meta(&line[start..])
+}
 
-    // First arg: "metadata ptr %reg" or "metadata %reg"
-    // Extract register name: find '%' then take until ',' or ')'
+/// Extract `(register_name, metadata_id)` from the argument list following a
+/// `dbg.declare` / `dbg.value` marker — e.g. `metadata i32 %.0, metadata !53, …`
+/// (old-style) or `i32 %.0, !53, …` (new-style record).
+///
+/// The first operand is the described value: its register name is `%` up to the
+/// next `,` or `)`. When that operand is a constant / `undef` / `poison` (no
+/// `%`), returns `None`. The second operand supplies the `!N` `DILocalVariable`
+/// reference.
+fn extract_reg_and_meta(args: &str) -> Option<(String, String)> {
+    // First operand: the described value's register name.
     let pct_pos = args.find('%')?;
     let reg_rest = &args[pct_pos..];
     let reg_end = reg_rest.find([',', ')'])?;
     let reg_name = reg_rest[..reg_end].trim().to_string();
 
-    // Second arg: "metadata !N"
-    // Find the second "metadata" after the comma
-    let comma_pos = args.find(',')?;
-    let after_comma = &args[comma_pos + 1..];
-    // Find !N (metadata reference)
-    let meta_start = after_comma.find('!')?;
-    let meta_rest = &after_comma[meta_start..];
-    // Metadata ID ends at ',' or ')' or space followed by non-digit
-    let meta_end = meta_rest[1..]
-        .find(|c: char| !c.is_ascii_digit())
-        .map_or(meta_rest.len(), |pos| pos + 1);
-    let meta_id = meta_rest[..meta_end].to_string();
-
-    if meta_id.len() > 1 && reg_name.starts_with('%') {
-        Some((reg_name, meta_id))
-    } else {
-        None
-    }
-}
-
-/// Parse LLVM 18 new-style `#dbg_declare` record.
-///
-/// Format: `#dbg_declare(ptr %reg, !N, !DIExpression(), !M)`
-fn parse_new_style_dbg_declare(line: &str) -> Option<(String, String)> {
-    let marker = "#dbg_declare(";
-    let start = line.find(marker)? + marker.len();
-    let args = &line[start..];
-
-    // First arg: "ptr %reg" or just "%reg"
-    let pct_pos = args.find('%')?;
-    let reg_rest = &args[pct_pos..];
-    let reg_end = reg_rest.find([',', ')'])?;
-    let reg_name = reg_rest[..reg_end].trim().to_string();
-
-    // Second arg: !N
+    // Second operand: the `!N` metadata reference.
     let comma_pos = args.find(',')?;
     let after_comma = &args[comma_pos + 1..];
     let meta_start = after_comma.find('!')?;
@@ -580,5 +573,57 @@ define dso_local i32 @main() {
 ";
         let map = extract_local_variable_names(module_ir);
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parse_dbg_value_old_style_promoted_phi() {
+        // The exact shape clang-18 + `opt -passes=mem2reg` emits for the
+        // loop-header phi of `s` in loop-invariants/const.c.
+        let line = "  tail call void @llvm.dbg.value(metadata i32 %.0, metadata !53, metadata !DIExpression()), !dbg !55";
+        let (reg, meta) = parse_dbg_value(line).unwrap();
+        assert_eq!(reg, "%.0");
+        assert_eq!(meta, "!53");
+    }
+
+    #[test]
+    fn parse_dbg_value_skips_constant_description() {
+        // `metadata i32 0` has no register operand -> not a name mapping.
+        let line = "  tail call void @llvm.dbg.value(metadata i32 0, metadata !53, metadata !DIExpression()), !dbg !55";
+        assert!(parse_dbg_value(line).is_none());
+    }
+
+    #[test]
+    fn parse_dbg_value_new_style_record() {
+        let line = "    #dbg_value(i32 %.01, !21, !DIExpression(), !20)";
+        let (reg, meta) = parse_dbg_value(line).unwrap();
+        assert_eq!(reg, "%.01");
+        assert_eq!(meta, "!21");
+    }
+
+    #[test]
+    fn parse_dbg_value_named_register() {
+        let line = "  call void @llvm.dbg.value(metadata i32 %inc, metadata !7, metadata !DIExpression()), !dbg !9";
+        let (reg, meta) = parse_dbg_value(line).unwrap();
+        assert_eq!(reg, "%inc");
+        assert_eq!(meta, "!7");
+    }
+
+    #[test]
+    fn extract_local_variable_names_from_dbg_value_post_mem2reg() {
+        // Post-mem2reg shape: allocas promoted, dbg.declare replaced by
+        // dbg.value on the promoted SSA value. No dbg.declare present.
+        let module_ir = r#"
+define dso_local i32 @main() #0 !dbg !13 {
+  tail call void @llvm.dbg.value(metadata i32 %.0, metadata !53, metadata !DIExpression()), !dbg !55
+  ret i32 0
+}
+
+!53 = !DILocalVariable(name: "s", scope: !50, file: !2, line: 19, type: !54)
+"#;
+        let map = extract_local_variable_names(module_ir);
+        assert_eq!(
+            map.get("main").and_then(|m| m.get("%.0")),
+            Some(&"s".to_string())
+        );
     }
 }
