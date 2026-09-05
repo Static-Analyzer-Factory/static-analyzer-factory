@@ -142,7 +142,7 @@ TDD:
 ## 8. Acceptance criteria
 
 - [x] Slice 0: `parse_dbg_value` + Phi symbol attachment landed, tested; loop-head name-recovery rate measured = **100%** (≫ ~70% gate). **PROCEED to Slice 1.**
-- [ ] Slice 1: `invariant_set` emitter serializes the finalized 2.0 shape; deterministic golden test green.
+- [x] Slice 1 (2026-09-06): `invariant_set` emitter (`saf-svcomp/src/correctness_witness.rs`) — `interval_to_c_expr` + `SourceInvariant`/`InvariantSetWitness::assemble`/`to_yaml_string`, reusing `witness_yaml`'s `build_metadata_seeded`/`LocationOut`. 9 new tests incl. golden layout + determinism; saf-svcomp 438/438; clippy/fmt clean.
 - [ ] Slice 2: driver honors every §5 redline; dev subcommand produces a self-validated witness; `saf verify`/`strategy_for`/write-gate **unchanged** (diff-verified).
 - [ ] Slice 3: `validate_correctness_witness.sh` returns **CONFIRMED** for the two 1a programs from SAF's own emitted witnesses; measurement report produced.
 - [ ] FP=0 / wrong-TRUE=0 preserved (no verdict emitted by 1b).
