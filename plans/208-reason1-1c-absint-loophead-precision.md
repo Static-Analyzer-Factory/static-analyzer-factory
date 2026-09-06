@@ -1,6 +1,6 @@
 # Plan 208 — Reason-1 / 1c: absint loop-head interval precision (the ranks-2/3 unblocker)
 
-**Status:** DESIGN — awaiting sign-off before the core absint change (this is a cross-cutting component).
+**Status:** IMPLEMENTED — Slices 1-4b committed 2026-09-06 (`33835f73` core absint fix, `0e1f9418` Slice 4b bench gate) on `reason1/1c-absint-loophead-precision`. Approved fix = A-struct + B-TOP. Remaining before MERGE to the loop/competition branch: Slice 4 full-scale FP=0/perf A/B (loop is STOPPED; merge is a deliberate future step).
 **Branch:** `reason1/1c-absint-loophead-precision` (off `reason1/1b-correctness-witness` HEAD `35dfd81f`; **re-verify all cited line numbers on current HEAD — they drift**). Nothing pushed; `saf verify` untouched; loop STOPPED.
 **Track:** TRUE-side ("Reason 1"). Sequence `1a✅ → 1b✅ → 1c (this, BLOCKS 2&3) → 2 (no-overflow-TRUE) → 3 (unreach-TRUE)`.
 **Research notes (laptop-side, NOT in repo):** `investigation/reason1-1c-spike-findings.md` (root cause + the validated prototype), `investigation/reason1-true-side-roadmap.md` §4/§7. Key facts embedded below so this plan is self-contained.
@@ -89,3 +89,13 @@ Question: does making loop-head intervals **wider** (sound over-approx) risk an 
 
 1. Recommended path = **A-struct + B-⊤** (validated end-to-end, minimal blast radius). OK, or prefer the more-principled **A-leq** (fix the root `leq` bug) despite wider blast radius?
 2. Apply the bench-harness Error-only mitigation in this plan (Slice 4b), or track it separately as a bench-precision follow-up?
+
+
+## 9. Results (implemented 2026-09-06)
+
+- **Fix landed:** Bug A = structural change-gate (`fixpoint.rs:586`); Bug B = phi reached-but-absent -> TOP (`transfer.rs:892`). Approved combo A-struct + B-TOP.
+- **Regression test** `crates/saf-analysis/tests/absint_loophead_precision.rs`: `spike_counter` i=[0,1000000], `dbgvalue` i=[0,100] (tight); accumulator `s` sound TOP (never [0,0]). Full `saf-analysis`+`saf-frontends` suite green (**1835 passed**). `clippy --workspace -D warnings` + fmt clean.
+- **MILESTONE CONFIRMED:** `saf emit-correctness-witness spike_counter.c --data-model ILP32` -> `0 <= i && i <= 1000000` -> real CPAchecker `CONFIRMED`.
+- **Slice 4b landed** (`0e1f9418`): severity threaded through `BenchBufferFinding`; bench memsafety scores direct-FALSE on Error only; 2 unit tests lock Warning->True / Error->False.
+- **Confirmation-rate reality (honest):** on a 5-program `c/loops`/`loop-invariants` sample (`linear-inequality-inv-a`, `count_up_down-1/2`, `const`, `even`) SAF ABSTAINS on all — they need RELATIONAL (`x+y==N`) or MODULAR (`i%2`) invariants the interval domain cannot express (sound abstain, no wrong-TRUE). The fix unblocks the PURE-INTERVAL counted-loop subset (spike_counter); that subset is a minority of loop-invariant benchmarks -> ranks-2/3 prize is MODEST, as the roadmap predicted. Octagon/relational or modular domains would be needed to grow it (separate work).
+- **Remaining (Slice 4, merge gate):** full-scale FP=0/perf A/B on the competition pool. Top residual risk = absint perf (header now iterates ~|thresholds| per loop); small-program emits ran fast, but large loop-heavy programs need measurement before merging to the loop branch.
