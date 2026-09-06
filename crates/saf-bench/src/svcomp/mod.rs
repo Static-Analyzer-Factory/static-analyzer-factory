@@ -380,7 +380,12 @@ pub fn bench_result_to_verdict(result: &BenchResult, property: &Property) -> SvC
             let definite_buffer: Vec<_> = result
                 .buffer_findings
                 .iter()
-                .filter(|f| !f.description.contains("Unconstrained"))
+                // Plan 208 (1c 4b): score a direct FALSE only on Error-severity
+                // buffer findings. Warning-severity may-exceed findings (which wider,
+                // sound loop-head intervals can newly produce on safe programs) are
+                // excluded so the research harness stays precise; the competition path
+                // is unaffected (it reads no interval-derived verdict).
+                .filter(|f| !f.description.contains("Unconstrained") && f.severity == "Error")
                 .collect();
             if !relevant_findings.is_empty() || !definite_buffer.is_empty() {
                 let mut witness = Vec::new();
@@ -460,5 +465,46 @@ pub fn format_duration(d: Duration) -> String {
         format!("{}m {}s", secs / 60, secs % 60)
     } else {
         format!("{:.1}s", d.as_secs_f64())
+    }
+}
+
+#[cfg(test)]
+mod slice4b_tests {
+    use super::*;
+    use saf_cli::bench_types::{BenchBufferFinding, BenchResult};
+
+    fn buf_result(severity: &str) -> BenchResult {
+        BenchResult {
+            success: true,
+            buffer_findings: vec![BenchBufferFinding {
+                ptr: String::new(),
+                function: "main".to_string(),
+                kind: "BufferOverflow".to_string(),
+                description: "Array index [0,1000000] may exceed allocation size".to_string(),
+                severity: severity.to_string(),
+            }],
+            ..BenchResult::default()
+        }
+    }
+
+    #[test]
+    fn memsafety_warning_buffer_finding_is_not_false() {
+        // A Warning-severity may-exceed finding (what wider sound loop-head
+        // intervals produce on a SAFE program) must NOT score a bench FALSE.
+        let v = bench_result_to_verdict(&buf_result("Warning"), &Property::ValidMemsafety);
+        assert!(
+            matches!(v, SvCompVerdict::True),
+            "Warning buffer finding must be True, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn memsafety_error_buffer_finding_is_false() {
+        // A provably-out-of-bounds Error finding still scores FALSE (recall lock).
+        let v = bench_result_to_verdict(&buf_result("Error"), &Property::ValidMemsafety);
+        assert!(
+            matches!(v, SvCompVerdict::False { .. }),
+            "Error buffer finding must be False, got {v:?}"
+        );
     }
 }

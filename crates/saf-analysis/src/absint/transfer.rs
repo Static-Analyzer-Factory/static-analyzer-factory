@@ -889,7 +889,13 @@ pub fn transfer_instruction_with_context(
                     .get_opt(*val_id)
                     .cloned()
                     .or_else(|| constant_map.get(val_id).cloned())
-                    .unwrap_or_else(|| Interval::make_bottom(DEFAULT_BITS));
+                    // Plan 208 (Reason-1/1c, Bug B): a REACHED predecessor whose incoming value is
+                    // absent means the value is ⊤ under the "absent = ⊤" convention
+                    // (e.g. it widened to ⊤ and was dropped) — NOT ⊥. Reading it as ⊥
+                    // silently under-approximates the phi (e.g. an overflowing
+                    // accumulator collapses to its entry constant). Unreached preds are
+                    // already excluded above, so reached+absent is soundly ⊤.
+                    .unwrap_or_else(|| Interval::make_top(DEFAULT_BITS));
                 result = result.join(&val);
             }
             state.set(dst, result);

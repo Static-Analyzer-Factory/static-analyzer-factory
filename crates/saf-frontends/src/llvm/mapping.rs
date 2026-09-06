@@ -1279,11 +1279,19 @@ fn convert_instruction(
     // Extract debug info
     air_inst.span = extract_span(inst, &mut ctx.source_files);
 
-    // Populate symbol for alloca instructions from debug info.
-    // The pre-pass over llvm.dbg.declare intrinsics has already built a mapping
-    // from LLVM register names to C/C++ variable names. Look up the alloca's
-    // register name (e.g., "%2") in that map to set the symbol.
-    if matches!(air_inst.op, Operation::Alloca { .. }) && !ctx.current_local_var_names.is_empty() {
+    // Populate symbol for named value-producing instructions from debug info.
+    // The pre-pass over llvm.dbg.declare / llvm.dbg.value intrinsics has already
+    // built a mapping from LLVM register names to C/C++ variable names. Look up
+    // the instruction's register name (e.g., "%2", "%.0") in that map to set the
+    // symbol. Allocas carry dbg.declare (pre-mem2reg stack slots); promoted phis
+    // carry dbg.value (post-mem2reg loop-header induction variables) — naming the
+    // latter is what lets a correctness-witness emitter render `lo <= s && s <= hi`
+    // for a loop invariant instead of an anonymous `%<hex>` (plan 207 / 1b.0).
+    if matches!(
+        air_inst.op,
+        Operation::Alloca { .. } | Operation::Phi { .. }
+    ) && !ctx.current_local_var_names.is_empty()
+    {
         let inst_str = inst.print_to_string().to_string();
         if let Some(reg_name) = extract_register_name(&inst_str) {
             if let Some(var_name) = ctx.current_local_var_names.get(&reg_name) {

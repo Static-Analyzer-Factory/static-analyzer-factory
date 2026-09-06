@@ -191,7 +191,7 @@ impl ViolationWitness {
         Ok(Self {
             entry: Entry {
                 entry_type: "violation_sequence",
-                metadata: build_metadata(meta),
+                metadata: build_metadata_seeded(meta, &[]),
                 content,
             },
         })
@@ -235,7 +235,7 @@ struct Entry {
 }
 
 #[derive(Debug, Serialize)]
-struct Metadata {
+pub(crate) struct Metadata {
     format_version: &'static str,
     uuid: String,
     creation_time: &'static str,
@@ -279,13 +279,30 @@ struct WaypointOut {
 }
 
 #[derive(Debug, Serialize)]
-struct LocationOut {
+pub(crate) struct LocationOut {
     file_name: String,
     line: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     column: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     function: Option<String>,
+}
+
+impl LocationOut {
+    /// Shared 2.0 `location` builder (reused by the `invariant_set` emitter).
+    pub(crate) fn new(
+        file_name: String,
+        line: u32,
+        column: Option<u32>,
+        function: Option<String>,
+    ) -> Self {
+        Self {
+            file_name,
+            line,
+            column,
+            function,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -312,7 +329,12 @@ fn waypoint_out(wp: &SourceWaypoint) -> WaypointOut {
     }
 }
 
-fn build_metadata(meta: &WitnessMeta) -> Metadata {
+/// Build the shared 2.0 `metadata` block (producer / task / deterministic uuid).
+///
+/// `extra_seed` is folded into the uuid seed so that emitters with distinct
+/// content (e.g. an `invariant_set` witness vs a `violation_sequence` for the
+/// same program) produce distinct uuids; violation witnesses pass `&[]`.
+pub(crate) fn build_metadata_seeded(meta: &WitnessMeta, extra_seed: &[u8]) -> Metadata {
     let hash = compute_file_hash(&meta.input_file);
     let basename = meta
         .input_file
@@ -338,6 +360,7 @@ fn build_metadata(meta: &WitnessMeta) -> Metadata {
     seed.extend_from_slice(hash.as_bytes());
     seed.extend_from_slice(meta.specification.as_bytes());
     seed.extend_from_slice(meta.producer_version.as_bytes());
+    seed.extend_from_slice(extra_seed);
 
     Metadata {
         format_version: FORMAT_VERSION,

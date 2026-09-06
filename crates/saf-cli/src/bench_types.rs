@@ -397,6 +397,11 @@ pub struct BenchBufferFinding {
     pub function: String,
     pub kind: String,
     pub description: String,
+    /// Numeric-checker severity ("Warning"/"Error"/"Safe"). Plan 208 (1c 4b):
+    /// bench memsafety scores a direct FALSE only on Error findings, so wider
+    /// (sound) loop-head intervals cannot add a bench false-positive.
+    #[serde(default)]
+    pub severity: String,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
