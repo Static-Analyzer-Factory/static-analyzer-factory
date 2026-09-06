@@ -577,9 +577,14 @@ fn solve_function_impl(
                 joined
             };
 
-            // State change detection on partitioned state
-            let state_changed =
-                !new_partitioned.leq(&old_partitioned) || old_partitioned.is_unreachable();
+            // State change detection on partitioned state.
+            // Plan 208 (Reason-1/1c, Bug A): use STRUCTURAL inequality of the merged state so a REFINED
+            // successor (new ⊏ old — e.g. an empty (=⊤) loop-header entry gaining the
+            // back-edge's concrete values) also re-queues. `leq()` alone never fires
+            // here because it treats an empty state as ≡ everything (it iterates only
+            // self.values, so empty.leq(concrete)=true). Widening still bounds iters.
+            let state_changed = new_partitioned.merge_all() != old_partitioned.merge_all()
+                || old_partitioned.is_unreachable();
             if state_changed {
                 block_entry_states.insert(*succ_id, new_partitioned);
                 if !worklist.contains(succ_id) {
