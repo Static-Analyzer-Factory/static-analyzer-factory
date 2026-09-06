@@ -358,6 +358,10 @@ pub enum Commands {
     /// converged interval fixpoint for offline `CPAchecker` confirmation (plan
     /// 207 / 1b). Prints NO verdict and is NOT wired into `verify`.
     EmitCorrectnessWitness(EmitCorrectnessWitnessArgs),
+    /// [dev/spike] Run the sound no-signed-overflow sentinel over the converged
+    /// interval fixpoint; print `PROVE` or `ABSTAIN:<reason>`. Emits NO verdict
+    /// and is NOT wired into `verify` (rank-2 measurement only).
+    ProveNoOverflow(ProveNoOverflowArgs),
     /// Query analysis results.
     Query(QueryArgs),
     /// Export graphs or findings.
@@ -434,6 +438,21 @@ pub struct EmitCorrectnessWitnessArgs {
     /// Where to write the witness (YAML 2.0). Stdout if omitted.
     #[arg(long, short = 'o')]
     pub output: Option<PathBuf>,
+}
+
+/// Arguments for `saf prove-no-overflow` — the rank-2 throwaway measurement
+/// subcommand. Compiles + ingests like `verify`, then runs the sound
+/// no-signed-overflow sentinel. Prints `PROVE` / `ABSTAIN:<reason>`; emits no
+/// verdict and never touches the competition `verify` path.
+#[derive(Args)]
+pub struct ProveNoOverflowArgs {
+    /// The C program (`.c` or preprocessed `.i`).
+    #[arg(required = true)]
+    pub input: PathBuf,
+
+    /// Data model; selects clang `-m32`/`-m64` and the LLVM target.
+    #[arg(long, value_enum, default_value_t = CliDataModel::Ilp32)]
+    pub data_model: CliDataModel,
 }
 
 // NOTE: CLI arg structs naturally accumulate bool flags for feature toggles.
@@ -890,6 +909,29 @@ pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
                 ),
             }
         }
+    } else if outcome.verdict.starts_with("true") {
+        // Witness-required sound TRUE (rank 2: no-overflow) — write the YAML-2.0
+        // `invariant_set` correctness witness. The verdict was already gated on an
+        // in-process CPAchecker confirmation of THIS witness, so writing it can
+        // never turn a right verdict wrong. A bare `true` with no correctness
+        // witness (e.g. termination, no-data-race) writes nothing (unchanged).
+        if let Some(correctness) = &outcome.correctness {
+            match correctness.to_yaml_string() {
+                Ok(yaml) => match std::fs::write(&args.witness, yaml) {
+                    Ok(()) => eprintln!(
+                        "saf verify: wrote correctness witness to {}",
+                        args.witness.display()
+                    ),
+                    Err(e) => eprintln!(
+                        "saf verify: failed to write correctness witness to {}: {e} (verdict still emitted)",
+                        args.witness.display()
+                    ),
+                },
+                Err(e) => eprintln!(
+                    "saf verify: correctness-witness serialization failed: {e:#} (verdict still emitted)"
+                ),
+            }
+        }
     }
     println!("{}", outcome.verdict);
     Ok(())
@@ -935,6 +977,44 @@ pub fn emit_correctness_witness(args: &EmitCorrectnessWitnessArgs) -> anyhow::Re
         None => eprintln!(
             "emit-correctness-witness: abstained (no converged, named, non-trivial loop-head invariant)"
         ),
+    }
+    Ok(())
+}
+
+/// `saf prove-no-overflow` (dev/spike, rank-2): compile → ingest → apply the
+/// property-level fail-closed gates (OpenMP source text; reachable thread spawn)
+/// → run the sound no-signed-overflow sentinel over the converged interval
+/// fixpoint. Prints exactly one line: `PROVE` or `ABSTAIN:<reason>`. Emits NO
+/// verdict; `strategy_for` / `verify` / the witness write-gate are untouched.
+///
+/// # Errors
+/// Returns `Err` if the stub header is missing, or compilation / ingestion fails.
+pub fn prove_no_overflow_cmd(args: &ProveNoOverflowArgs) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let data_model: saf_svcomp::DataModel = args.data_model.into();
+    let stub = resolve_svcomp_stub()
+        .context("bundled SV-COMP stub header (share/saf/stubs/sv-comp-stubs.h) not found")?;
+    let dir = tempfile::tempdir().context("create tempdir")?;
+    let ir =
+        compile_to_ir(&args.input, data_model, &stub, dir.path()).context("compile to LLVM IR")?;
+    let bundle = driver::AnalysisDriver::ingest(&[ir], CliFrontend::Llvm).context("ingest IR")?;
+    let source = std::fs::read_to_string(&args.input).unwrap_or_default();
+
+    // Property-level fail-closed gates (the AIR can't see OpenMP; a reachable
+    // thread spawn makes a sequential interval proof unsound).
+    if saf_svcomp::source_has_openmp(&source) {
+        println!("ABSTAIN:openmp");
+        return Ok(());
+    }
+    let callgraph = saf_analysis::callgraph::CallGraph::build(&bundle.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(&bundle.module, &callgraph) {
+        println!("ABSTAIN:threads");
+        return Ok(());
+    }
+
+    match saf_analysis::absint::prove_no_signed_overflow(&bundle.module) {
+        saf_analysis::absint::NoOverflowProof::Proven => println!("PROVE"),
+        saf_analysis::absint::NoOverflowProof::Abstain(reason) => println!("ABSTAIN:{reason}"),
     }
     Ok(())
 }
@@ -1194,6 +1274,11 @@ struct VerdictOutcome {
     witness: Option<saf_svcomp::ViolationWitness>,
     /// Pre-serialized `GraphML` 1.0 witness (concurrency properties, R7).
     graphml: Option<String>,
+    /// YAML-2.0 `invariant_set` **correctness** witness — present only for a
+    /// witness-required sound TRUE (rank 2: `no-overflow`). Written by the
+    /// `true`-branch of the verify write-gate. Mutually exclusive with
+    /// `witness`/`graphml` (those ride a `false`).
+    correctness: Option<saf_svcomp::InvariantSetWitness>,
 }
 
 /// The safe fallback: `unknown` with no witness.
@@ -1202,6 +1287,7 @@ fn unknown_outcome() -> VerdictOutcome {
         verdict: "unknown".to_string(),
         witness: None,
         graphml: None,
+        correctness: None,
     }
 }
 
@@ -1364,6 +1450,7 @@ fn bmc_confirm(
                     verdict: format!("false({})", Property::UnreachCall.name()),
                     witness,
                     graphml: None,
+                    correctness: None,
                 });
             }
             Ok(false) => {}
@@ -1411,6 +1498,7 @@ fn se_confirm(
                     verdict: format!("false({})", Property::UnreachCall.name()),
                     witness,
                     graphml: None,
+                    correctness: None,
                 });
             }
             Ok(false) => {}
@@ -1437,6 +1525,7 @@ fn fuzz_confirm(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
         verdict: format!("false({})", Property::UnreachCall.name()),
         witness,
         graphml: None,
+        correctness: None,
     })
 }
 
@@ -1455,6 +1544,7 @@ fn cbmc_confirm(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
         verdict: format!("false({})", Property::UnreachCall.name()),
         witness,
         graphml: None,
+        correctness: None,
     })
 }
 
@@ -1485,6 +1575,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             verdict: format!("false({})", Property::UnreachCall.name()),
             witness,
             graphml: None,
+            correctness: None,
         };
     }
 
@@ -1566,6 +1657,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
                     verdict: format!("false({})", Property::UnreachCall.name()),
                     witness,
                     graphml: None,
+                    correctness: None,
                 };
             }
             Ok(false) => {}
@@ -1613,6 +1705,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
                     verdict: format!("false({})", Property::UnreachCall.name()),
                     witness,
                     graphml: None,
+                    correctness: None,
                 };
             }
             Ok(false) => {}
@@ -1679,6 +1772,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
                         verdict: format!("false({})", Property::UnreachCall.name()),
                         witness,
                         graphml: None,
+                        correctness: None,
                     };
                 }
                 Ok(false) => {}
@@ -2583,6 +2677,7 @@ fn conc_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             verdict: format!("false({})", Property::UnreachCall.name()),
             witness: conc_target_witness(ctx),
             graphml: Some(graphml),
+            correctness: None,
         });
     }
 
@@ -2818,6 +2913,7 @@ fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             // `conc_confirm_false` / `conc_target_witness`.
             witness: conc_target_witness(ctx),
             graphml: Some(graphml),
+            correctness: None,
         });
     }
 
@@ -3064,6 +3160,7 @@ fn conc_shim_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             // `conc_confirm_false` / `conc_target_witness`.
             witness: conc_target_witness(ctx),
             graphml: Some(graphml),
+            correctness: None,
         });
     }
 
@@ -3975,6 +4072,7 @@ fn memsafety_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
                 verdict: saf_svcomp::memsafety_verdict(hit.subproperty),
                 witness,
                 graphml: None,
+                correctness: None,
             }
         }
         Ok(None) => {
@@ -4867,11 +4965,11 @@ fn is_ident_byte(b: u8) -> bool {
 /// the reaching path returned `(type)k`). For each SIMPLE signed-integer
 /// `__VERIFIER_nondet_*` read in `main`'s unconditional straight-line prefix, bind
 /// its assigned variable to that concrete value — the counterexample input a bare
-/// target waypoint omits and CPAchecker/Witch3 cannot otherwise replay.
+/// target waypoint omits and `CPAchecker`/Witch3 cannot otherwise replay.
 ///
 /// Returns empty (⇒ target-only witness, unchanged behavior) whenever inputs
 /// cannot be cleanly and safely attributed. Each guard only costs witness fidelity,
-/// never soundness (the verdict is already UBSan-confirmed `false`) — and, crucially,
+/// never soundness (the verdict is already `UBSan`-confirmed `false`) — and, crucially,
 /// never drops an already-confirmed target witness (a `follow` assumption is only
 /// emitted for a read that provably executes on every run):
 /// - **`k != 0`** — a non-zero winning constant means the specific input drove the
@@ -4935,10 +5033,172 @@ fn overflow_nondet_assumes(
     assumes
 }
 
-/// The `no-overflow` FALSE pipeline (plan 199, R6): confirmer-first, propose-free.
-/// Mirrors [`memsafety_strategy`], swapping the arbiter ASan→UBSan. No sub-property,
-/// so the verdict is always `false(no-overflow)` (no classifier).
+/// Locate a bundled `CPAchecker`-4.2.2 home for the in-process no-overflow TRUE
+/// confirmation gate: `$SAF_CPACHECKER`, else an ancestor of the running binary
+/// joined with `.svtools/CPAchecker-4.2.2-unix`, else `./.svtools/...`.
+fn resolve_cpachecker() -> Option<PathBuf> {
+    const REL: &str = ".svtools/CPAchecker-4.2.2-unix";
+    if let Some(p) = std::env::var_os("SAF_CPACHECKER") {
+        let p = PathBuf::from(p);
+        if p.join("bin/cpachecker").is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for anc in exe.ancestors() {
+            let c = anc.join(REL);
+            if c.join("bin/cpachecker").is_file() {
+                return Some(c);
+            }
+        }
+    }
+    let c = PathBuf::from(REL);
+    if c.join("bin/cpachecker").is_file() {
+        return Some(c);
+    }
+    None
+}
+
+/// `true` iff clang reports a compile-time integer-overflow warning for
+/// `ctx.input` — an overflowing CONSTANT expression clang folds away, leaving no IR
+/// arithmetic for the sentinel to see (a measured wrong-TRUE class). `-fsyntax-only`
+/// (no codegen). Fail-closed: on any probe error, returns `true` (abstain) so a
+/// fold we cannot rule out never yields a wrong `true`.
+fn overflow_source_constant_folds(ctx: &VerifyCtx) -> bool {
+    use std::process::{Command, Stdio};
+    let m = match ctx.data_model {
+        saf_svcomp::DataModel::ILP32 => "-m32",
+        saf_svcomp::DataModel::LP64 => "-m64",
+    };
+    match Command::new(ctx.clang)
+        .args(["-fsyntax-only", "-Wno-everything", "-Winteger-overflow", m])
+        .arg("-include")
+        .arg(ctx.stub)
+        .arg(ctx.input)
+        .stdout(Stdio::null())
+        .output()
+    {
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            err.contains("integer-overflow") || err.contains("overflow in expression")
+        }
+        Err(_) => true, // fail-closed
+    }
+}
+
+/// Run real `CPAchecker`'s overflow correctness-witness validation on `witness_path`
+/// against `ctx.input`, in process. `true` iff `CPAchecker`'s raw verdict is
+/// `Verification result: TRUE`. Fail-closed: `CPAchecker` absent / errored / any
+/// non-TRUE verdict (`FALSE`/`UNKNOWN`/timeout) ⇒ `false` ⇒ the caller abstains.
+/// This is the SOUNDNESS gate — the sentinel is only a filter; `CPAchecker` (the
+/// SV-COMP reference overflow analysis) has the final say on the `true` verdict.
+fn cpachecker_confirms_no_overflow(ctx: &VerifyCtx, witness_path: &Path) -> bool {
+    use std::process::{Command, Stdio};
+    let Some(cpa) = resolve_cpachecker() else {
+        eprintln!(
+            "saf verify: CPAchecker not found (set SAF_CPACHECKER) -> no-overflow TRUE abstains"
+        );
+        return false;
+    };
+    let config = cpa.join("config/correctness-witness-validation--overflow.properties");
+    let bit = match ctx.data_model {
+        saf_svcomp::DataModel::ILP32 => "--32",
+        saf_svcomp::DataModel::LP64 => "--64",
+    };
+    // `ctx.meta.specification` is the raw no-overflow `.prp` text; write it for --spec.
+    let prp = ctx.tempdir.join("saf_nooverflow_spec.prp");
+    if std::fs::write(&prp, &ctx.meta.specification).is_err() {
+        return false;
+    }
+    let out_dir = ctx.tempdir.join("saf_cpa_confirm");
+    match Command::new(cpa.join("bin/cpachecker"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--witness")
+        .arg(witness_path)
+        .arg("--spec")
+        .arg(&prp)
+        .arg(bit)
+        .arg("--option")
+        .arg("witness.checkProgramHash=false")
+        .arg("--timelimit")
+        .arg("150s")
+        .arg("--output-path")
+        .arg(&out_dir)
+        .arg(ctx.input)
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            s.contains("Verification result: TRUE")
+        }
+        Err(e) => {
+            eprintln!("saf verify: CPAchecker invocation failed: {e} -> no-overflow TRUE abstains");
+            false
+        }
+    }
+}
+
+/// Rank-2 sound `no-overflow` TRUE attempt: propose (sound interval sentinel) →
+/// emit an `invariant_set` witness → CONFIRM in process with real `CPAchecker`.
+/// Returns `Some(true + correctness witness)` ONLY on a `CPAchecker`-confirmed
+/// no-overflow proof; `None` to fall through to the FALSE / unknown path. NEVER
+/// emits `false`. Every gate is fail-closed; the TRUE authority (sound absint +
+/// `CPAchecker`) is STRICTLY separate from the FALSE authority (`UBSan`).
+fn try_overflow_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    let source = std::fs::read_to_string(ctx.input).ok()?;
+    // (1) OpenMP: the frontend drops `#pragma omp`, so the AIR loses parallelism.
+    if saf_svcomp::source_has_openmp(&source) {
+        return None;
+    }
+    // (2) Reachable thread spawn: a sequential interval proof is unsound under
+    //     concurrency (the same gate the UBSan FALSE path uses).
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        return None;
+    }
+    // (3) Compile-time constant overflow clang folds away (no IR arithmetic to see).
+    if overflow_source_constant_folds(ctx) {
+        return None;
+    }
+    // Sentinel: prove EVERY reachable signed add/sub/mul in-bounds over the
+    // converged interval solution (fail-closed on any TOP/absent/unmodeled op).
+    if !matches!(
+        saf_analysis::absint::prove_no_signed_overflow(ctx.module),
+        saf_analysis::absint::NoOverflowProof::Proven
+    ) {
+        return None;
+    }
+    // Correctness witness: SAF's converged loop invariants, or an empty
+    // invariant_set for a loop-free program (CPAchecker re-proves it).
+    let witness = saf_svcomp::build_interval_invariant_witness(ctx.module, &source, ctx.meta)
+        .unwrap_or_else(|| saf_svcomp::InvariantSetWitness::empty(ctx.meta));
+    let yaml = witness.to_yaml_string().ok()?;
+    let witness_path = ctx.tempdir.join("saf_overflow_correctness.yml");
+    std::fs::write(&witness_path, &yaml).ok()?;
+    // FINAL GATE: real CPAchecker overflow-witness validation (fail-closed).
+    if !cpachecker_confirms_no_overflow(ctx, &witness_path) {
+        return None;
+    }
+    Some(VerdictOutcome {
+        verdict: "true".to_string(),
+        witness: None,
+        graphml: None,
+        correctness: Some(witness),
+    })
+}
+
+/// The `no-overflow` strategy: **TRUE-first** (rank 2 — a sound interval proof
+/// gated on in-process `CPAchecker` confirmation) then the R6 FALSE pipeline
+/// (confirmer-first, propose-free `UBSan` replay). Mirrors [`memsafety_strategy`] for
+/// the FALSE half; no sub-property, so a FALSE is always `false(no-overflow)`.
 fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
+    // Sound no-overflow TRUE (fail-closed to the FALSE path on any doubt).
+    if let Some(outcome) = try_overflow_true(ctx) {
+        return outcome;
+    }
     match ubsan_confirm(
         ctx.input,
         ctx.data_model,
@@ -4969,6 +5229,7 @@ fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
                 verdict: saf_svcomp::overflow_verdict(),
                 witness,
                 graphml: None,
+                correctness: None,
             }
         }
         Ok(None) => {
@@ -5014,6 +5275,7 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             verdict: saf_svcomp::termination_verdict().to_string(),
             witness: None,
             graphml: None,
+            correctness: None,
         }
     } else {
         unknown_outcome()
@@ -5091,6 +5353,7 @@ fn race_true_outcome() -> VerdictOutcome {
         verdict: saf_svcomp::race_true_verdict().to_string(),
         witness: None,
         graphml: None,
+        correctness: None,
     }
 }
 
@@ -5262,6 +5525,7 @@ fn try_no_data_race_false(ctx: &VerifyCtx, source: &str) -> Option<VerdictOutcom
                 verdict: format!("false({})", saf_svcomp::Property::NoDataRace.name()),
                 witness: None,
                 graphml: Some(graphml),
+                correctness: None,
             })
         }
         Ok(None) => {
@@ -5701,7 +5965,7 @@ fn tsan_confirm(
     Ok(None)
 }
 
-/// Confirm a `no-overflow` FALSE by UBSan-instrumented native execution (plan 199, R6).
+/// Confirm a `no-overflow` FALSE by `UBSan`-instrumented native execution (plan 199, R6).
 ///
 /// Compiles the ORIGINAL program with `-fsanitize=signed-integer-overflow -g` + the
 /// nondet driver, runs it under the [`OVERFLOW_CONSTS`] mini-fuzz capturing stderr to a

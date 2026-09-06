@@ -68,11 +68,13 @@ mod transfer;
 mod transfer_fn;
 
 pub use checker::{
-    NumericCheckResult, NumericCheckerKind, NumericFinding, NumericSeverity, check_all_numeric,
-    check_buffer_overflow, check_buffer_overflow_with_pta, check_buffer_overflow_with_specs,
-    check_division_by_zero, check_integer_overflow, check_integer_overflow_with_specs,
-    check_memcpy_overflow, check_memcpy_overflow_with_pta_and_specs,
-    check_memcpy_overflow_with_result, check_memcpy_overflow_with_specs, check_shift_count,
+    NoOverflowProof, NumericCheckResult, NumericCheckerKind, NumericFinding, NumericSeverity,
+    check_all_numeric, check_buffer_overflow, check_buffer_overflow_with_pta,
+    check_buffer_overflow_with_specs, check_division_by_zero, check_integer_overflow,
+    check_integer_overflow_with_specs, check_memcpy_overflow,
+    check_memcpy_overflow_with_pta_and_specs, check_memcpy_overflow_with_result,
+    check_memcpy_overflow_with_specs, check_shift_count, prove_no_signed_overflow,
+    prove_no_signed_overflow_with_result,
 };
 pub use config::AbstractInterpConfig;
 pub use domain::AbstractDomain;

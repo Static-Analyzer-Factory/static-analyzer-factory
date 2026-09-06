@@ -1077,6 +1077,181 @@ fn check_integer_overflow_with_result(
     findings
 }
 
+// ============================================================================
+// Sound no-signed-overflow prover (rank-2 spike; fail-closed TRUE read-out).
+//
+// The TRUE-side counterpart to `check_integer_overflow_with_result`: instead of
+// emitting a finding when an op MIGHT overflow, it proves the WHOLE program has
+// NO reachable signed overflow (fail-closed — any uncertainty ⇒ Abstain). The
+// burden of proof is on the SAFE side, per the plan-207/roadmap soundness
+// guardrails (wrong-TRUE must stay 0).
+// ============================================================================
+
+/// Verdict of the sound no-signed-overflow prover: `Proven` ONLY if every
+/// reachable signed `add`/`sub`/`mul` is provably in-bounds over the CONVERGED
+/// interval solution, each checked against ITS OWN result-type width; any
+/// TOP/bottom/absent operand, unmodeled overflow-capable op (`shl`/`sdiv`/`srem`),
+/// indirect call, missing width, or non-converged fixpoint ⇒ `Abstain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoOverflowProof {
+    /// No reachable signed arithmetic op can overflow (sound, fail-closed).
+    Proven,
+    /// Could not prove no-overflow; carries a short machine reason tag.
+    Abstain(String),
+}
+
+/// Signed result-type width (bits) of `inst`, iff it has a known integer result
+/// type; `None` otherwise (⇒ caller abstains — NEVER guess a width, else the
+/// `DEFAULT_BITS = 64` data-model trap would judge a 32-bit op against 64-bit
+/// bounds and could fabricate a wrong TRUE).
+fn signed_result_bits(module: &AirModule, inst: &Instruction) -> Option<u8> {
+    match module.types.get(&inst.result_type?)? {
+        AirType::Integer { bits } => u8::try_from(*bits).ok(),
+        _ => None,
+    }
+}
+
+/// Is a signed `kind` (Add/Sub/Mul) op with CONCRETE operand intervals `lhs`,
+/// `rhs` provably within `[signed_min(bits), signed_max(bits)]`? Uses the exact
+/// (un-clamped) mathematical result range; returns `false` for any other `kind`.
+#[must_use]
+fn signed_arith_in_bounds(kind: BinaryOp, lhs: &Interval, rhs: &Interval, bits: u8) -> bool {
+    let (lo, hi) = match kind {
+        BinaryOp::Add => lhs.add_unwrapped(rhs),
+        BinaryOp::Sub => lhs.sub_unwrapped(rhs),
+        BinaryOp::Mul => lhs.mul_unwrapped(rhs),
+        _ => return false,
+    };
+    lo >= signed_min(bits) && hi <= signed_max(bits)
+}
+
+/// Prove (fail-closed) that no reachable signed integer overflow occurs, running
+/// the interval fixpoint with the default config. Thin wrapper over
+/// [`prove_no_signed_overflow_with_result`].
+#[must_use]
+pub fn prove_no_signed_overflow(module: &AirModule) -> NoOverflowProof {
+    let result = solve_abstract_interp(module, &AbstractInterpConfig::default());
+    prove_no_signed_overflow_with_result(module, &result)
+}
+
+/// Prove no-overflow over a PRE-COMPUTED converged solution. See
+/// [`NoOverflowProof`] for the fail-closed contract. Proves the SIGNED-ARITHMETIC
+/// overflow property (add/sub/mul in-bounds; abstain on shl/sdiv/srem); integer
+/// conversions are not signed-arithmetic-overflow sites and are skipped.
+/// Property-level gates (OpenMP source text, reachable thread spawn) are the
+/// caller's responsibility — this reads the (sequential) absint solution only.
+#[must_use]
+pub fn prove_no_signed_overflow_with_result(
+    module: &AirModule,
+    result: &AbstractInterpResult,
+) -> NoOverflowProof {
+    use super::transfer::{build_constant_map, resolve_operand};
+
+    // Convergence gate (fail-closed): only trust the converged solution.
+    if !result.diagnostics().converged {
+        return NoOverflowProof::Abstain("not-converged".to_string());
+    }
+    let constant_map = build_constant_map(module);
+
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                // Only REACHED instructions matter; None ⇒ the absint proved this
+                // point unreachable (sound over-approx) ⇒ cannot overflow here.
+                let Some(state) = result.state_at_inst(inst.id) else {
+                    continue;
+                };
+                match &inst.op {
+                    Operation::BinaryOp { kind } => match kind {
+                        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                            if inst.operands.len() < 2 {
+                                return NoOverflowProof::Abstain("malformed-binop".to_string());
+                            }
+                            let Some(bits) = signed_result_bits(module, inst) else {
+                                return NoOverflowProof::Abstain("no-result-width".to_string());
+                            };
+                            let lhs = resolve_operand(inst.operands[0], state, &constant_map);
+                            let rhs = resolve_operand(inst.operands[1], state, &constant_map);
+                            if lhs.is_bottom() || rhs.is_bottom() || lhs.is_top() || rhs.is_top() {
+                                return NoOverflowProof::Abstain(
+                                    "top-or-bottom-operand".to_string(),
+                                );
+                            }
+                            if !signed_arith_in_bounds(*kind, &lhs, &rhs, bits) {
+                                return NoOverflowProof::Abstain("may-overflow".to_string());
+                            }
+                        }
+                        // Overflow-capable but not modeled here ⇒ fail-closed.
+                        BinaryOp::Shl | BinaryOp::SDiv | BinaryOp::SRem => {
+                            return NoOverflowProof::Abstain("unmodeled-arith".to_string());
+                        }
+                        // Bitwise / comparisons / unsigned div-rem / logical shr
+                        // cannot cause signed-arithmetic overflow.
+                        _ => {}
+                    },
+                    // An indirect call may reach un-analyzed code whose ops would
+                    // be silently skipped ⇒ fail-closed.
+                    Operation::CallIndirect { .. } => {
+                        return NoOverflowProof::Abstain("indirect-call".to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    NoOverflowProof::Proven
+}
+
+#[cfg(test)]
+mod nooverflow_prove_tests {
+    use super::{BinaryOp, Interval, signed_arith_in_bounds};
+
+    #[test]
+    fn add_in_bounds_small() {
+        let a = Interval::new(0, 100, 32);
+        assert!(signed_arith_in_bounds(BinaryOp::Add, &a, &a, 32));
+    }
+
+    #[test]
+    fn add_overflows_at_i32_max() {
+        let a = Interval::new(0, i128::from(i32::MAX), 32);
+        let one = Interval::new(0, 1, 32);
+        assert!(!signed_arith_in_bounds(BinaryOp::Add, &a, &one, 32));
+    }
+
+    #[test]
+    fn sub_underflows_at_i32_min() {
+        let a = Interval::new(i128::from(i32::MIN), 0, 32);
+        let one = Interval::new(0, 1, 32);
+        assert!(!signed_arith_in_bounds(BinaryOp::Sub, &a, &one, 32));
+    }
+
+    #[test]
+    fn mul_in_bounds() {
+        let a = Interval::new(0, 1000, 32);
+        assert!(signed_arith_in_bounds(BinaryOp::Mul, &a, &a, 32)); // 1e6 < i32::MAX
+    }
+
+    /// THE data-model width trap: a value that fits i64 must NOT be judged safe
+    /// for a 32-bit result. This is the single most important soundness guard.
+    #[test]
+    fn width_trap_64bit_value_overflows_32bit_target() {
+        let big = Interval::new(0, 3_000_000_000, 64);
+        let zero = Interval::new(0, 0, 64);
+        assert!(signed_arith_in_bounds(BinaryOp::Add, &big, &zero, 64)); // fits i64
+        assert!(!signed_arith_in_bounds(BinaryOp::Add, &big, &zero, 32)); // NOT i32
+    }
+
+    #[test]
+    fn shl_is_never_proven_by_arith_helper() {
+        let a = Interval::new(0, 1, 32);
+        assert!(!signed_arith_in_bounds(BinaryOp::Shl, &a, &a, 32));
+    }
+}
+
 /// Division by zero check using pre-computed abstract interpretation result.
 fn check_division_by_zero_with_result(
     module: &AirModule,
