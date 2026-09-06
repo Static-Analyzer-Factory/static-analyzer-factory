@@ -1544,6 +1544,7 @@ impl AnalysisDriver {
                             .map_or_else(String::new, saf_core::ids::ValueId::to_hex),
                         function: f.function.clone(),
                         kind: format!("{:?}", f.checker),
+                        severity: format!("{:?}", f.severity),
                         description: f.description.clone(),
                     });
                 }
@@ -1565,6 +1566,7 @@ impl AnalysisDriver {
                             .map_or_else(String::new, saf_core::ids::ValueId::to_hex),
                         function: f.function.clone(),
                         kind: format!("{:?}", f.checker),
+                        severity: format!("{:?}", f.severity),
                         description: f.description.clone(),
                     });
                 }
@@ -1590,6 +1592,7 @@ impl AnalysisDriver {
                                 .map_or_else(String::new, saf_core::ids::ValueId::to_hex),
                             function: f.function.clone(),
                             kind: format!("{:?}", f.checker),
+                            severity: format!("{:?}", f.severity),
                             description: f.description.clone(),
                         });
                     }
