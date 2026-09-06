@@ -39,6 +39,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Run(args) => commands::run(&args),
         Commands::Verify(args) => commands::verify(&args),
         Commands::EmitCorrectnessWitness(args) => commands::emit_correctness_witness(&args),
+        Commands::ProveNoOverflow(args) => commands::prove_no_overflow_cmd(&args),
         Commands::Query(args) => commands::query(&args),
         Commands::Export(args) => commands::export(&args),
         Commands::Schema(args) => commands::schema(&args),

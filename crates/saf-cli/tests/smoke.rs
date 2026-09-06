@@ -809,11 +809,14 @@ fn verify_overflow_guarded_is_false() {
     verify_overflow("overflow_false_guarded.c", "LP64").stdout("false(no-overflow)\n");
 }
 
-/// A safe program: UBSan never traps -> `unknown` (never `true`, never a false alarm).
+/// A safe, PROVABLE program: rank-2 sound no-overflow TRUE — the interval sentinel
+/// proves every reachable signed op in-bounds (the guard bounds `x` to [1,99]
+/// before `x+1`), and the emitted witness is confirmed in-process by real
+/// CPAchecker -> `true`. (Before rank 2 this was `unknown`.)
 #[test]
 #[ignore]
-fn verify_overflow_safe_is_unknown() {
-    verify_overflow("overflow_true_safe.c", "LP64").stdout("unknown\n");
+fn verify_overflow_safe_provable_is_true() {
+    verify_overflow("overflow_true_safe.c", "LP64").stdout("true\n");
 }
 
 /// A confirmed overflow FALSE writes a YAML 2.0 violation witness whose target is the
@@ -833,17 +836,26 @@ fn verify_overflow_false_writes_witness() {
     );
 }
 
-/// A safe program writes NO witness (the verdict is `unknown`).
+/// A rank-2 no-overflow TRUE writes a YAML-2.0 `invariant_set` CORRECTNESS witness
+/// (the artifact CPAchecker confirmed in-process before the verdict was emitted).
 #[test]
 #[ignore]
-fn verify_overflow_safe_writes_no_witness() {
+fn verify_overflow_true_writes_correctness_witness() {
     let dir = tempfile::tempdir().unwrap();
     let w = dir.path().join("w.yml");
-    verify_overflow_witness("overflow_true_safe.c", "LP64", &w).stdout("unknown\n");
-    assert!(
-        !w.exists(),
-        "no witness may be written for an unknown verdict"
-    );
+    verify_overflow_witness("overflow_true_safe.c", "LP64", &w).stdout("true\n");
+    let yaml = std::fs::read_to_string(&w).expect("correctness witness written for a true verdict");
+    assert!(yaml.contains("entry_type: invariant_set"), "{yaml}");
+}
+
+/// SOUNDNESS REGRESSION (wrong-TRUE=0): a COMPILE-TIME constant overflow that clang
+/// folds away (no IR arithmetic for the sentinel to see) must NEVER yield `true`.
+/// The TRUE arm abstains (the `-Winteger-overflow` probe fires, and the CPAchecker
+/// gate would reject anyway); the UBSan FALSE path then confirms the overflow.
+#[test]
+#[ignore]
+fn verify_overflow_constant_fold_is_not_true() {
+    verify_overflow("overflow_false_constfold.c", "LP64").stdout("false(no-overflow)\n");
 }
 
 /// The overflow witness is byte-identical across re-runs (NFR-DET determinism).
