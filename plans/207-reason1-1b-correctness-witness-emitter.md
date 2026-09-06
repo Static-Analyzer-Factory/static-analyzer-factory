@@ -108,6 +108,15 @@ TDD:
 2. **End-to-end milestone (definition of done):** SAF's own absint → `emit-correctness-witness` → CPAchecker `TRUE` on `spike_counter.c` (`0<=i<=1000000`) and `const.c` (`s==0`), reproduced. Regression test asserts a well-formed, self-validated witness (CPAchecker step runs on the VM, not in `cargo test`).
 3. **Measurement:** run the emitter + offline confirmation over the Slice-0 loops sample; report name-recovery %, emit %, and CPAchecker-confirmation % (feeds the ranks-2/3 ceiling estimate).
 
+## 4a. Slice 2 implementation notes (APIs locked 2026-09-06 on HEAD `e8a2cd76`)
+
+- Driver lives in `saf-svcomp` (it already deps `saf-analysis` with `z3-solver`+`analysis-mta`).
+- Read-out: `saf_analysis::absint::{solve_abstract_interp, detect_loop_headers, Interval}`, `saf_analysis::cfg::Cfg::build(func)`, `result.invariants_at_block(block.id) -> BTreeMap<ValueId, Interval>`, `result.diagnostics().converged`.
+- `Interval::{lo(),hi(),bits()}` are pub; `is_top()/is_bottom()` are PRIVATE — do NOT call them; rely on `interval_to_c_expr` returning `None` for top/empty (loop headers are reachable, never ⊥).
+- Naming: `saf_analysis::display::DisplayResolver::from_module(&module)`, `resolver.resolve(vid.raw()) -> HumanLabel { short_name, source_loc, containing_function }`. Every `*Id` has `.raw() -> u128`. Keep only vars whose `short_name` is a C identifier (reject `%<hex>`).
+- Location: header LINE from the header block's first spanned instruction (phis carry NO span post-mem2reg; the guard `icmp`/`br` do — verified in 1a). Basename+line via `saf_svcomp::span_to_location(module, &span)`; COLUMN = leftmost-non-ws of that source line (read source text) — NOT the dbg column. `Span{file_id, line_start, col_start}` pub in saf-core.
+- Function-call-guard abstain (heuristic): skip a loop whose header block contains any `Operation::Call{..}|CallIndirect{..}` (covers `while(nondet())`; over-abstaining is safe). One conjoined invariant per header (BTreeMap order = deterministic).
+
 ## 5. Soundness redlines (built now; 1b emits no verdict, so these protect ranks 2/3)
 
 - **Converged gate:** never build an invariant unless `diagnostics().converged==true` (fail-closed).
@@ -138,6 +147,12 @@ TDD:
 - `parse_dbg_value` (old- + new-style) + shared `extract_reg_and_meta` helper added to `debug_info.rs`; `extract_local_variable_names` now ingests `dbg.value`; `parse_dbg_declare` refactored onto the shared helper (−~64 LOC dup). mapping.rs symbol-attachment extended from Alloca-only to `Alloca | Phi`.
 - Tests: 5 new unit tests (parse_dbg_value old/new/constant-skip/named + extract-from-dbg.value) — `debug_info` module 23/23 green; new e2e `dbg_value_naming_e2e` (mem2reg'd fixture `dbgvalue_promoted_phi`) green. Full regression: **saf-frontends + saf-analysis 1815/1815 pass**, clippy `-D warnings` clean, fmt clean.
 - **Measurement gate:** over 138 ingested mem2reg'd `-g` programs from `c/loops` + `c/loop-invariants` + `c/loop-simple` + `c/loop-acceleration`, **loop-head phis named = 375/375 = 100.0%** (loop-header blocks with a named phi 253/253; programs all-named 120/120). Explanation: at `-O0 + mem2reg` clang emits `dbg.value` for every promoted local, so there are no anonymous loop-carried phis (the "optimized-out dbg.value" risk is `-O2+`, not the `saf verify` regime). Throwaway harness deleted post-measurement; the `dbg_value_naming_e2e` test is the permanent regression.
+
+## 8b. Slice 2 result + ⚠️ absint BLOCKER finding (2026-09-06)
+
+- **Driver built + green** (`saf-svcomp/src/correctness_driver.rs`): `build_interval_invariant_witness` honors all §5 gates (OpenMP abstain, convergence gate, function-call-guard abstain, named-var-only via an `inst.symbol`/`param.name` map, first-non-phi read point, leftmost-non-ws column, skip null spans, drop-empty self-validation). Fixed 3 real driver bugs found by measurement: (1) block-entry state is empty → read `invariants_at_inst` at the first non-phi; (2) `DisplayResolver` returns `%`-prefixed names + hex temps → use bare symbol names; (3) promoted phis carry null (line-0) spans → skip them. Driver e2e green; saf-svcomp 442/442, saf-cli 50/50, clippy/fmt clean. Still library-only; `saf verify` untouched.
+
+- **⚠️ MEASURED BLOCKER (changes the Slice-3 outcome):** across `spike_counter`, `linear-inequality-inv-a`, `dbgvalue_promoted_phi`, SAF's absint gives every **named** loop variable `[0,0]` (its entry value) at the loop head — `i=[0,0]`, `s=[0,0]`, `v=[0,0]` — while widening (which DOES fire: `widening=2`) lands only on **anonymous** derived SSA values (and for `spike_counter` those reach `i64::MAX`, not the tight `[0,1000000]`). So the emitter renders imprecise invariants (`i == 0` for a counting loop) that CPAchecker will refute. The **witness pipeline is correct** (1a confirmed hand-authored witnesses); the bottleneck is **absint loop-invariant precision/representation on named variables** — the named phi holds the entry value, not the iterated range. This must be understood (incl. a soundness audit: is `[0,0]` on the phi unsound, or a value-numbering split?) before ranks 2/3 can read loop invariants. Separate, larger work item; out of 1b's emitter scope.
 
 ## 8. Acceptance criteria
 

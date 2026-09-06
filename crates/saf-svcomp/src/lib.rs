@@ -20,6 +20,7 @@ pub mod cbmc;
 pub mod conc_replay;
 pub mod conc_seq;
 pub mod conc_shim;
+pub mod correctness_driver;
 pub mod correctness_witness;
 pub mod fast_paths;
 pub mod fuzz;
@@ -53,6 +54,7 @@ pub use conc_shim::{
     SHIM_CBOUND, SHIM_MAX_STEP, ShimPlan, conc_shim_schedulable, shim_preemption_plans,
     synthesize_conc_shim_driver,
 };
+pub use correctness_driver::{build_interval_invariant_witness, source_has_openmp};
 pub use correctness_witness::{InvariantSetWitness, SourceInvariant, interval_to_c_expr};
 pub use memsafety::{
     AsanHit, asan_class_to_subproperty, lower_memsafety_hit, memsafety_verdict, parse_asan_report,
