@@ -354,6 +354,10 @@ pub enum Commands {
     Run(RunArgs),
     /// Verify a C program against an SV-COMP property (blind; prints `true`/`false(p)`/`unknown`).
     Verify(VerifyArgs),
+    /// [dev] Emit a YAML-2.0 correctness (`invariant_set`) witness from SAF's
+    /// converged interval fixpoint for offline `CPAchecker` confirmation (plan
+    /// 207 / 1b). Prints NO verdict and is NOT wired into `verify`.
+    EmitCorrectnessWitness(EmitCorrectnessWitnessArgs),
     /// Query analysis results.
     Query(QueryArgs),
     /// Export graphs or findings.
@@ -410,6 +414,25 @@ pub struct VerifyArgs {
 
     /// Optional full machine-readable report (JSON) to a file; stdout stays verdict-only.
     #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+/// Arguments for `saf emit-correctness-witness` — the dev-only correctness-witness
+/// emitter (plan 207 / 1b). Compiles + ingests like `verify`, runs the interval
+/// fixpoint, and writes an `invariant_set` witness (or reports an abstain). Emits
+/// no verdict and never touches the competition `verify` path.
+#[derive(Args)]
+pub struct EmitCorrectnessWitnessArgs {
+    /// The C program (`.c` or preprocessed `.i`).
+    #[arg(required = true)]
+    pub input: PathBuf,
+
+    /// Data model; selects clang `-m32`/`-m64` and the LLVM target.
+    #[arg(long, value_enum, default_value_t = CliDataModel::Ilp32)]
+    pub data_model: CliDataModel,
+
+    /// Where to write the witness (YAML 2.0). Stdout if omitted.
+    #[arg(long, short = 'o')]
     pub output: Option<PathBuf>,
 }
 
@@ -869,6 +892,50 @@ pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
         }
     }
     println!("{}", outcome.verdict);
+    Ok(())
+}
+
+/// `saf emit-correctness-witness` (dev, plan 207 / 1b): compile → ingest → run the
+/// interval fixpoint → emit an `invariant_set` correctness witness for offline
+/// `CPAchecker` confirmation. Emits NO verdict and never touches `strategy_for`
+/// / the `verify` write-gate — the competition surface is untouched.
+///
+/// # Errors
+/// Returns `Err` if the stub header is missing, or compilation / ingestion fails.
+pub fn emit_correctness_witness(args: &EmitCorrectnessWitnessArgs) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let data_model: saf_svcomp::DataModel = args.data_model.into();
+    let stub = resolve_svcomp_stub()
+        .context("bundled SV-COMP stub header (share/saf/stubs/sv-comp-stubs.h) not found")?;
+    let dir = tempfile::tempdir().context("create tempdir")?;
+    let ir =
+        compile_to_ir(&args.input, data_model, &stub, dir.path()).context("compile to LLVM IR")?;
+    let bundle = driver::AnalysisDriver::ingest(&[ir], CliFrontend::Llvm).context("ingest IR")?;
+    let source = std::fs::read_to_string(&args.input).unwrap_or_default();
+    let meta = saf_svcomp::WitnessMeta {
+        producer_version: env!("CARGO_PKG_VERSION").to_string(),
+        // The unreach-call spec (1b's target property); ranks 2/3 parameterize this.
+        specification: "G ! call(reach_error())".to_string(),
+        data_model,
+        language: saf_svcomp::Language::C,
+        input_file: args.input.clone(),
+    };
+    match saf_svcomp::build_interval_invariant_witness(&bundle.module, &source, &meta) {
+        Some(witness) => {
+            let yaml = witness.to_yaml_string().context("serialize witness")?;
+            match &args.output {
+                Some(path) => {
+                    std::fs::write(path, &yaml)
+                        .with_context(|| format!("write {}", path.display()))?;
+                    eprintln!("emit-correctness-witness: wrote {}", path.display());
+                }
+                None => print!("{yaml}"),
+            }
+        }
+        None => eprintln!(
+            "emit-correctness-witness: abstained (no converged, named, non-trivial loop-head invariant)"
+        ),
+    }
     Ok(())
 }
 
