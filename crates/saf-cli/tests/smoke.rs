@@ -271,6 +271,42 @@ fn verify_true_simple_is_unknown() {
     verify_unreach("unreach_true_simple.c").stdout("unknown\n");
 }
 
+/// Rank-3 sound TRUE (END-TO-END MILESTONE): `x > 0 && x < 0` is a contradiction
+/// over a nondet value, so the interval sentinel proves the `reach_error` block ⊥
+/// and the in-process CPAchecker confirmation gate agrees → `saf verify` emits
+/// `true` and writes an `invariant_set` correctness witness. (The guards are over a
+/// nondet value, so they survive as real `icmp`s the interval refinement can prune,
+/// unlike a constant-folded `if (0)`.)
+#[test]
+#[ignore]
+fn verify_unreach_true_infeasible() {
+    verify_unreach("unreach_true_infeasible.c").stdout("true\n");
+}
+
+/// Rank-3 wrong-TRUE guard (soundness): `signextension-1` is a genuine FALSE task
+/// the interval sentinel WRONGLY proves (it cannot model the sign/unsigned
+/// conversions that satisfy the error guard), but the in-process CPAchecker gate
+/// REJECTS it, so `saf verify` must NOT emit `true` — it falls through to the FALSE
+/// pipeline. ILP32 (the task's declared data model).
+#[test]
+#[ignore]
+fn verify_unreach_wrongprove_is_not_true() {
+    let prp = unreach_prp();
+    let fx = svcomp_fixture("unreach_false_signext.c");
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.as_str(),
+            "--data-model",
+            "ILP32",
+            fx.as_str(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("true").not());
+}
+
 /// `__VERIFIER_assume(x == 0)` makes the `x != 0` error path infeasible — must
 /// NOT be a false alarm. The verdict is `unknown` (never `false`).
 #[test]

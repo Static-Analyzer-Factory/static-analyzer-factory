@@ -465,6 +465,128 @@ pub fn reach_error_call_sites(module: &AirModule) -> Vec<InstId> {
     sites
 }
 
+/// Verdict of the sound error-unreachability prover (rank-3 spike): `Proven` ONLY
+/// if EVERY `reach_error`/`__VERIFIER_error` call site sits in a block the CONVERGED
+/// interval fixpoint proved unreachable (⊥), each in a function that was actually
+/// analyzed. Any non-converged fixpoint, un-analyzed function, reachable error
+/// block, or absent error site ⇒ `Abstain`. Fail-closed: **absence is NEVER read as
+/// unreachability** (an absent block means "not analyzed", not "dead").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnreachProof {
+    /// Every error call site is provably unreachable over the converged solution.
+    Proven,
+    /// Could not prove unreachability; carries a short machine reason tag.
+    Abstain(String),
+}
+
+/// Cost guards for the rank-3 unreach-call TRUE attempt. The interval fixpoint blows
+/// up in BOTH time and MEMORY on programs that dominate the unreach pool but are
+/// never interval-provable: giant reactive/driver CFGs (`eca-rers`, `ldv-linux`,
+/// huge CIL) have many BLOCKS, while dense bit-level models
+/// (`hardware-verification-bv` btor2c) have few blocks but a huge INSTRUCTION/value
+/// count that made a single `saf verify` reach 16 GB RSS and OOM-kill the eval
+/// container. `prove_unreachable` abstains BEFORE the solve when EITHER bound is
+/// exceeded, so the (budget-bound) FALSE path is unaffected and the absint never
+/// OOMs. Spike: every proved task was tiny (≤17 defined instructions for the
+/// loop-free proves, ≤~1600 source lines overall). Purely a cost heuristic —
+/// skipping only ever forgoes a TRUE attempt, never affects soundness or the FALSE
+/// verdict.
+const UNREACH_TRUE_MAX_BLOCKS: usize = 5000;
+const UNREACH_TRUE_MAX_INSTS: usize = 20_000;
+
+/// Total number of basic blocks across all DEFINED functions of `module`.
+#[must_use]
+fn defined_block_count(module: &AirModule) -> usize {
+    module
+        .functions
+        .iter()
+        .filter(|f| !f.is_declaration)
+        .map(|f| f.blocks.len())
+        .sum()
+}
+
+/// Total number of instructions across all DEFINED functions of `module` (the
+/// interval fixpoint's memory scales with this — the block count alone misses the
+/// dense few-block bit-level models that OOM the absint).
+#[must_use]
+fn defined_inst_count(module: &AirModule) -> usize {
+    module
+        .functions
+        .iter()
+        .filter(|f| !f.is_declaration)
+        .flat_map(|f| f.blocks.iter())
+        .map(|b| b.instructions.len())
+        .sum()
+}
+
+/// Prove (fail-closed) that no `reach_error` call is reachable, over the converged
+/// interval fixpoint. Uses the SOUND read-out rule: an error site is dead iff its
+/// containing block is PRESENT in the solution AND `is_unreachable()` (⊥). SAF's
+/// per-function analysis starts every function from a ⊤ entry, which over-
+/// approximates every concrete call context, so a ⊥ error block is unreachable in
+/// the whole program regardless of how the function is called. Property-level gates
+/// (OpenMP source text, reachable thread spawn) are the caller's responsibility.
+///
+/// NOTE (rank-3): the sentinel is a FILTER; a wrong `Proven` from an absint
+/// unsoundness bug is caught downstream by the in-process CPAchecker confirmation
+/// gate (the FINAL verdict authority). This function emits no verdict.
+#[must_use]
+pub fn prove_unreachable(module: &AirModule) -> UnreachProof {
+    // Cost guard (fail-closed to Abstain): skip the expensive solve on giant / dense
+    // programs that are never interval-provable, protecting the FALSE path's budget
+    // AND keeping the absint's memory bounded (it reached 16 GB on btor2c models).
+    if defined_block_count(module) > UNREACH_TRUE_MAX_BLOCKS
+        || defined_inst_count(module) > UNREACH_TRUE_MAX_INSTS
+    {
+        return UnreachProof::Abstain("module-too-large".to_string());
+    }
+    let result =
+        saf_analysis::absint::solve_abstract_interp(module, &AbstractInterpConfig::default());
+    // Convergence gate (fail-closed): only trust the converged solution — a mid-
+    // ascent worklist abandon (iteration cap) can leave reachable blocks ⊥/absent.
+    if !result.diagnostics().converged {
+        return UnreachProof::Abstain("not-converged".to_string());
+    }
+    // Enumerate every located error call site (func, block, inst), deterministically.
+    let mut sites: Vec<(FunctionId, BlockId, InstId)> = Vec::new();
+    for name in REACH_ERROR_NAMES {
+        sites.extend(find_calls_to(module, name));
+    }
+    // Fail-closed: no located error site ⇒ we cannot prove anything (a finder gap
+    // or an unrecognized error mechanism). NEVER read "no error found" as TRUE (the
+    // dead `analyze_unreachability` fast-path did exactly that, unsoundly).
+    if sites.is_empty() {
+        return UnreachProof::Abstain("no-error-site".to_string());
+    }
+    for (func_id, block_id, inst_id) in sites {
+        // (1) function-analyzed guard: the error's function must have been analyzed
+        //     — its entry block PRESENT and reachable (non-⊥). Absence ⇒ the function
+        //     was skipped (declaration/empty body) ⇒ absence != unreachable.
+        let Some(entry) = get_entry_block(module, func_id) else {
+            return UnreachProof::Abstain("no-entry-block".to_string());
+        };
+        match result.state_at_block(entry) {
+            None => return UnreachProof::Abstain("func-not-analyzed".to_string()),
+            Some(s) if s.is_unreachable() => {
+                return UnreachProof::Abstain("entry-bottom".to_string());
+            }
+            Some(_) => {}
+        }
+        // (2) the SOUND unreachability rule: the error's block must be PRESENT and ⊥.
+        //     Also accept an in-block ⊥ at the error instruction itself (a preceding
+        //     guard proved the path dead). A reachable, non-⊥ error block/inst ⇒
+        //     cannot prove TRUE ⇒ abstain.
+        let Some(bs) = result.state_at_block(block_id) else {
+            return UnreachProof::Abstain("error-block-absent".to_string());
+        };
+        let inst_dead = matches!(result.state_at_inst(inst_id), Some(s) if s.is_unreachable());
+        if !bs.is_unreachable() && !inst_dead {
+            return UnreachProof::Abstain("error-reachable".to_string());
+        }
+    }
+    UnreachProof::Proven
+}
+
 /// Get the entry block of a function.
 fn get_entry_block(module: &AirModule, func_id: FunctionId) -> Option<BlockId> {
     module
@@ -2587,6 +2709,206 @@ mod must_reach_tests {
         m.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
         m.functions.push(decl(err_id, "reach_error"));
         assert!(must_reach_error(&m).is_some());
+    }
+}
+
+#[cfg(test)]
+mod prove_unreachable_tests {
+    //! Rank-3 read-out core (`prove_unreachable`) — the SOUND rule (error block
+    //! PRESENT and ⊥, never absence) + fail-closed gates. The full PROVE→confirm
+    //! pipeline (incl. the wrong-TRUE class the interval absint gets wrong) is
+    //! covered by the in-process-CPAchecker e2e in `saf-cli/tests/smoke.rs`.
+    use super::*;
+    use saf_core::air::{AirBlock, AirFunction, BinaryOp, Constant, Instruction};
+    use saf_core::ids::ModuleId;
+
+    fn decl(id: FunctionId, name: &str) -> AirFunction {
+        AirFunction {
+            id,
+            name: name.into(),
+            params: vec![],
+            blocks: vec![],
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    fn func(id: FunctionId, name: &str, blocks: Vec<AirBlock>, entry: BlockId) -> AirFunction {
+        AirFunction {
+            id,
+            name: name.into(),
+            params: vec![],
+            blocks,
+            entry_block: Some(entry),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        }
+    }
+
+    fn blk(id: BlockId, instructions: Vec<Instruction>) -> AirBlock {
+        AirBlock {
+            id,
+            label: None,
+            instructions,
+        }
+    }
+
+    fn call(iid: u128, callee: FunctionId) -> Instruction {
+        Instruction::new(InstId::new(iid), Operation::CallDirect { callee })
+    }
+
+    fn ret(iid: u128) -> Instruction {
+        Instruction::new(InstId::new(iid), Operation::Ret)
+    }
+
+    /// `main() { return; }` with no `reach_error` anywhere ⇒ fail-closed
+    /// `Abstain("no-error-site")` (NEVER PROVEN — the dead `analyze_unreachability`
+    /// fast-path used to (unsoundly) call this TRUE).
+    #[test]
+    fn no_error_site_abstains() {
+        let main_id = FunctionId::new(1);
+        let entry = BlockId::new(10);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions
+            .push(func(main_id, "main", vec![blk(entry, vec![ret(1)])], entry));
+        assert_eq!(
+            prove_unreachable(&m),
+            UnreachProof::Abstain("no-error-site".to_string())
+        );
+    }
+
+    /// `main() { reach_error(); }` — the error block is plainly reachable (non-⊥)
+    /// ⇒ `Abstain("error-reachable")` (the sound rule cannot prove it dead).
+    #[test]
+    fn unconditional_reachable_error_abstains() {
+        let (main_id, err_id) = (FunctionId::new(1), FunctionId::new(2));
+        let entry = BlockId::new(10);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(entry, vec![call(1, err_id), ret(2)])],
+            entry,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert_eq!(
+            prove_unreachable(&m),
+            UnreachProof::Abstain("error-reachable".to_string())
+        );
+    }
+
+    /// `main() { if (5 == 7) reach_error(); }` — the guard compares two DISTINCT
+    /// constants, so the interval fixpoint refines the then-edge to ⊥ (`refine_eq_true`
+    /// meets `[5,5]` with `[7,7]`) and the `reach_error` block is PRESENT-and-
+    /// `is_unreachable()` ⇒ `Proven` (the SOUND rule fires). NB a same-operand guard
+    /// like `x != x` is NOT provable — the interval domain can't refine one value.
+    #[test]
+    fn dead_guarded_error_is_proven() {
+        let (main_id, err_id) = (FunctionId::new(1), FunctionId::new(2));
+        let (entry, err_blk, exit) = (BlockId::new(10), BlockId::new(11), BlockId::new(12));
+        let (five, seven, cond) = (ValueId::new(100), ValueId::new(101), ValueId::new(102));
+        let e = blk(
+            entry,
+            vec![
+                Instruction::new(
+                    InstId::new(1),
+                    Operation::BinaryOp {
+                        kind: BinaryOp::ICmpEq,
+                    },
+                )
+                .with_operands(vec![five, seven])
+                .with_dst(cond),
+                Instruction::new(
+                    InstId::new(2),
+                    Operation::CondBr {
+                        then_target: err_blk,
+                        else_target: exit,
+                    },
+                )
+                .with_operands(vec![cond]),
+            ],
+        );
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.constants
+            .insert(five, Constant::Int { value: 5, bits: 32 });
+        m.constants
+            .insert(seven, Constant::Int { value: 7, bits: 32 });
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![
+                e,
+                blk(err_blk, vec![call(3, err_id), ret(4)]),
+                blk(exit, vec![ret(5)]),
+            ],
+            entry,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert_eq!(prove_unreachable(&m), UnreachProof::Proven);
+    }
+
+    /// A module above the block-count cost guard abstains BEFORE the solve, so the
+    /// (budget-bound) FALSE path is never starved on giant reactive/driver programs.
+    #[test]
+    fn oversized_module_abstains() {
+        let main_id = FunctionId::new(1);
+        let n = UNREACH_TRUE_MAX_BLOCKS + 1;
+        let blocks: Vec<AirBlock> = (0..n)
+            .map(|i| {
+                blk(
+                    BlockId::new(u128::try_from(i + 10).unwrap()),
+                    vec![ret(u128::try_from(i + 1).unwrap())],
+                )
+            })
+            .collect();
+        let entry = blocks[0].id;
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(func(main_id, "main", blocks, entry));
+        assert_eq!(
+            prove_unreachable(&m),
+            UnreachProof::Abstain("module-too-large".to_string())
+        );
+        assert!(defined_block_count(&m) > UNREACH_TRUE_MAX_BLOCKS);
+    }
+
+    /// A FEW-block but DENSE (high instruction count) module also abstains before the
+    /// solve — this is the `hardware-verification-bv` btor2c class the block-count
+    /// guard alone missed (few blocks, huge bit-level instruction/value count → the
+    /// absint reached 16 GB and OOM-killed the eval container).
+    #[test]
+    fn dense_module_abstains() {
+        let main_id = FunctionId::new(1);
+        let entry = BlockId::new(10);
+        let n = UNREACH_TRUE_MAX_INSTS + 1;
+        let insts: Vec<Instruction> = (0..n)
+            .map(|i| ret(u128::try_from(i + 1).unwrap()))
+            .collect();
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions
+            .push(func(main_id, "main", vec![blk(entry, insts)], entry));
+        assert!(defined_block_count(&m) <= UNREACH_TRUE_MAX_BLOCKS);
+        assert!(defined_inst_count(&m) > UNREACH_TRUE_MAX_INSTS);
+        assert_eq!(
+            prove_unreachable(&m),
+            UnreachProof::Abstain("module-too-large".to_string())
+        );
+    }
+
+    /// `defined_block_count` counts only DEFINED-function blocks (declarations = 0).
+    #[test]
+    fn block_count_ignores_declarations() {
+        let (main_id, err_id) = (FunctionId::new(1), FunctionId::new(2));
+        let entry = BlockId::new(10);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions
+            .push(func(main_id, "main", vec![blk(entry, vec![ret(1)])], entry));
+        m.functions.push(decl(err_id, "reach_error"));
+        assert_eq!(defined_block_count(&m), 1);
     }
 }
 
