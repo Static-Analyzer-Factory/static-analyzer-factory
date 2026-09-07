@@ -362,6 +362,10 @@ pub enum Commands {
     /// interval fixpoint; print `PROVE` or `ABSTAIN:<reason>`. Emits NO verdict
     /// and is NOT wired into `verify` (rank-2 measurement only).
     ProveNoOverflow(ProveNoOverflowArgs),
+    /// [dev/spike] Run the sound error-unreachability sentinel over the converged
+    /// interval fixpoint; print `PROVE` or `ABSTAIN:<reason>`. Emits NO verdict
+    /// and is NOT wired into `verify` (rank-3 measurement only).
+    ProveUnreachable(ProveUnreachableArgs),
     /// Query analysis results.
     Query(QueryArgs),
     /// Export graphs or findings.
@@ -446,6 +450,21 @@ pub struct EmitCorrectnessWitnessArgs {
 /// verdict and never touches the competition `verify` path.
 #[derive(Args)]
 pub struct ProveNoOverflowArgs {
+    /// The C program (`.c` or preprocessed `.i`).
+    #[arg(required = true)]
+    pub input: PathBuf,
+
+    /// Data model; selects clang `-m32`/`-m64` and the LLVM target.
+    #[arg(long, value_enum, default_value_t = CliDataModel::Ilp32)]
+    pub data_model: CliDataModel,
+}
+
+/// Arguments for `saf prove-unreachable` — the rank-3 throwaway measurement
+/// subcommand (clone of `prove-no-overflow`). Compiles + ingests like `verify`,
+/// then runs the sound error-unreachability sentinel. Prints `PROVE` /
+/// `ABSTAIN:<reason>`; emits no verdict and never touches the `verify` path.
+#[derive(Args)]
+pub struct ProveUnreachableArgs {
     /// The C program (`.c` or preprocessed `.i`).
     #[arg(required = true)]
     pub input: PathBuf,
@@ -1019,6 +1038,44 @@ pub fn prove_no_overflow_cmd(args: &ProveNoOverflowArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `saf prove-unreachable` (dev/spike, rank-3): compile → ingest → apply the
+/// property-level fail-closed gates (OpenMP source text; reachable thread spawn)
+/// → run the sound error-unreachability sentinel over the converged interval
+/// fixpoint. Prints exactly one line: `PROVE` or `ABSTAIN:<reason>`. Emits NO
+/// verdict; `strategy_for` / `verify` / the witness write-gate are untouched.
+///
+/// # Errors
+/// Returns `Err` if the stub header is missing, or compilation / ingestion fails.
+pub fn prove_unreachable_cmd(args: &ProveUnreachableArgs) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let data_model: saf_svcomp::DataModel = args.data_model.into();
+    let stub = resolve_svcomp_stub()
+        .context("bundled SV-COMP stub header (share/saf/stubs/sv-comp-stubs.h) not found")?;
+    let dir = tempfile::tempdir().context("create tempdir")?;
+    let ir =
+        compile_to_ir(&args.input, data_model, &stub, dir.path()).context("compile to LLVM IR")?;
+    let bundle = driver::AnalysisDriver::ingest(&[ir], CliFrontend::Llvm).context("ingest IR")?;
+    let source = std::fs::read_to_string(&args.input).unwrap_or_default();
+
+    // Property-level fail-closed gates (the AIR can't see OpenMP; a reachable
+    // thread spawn makes a sequential interval proof unsound).
+    if saf_svcomp::source_has_openmp(&source) {
+        println!("ABSTAIN:openmp");
+        return Ok(());
+    }
+    let callgraph = saf_analysis::callgraph::CallGraph::build(&bundle.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(&bundle.module, &callgraph) {
+        println!("ABSTAIN:threads");
+        return Ok(());
+    }
+
+    match saf_svcomp::prove_unreachable(&bundle.module) {
+        saf_svcomp::UnreachProof::Proven => println!("PROVE"),
+        saf_svcomp::UnreachProof::Abstain(reason) => println!("ABSTAIN:{reason}"),
+    }
+    Ok(())
+}
+
 /// Clang / opt binaries matching the LLVM this binary links against, overridable
 /// via `$SAF_CLANG` / `$SAF_OPT`.
 #[cfg(feature = "llvm-22")]
@@ -1551,17 +1608,30 @@ fn cbmc_confirm(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
 /// The `unreach-call` FALSE pipeline (plan 192 §1.6 / slice 1c), now emitting a
 /// violation witness alongside each sound FALSE.
 ///
-/// Soundness (unchanged): emit `false` only when `reach_error` is UNCONDITIONALLY
-/// reachable (Stage 1, `must_reach_error`) or a concrete native replay reaches it
-/// (Stage 2/3). Never emits `true`. The witness is a *side output* of an
-/// already-sound verdict — a `false` is still returned when the witness cannot be
-/// constructed (e.g. a missing span), it just scores 0 like `unknown`.
+/// Soundness (FALSE, unchanged): emit `false` only when `reach_error` is
+/// UNCONDITIONALLY reachable (Stage 1, `must_reach_error`) or a concrete native
+/// replay reaches it (Stage 2/3). The witness is a *side output* of an already-sound
+/// verdict — a `false` is still returned when the witness cannot be constructed (e.g.
+/// a missing span), it just scores 0 like `unknown`.
+///
+/// Rank-3 (TRUE-first): before the FALSE pipeline, attempt a sound `unreach-call`
+/// TRUE via [`try_unreach_true`] — a cost-guarded, fail-closed interval
+/// error-block-⊥ proof gated on in-process `CPAchecker` confirmation. It emits `true`
+/// ONLY on a confirmed proof, else returns `None` and the (unchanged) FALSE pipeline
+/// runs. The TRUE authority is STRICTLY separate from the FALSE authority.
 // NOTE: staged unreach-call strategy (Stage 1 must-reach → Stage 2/3 replay) kept
 // as one cohesive unit; splitting the stages across helpers would obscure the
 // fail-closed control flow.
 #[allow(clippy::too_many_lines)]
 fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     use saf_svcomp::Property;
+
+    // Rank-3 sound TRUE (fail-closed to the FALSE path on any doubt): a
+    // CPAchecker-confirmed error-unreachability proof. Cost-guarded + cheap-gated so
+    // it never starves the FALSE path (SAF's core recall) on giant programs.
+    if let Some(outcome) = try_unreach_true(ctx) {
+        return outcome;
+    }
 
     // Stage 1 (sound, cheap): reach_error UNCONDITIONALLY reached.
     if let Some(chain) = saf_svcomp::must_reach_error(ctx.module) {
@@ -5180,6 +5250,113 @@ fn try_overflow_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     std::fs::write(&witness_path, &yaml).ok()?;
     // FINAL GATE: real CPAchecker overflow-witness validation (fail-closed).
     if !cpachecker_confirms_no_overflow(ctx, &witness_path) {
+        return None;
+    }
+    Some(VerdictOutcome {
+        verdict: "true".to_string(),
+        witness: None,
+        graphml: None,
+        correctness: Some(witness),
+    })
+}
+
+/// Run real `CPAchecker`'s GENERIC correctness-witness validation on `witness_path`
+/// against `ctx.input`, in process. `true` iff `CPAchecker`'s raw verdict is
+/// `Verification result: TRUE`. Fail-closed: `CPAchecker` absent / errored / any
+/// non-TRUE verdict (`FALSE`/`UNKNOWN`/timeout) ⇒ `false` ⇒ the caller abstains.
+/// This is the rank-3 SOUNDNESS gate — the interval error-block-⊥ sentinel is only a
+/// FILTER; `CPAchecker` (an SV-COMP reference verifier) has the final say on `true`.
+/// Uses the GENERIC `correctness-witness-validation.properties` config (NOT the
+/// `--overflow` one) + the raw unreach-call `.prp` (`ctx.meta.specification`).
+fn cpachecker_confirms_unreach(ctx: &VerifyCtx, witness_path: &Path) -> bool {
+    use std::process::{Command, Stdio};
+    let Some(cpa) = resolve_cpachecker() else {
+        eprintln!(
+            "saf verify: CPAchecker not found (set SAF_CPACHECKER) -> unreach-call TRUE abstains"
+        );
+        return false;
+    };
+    let config = cpa.join("config/correctness-witness-validation.properties");
+    let bit = match ctx.data_model {
+        saf_svcomp::DataModel::ILP32 => "--32",
+        saf_svcomp::DataModel::LP64 => "--64",
+    };
+    // `ctx.meta.specification` is the raw unreach-call `.prp` text; write it for --spec.
+    let prp = ctx.tempdir.join("saf_unreach_spec.prp");
+    if std::fs::write(&prp, &ctx.meta.specification).is_err() {
+        return false;
+    }
+    let out_dir = ctx.tempdir.join("saf_cpa_confirm_unreach");
+    match Command::new(cpa.join("bin/cpachecker"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--witness")
+        .arg(witness_path)
+        .arg("--spec")
+        .arg(&prp)
+        .arg(bit)
+        .arg("--option")
+        .arg("witness.checkProgramHash=false")
+        .arg("--timelimit")
+        .arg("150s")
+        .arg("--output-path")
+        .arg(&out_dir)
+        .arg(ctx.input)
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            s.contains("Verification result: TRUE")
+        }
+        Err(e) => {
+            eprintln!(
+                "saf verify: CPAchecker invocation failed: {e} -> unreach-call TRUE abstains"
+            );
+            false
+        }
+    }
+}
+
+/// Rank-3 sound `unreach-call` TRUE attempt: propose (sound interval error-block-⊥
+/// sentinel, cost-guarded) → emit an `invariant_set` witness (SAF's loop invariants
+/// when renderable, else empty — `CPAchecker` re-proves) → CONFIRM in process with
+/// real `CPAchecker` (GENERIC correctness config). Returns `Some(true + correctness
+/// witness)` ONLY on a `CPAchecker`-confirmed proof; `None` to fall through to the
+/// EXISTING FALSE path. NEVER emits `false`. Every gate is fail-closed; the TRUE
+/// authority (sound absint + `CPAchecker`) is STRICTLY separate from the FALSE
+/// authority (must-reach / native replay).
+fn try_unreach_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    let source = std::fs::read_to_string(ctx.input).ok()?;
+    // (1) OpenMP: the frontend drops `#pragma omp`, so the AIR loses parallelism.
+    if saf_svcomp::source_has_openmp(&source) {
+        return None;
+    }
+    // (2) Reachable thread spawn: a sequential interval proof is unsound under
+    //     concurrency (the same gate the FALSE path uses below).
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        return None;
+    }
+    // Sentinel (cost-guarded internally): prove EVERY reach_error site's block is ⊥
+    // over the converged interval solution (fail-closed on any doubt / oversized
+    // module — the giant eca/ldv programs that would starve the FALSE path).
+    if !matches!(
+        saf_svcomp::prove_unreachable(ctx.module),
+        saf_svcomp::UnreachProof::Proven
+    ) {
+        return None;
+    }
+    // Correctness witness: SAF's converged loop invariants, or an empty invariant_set
+    // for a loop-free / unrenderable program (CPAchecker re-proves it).
+    let witness = saf_svcomp::build_interval_invariant_witness(ctx.module, &source, ctx.meta)
+        .unwrap_or_else(|| saf_svcomp::InvariantSetWitness::empty(ctx.meta));
+    let yaml = witness.to_yaml_string().ok()?;
+    let witness_path = ctx.tempdir.join("saf_unreach_correctness.yml");
+    std::fs::write(&witness_path, &yaml).ok()?;
+    // FINAL GATE: real CPAchecker correctness-witness validation (fail-closed).
+    if !cpachecker_confirms_unreach(ctx, &witness_path) {
         return None;
     }
     Some(VerdictOutcome {
