@@ -427,11 +427,31 @@ def main() -> int:
         return eval_one(t, svb, args.timeout, args.confirm_witness,
                         args.confirm_timeout, args.max_rss_mb)
 
+    # Crash-resilient: append each result as it completes (flushed) to a `.partial`
+    # sidecar, so a mid-run failure (e.g. ENOSPC) never loses the whole run — the
+    # partial can be resumed/analyzed. Also prints coarse progress for live monitoring.
+    results = []
+    partial_f = open(args.per_task + ".partial", "w") if args.per_task else None
+    total = len(rows)
     if args.jobs > 1:
+        from concurrent.futures import as_completed
         with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-            results = list(ex.map(work, rows))
+            futs = [ex.submit(work, t) for t in rows]
+            for fut in as_completed(futs):
+                r = fut.result()
+                results.append(r)
+                if partial_f:
+                    partial_f.write(json.dumps(r) + "\n"); partial_f.flush()
+                if len(results) % 500 == 0:
+                    print(f"  progress: {len(results)}/{total} tasks", flush=True)
     else:
-        results = [work(t) for t in rows]
+        for t in rows:
+            r = work(t)
+            results.append(r)
+            if partial_f:
+                partial_f.write(json.dumps(r) + "\n"); partial_f.flush()
+    if partial_f:
+        partial_f.close()
 
     if args.per_task:
         with open(args.per_task, "w") as f:
