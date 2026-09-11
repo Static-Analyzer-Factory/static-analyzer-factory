@@ -1858,10 +1858,13 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     // the bit-precise CBMC oracle — historically ran in ONE fixed order on every
     // task. Instead, extract a few cheap AIR Booleans once and route to a *ranked,
     // pruned* sequence:
-    //   * a lever whose internal gate cannot fire (no fuzzable nondet -> BMC/fuzz;
-    //     no loop -> SE/CBMC) is dropped, cutting per-task latency (each predicate is
+    //   * a lever whose internal gate cannot fire (no fuzzable nondet -> BMC/fuzz/CBMC;
+    //     no loop -> SE) is dropped, cutting per-task latency (each predicate is
     //     a superset of the lever's own gate, so a dropped lever would enumerate zero
-    //     candidates — the verdict is provably unchanged);
+    //     candidates — the verdict is provably unchanged). CBMC is deliberately NOT
+    //     loop-gated: its SAT backend also cracks the acyclic wide-conjunction
+    //     constraint-problem class, and it runs last, so the extra reach costs latency
+    //     only on tasks every cheaper lever already abstained on;
     //   * a non-linear nondet guard (`x*y`/`x/y`/... feeding a comparison), which the
     //     linear/bit-vector Z3 engines stall on but the fuzzer cracks, promotes the
     //     fuzzer to the front.
@@ -2415,8 +2418,8 @@ fn cbmc_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
     let error_sites = saf_svcomp::reach_error_call_sites(ctx.module);
     let &reach_error_inst = error_sites.first()?;
 
-    // Gate 2: the cheap, deterministic structural pre-filter (loops present AND
-    // scalar-integer nondet AND no float/pointer nondet).
+    // Gate 2: the cheap, deterministic structural pre-filter (scalar-integer nondet
+    // AND no float/pointer nondet).
     if !saf_svcomp::cbmc_precheck(ctx.module) {
         return None;
     }

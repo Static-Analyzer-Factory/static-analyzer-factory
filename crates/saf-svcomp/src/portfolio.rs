@@ -61,11 +61,17 @@ impl Lever {
     /// enumerate zero candidates. Pruning a non-applicable lever is therefore
     /// verdict-preserving.
     ///
-    /// - `Bmc` / `Fuzz`: both need a fuzzable nondet input to have anything to
-    ///   pin/drive (BMC's per-site gate and the fuzzer's gate both require it).
-    /// - `Se` / `Cbmc`: additionally need a reachable loop — SE only fires on a
-    ///   `reach_error` function with a CFG cycle, and CBMC's precheck requires
-    ///   loops (both are `false` on a loop-free program).
+    /// - `Bmc` / `Fuzz` / `Cbmc`: all need a fuzzable nondet input to have anything
+    ///   to pin/drive (BMC's per-site gate, the fuzzer's gate and
+    ///   [`crate::cbmc::cbmc_precheck`] all require it).
+    /// - `Se`: additionally needs a reachable loop — it only fires on a
+    ///   `reach_error` function with a CFG cycle, so it is `false` on a loop-free
+    ///   program.
+    ///
+    /// `Cbmc` is deliberately NOT gated on a loop: its SAT backend also cracks the
+    /// acyclic wide-conjunction *constraint-problem* class (`xcsp`), where every
+    /// cheaper lever abstains. It runs last in the plan, so the extra reach costs
+    /// latency only on tasks nothing else solved.
     #[must_use]
     fn applicable(self, f: UnreachFeatures) -> bool {
         match self {
@@ -75,8 +81,8 @@ impl Lever {
             // integer nondet input — a float-only program yields no candidates from
             // them, so pruning them is verdict-preserving.
             Lever::Fuzz => f.fuzzable_nondet || f.float_nondet,
-            Lever::Bmc => f.fuzzable_nondet,
-            Lever::Se | Lever::Cbmc => f.fuzzable_nondet && f.has_loop,
+            Lever::Bmc | Lever::Cbmc => f.fuzzable_nondet,
+            Lever::Se => f.fuzzable_nondet && f.has_loop,
         }
     }
 }
@@ -100,7 +106,7 @@ pub struct UnreachFeatures {
     pub float_nondet: bool,
     /// Some defined function contains a CFG back-edge (a loop). Uses the
     /// whole-module [`crate::fast_paths::module_has_any_loop`] (NOT the
-    /// reachability-scoped check) so that pruning the loop-only levers is sound
+    /// reachability-scoped check) so that pruning the loop-only lever (SE) is sound
     /// even when a loop is reachable only via an unresolved indirect call.
     pub has_loop: bool,
     /// A nondet-derived value flows through a *non-linear* integer operation
@@ -457,15 +463,17 @@ mod tests {
     }
 
     #[test]
-    fn loop_free_prunes_se_and_cbmc() {
+    fn loop_free_prunes_se_but_keeps_cbmc() {
         let f = UnreachFeatures {
             fuzzable_nondet: true,
             float_nondet: false,
             has_loop: false,
             nonlinear_nondet_guard: false,
         };
-        // SE needs a CFG cycle and CBMC's precheck needs loops -> both dropped.
-        assert_eq!(plan_unreach(f), vec![Lever::Bmc, Lever::Fuzz]);
+        // SE needs a CFG cycle -> dropped. CBMC is a whole-program bit-precise
+        // solver whose value on a loop-free program is the constraint solve, not
+        // unwinding, so it is RETAINED (last, after the cheaper levers abstain).
+        assert_eq!(plan_unreach(f), vec![Lever::Bmc, Lever::Fuzz, Lever::Cbmc]);
     }
 
     #[test]
@@ -507,15 +515,15 @@ mod tests {
     }
 
     #[test]
-    fn nonlinear_promotion_still_prunes_loop_free() {
+    fn nonlinear_promotion_still_prunes_loop_free_se() {
         let f = UnreachFeatures {
             fuzzable_nondet: true,
             float_nondet: false,
             has_loop: false,
             nonlinear_nondet_guard: true,
         };
-        // Fuzz promoted, then BMC; SE/CBMC pruned (loop-free).
-        assert_eq!(plan_unreach(f), vec![Lever::Fuzz, Lever::Bmc]);
+        // Fuzz promoted, then BMC; SE pruned (loop-free), CBMC retained last.
+        assert_eq!(plan_unreach(f), vec![Lever::Fuzz, Lever::Bmc, Lever::Cbmc]);
     }
 
     #[test]

@@ -890,8 +890,8 @@ pub fn module_reachable_is_loop_free(module: &AirModule) -> bool {
 /// returns `true` whenever *any* function has a loop even if that function is only
 /// reachable through an indirect call the call graph cannot resolve. This makes
 /// `!module_has_any_loop` a **sound** "no loop can possibly execute" test — used by
-/// the portfolio router to prune loop-only levers (SE / CBMC) without risk of
-/// dropping a lever that could still fire via an unresolved indirect edge.
+/// the portfolio router to prune the loop-only lever (SE) without risk of dropping
+/// a lever that could still fire via an unresolved indirect edge.
 #[must_use]
 pub fn module_has_any_loop(module: &AirModule) -> bool {
     module

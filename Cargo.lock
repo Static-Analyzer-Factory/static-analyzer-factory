@@ -2144,6 +2144,7 @@ dependencies = [
  "saf-core",
  "saf-frontends",
  "saf-svcomp",
+ "saf-test-utils",
  "serde",
  "serde_json",
  "serde_yaml",

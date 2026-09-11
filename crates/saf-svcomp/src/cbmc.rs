@@ -22,6 +22,12 @@
 //! `k` times and solving the resulting propositional formula gives the exact
 //! nondet input vector that drives the program to `reach_error`.
 //!
+//! The same SAT backend covers a second, *loop-free* class those stages also miss:
+//! constraint problems (the `xcsp` cluster) whose reach condition is a wide
+//! conjunction over dozens of interacting nondet inputs. There is nothing to unwind
+//! there — the difficulty is purely the joint solve — so [`cbmc_precheck`]
+//! deliberately does not require a loop.
+//!
 //! CBMC is used ONLY as a candidate *oracle*: the concrete `__VERIFIER_nondet_*`
 //! return values it reports are parsed into a [`NondetCall`] sequence and fed to
 //! SAF's EXISTING native-replay confirmer, which re-runs the ORIGINAL (unsliced)
@@ -61,7 +67,6 @@
 //! - **R6** — the discovered vector must re-trigger `reach_error` deterministically
 //!   on the original program (the native replay) before any verdict is emitted.
 
-use crate::fast_paths;
 use crate::fuzz::{self, SCALAR_NONDET};
 use crate::property::NondetCall;
 use saf_core::air::AirModule;
@@ -95,27 +100,40 @@ pub struct NondetSite {
 ///
 /// The pre-filter is cheap and deterministic, and gates the (relatively expensive)
 /// CBMC subprocess so it runs only where it can pay off — after every other
-/// unreach-call stage has already abstained. All three conditions must hold:
+/// unreach-call stage has already abstained. Both conditions must hold:
 ///
 /// 1. **references a scalar-integer nondet** — there is an input vector to
 ///    synthesize and pin; a program with no fuzzable nondet has a single
 ///    deterministic path the earlier stages already cover.
-/// 2. **loops are present** — CBMC's value-add over SAF's fixed-k BMC / forward SE
-///    is deep bit-precise loop unwinding; on a loop-free program those stages
-///    already explore the whole (acyclic) reach set, so CBMC would only duplicate
-///    work.
-/// 3. **no unsupported nondet** — the program must NOT reference any
+/// 2. **no unsupported nondet** — the program must NOT reference any
 ///    `__VERIFIER_nondet_*` outside the scalar-integer family (float / double /
 ///    pointer / `charp` / …). Those values are not pinnable by the integer replay
 ///    driver (so a CBMC model over them could never re-confirm), and CBMC's
 ///    floating-point / pointer-nondet reasoning is exactly where it stalls. This
 ///    is conservative (a program touching a float nondet on an irrelevant path is
 ///    skipped), which only costs recall.
+///
+/// # Why loop-freedom is NOT a condition
+///
+/// The filter used to additionally require a reachable loop, on the theory that
+/// CBMC's only value-add over SAF's fixed-`k` BMC / forward SE is deep bit-precise
+/// unwinding, so an acyclic program is already fully explored by those stages. That
+/// is false for the *constraint-problem* class (the `xcsp` cluster: a straight-line
+/// nondet assignment vector followed by a long chain of `if (…) goto ERROR;`
+/// constraint checks). There is no loop to unwind, but the earlier stages still
+/// abstain — the reach condition is a wide conjunction over dozens of interacting
+/// inputs that the linear-integer models cannot invert and the blind fuzzer cannot
+/// hit by chance, while CBMC's SAT backend solves it directly.
+///
+/// The clause was a *cost* heuristic, never a soundness one — the native replay is
+/// the sole arbiter either way (R6) — and it pruned exactly the class CBMC is best
+/// at. The cost it was guarding is bounded instead by CBMC running LAST in the
+/// portfolio ([`crate::portfolio::plan_unreach`]), i.e. only on tasks every cheaper
+/// lever has already abstained on, and by the caller's `--unwind` bound and
+/// safety-valve timeout.
 #[must_use]
 pub fn cbmc_precheck(module: &AirModule) -> bool {
-    fuzz::references_scalar_nondet(module)
-        && !fast_paths::module_reachable_is_loop_free(module)
-        && !references_unsupported_nondet(module)
+    fuzz::references_scalar_nondet(module) && !references_unsupported_nondet(module)
 }
 
 /// True iff the program references any `__VERIFIER_nondet_*` function that is NOT
@@ -532,5 +550,87 @@ State 2 file p.c function main line 6 thread 0
     fn no_nondet_is_not_unsupported() {
         let m = module_with_decls(&["main", "foo"]);
         assert!(!references_unsupported_nondet(&m));
+    }
+
+    // --- cbmc_precheck (the whole structural pre-filter) ---
+
+    /// The module of [`module_with_decls`] with its `main` replaced by a DEFINED
+    /// two-block `main` carrying a `b0 -> b1 -> b0` CFG back-edge, so
+    /// `module_reachable_is_loop_free` is `false`.
+    fn with_looping_main(mut module: AirModule) -> AirModule {
+        use saf_core::air::{AirBlock, AirFunction, Instruction, Operation};
+        use saf_core::id::make_id;
+        use saf_core::ids::{BlockId, FunctionId, InstId};
+        let (b0, b1) = (
+            BlockId(make_id("block", b"b0")),
+            BlockId(make_id("block", b"b1")),
+        );
+        let mut block0 = AirBlock::new(b0);
+        block0.instructions.push(Instruction::new(
+            InstId(make_id("inst", b"b0_term")),
+            Operation::Br { target: b1 },
+        ));
+        let mut block1 = AirBlock::new(b1);
+        block1.instructions.push(Instruction::new(
+            InstId(make_id("inst", b"b1_term")),
+            Operation::Br { target: b0 },
+        ));
+        module.functions.retain(|f| f.name != "main");
+        module.functions.push(AirFunction {
+            id: FunctionId(make_id("func", b"main")),
+            name: "main".to_string(),
+            params: Vec::new(),
+            blocks: vec![block0, block1],
+            entry_block: Some(b0),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        });
+        module
+    }
+
+    #[test]
+    fn precheck_accepts_loop_free_scalar_nondet() {
+        // A loop-free constraint program (the `xcsp` shape: a nondet assignment
+        // vector then a straight-line chain of constraint checks). CBMC's value here
+        // is the bit-precise SAT solve, not loop unwinding, so it must NOT be pruned.
+        let m = module_with_decls(&["main", "__VERIFIER_nondet_int", "reach_error"]);
+        assert!(crate::fast_paths::module_reachable_is_loop_free(&m));
+        assert!(cbmc_precheck(&m));
+    }
+
+    #[test]
+    fn precheck_accepts_looping_scalar_nondet() {
+        let m = with_looping_main(module_with_decls(&["main", "__VERIFIER_nondet_uint"]));
+        assert!(!crate::fast_paths::module_reachable_is_loop_free(&m));
+        assert!(cbmc_precheck(&m));
+    }
+
+    #[test]
+    fn precheck_rejects_program_without_scalar_nondet() {
+        // Nothing to synthesize/pin: the deterministic path is already covered.
+        assert!(!cbmc_precheck(&module_with_decls(&["main", "foo"])));
+        assert!(!cbmc_precheck(&with_looping_main(module_with_decls(&[
+            "main", "foo"
+        ]))));
+    }
+
+    #[test]
+    fn precheck_rejects_float_only_nondet() {
+        // The loop-free x float-only frontier: the blind fuzzer drives these, but the
+        // integer replay driver cannot pin a float, so CBMC must stay out.
+        let names = &["main", "__VERIFIER_nondet_float"];
+        assert!(!cbmc_precheck(&module_with_decls(names)));
+        assert!(!cbmc_precheck(&with_looping_main(module_with_decls(names))));
+    }
+
+    #[test]
+    fn precheck_rejects_unsupported_nondet_regardless_of_loops() {
+        // A float/pointer nondet is not pinnable by the integer replay driver, so a
+        // CBMC model over it could never re-confirm — with or without loops.
+        let names = &["main", "__VERIFIER_nondet_int", "__VERIFIER_nondet_float"];
+        assert!(!cbmc_precheck(&module_with_decls(names)));
+        assert!(!cbmc_precheck(&with_looping_main(module_with_decls(names))));
     }
 }

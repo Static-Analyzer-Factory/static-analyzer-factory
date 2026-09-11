@@ -355,6 +355,23 @@ fn verify_recursion_false_alarm_is_unknown() {
         .stderr(predicate::str::contains("candidate(s) enumerated"));
 }
 
+/// LOOP-FREE CBMC-oracle over-approximation: `cbmc_precheck` admits acyclic
+/// programs, and CBMC runs with `--no-standard-checks`, so it models `x + y` as
+/// wrapping and PROPOSES the overflowing vector. The native replay compiles with
+/// `-fsanitize-trap=signed-integer-overflow`, traps at the addition and never
+/// reaches the sentinel → `unknown`. The stderr assertion pins the replay gate as
+/// the SOLE arbiter (R6) for the loop-free population: short-circuit it and this
+/// fixture becomes a false alarm. Needs the provisioned CBMC (`$SAF_CBMC`).
+#[test]
+#[ignore]
+fn verify_loopfree_cbmc_overapprox_is_unknown() {
+    verify_unreach("false_alarm_cbmc_loopfree.c")
+        .stdout("unknown\n")
+        .stderr(predicate::str::contains(
+            "CBMC-proposed vector did not re-confirm deterministically",
+        ));
+}
+
 /// A task that DEFINES its own `reach_error` (via `__assert_fail`) — the
 /// canonical sv-benchmarks pattern. The replay driver's `reach_error` is weak
 /// (yields to the task's) and `__assert_fail` is intercepted, so the guarded
