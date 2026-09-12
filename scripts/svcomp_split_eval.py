@@ -9,14 +9,19 @@ run TWO ways so the gap between them is explicit:
   * RAW score      — the naive verdict-vs-expected score (SvCompOutcome in
                      crates/saf-bench/src/svcomp/scoring.rs): +2 correct-TRUE,
                      +1 correct-FALSE, -16 false-alarm, -32 wrong-TRUE, 0 unknown.
-  * CONFIRMED score — the OFFICIAL score: a correct FALSE earns +1 only if its
-                     violation witness is CONFIRMED by a validator (else 0 —
-                     "correct-unconfirmed"); a correct TRUE earns +2 on the verdict
-                     alone for the witness-not-required properties (termination /
-                     valid-memsafety / valid-memcleanup / no-data-race) and only
-                     with a confirmed correctness witness for unreach-call /
-                     no-overflow. Negative outcomes (-16 / -32) apply regardless of
+  * CONFIRMED score — the OFFICIAL score under the **SV-COMP 2027** rules: a correct
+                     verdict earns its points only if the witness its BASE CATEGORY
+                     requires is CONFIRMED by a validator (else 0 —
+                     "correct-unconfirmed"); where the base category requires no
+                     witness ("not supported" or "(demo mode)") the verdict scores
+                     alone. Negative outcomes (-16 / -32) apply regardless of
                      confirmation — a wrong verdict is always penalized.
+
+The requirement is per BASE CATEGORY `C.<property>.<suffix>`, NOT per property —
+see `scripts/svcomp_witness_rules.py`. This matters: 2027 moved `C.termination.*`
+from "2.1 (demo mode)" (free) to "2.1 or higher" (required), and SAF emits no
+correctness witness for termination, so 36 of its dedup-weighted points went to 0.
+Reporting the pre-2027 rule overstated the score by 41 weighted points.
 
 Reporting RAW alone overstates the competition score, because unconfirmed-correct
 results score 0 in the scored categories. Run this on the HOLDOUT manifest for an
@@ -48,6 +53,11 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from svcomp_witness_rules import (  # noqa: E402
+    base_categories, false_witness_requirement, load_set_membership,
+    sniff_witness_format, true_witness_requirement, version_satisfies)
+
 SAF = os.environ.get("SAF_BIN", "target/release/saf")
 VALIDATE_SH = os.environ.get("SAF_VALIDATE_WITNESS", "scripts/validate_witness.sh")
 # The TRUE-side counterpart: CPAchecker `correctness-witness-validation.properties`
@@ -59,20 +69,11 @@ CORRECTNESS_VALIDATE_SH = os.environ.get(
     "SAF_VALIDATE_CORRECTNESS_WITNESS", "scripts/validate_correctness_witness.sh")
 VERDICT_RE = re.compile(r"^(true|false\(([a-z0-9-]+)\)|unknown)$")
 
-# TRUE is scored on the verdict alone (no correctness witness required) for these
-# properties in SV-COMP 2025/2026; unreach-call and no-overflow TRUE need a confirmed
-# correctness witness (SAF never emits TRUE for those, so this is defensive).
-TRUE_WITNESS_NOT_REQUIRED = {
-    "termination", "valid-memsafety", "valid-memcleanup", "no-data-race",
-}
-# FALSE is scored on the verdict alone for these properties. SV-COMP 2024+
-# EXCLUDES no-data-race from violation-witness validation (there is no agreed
-# data-race witness format or validator), so a no-data-race FALSE needs no
-# confirmed witness. NOTE: memsafety / overflow / unreach FALSE DO require a
-# confirmed witness, so this set is intentionally NOT TRUE_WITNESS_NOT_REQUIRED.
-FALSE_WITNESS_NOT_REQUIRED = {
-    "no-data-race",
-}
+# The witness requirement is per BASE CATEGORY `C.<property>.<suffix>`, not per
+# property — see `scripts/svcomp_witness_rules.py`, which holds the SV-COMP 2027
+# table and the base-category membership map. Until 2026 this file encoded the
+# rule as two flat per-property sets; that was right for 2026 and is wrong for
+# 2027, most expensively for termination (36 weighted points).
 SCORE = {"TrueCorrect": 2, "FalseCorrect": 1, "TrueIncorrect": -32,
          "FalseIncorrect": -16, "Unknown": 0}
 
@@ -205,19 +206,23 @@ def run_verify(task: dict, src: str, prp: str, timeout: int,
     return line, dur, err_tail
 
 
-def witness_validator_for(kind: str, prop: str) -> str | None:
+def witness_validator_for(kind: str, prop: str, suffixes=()) -> str | None:
     """Which validator script should confirm this verdict's witness, or `None` when the
     verdict is scored without one (so running a validator would be wasted wall-clock).
 
-    Mirrors `confirmed_score`: a FALSE needs a confirmed VIOLATION witness, a TRUE on
-    `unreach-call` / `no-overflow` needs a confirmed CORRECTNESS witness, and a TRUE on
-    the verdict-only properties needs nothing. FALSE keeps its historical behaviour of
-    always being validated — even for `no-data-race`, where the score does not require
-    it — so dumps stay comparable across runs.
+    Mirrors `confirmed_score`: a FALSE needs a confirmed VIOLATION witness, a TRUE needs
+    a confirmed CORRECTNESS witness, and either is skipped when the task's 2027 base
+    categories require no witness. FALSE keeps its historical behaviour of always being
+    validated — even where the score does not require it — so dumps stay comparable
+    across runs; only the TRUE side gates on the requirement, because a correctness
+    validation re-proves the program and is far more expensive.
+
+    `suffixes` is the task's 2027 base-category suffix set (see `svcomp_witness_rules`).
+    It defaults to empty, which falls back to the property's generic cell.
     """
     if kind == "false":
         return VALIDATE_SH
-    if kind == "true" and prop not in TRUE_WITNESS_NOT_REQUIRED:
+    if kind == "true" and true_witness_requirement(prop, suffixes)[0]:
         return CORRECTNESS_VALIDATE_SH
     return None
 
@@ -268,15 +273,35 @@ def raw_outcome(kind: str, expected: bool) -> str:
     return "Unknown"  # unknown / timeout / error all score 0
 
 
-def confirmed_score(outcome: str, prop: str, witness_status: str | None) -> int:
-    """Official-style points: gate positive credit on confirmation; penalties stand."""
+def confirmed_score(outcome: str, prop: str, witness_status: str | None,
+                    suffixes=(), sub: str | None = None,
+                    witness_format: str | None = None, version_aware: bool = False) -> int:
+    """Official-style points under the SV-COMP 2027 rules: gate positive credit on
+    confirmation where the task's base category requires a witness; penalties stand.
+
+    `suffixes` — the task's 2027 base-category suffixes; `sub` — the violated
+    subproperty of a FALSE (drives the valid-memtrack footnote).
+
+    `version_aware` additionally enforces the cell's format-version FLOOR against the
+    witness SAF actually emitted. Off by default so that (a) every dump written before
+    the `witness_format` field re-scores identically and (b) the headline stays directly
+    comparable with prior A/B runs. Report both: the floor is real (SAF emits 2.0 into
+    cells demanding 2.2) and it is the only signal that tells 0B whether a new witness
+    failed on its CONTENT or merely on its declared version.
+    """
     if outcome == "FalseCorrect":
-        if prop in FALSE_WITNESS_NOT_REQUIRED:
+        required, minimum = false_witness_requirement(prop, suffixes, sub)
+        if not required:
             return 1
+        if version_aware and not version_satisfies(witness_format, minimum):
+            return 0
         return 1 if witness_status == "CONFIRMED" else 0
     if outcome == "TrueCorrect":
-        if prop in TRUE_WITNESS_NOT_REQUIRED:
+        required, minimum = true_witness_requirement(prop, suffixes)
+        if not required:
             return 2
+        if version_aware and not version_satisfies(witness_format, minimum):
+            return 0
         return 2 if witness_status == "CONFIRMED" else 0
     return SCORE[outcome]  # -16 / -32 / 0 apply regardless of confirmation
 
@@ -308,8 +333,15 @@ def load_manifest(path: Path, only_prop: str | None, sample: int) -> list[dict]:
 
 def eval_one(task: dict, svb: Path, timeout: int, confirm: bool,
              confirm_timeout: int, max_rss_mb: int = 0,
-             correctness_confirm_timeout: int | None = None) -> dict:
+             correctness_confirm_timeout: int | None = None,
+             membership: dict | None = None) -> dict:
     prp = resolve_prp(svb, task["property"])
+    # The 2027 base categories this task belongs to decide whether a witness is
+    # required at all. An empty set means SV-COMP runs no category containing it
+    # (the `Unused_*` and `/todo` populations) — `confirmed_score` then falls back
+    # to the property's generic cell rather than granting a free pass.
+    sets = (membership or {}).get(task["rel_yml"], frozenset())
+    suffixes = base_categories(task["property"], sets)
     # Resolve a PORTABLE source path against --svb (relative → works both on the host
     # and inside the Docker container where the repo is at /workspace). Falls back to
     # the stored absolute path for older manifests without rel_src.
@@ -319,7 +351,8 @@ def eval_one(task: dict, svb: Path, timeout: int, confirm: bool,
         line, dur, err_tail = run_verify(task, src, prp, timeout, w, max_rss_mb)
         kind, sub = classify(line)
         wstatus = None
-        validator = witness_validator_for(kind, task["property"]) if confirm else None
+        wformat = sniff_witness_format(w)
+        validator = witness_validator_for(kind, task["property"], suffixes) if confirm else None
         if validator:
             # A correctness witness is re-verified from scratch by CPAchecker
             # (k-induction), which is slower than violation validation and needs its
@@ -336,13 +369,18 @@ def eval_one(task: dict, svb: Path, timeout: int, confirm: bool,
         "kind": kind, "sub": sub, "rel_yml": task["rel_yml"],
         "data_model": task["data_model"], "group": task.get("group", ""),
         "outcome": outcome, "raw": SCORE[outcome],
-        "confirmed": confirmed_score(outcome, task["property"], wstatus),
-        "witness": wstatus, "duration_s": round(dur, 2),
+        "confirmed": confirmed_score(outcome, task["property"], wstatus, suffixes, sub,
+                                     wformat, version_aware=False),
+        "confirmed_va": confirmed_score(outcome, task["property"], wstatus, suffixes, sub,
+                                        wformat, version_aware=True),
+        "witness": wstatus, "witness_format": wformat,
+        "base_categories": sorted(suffixes), "sets": sorted(sets),
+        "duration_s": round(dur, 2),
         "stderr_tail": err_tail if keep_err else "",
     }
 
 
-def weighted_confirmed_summary(results: list[dict], cap: int = 1) -> dict:
+def weighted_confirmed_summary(results: list[dict], cap: int = 1, field: str = "confirmed") -> dict:
     """Per-CLUSTER-deduped confirmed score. Each origin cluster (the task's `group`, e.g. a single Juliet
     CWE family) contributes at most `cap` POSITIVE points — so confirming 300 near-duplicate tasks moves the
     number by at most `cap` — while penalties (−16/−32) pass through in FULL (a cluster can never hide a
@@ -362,8 +400,9 @@ def weighted_confirmed_summary(results: list[dict], cap: int = 1) -> dict:
     by_cluster_prop: dict[tuple[str, str], int] = defaultdict(int)  # scoring: per (group, property)
     for r in results:
         g = r.get("group") or r["rel_yml"]
-        by_cluster[g] += r["confirmed"]
-        by_cluster_prop[(g, r["property"])] += r["confirmed"]
+        pts = r.get(field, r["confirmed"])   # `field` lets the caller score the
+        by_cluster[g] += pts                 # version-aware column off the same rows
+        by_cluster_prop[(g, r["property"])] += pts
 
     def capped(c: int) -> int:
         return min(c, cap) if c > 0 else c   # cap positives per (cluster,property); keep penalties whole
@@ -445,6 +484,12 @@ def main() -> int:
                          "contributes at most --weight-cap POSITIVE points (penalties pass through whole). "
                          "The generalization gate's metric — rewards distinct solving, not pool volume.")
     ap.add_argument("--weight-cap", type=int, default=1)
+    ap.add_argument("--out-of-competition", choices=("keep", "drop"), default="keep",
+                    help="what to do with tasks in NO SV-COMP 2027 base category (the "
+                         "Unused_* and /todo populations, ~19.9k of 55,690 rows — SV-COMP "
+                         "never runs them). 'keep' (default) scores them under the "
+                         "property's generic cell and preserves n for cross-run diffing; "
+                         "'drop' models the competition population exactly.")
     ap.add_argument("--per-task", default=None,
                     help="write a per-task diagnostic JSONL (verdict, outcome, "
                          "duration, stderr tail on misses) for later inspection")
@@ -458,13 +503,26 @@ def main() -> int:
     svb = Path(args.svb)
     rows = load_manifest(Path(args.manifest), args.property, args.sample)
     label = os.path.basename(args.manifest)
+
+    # ~50k globs over 37 `.set` files — build once, share across every worker.
+    t_mem = time.time()
+    membership = load_set_membership(svb)
+    print(f"== .set membership: {len(membership)} tasks reachable "
+          f"({time.time() - t_mem:.1f}s) ==")
+    if args.out_of_competition == "drop":
+        before = len(rows)
+        rows = [t for t in rows
+                if base_categories(t["property"], membership.get(t["rel_yml"], frozenset()))]
+        print(f"== dropped {before - len(rows)} tasks in no 2027 base category "
+              f"({len(rows)} remain) ==")
+
     print(f"== {label}: {len(rows)} tasks; confirm={args.confirm_witness}; "
           f"jobs={args.jobs}; timeout={args.timeout}s ==")
 
     def work(t):
         return eval_one(t, svb, args.timeout, args.confirm_witness,
                         args.confirm_timeout, args.max_rss_mb,
-                        args.correctness_confirm_timeout)
+                        args.correctness_confirm_timeout, membership)
 
     # Crash-resilient: append each result as it completes (flushed) to a `.partial`
     # sidecar, so a mid-run failure (e.g. ENOSPC) never loses the whole run — the
@@ -546,6 +604,19 @@ def main() -> int:
         }
         if args.group_weight:
             out_obj.update(weighted_confirmed_summary(results, args.weight_cap))
+            # The version-AWARE column, scored off the same rows: identical except
+            # that a witness below its base category's format floor scores 0. SAF
+            # emits 2.0 into cells demanding 2.1/2.2, so this is the stricter and
+            # more honest total; the blind one stays the headline because it is
+            # what every prior A/B is comparable against.
+            va = weighted_confirmed_summary(results, args.weight_cap, field="confirmed_va")
+            out_obj["confirmed_score_weighted_version_aware"] = va["confirmed_score_weighted"]
+            out_obj["per_property_weighted_version_aware"] = va["per_property_weighted"]
+            out_obj["confirmed_score_version_aware"] = sum(
+                r.get("confirmed_va", r["confirmed"]) for r in results)
+        out_obj["rules_edition"] = "SV-COMP 2027"
+        out_obj["out_of_competition"] = args.out_of_competition
+        out_obj["svbench_commit"] = _svbench_commit(svb)
         Path(args.out).write_text(json.dumps(out_obj, indent=2, default=int))
         print(f"\n  wrote {args.out}")
     print("\nRESULT:", "PASS (sound)" if ok else "FAIL (soundness violation)")
@@ -554,6 +625,18 @@ def main() -> int:
 
 def pct(x: int, m: int) -> str:
     return f"{(100.0 * x / m):.1f}%" if m else "n/a"
+
+
+def _svbench_commit(svb: Path) -> str | None:
+    """The sv-benchmarks pin. `.gitmodules` sets `ignore = dirty`, so a local edit to
+    a `.set` would silently change every score and never show in `git status` — record
+    the revision next to any published number."""
+    try:
+        r = subprocess.run(["git", "-C", str(svb), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 if __name__ == "__main__":

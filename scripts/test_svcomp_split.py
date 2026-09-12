@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from svcomp_split import (  # noqa: E402
     assign_groups, origin_group, stable_key, category_root, is_reasoning_task)
 from svcomp_split_eval import (  # noqa: E402
-    weighted_confirmed_summary, witness_validator_for)
+    confirmed_score, weighted_confirmed_summary, witness_validator_for)
 
 
 def _synthetic_tasks():
@@ -151,16 +151,61 @@ def test_true_on_witness_required_properties_uses_the_correctness_validator():
     witness, so the harness must actually run the correctness validator on them.
     Before this existed the harness validated FALSE only, so every TRUE row was
     `witness: None` and scored 0 no matter how good the witness was."""
-    for prop in ("unreach-call", "no-overflow"):
-        v = witness_validator_for("true", prop)
+    for prop, suffix in (("unreach-call", "Loops"), ("no-overflow", "Main")):
+        v = witness_validator_for("true", prop, {suffix})
         assert v is not None and v.endswith("validate_correctness_witness.sh"), (prop, v)
 
 
-def test_true_on_verdict_only_properties_needs_no_validator():
-    """termination / valid-memsafety / valid-memcleanup / no-data-race TRUE are scored
-    on the verdict alone — validating them would be wasted wall-clock."""
-    for prop in ("termination", "valid-memsafety", "valid-memcleanup", "no-data-race"):
-        assert witness_validator_for("true", prop) is None, prop
+def test_termination_true_now_needs_the_correctness_validator():
+    """SV-COMP 2027 moved `C.termination.*` from "2.1 (demo mode)" (free) to
+    "2.1 or higher" (required). This is the 36-weighted-point change; if this test
+    passes under the OLD rule the harness is still scoring the 2026 rulebook."""
+    for suffix in ("Other", "MainHeap", "MainControlFlow", "BitVectors"):
+        v = witness_validator_for("true", "termination", {suffix})
+        assert v is not None and v.endswith("validate_correctness_witness.sh"), suffix
+
+
+def test_true_on_verdict_only_categories_needs_no_validator():
+    """Base categories whose correctness column reads "not supported" or "(demo mode)"
+    score on the verdict alone — validating them would be wasted wall-clock."""
+    free = (("valid-memsafety", "Heap"), ("valid-memcleanup", "Main"),
+            ("no-data-race", "Concurrency"), ("unreach-call", "Arrays"),
+            ("unreach-call", "Heap"), ("unreach-call", "Floats"),
+            ("no-overflow", "Huawei-Concurrency-Challenges"))
+    for prop, suffix in free:
+        assert witness_validator_for("true", prop, {suffix}) is None, (prop, suffix)
+
+
+def test_confirmed_score_gates_termination_true_on_a_confirmed_witness():
+    # The whole point of Movement 0A, at the smallest scale that shows it.
+    assert confirmed_score("TrueCorrect", "termination", None, {"Other"}) == 0
+    assert confirmed_score("TrueCorrect", "termination", "CONFIRMED", {"Other"}) == 2
+    # ...while a witness-free category still scores on the verdict alone.
+    assert confirmed_score("TrueCorrect", "valid-memsafety", None, {"Heap"}) == 2
+
+
+def test_confirmed_score_gates_no_data_race_false_on_a_confirmed_witness():
+    # 2027 violation column for C.no-data-race is "2.2", not "not supported".
+    assert confirmed_score("FalseCorrect", "no-data-race", "NOT_CONFIRMED", {"Concurrency"}) == 0
+    assert confirmed_score("FalseCorrect", "no-data-race", "CONFIRMED", {"Concurrency"}) == 1
+
+
+def test_confirmed_score_keeps_penalties_whole_regardless_of_the_rule():
+    # The hard invariant: a witness rule can never turn a wrong verdict into points,
+    # so false_alarms / wrong_true are untouched by anything in Movement 0A.
+    for suffixes in (set(), {"Other"}, {"Concurrency"}):
+        assert confirmed_score("TrueIncorrect", "termination", "CONFIRMED", suffixes) == -32
+        assert confirmed_score("FalseIncorrect", "unreach-call", "CONFIRMED", suffixes) == -16
+        assert confirmed_score("Unknown", "unreach-call", None, suffixes) == 0
+
+
+def test_version_floor_is_off_by_default_and_bites_when_asked():
+    # SAF emits 2.0; C.unreach-call.Concurrency's violation cell demands 2.2.
+    blind = confirmed_score("FalseCorrect", "unreach-call", "CONFIRMED", {"Concurrency"},
+                            witness_format="2.0", version_aware=False)
+    aware = confirmed_score("FalseCorrect", "unreach-call", "CONFIRMED", {"Concurrency"},
+                            witness_format="2.0", version_aware=True)
+    assert (blind, aware) == (1, 0)
 
 
 def test_false_still_uses_the_violation_validator():

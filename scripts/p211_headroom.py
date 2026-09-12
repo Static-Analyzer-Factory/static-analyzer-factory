@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
 """TRUE-side dedup-weighted headroom priced against the PUBLISHED SV-COMP 2027 rules.
 
-The witness requirement is per BASE CATEGORY = `C.<property>.<suffix>`, where the suffix
-is the benchmark family = the `.set` file the task belongs to. From
-https://sv-comp.sosy-lab.org/2027/rules.php (verified 2026-09-12):
+The witness requirement is per BASE CATEGORY `C.<property>.<suffix>`. This file used to
+carry its own copy of the rules table; it now imports the single shared one from
+`svcomp_witness_rules`, which also fixes two things the local copy got wrong: the
+suffix is NOT the `.set` basename (`LinkedLists.set` sits inside `C.unreach-call.Heap`,
+and there is no `C.unreach-call.LinkedLists`), and the Huawei rows are demo-mode.
 
-    C.unreach-call.{Arrays,Heap}     not supported        -> verdict alone
-    C.unreach-call.Floats            2.0+ (demo mode)     -> verdict alone
-    C.unreach-call.Concurrency       2.1+                 -> witness REQUIRED
-    C.unreach-call.<other>           2.0+                 -> witness REQUIRED
-    C.valid-memsafety.<any>          not supported        -> verdict alone
-    C.valid-memcleanup.all           not supported        -> verdict alone
-    C.no-overflow.Concurrency        2.1+                 -> witness REQUIRED
-    C.no-overflow.<other>            2.0+                 -> witness REQUIRED
-    C.no-data-race.all               not supported        -> verdict alone
-    C.termination.all                2.1+                 -> witness REQUIRED  (NEW in 2027)
-
-Usage: python3 headroom_final.py <svbench-c-root>
+Usage: python3 p211_headroom.py <svbench-c-root>
 """
 import collections
 import glob
@@ -38,21 +29,15 @@ for path in sorted(glob.glob(os.path.join(SVB, "*.set"))):
             suffix_of[os.path.relpath(m, SVB)].add(suffix)
 print(f"{len(suffix_of)} task .yml files are reachable from a .set file")
 
-WITNESS_FREE = {
-    "unreach-call": {"Arrays", "Heap", "Floats"},
-    "valid-memsafety": None,     # None = always witness-free
-    "valid-memcleanup": None,
-    "no-data-race": None,
-}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from svcomp_witness_rules import (  # noqa: E402
+    base_categories, true_witness_requirement)
 
 
-def needs_witness(prop, suffixes):
-    if prop in WITNESS_FREE:
-        free = WITNESS_FREE[prop]
-        if free is None:
-            return False
-        return not (suffixes & free)
-    return True                   # no-overflow, termination: always required in 2027
+def needs_witness(prop, set_names):
+    """TRUE-side requirement, from the single shared 2027 table. `set_names` are `.set`
+    basenames, which must be mapped to base-category suffixes before the rule applies."""
+    return true_witness_requirement(prop, base_categories(prop, set_names))[0]
 
 
 rows = [json.loads(l) for l in open("lever1-pertask.jsonl")]

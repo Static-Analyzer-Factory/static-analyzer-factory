@@ -1,0 +1,34 @@
+{
+  "rules_edition": "SV-COMP 2027",
+  "source": "re-score of lever1-pertask.jsonl + the 99 spliced rows of lever1-true99-pertask.jsonl",
+  "saf_commit": "038e4122e13d41b2d45f3d4bf43cfc71a12ed13d",
+  "svbench_commit": "7efe28dd29576b46927b7a34e8f742bd90966a75",
+  "n": 55690,
+  "in_competition": 35767,
+  "false_alarms": 0,
+  "wrong_true": 0,
+  "weighted_2026_rule": 151,
+  "per_property_weighted_2026_rule": {
+    "no-data-race": 14,
+    "no-overflow": 34,
+    "termination": 36,
+    "unreach-call": 52,
+    "valid-memsafety": 15
+  },
+  "confirmed_score_weighted": 110,
+  "per_property_weighted": {
+    "no-data-race": 9,
+    "no-overflow": 34,
+    "termination": 0,
+    "unreach-call": 52,
+    "valid-memsafety": 15
+  },
+  "confirmed_score_weighted_version_aware": 107,
+  "per_property_weighted_version_aware": {
+    "no-data-race": 9,
+    "no-overflow": 34,
+    "termination": 0,
+    "unreach-call": 49,
+    "valid-memsafety": 15
+  }
+}
