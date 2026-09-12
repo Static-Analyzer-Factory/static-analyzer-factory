@@ -32,7 +32,7 @@ decide.
 **Existing exposure to fix, not extend:** the rank-2/rank-3 TRUE path
 (`try_unreach_true` / `try_overflow_true` in `crates/saf-cli/src/commands.rs`) emits
 `true` only when an in-process CPAchecker gate confirms. Those results *are* computable
-by CPAchecker alone. That is 12 of the current 151 weighted points. SAF is clearly not
+by CPAchecker alone. That is 12 of the 151 weighted points SAF scored under the 2026 rules (11 of the corrected 110 — see Movement 0A). SAF is clearly not
 meta overall, but this is the wrong side of the line and should be replaced by
 SAF-native proving.
 
@@ -49,8 +49,11 @@ fail-closed: prove or abstain, never guess.
 > (termination, no-data-race)" is wrong for SV-COMP 2027: `C.termination.all` now requires
 > a 2.1 correctness witness and SAF emits none, so termination's **36 weighted points do
 > not hold**. (`no-data-race` is fine — still "not supported" in 2027, so verdict-only.)
-> The headline **151 is inflated; expect ~115** once the harness is re-derived from the
-> 2027 rules page. `valid-memsafety` is the one block that is verdict-only in every
+> The headline **151 is inflated** — MEASURED 2026-09-12: the corrected score is
+> **110** (TRUE-side rule alone gives 115; the extra −5 is the `no-data-race`
+> violation cell this note did not anticipate; version-aware 107).
+> `no-data-race` is NOT fine: its *correctness* column is "not supported" as stated,
+> but its *violation* column is "2.2", i.e. required, and the harness exempted it. `valid-memsafety` is the one block that is verdict-only in every
 > suffix, including Concurrency.
 
 Raw max 92,026 = TRUE-side 72,672 (79%) + FALSE-side 19,354 (21%).
@@ -63,7 +66,8 @@ Raw max 92,026 = TRUE-side 72,672 (79%) + FALSE-side 19,354 (21%).
 | TRUE-side valid-memsafety (verdict-only) | 0 | 20,966 | 0% |
 
 **Score on the metric that matters — distinct (group, property) clusters solved, each
-capped at 1 — is 151 / 398.** Always report weighted, not raw: this project has
+capped at 1 — is 110 / 398** (it was 151 under the 2026 rules; see Movement 0A).
+Note 398 itself is understated: it omits `valid-memcleanup`, which the manifest excludes.** Always report weighted, not raw: this project has
 repeatedly been burned by prizes that evaporated under dedup (raw counts are inflated
 by thousands of near-duplicate Juliet files).
 
@@ -188,8 +192,10 @@ stand without the CPAchecker gate the mandate requires us to remove (§5.1(c)). 
 | 3 | `no-overflow` precision, re-scoped after Movement 1 re-baselines the funnel | [`plans/215`](215-movement3-nooverflow-precision.md) | M | +5 to +10 |
 
 Movements 0 and 1 are not optional and not reorderable: 0 because every A/B until it
-lands is steering on a number that is ~36 too high, 1 because cutting the delegation
-before the soundness fixes costs roughly **−160 weighted against a score of 151**.
+lands is steering on a number that is 41 too high (MEASURED; the estimate here was ~36), 1 because cutting the delegation
+before the soundness fixes costs roughly **−160 weighted against a score of 110**
+(the figure was computed against the pre-2027 scoreboard's 151; the sign and the
+conclusion are unchanged, only the denominator).
 
 **This document is the strategy and the evidence; each movement has its own executable
 plan.** §5.3-§5.6 below are the summaries those four plans expand.
@@ -254,7 +260,7 @@ baselines, 150 tasks each, stratified over every cluster holding TRUE tasks:
 Swept over the COMPLETE ground-truth-FALSE population (`sweep_soundness.py`):
 unreach-call **3 wrong PROVEs / 4,324**; no-overflow **4 / 3,733**. Because penalties
 pass the per-cluster dedup cap in full, cutting the delegation today would cost roughly
-**−160 weighted against a score of 151.** The 7 reduce to two classes:
+**−160 weighted against a score of 110** (computed against the pre-2027 151).** The 7 reduce to two classes:
 1. *Unsound ⊥ from the interval domain* — `refine_branch_condition`
    (`transfer.rs:1510-1520`) applies **signed** refinement to **unsigned** comparisons
    with no `lo >= 0` guard, while its evaluation counterpart `Interval::icmp_ult`
@@ -371,8 +377,9 @@ Nothing else should be scoped until the scoreboard matches the 2027 rules.
    the loader). `{valid-memsafety, valid-memcleanup, no-data-race}` stay verdict-only;
    `termination` moves to witness-required; `unreach-call` gains the
    `{Arrays, Heap, Floats}` carve-out. Re-run the authoritative eval and publish the
-   corrected score. **Expect ~151 → ~115** (termination's 36 lost, a little returned by
-   the unreach carve-out). Until this lands every A/B in the loop campaign — and the
+   corrected score. **MEASURED: 151 → 110.** Termination's 36 lost, `no-data-race`'s
+   violation requirement a further 5, and the unreach carve-out returned exactly +0 —
+   SAF emits 3 unreach-call TRUEs in 22,631 tasks and their clusters are already capped. Until this lands every A/B in the loop campaign — and the
    KEEP metric it steers by — is measured against the wrong target.
 2. Emit a 2.1 correctness witness on the termination path, to win the 36 back.
    `ranking.rs` already synthesises linear ranking-function coefficients via Farkas and
@@ -496,8 +503,13 @@ soundness run over **all 10,014** expected-FALSE `valid-memsafety` tasks, not a 
   fourth ad-hoc gate. That is evidence the syntactic argument does not actually close,
   and one uncaught wrong proof is −32 uncapped.
 
-**What would kill the whole plan:** if Movement 0's corrected score does not fall by
-roughly 50, the 2027 rule reading is wrong and §5.2's entire ranking inverts.
+**What would kill the whole plan:** if Movement 0's corrected score does not fall as
+predicted, the 2027 rule reading is wrong and §5.2's entire ranking inverts. Test it as
+TWO exact assertions, not one fuzzy one — the "roughly 50" written here was stale and
+contradicted §5.3, and would have killed the plan on a passing result:
+(a) switching only the TRUE-side rule must give exactly `151 → 115` (−36);
+(b) the full table must give exactly `151 → 110` (−41).
+**Both MEASURED and PASSED 2026-09-12** — see `plans/212`.
 
 **The single measurement most worth buying next:** run a *second* validator family
 (uautomizer-v2 / goblint-v2, not the bundled CPAchecker) against the 5 clusters of
