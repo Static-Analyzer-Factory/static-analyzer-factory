@@ -10,7 +10,7 @@ from svcomp_witness_rules import base_categories, load_set_membership  # noqa: E
 
 base = [json.loads(l) for l in open("m0a-2027-pertask.jsonl")]
 fresh = {}
-for l in open("0b2-term-pertask.jsonl"):
+for l in open("0b3-term-pertask.jsonl"):
     r = json.loads(l)
     fresh[(r["rel_yml"], r["property"], r["data_model"])] = r
 

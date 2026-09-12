@@ -169,12 +169,9 @@ pub fn rank_loops(func: &AirFunction, module: &AirModule, cfg: &Cfg) -> Option<V
     loops
         .iter()
         .map(|ml| {
-            multilatch_loop_is_ranked(func, module, cfg, ml).then_some(LoopRanking {
+            multilatch_loop_is_ranked(func, module, cfg, ml).map(|ranked| LoopRanking {
                 header: ml.header,
-                // The multi-latch route ranks with a lexicographic function over
-                // several back-edge transitions; that tuple is not recovered yet,
-                // so the proof stands without a witness artifact.
-                ranked: Ranked::Opaque,
+                ranked,
             })
         })
         .collect()
@@ -270,7 +267,7 @@ fn multilatch_loop_is_ranked(
     module: &AirModule,
     cfg: &Cfg,
     ml: &MultiLatchLoop,
-) -> bool {
+) -> Option<Ranked> {
     match build_multipath_model_multi(
         func,
         module,
@@ -281,7 +278,7 @@ fn multilatch_loop_is_ranked(
         &ml.idom,
     ) {
         Some(model) => greedy_lex_rank(&model),
-        None => false,
+        None => None,
     }
 }
 
@@ -312,11 +309,18 @@ fn loop_ranking(
     // havoc model purely to obtain a witness artifact. That extra attempt cannot
     // change the verdict — the loop is already proven at that point — and a failure
     // just leaves the ranking opaque.
-    if multipath_ranked(func, module, cfg, li) {
+    if let Some(via_multipath) = multipath_ranked(func, module, cfg, li) {
+        // Proven. Prefer whatever artifact is renderable: the multipath route's own
+        // scalar/lexicographic tuple if it produced one, else a second, cheaper
+        // attempt via the havoc model purely for the witness. That extra attempt
+        // runs only AFTER the loop is proven, so it cannot change the verdict.
+        if via_multipath.components().is_some() {
+            return Some(via_multipath);
+        }
         let artifact = build_loop_model(func, module, li)
             .and_then(|model| synthesize_ranking_function(&model));
         return Some(match artifact {
-            Some(r @ Ranked::With(_)) => r,
+            Some(r) if r.components().is_some() => r,
             _ => Ranked::Opaque,
         });
     }
@@ -1868,21 +1872,60 @@ impl RankingFunction {
 /// failing must never turn a proven `true` into an abstain.
 #[derive(Debug, Clone)]
 pub enum Ranked {
-    /// Proven, and the ranking function was recovered.
+    /// Proven by a single scalar ranking function.
     With(RankingFunction),
-    /// Proven, but the Z3 model could not be read back (coefficient wider than
-    /// `i64`, or a const absent from the model). No witness; verdict unaffected.
+    /// Proven by a LEXICOGRAPHIC tuple, most-significant component first. Each
+    /// component is bounded and non-increasing on the branches still remaining when
+    /// it was synthesized, and strictly decreasing on the branch it retired.
+    Lex(Vec<RankingFunction>),
+    /// Proven, but no witness artifact: the Z3 model could not be read back
+    /// (coefficient wider than `i64`), or the proof shape is not expressible as a
+    /// single transition invariant (the disjunctive-SCC and recursion routes).
+    /// Verdict unaffected.
     Opaque,
 }
 
 impl Ranked {
-    /// The recovered ranking function, if any.
+    /// The recovered scalar ranking function, if this was ranked by one.
     #[must_use]
     pub fn function(&self) -> Option<&RankingFunction> {
         match self {
             Self::With(f) => Some(f),
+            Self::Lex(_) | Self::Opaque => None,
+        }
+    }
+
+    /// The ranking components, most-significant first: one for a scalar rank, `k`
+    /// for a lexicographic one, none when opaque.
+    #[must_use]
+    pub fn components(&self) -> Option<&[RankingFunction]> {
+        match self {
+            Self::With(f) => Some(std::slice::from_ref(f)),
+            Self::Lex(fs) => Some(fs),
             Self::Opaque => None,
         }
+    }
+}
+
+/// Fold a list of per-round outcomes into one [`Ranked`]. Any opaque round makes
+/// the whole tuple opaque — a lexicographic relation is only sound as a unit, and a
+/// tuple missing a component states a different (unproven) claim.
+fn fold_lex(rounds: Vec<Ranked>) -> Ranked {
+    if rounds.is_empty() {
+        // A vacuously-ranked empty subset: proven, nothing to witness.
+        return Ranked::Opaque;
+    }
+    let mut fs = Vec::with_capacity(rounds.len());
+    for r in rounds {
+        match r {
+            Ranked::With(f) => fs.push(f),
+            Ranked::Lex(_) | Ranked::Opaque => return Ranked::Opaque,
+        }
+    }
+    if fs.len() == 1 {
+        Ranked::With(fs.remove(0))
+    } else {
+        Ranked::Lex(fs)
     }
 }
 
@@ -2106,10 +2149,15 @@ struct MultiPathModel {
 /// Try to prove `li` terminates path-sensitively. Returns `false` (⇒ fall back to
 /// the havoc model) when the model does not apply (nested inner loop, too many
 /// paths, no affine phi) or no lexicographic ranking is found.
-fn multipath_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg, li: &LoopInfo) -> bool {
+fn multipath_ranked(
+    func: &AirFunction,
+    module: &AirModule,
+    cfg: &Cfg,
+    li: &LoopInfo,
+) -> Option<Ranked> {
     match build_multipath_model(func, module, cfg, li) {
         Some(model) => greedy_lex_rank(&model),
-        None => false,
+        None => None,
     }
 }
 
@@ -2122,21 +2170,25 @@ fn multipath_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg, li: &Loop
 /// records per-transition guards + affine `next`, so the same driver ranks a
 /// loop's back-edge transitions or a self-recursive function's call-site
 /// transitions identically.
-fn greedy_lex_rank(model: &MultiPathModel) -> bool {
+fn greedy_lex_rank(model: &MultiPathModel) -> Option<Ranked> {
     if model.branches.is_empty() {
-        return false;
+        return None;
     }
     let all: Vec<usize> = (0..model.branches.len()).collect();
     // Fast path: a single lexicographic tuple that ranks every branch jointly (the
     // classic Cook/BMS synthesis). Covers all previously-ranked programs at no extra
     // Z3 cost, so it can never regress a `true`.
-    if greedy_lex_subset(model, &all) {
-        return true;
+    if let Some(ranked) = greedy_lex_subset(model, &all) {
+        return Some(ranked);
     }
     // Disjunctive fallback (only when the joint tuple fails — so zero cost on the
     // common case): decompose the branch "can-immediately-follow" graph into SCCs
     // and rank each *cyclic* SCC independently. See [`disjunctive_scc_rank`].
-    disjunctive_scc_rank(model, &all)
+    //
+    // Deliberately OPAQUE for witness purposes: the union of per-SCC relations is
+    // not transitive, so a `\at(_, AnyPrev)` claim — which quantifies over ANY
+    // previous state — would be false across an SCC boundary.
+    disjunctive_scc_rank(model, &all).then_some(Ranked::Opaque)
 }
 
 /// Greedy lexicographic synthesis restricted to a subset of branch indices. Each
@@ -2146,29 +2198,27 @@ fn greedy_lex_rank(model: &MultiPathModel) -> bool {
 /// admits a lexicographic ranking. An empty subset is vacuously ranked (no cyclic
 /// branch to bound). Sound because [`synthesize_round`] over a subset is exactly
 /// the joint-ranking soundness condition applied to those branches only.
-fn greedy_lex_subset(model: &MultiPathModel, indices: &[usize]) -> bool {
+fn greedy_lex_subset(model: &MultiPathModel, indices: &[usize]) -> Option<Ranked> {
     let mut remaining: Vec<usize> = indices.to_vec();
-    let mut rounds = 0;
+    // Components in discovery order: round 0's `f` is the most significant, which
+    // is exactly the order the rendered lexicographic relation needs.
+    let mut components: Vec<Ranked> = Vec::new();
     while !remaining.is_empty() {
-        if rounds >= MAX_LEX_ROUNDS {
-            return false;
+        if components.len() >= MAX_LEX_ROUNDS {
+            return None;
         }
-        let mut removed_pos = None;
+        let mut removed = None;
         for (pos, &strict) in remaining.iter().enumerate() {
-            if synthesize_round(model, &remaining, strict) {
-                removed_pos = Some(pos);
+            if let Some(ranked) = synthesize_round(model, &remaining, strict) {
+                removed = Some((pos, ranked));
                 break;
             }
         }
-        match removed_pos {
-            Some(pos) => {
-                remaining.remove(pos);
-                rounds += 1;
-            }
-            None => return false,
-        }
+        let (pos, ranked) = removed?;
+        remaining.remove(pos);
+        components.push(ranked);
     }
-    true
+    Some(fold_lex(components))
 }
 
 /// Maximum branch count for the disjunctive SCC fallback. The fallback is
@@ -2244,7 +2294,7 @@ fn disjunctive_scc_rank(model: &MultiPathModel, indices: &[usize]) -> bool {
                 scc.push(indices[j]);
             }
         }
-        if !greedy_lex_subset(model, &scc) {
+        if greedy_lex_subset(model, &scc).is_none() {
             return false;
         }
     }
@@ -2337,8 +2387,12 @@ fn branch_can_follow(model: &MultiPathModel, i: usize, j: usize) -> bool {
 /// caller identified it as a size-1 self-recursive call-graph SCC).
 #[must_use]
 pub fn recursion_is_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg) -> bool {
+    // Proof only: a self-recursive function has no loop head, so there is no
+    // `while`/`for`/`do` keyword for a `loop_transition_invariant` to sit on. The
+    // 2.1 construct for this shape is a function contract, which this emitter does
+    // not produce — so the ranking tuple is intentionally discarded here.
     match build_recursion_model(func, module, cfg) {
-        Some(model) => greedy_lex_rank(&model),
+        Some(model) => greedy_lex_rank(&model).is_some(),
         None => false,
     }
 }
@@ -2674,8 +2728,12 @@ fn build_recursion_model(
 /// not affine.
 #[must_use]
 pub fn mutual_recursion_is_ranked(module: &AirModule, scc: &BTreeSet<FunctionId>) -> bool {
+    // Proof only, and here discarding the tuple is a CORRECTNESS requirement rather
+    // than conservatism: `remap_affine` rewrites every symbol onto the canonical
+    // SCC member's parameters, so resolving a name from it would name a variable in
+    // the wrong function and emit a WRONG witness, not merely a missing one.
     match build_mutual_recursion_model(module, scc) {
-        Some(model) => greedy_lex_rank(&model),
+        Some(model) => greedy_lex_rank(&model).is_some(),
         None => false,
     }
 }
@@ -3934,7 +3992,7 @@ fn resolve_affine_path(
 /// (`f ≥ 0`) and **non-increasing** (`f − f′ ≥ 0`) on every `remaining` branch and
 /// **strictly** decreasing (`f − f′ ≥ 1`) on branch `strict`? Discharged by the
 /// same Farkas reduction as [`synthesize_ranking_function`], summed over branches.
-fn synthesize_round(model: &MultiPathModel, remaining: &[usize], strict: usize) -> bool {
+fn synthesize_round(model: &MultiPathModel, remaining: &[usize], strict: usize) -> Option<Ranked> {
     let universe: Vec<ValueId> = model.universe.iter().copied().collect();
 
     let solver = new_solver();
@@ -3988,47 +4046,40 @@ fn synthesize_round(model: &MultiPathModel, remaining: &[usize], strict: usize) 
         // Per-symbol coefficient identities (requirement A: f ≥ 0; requirement B:
         // f − f∘next_b ≥ k_b — only header phis change, so only they appear in B).
         for m in &universe {
-            let Some(ra) = region_coeff(&lam_a, m) else {
-                return false;
-            };
+            let ra = region_coeff(&lam_a, m)?;
             solver.assert(coeff_f(m).eq(ra));
 
             let mut lb_m = zero();
             for (phi, nxt) in &branch.next {
                 let indicator = i128::from(phi == m);
                 let in_next = nxt.terms.get(m).copied().unwrap_or(0);
-                let Some(k) = i128_to_i64(indicator - in_next) else {
-                    return false;
-                };
+                let k = i128_to_i64(indicator - in_next)?;
                 lb_m += &coeff_f(phi) * z3::ast::Int::from_i64(k);
             }
-            let Some(rb) = region_coeff(&lam_d, m) else {
-                return false;
-            };
+            let rb = region_coeff(&lam_d, m)?;
             solver.assert(lb_m.eq(rb));
         }
 
         // Constant-term inequalities: const_L − k − Σ λ·bⱼ ≥ 0.
-        let Some(const_a) = region_const(&lam_a) else {
-            return false;
-        };
+        let const_a = region_const(&lam_a)?;
         solver.assert((c0.clone() - const_a).ge(zero()));
 
         let mut lb_const = zero();
         for (phi, nxt) in &branch.next {
-            let Some(k) = i128_to_i64(-nxt.constant) else {
-                return false;
-            };
+            let k = i128_to_i64(-nxt.constant)?;
             lb_const += &coeff_f(phi) * z3::ast::Int::from_i64(k);
         }
         let k_b = if b == strict { delta.clone() } else { zero() };
-        let Some(const_d) = region_const(&lam_d) else {
-            return false;
-        };
+        let const_d = region_const(&lam_d)?;
         solver.assert((lb_const - k_b - const_d).ge(zero()));
     }
 
-    matches!(solver.check(), z3::SatResult::Sat)
+    // Sat IS this round's proof; reading the model back is best-effort on top of
+    // it and can only downgrade the WITNESS, never the verdict.
+    if !matches!(solver.check(), z3::SatResult::Sat) {
+        return None;
+    }
+    Some(extract_ranking(&solver, &coeff, &c0))
 }
 
 // ---------------------------------------------------------------------------
@@ -8223,8 +8274,8 @@ mod tests {
             branches: vec![a, b],
         };
         // The joint tuple genuinely fails, and the disjunctive fallback succeeds.
-        assert!(!greedy_lex_subset(&model, &[0, 1]));
-        assert!(greedy_lex_rank(&model));
+        assert!(greedy_lex_subset(&model, &[0, 1]).is_none());
+        assert!(greedy_lex_rank(&model).is_some());
     }
 
     #[test]
@@ -8259,7 +8310,7 @@ mod tests {
         };
         assert!(branch_can_follow(&model, 0, 1)); // A → B is feasible (reset).
         assert!(branch_can_follow(&model, 1, 0)); // B → A is feasible (reset).
-        assert!(!greedy_lex_rank(&model)); // one SCC, not jointly rankable ⇒ abstain.
+        assert!(greedy_lex_rank(&model).is_none()); // one SCC, not jointly rankable ⇒ abstain.
     }
 
     #[test]
@@ -8283,6 +8334,6 @@ mod tests {
         };
         assert!(branch_can_follow(&model, 0, 0)); // A → A (diverging self-loop).
         assert!(!branch_can_follow(&model, 0, 1)); // A (x≥6→x+2) can't reach B (x≤4).
-        assert!(!greedy_lex_rank(&model));
+        assert!(greedy_lex_rank(&model).is_none());
     }
 }

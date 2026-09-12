@@ -49,7 +49,7 @@ use crate::correctness_driver::{
     source_has_openmp,
 };
 use crate::correctness_witness::{InvariantKind, InvariantSetWitness, SourceInvariant};
-use crate::ranking::{RankingFunction, rank_loops};
+use crate::ranking::{Ranked, RankingFunction, rank_loops};
 use crate::witness_yaml::WitnessMeta;
 
 /// Render one side of the transition relation: `Σ cᵥ·name(v)`, with `\at(v,
@@ -93,15 +93,53 @@ fn render_side(
     (!out.is_empty()).then_some(out)
 }
 
-/// The `ext_c_expression` for a ranking function: the previous state's rank is
-/// strictly greater than the current one.
+/// The `ext_c_expression` for a SCALAR ranking function: the previous state's rank
+/// is strictly greater than the current one.
 ///
 /// The constant is deliberately absent — it appears identically on both sides of
 /// `>` and cancels, so including it would only widen the expression.
-fn transition_invariant(f: &RankingFunction, names: &BTreeMap<ValueId, String>) -> Option<String> {
+fn scalar_relation(f: &RankingFunction, names: &BTreeMap<ValueId, String>) -> Option<String> {
     let prev = render_side(f, names, true)?;
     let cur = render_side(f, names, false)?;
     Some(format!("{prev} > {cur}"))
+}
+
+/// The `ext_c_expression` for a LEXICOGRAPHIC tuple `(f0 .. fk)`, most-significant
+/// component first:
+///
+/// ```text
+/// f0p > f0 || (f0p >= f0 && (f1p > f1 || (f1p >= f1 && f2p > f2)))
+/// ```
+///
+/// `>=` on the higher components, **not** `==`. Each greedy round proves its `f`
+/// only NON-INCREASING on the branches still remaining, so `==` would claim
+/// something strictly stronger than the synthesis established. The disjunction
+/// above states exactly what was proven, branch by branch: the branch retired at
+/// round `i` satisfies `(AND over j<i of fjp >= fj) && fip > fi`.
+///
+/// Well-founded because every component is bounded below (requirement A of its own
+/// round), so the tuple ranges over a product of naturals under a non-increasing
+/// prefix.
+fn lex_relation(fs: &[RankingFunction], names: &BTreeMap<ValueId, String>) -> Option<String> {
+    let (last, head) = fs.split_last()?;
+    // Build outward from the least-significant component.
+    let mut acc = scalar_relation(last, names)?;
+    for f in head.iter().rev() {
+        let prev = render_side(f, names, true)?;
+        let cur = render_side(f, names, false)?;
+        acc = format!("{prev} > {cur} || ({prev} >= {cur} && ({acc}))");
+    }
+    Some(acc)
+}
+
+/// The `ext_c_expression` witnessing whatever ranked this loop, or `None` when the
+/// proof shape is not expressible as a single transition invariant.
+fn transition_invariant(r: &Ranked, names: &BTreeMap<ValueId, String>) -> Option<String> {
+    match r.components()? {
+        [] => None,
+        [f] => scalar_relation(f, names),
+        fs => lex_relation(fs, names),
+    }
 }
 
 /// Build a 2.1 `invariant_set` of `loop_transition_invariant` entries from the
@@ -137,11 +175,11 @@ pub fn build_ranking_witness(
             continue;
         };
         for lr in rankings {
-            // Lexicographic / multi-latch / disjunctive ranks are not expressible
-            // as one transition invariant.
-            let Some(f) = lr.ranked.function() else {
+            // The disjunctive-SCC and recursion routes are not expressible as a
+            // single transition invariant and arrive opaque.
+            if lr.ranked.components().is_none() {
                 continue;
-            };
+            }
             let Some(block) = func.blocks.iter().find(|b| b.id == lr.header) else {
                 continue;
             };
@@ -154,7 +192,7 @@ pub fn build_ranking_witness(
             else {
                 continue;
             };
-            let Some(value) = transition_invariant(f, &names) else {
+            let Some(value) = transition_invariant(&lr.ranked, &names) else {
                 continue;
             };
             invariants.push(SourceInvariant {
@@ -197,7 +235,7 @@ mod tests {
         // The sv-witnesses reference termination witness is exactly this shape.
         let f = rank(&[(1, 1)], 0);
         assert_eq!(
-            transition_invariant(&f, &names(&[(1, "i")])).unwrap(),
+            transition_invariant(&Ranked::With(f.clone()), &names(&[(1, "i")])).unwrap(),
             "\\at(i, AnyPrev) > i"
         );
     }
@@ -206,7 +244,7 @@ mod tests {
     fn coefficient_greater_than_one_is_multiplied_out() {
         let f = rank(&[(1, 3)], 0);
         assert_eq!(
-            transition_invariant(&f, &names(&[(1, "n")])).unwrap(),
+            transition_invariant(&Ranked::With(f.clone()), &names(&[(1, "n")])).unwrap(),
             "3*\\at(n, AnyPrev) > 3*n"
         );
     }
@@ -215,7 +253,8 @@ mod tests {
     fn negative_coefficient_renders_as_subtraction() {
         // f = x - y: the leading sign is inlined, the second term folds into `-`.
         let f = rank(&[(1, 1), (2, -1)], 0);
-        let got = transition_invariant(&f, &names(&[(1, "x"), (2, "y")])).unwrap();
+        let got =
+            transition_invariant(&Ranked::With(f.clone()), &names(&[(1, "x"), (2, "y")])).unwrap();
         assert_eq!(got, "\\at(x, AnyPrev) - \\at(y, AnyPrev) > x - y");
     }
 
@@ -223,15 +262,17 @@ mod tests {
     fn leading_negative_coefficient_keeps_its_sign() {
         let f = rank(&[(1, -2)], 0);
         assert_eq!(
-            transition_invariant(&f, &names(&[(1, "k")])).unwrap(),
+            transition_invariant(&Ranked::With(f.clone()), &names(&[(1, "k")])).unwrap(),
             "-2*\\at(k, AnyPrev) > -2*k"
         );
     }
 
     #[test]
     fn the_constant_is_dropped_because_it_cancels() {
-        let a = transition_invariant(&rank(&[(1, 1)], 0), &names(&[(1, "i")])).unwrap();
-        let b = transition_invariant(&rank(&[(1, 1)], 99), &names(&[(1, "i")])).unwrap();
+        let a =
+            transition_invariant(&Ranked::With(rank(&[(1, 1)], 0)), &names(&[(1, "i")])).unwrap();
+        let b =
+            transition_invariant(&Ranked::With(rank(&[(1, 1)], 99)), &names(&[(1, "i")])).unwrap();
         assert_eq!(a, b);
     }
 
@@ -240,19 +281,76 @@ mod tests {
         // `\at(x, AnyPrev)` needs a variable; a `%3f`-style temporary is not one,
         // and silently omitting its term would state a DIFFERENT relation.
         let f = rank(&[(1, 1), (2, 1)], 0);
-        assert!(transition_invariant(&f, &names(&[(1, "i")])).is_none());
-        assert!(transition_invariant(&f, &names(&[(1, "i"), (2, "%3f")])).is_none());
+        assert!(transition_invariant(&Ranked::With(f.clone()), &names(&[(1, "i")])).is_none());
+        assert!(
+            transition_invariant(&Ranked::With(f.clone()), &names(&[(1, "i"), (2, "%3f")]))
+                .is_none()
+        );
     }
 
     #[test]
     fn a_symbolless_ranking_function_renders_nothing() {
-        assert!(transition_invariant(&rank(&[], 5), &names(&[])).is_none());
+        assert!(transition_invariant(&Ranked::With(rank(&[], 5)), &names(&[])).is_none());
+    }
+
+    #[test]
+    fn two_component_lex_tuple_nests_one_level() {
+        let fs = vec![rank(&[(1, 1)], 0), rank(&[(2, 1)], 0)];
+        let got = transition_invariant(&Ranked::Lex(fs), &names(&[(1, "x"), (2, "y")])).unwrap();
+        assert_eq!(
+            got,
+            "\\at(x, AnyPrev) > x || (\\at(x, AnyPrev) >= x && (\\at(y, AnyPrev) > y))"
+        );
+    }
+
+    #[test]
+    fn three_component_lex_tuple_nests_twice_most_significant_first() {
+        let fs = vec![rank(&[(1, 1)], 0), rank(&[(2, 1)], 0), rank(&[(3, 1)], 0)];
+        let got = transition_invariant(&Ranked::Lex(fs), &names(&[(1, "a"), (2, "b"), (3, "c")]))
+            .unwrap();
+        // `a` is the outermost (most significant) component, `c` the innermost.
+        assert_eq!(
+            got,
+            "\\at(a, AnyPrev) > a || (\\at(a, AnyPrev) >= a \
+             && (\\at(b, AnyPrev) > b || (\\at(b, AnyPrev) >= b && (\\at(c, AnyPrev) > c))))"
+        );
+    }
+
+    #[test]
+    fn lex_uses_non_strict_on_the_prefix_because_that_is_what_was_proven() {
+        // A greedy round proves its f NON-INCREASING on the remaining branches.
+        // Rendering `==` would overclaim.
+        let fs = vec![rank(&[(1, 1)], 0), rank(&[(2, 1)], 0)];
+        let got = transition_invariant(&Ranked::Lex(fs), &names(&[(1, "x"), (2, "y")])).unwrap();
+        assert!(got.contains(">="), "{got}");
+        assert!(!got.contains("=="), "{got}");
+    }
+
+    #[test]
+    fn a_single_component_lex_tuple_is_just_the_scalar_relation() {
+        let one = transition_invariant(&Ranked::Lex(vec![rank(&[(1, 1)], 0)]), &names(&[(1, "i")]));
+        let scalar = transition_invariant(&Ranked::With(rank(&[(1, 1)], 0)), &names(&[(1, "i")]));
+        assert_eq!(one, scalar);
+    }
+
+    #[test]
+    fn an_opaque_ranking_renders_nothing() {
+        assert!(transition_invariant(&Ranked::Opaque, &names(&[(1, "i")])).is_none());
+    }
+
+    #[test]
+    fn one_anonymous_symbol_anywhere_abstains_the_whole_lex_tuple() {
+        // A tuple missing a component states a DIFFERENT relation, so a single
+        // unnameable symbol must drop the entry rather than the component.
+        let fs = vec![rank(&[(1, 1)], 0), rank(&[(2, 1)], 0)];
+        assert!(transition_invariant(&Ranked::Lex(fs), &names(&[(1, "x")])).is_none());
     }
 
     #[test]
     fn multi_variable_sides_stay_in_sync() {
         let f = rank(&[(1, 1), (2, 2)], 0);
-        let got = transition_invariant(&f, &names(&[(1, "a"), (2, "b")])).unwrap();
+        let got =
+            transition_invariant(&Ranked::With(f.clone()), &names(&[(1, "a"), (2, "b")])).unwrap();
         let (prev, cur) = got.split_once(" > ").unwrap();
         // Same shape on both sides, differing only by the \at wrapper.
         assert_eq!(prev.matches("\\at(").count(), 2);
