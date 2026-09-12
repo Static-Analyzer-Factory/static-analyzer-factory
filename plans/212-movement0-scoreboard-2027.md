@@ -51,9 +51,9 @@ Two independent deliverables:
   CATEGORY. This makes the score **fall** — MEASURED **151 → 110**. That is the point:
   every A/B in the loop campaign was steering on a number 41 too high.
 - **0B (offensive):** emit a 2.1 correctness witness on the termination path so the 36
-  weighted points come back legitimately. MEASURED ceiling: 22–26 of the 36 are
-  confidently recoverable; 10 sit in loop-free-only and recursion-only clusters that a
-  ranking function cannot describe.
+  weighted points come back legitimately. MEASURED split: **10** recoverable by an empty
+  invariant set on loop-free tasks (~40 lines, ships alone), **23** needing a real ranking
+  function, **3** recursion-only with no loop to describe.
 
 **Do 0A first and land it on its own.** If 0B lands first the drop is masked and we never
 learn whether the rule reading was right.
@@ -215,11 +215,27 @@ SAF emits nothing today: `termination_strategy`
 > `.svwitnesses` (commit 5297b58, witnesslint 2.1.3-dev)** — nothing to download.
 >
 > **(iv) "for `program_structurally_terminates` tasks the entry set may be empty, and the
-> schema permits it" — SCHEMA-VALID BUT REFUTED IN PRACTICE.** `content: []` inside one
-> entry is indeed schema-legal (no `minItems` anywhere), though a zero-ENTRY document is
-> rejected by witnesslint. It does not matter: fed to a validator, an empty invariant set
-> returns **UNKNOWN, not TRUE** — so it confirms nothing and scores 0, exactly as
-> `correctness: None` does today. The loop-free escape hatch is closed.
+> schema permits it" — CONFIRMED, with a qualifier that two scouts fought over.**
+> `content: []` inside one entry is schema-legal (no `minItems` anywhere), though a
+> zero-ENTRY document is rejected by witnesslint. The behavioural question was settled by
+> running BOTH arms on real tasks, after one scout generalised from a single negative:
+> **empty + LOOP-FREE program → `Verification result: TRUE`; empty + LOOPING program →
+> UNKNOWN.** The failing probe had used `terminating-program-example.c`, which has a loop.
+> Measured on 11 real loop-free sv-benchmarks tasks: **10 TRUE**. So the escape hatch is
+> OPEN for exactly the population it was proposed for.
+>
+> ⚠️ **But be honest about what it is.** An empty invariant set means the validator
+> re-proves termination unaided. SAF still owns the verdict —
+> `program_structurally_terminates` decides it, and SV-COMP scores verdict + confirmed
+> witness — so this is inside the no-delegation rule. It is NOT, however, a SAF-native
+> termination *argument*, and it must not be written up as 10 points of prover capability.
+> It also sits close to the boundary the +47 CPAchecker-answers-for-us exploit was ruled
+> out over; the distinction is that there SAF had no verdict of its own, here it does.
+>
+> **(vi) The loop-free bucket is 10 clusters, not 11.** `ldv-memsafety`'s 40 "loop-free"
+> tasks all contain a `while` in dead CIL code that SAF's reachability prunes and
+> CPAchecker's does not, so its empty witness is rejected; it must be carried by its 8
+> ranked-loop tasks instead. Revised split: **10 empty / 23 ranking / 3 recursion = 36.**
 >
 > **(v) BONUS — the validator premise below is FALSE, and 0B is not blocked.**
 > CPAchecker 4.2.2 **accepts and meaningfully validates** format-2.1 termination
@@ -246,7 +262,8 @@ SAF emits nothing today: `termination_strategy`
 > | mixed loop-free + ranked | 4 | the ranked task carries the cluster |
 > | recursion-only, no loop anywhere | **3** | no loop to hang an invariant on; needs function contracts |
 >
-> So the confident recovery is **22–26 of 36**, not 36. `recursive-simple` (58 tasks),
+> So the confident recovery is 10 (empty, loop-free) + ~8 (simple single-loop ranking)
+> = ~18 of 36 by the deadline, not 36. `recursive-simple` (58 tasks),
 > `recursive` (10) and `termination-memory-linkedlists` (1) are proven only by
 > `recursion_is_ranked` / `mutual_recursion_is_ranked`; 2.1 added `function_contract`
 > entries, which is the lead to follow for those.
