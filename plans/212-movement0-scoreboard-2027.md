@@ -257,10 +257,9 @@ SAF emits nothing today: `termination_strategy`
 >
 > | | clusters | recoverable how |
 > |---|---:|---|
-> | ranked-loop present | **22** | a real `loop_transition_invariant` — needs (i) |
-> | loop-free only | 7 | **blocked by (iv)** — an empty witness confirms nothing |
-> | mixed loop-free + ranked | 4 | the ranked task carries the cluster |
-> | recursion-only, no loop anywhere | **3** | no loop to hang an invariant on; needs function contracts |
+> | loop-free only, empty witness confirms | **10** | ~40 lines, ships alone — MEASURED 10/11 TRUE |
+> | ranked-loop present | **23** | a real `loop_transition_invariant` — needs (i) |
+> | recursion-only, no loop anywhere | **3** | no loop to hang an invariant on; needs `function_contract` |
 >
 > So the confident recovery is 10 (empty, loop-free) + ~8 (simple single-loop ranking)
 > = ~18 of 36 by the deadline, not 36. `recursive-simple` (58 tasks),
@@ -358,7 +357,8 @@ Slice 0B — not started:
       independence, and still a prerequisite for Movement 3.
 - [ ] The z3 exec-bit fix + a solver-exercising smoke test in the provisioner, BEFORE any
       validation measurement is trusted.
-- [ ] An answer for the 7 loop-free-only and 3 recursion-only clusters, or an explicit
+- [ ] An answer for the 3 recursion-only clusters (2.1 `function_contract` entries are
+      the lead), or an explicit
       decision to leave those 10 points on the table.
 
 Follow-ups this slice surfaced but did NOT fix (each is out of 0A's scope, all flagged
