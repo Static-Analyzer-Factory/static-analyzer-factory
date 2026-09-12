@@ -48,10 +48,12 @@ back the points that re-derivation exposes.
 
 Two independent deliverables:
 - **0A (defensive, must-do):** re-derive the harness's witness-requirement rule per BASE
-  CATEGORY. This will make the score **fall** — expected ~151 → ~115. That is the point:
-  every A/B in the loop campaign is currently steering on a number ~36 too high.
+  CATEGORY. This makes the score **fall** — MEASURED **151 → 110**. That is the point:
+  every A/B in the loop campaign was steering on a number 41 too high.
 - **0B (offensive):** emit a 2.1 correctness witness on the termination path so the 36
-  weighted points come back legitimately.
+  weighted points come back legitimately. MEASURED ceiling: 22–26 of the 36 are
+  confidently recoverable; 10 sit in loop-free-only and recursion-only clusters that a
+  ranking function cannot describe.
 
 **Do 0A first and land it on its own.** If 0B lands first the drop is masked and we never
 learn whether the rule reading was right.
@@ -112,11 +114,18 @@ The violation column, which the original table omitted entirely:
 | **`C.no-data-race.all`** | **2.2** | **no — the harness gave this away free** |
 | `C.termination.all` | 2.1+ | no (inert: SAF emits no termination FALSE) |
 
-**⚠️ METHOD WARNING.** Do NOT re-derive this from `benchmark-defs/category-structure.yml`
-or from each validator's `<rundefinition>`s. That method gives the WRONG answer for
-`no-data-race`: five validators declare a `SV-COMP27_no-data-race` correctness
-rundefinition, yet the rules table says "not supported", so it is verdict-only. Read the
-rules page.
+**⚠️ METHOD WARNING — and the one legitimate exception.** Do NOT re-derive the
+*requirement* from `benchmark-defs/category-structure.yml` or from each validator's
+`<rundefinition>`s. That method gives the WRONG answer for `no-data-race`: five validators
+declare a `SV-COMP27_no-data-race` correctness rundefinition, yet the rules table says
+"not supported", so it is verdict-only. Read the rules page.
+
+The exception, which CORRECTION 1 depends on: bench-defs ARE the right source for *which
+base category a task is in*, because that is a structural question about how the
+competition groups tasks, not a question about what a witness must satisfy. The two live
+in separate sections of `scripts/svcomp_witness_rules.py` precisely so the distinction
+cannot blur — §1 membership from bench-defs, §2 requirement from the rules page, and
+nothing reads across.
 
 Two more facts from the same page that shape later movements: the correctness-witness
 validator budget was **cut from 900 s to 300 s**, and an unconfirmed-but-correct TRUE
