@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Validate an SV-COMP YAML 2.0 *correctness* (invariant_set) witness (plan 207 / 1b).
+# Validate an SV-COMP YAML *correctness* (invariant_set) witness (plan 207 / 1b).
+# Handles format 2.0 and 2.1 — 2.1 is what SV-COMP 2027 requires for every
+# C.termination.* base category, and the version is read from the witness, never
+# assumed (witnesslint fails a 2.1 document told to expect 2.0, and CPAchecker's
+# 2.0 parser rejects a 2.1 document outright rather than tolerating it).
 #
 #   validate_correctness_witness.sh <witness.yml> <program.c> [property.prp] [data_model]
 #
@@ -30,11 +34,27 @@ case "$DATA_MODEL" in
     *) bit=--64 ;;
 esac
 
+# ---- Stage 0: native-binary exec bits -------------------------------------
+# The shipped archive leaves `lib/native/x86_64-linux/{z3,ltl3ba}` non-executable.
+# `bin/cpachecker --version` still passes, so the skew is invisible until an
+# analysis needs the SMT solver (z3) or the LTL-to-Buechi translator (ltl3ba —
+# which is exactly what termination validation uses). Idempotent; cheap; must run
+# before any measurement is trusted.
+for nb in "$CPA_HOME"/lib/native/*/z3 "$CPA_HOME"/lib/native/*/ltl3ba; do
+    [ -f "$nb" ] && [ ! -x "$nb" ] && chmod +x "$nb" 2>/dev/null && \
+        echo "[validate-correctness] fixed missing exec bit on $(basename "$nb")" >&2
+done
+
 # ---- Stage 1: witnesslint (best-effort syntactic check) --------------------
-echo "[validate-correctness] witnesslint: $WITNESS"
+# Take the version from the witness; an assumed version turns a well-formed 2.1
+# witness into a lint failure that looks like a content bug.
+WVERSION="$(grep -m1 -oE "format_version:[[:space:]]*['\"]?[0-9]+\.[0-9]+" "$WITNESS" 2>/dev/null \
+            | grep -oE '[0-9]+\.[0-9]+' || true)"
+WVERSION="${WVERSION:-2.0}"
+echo "[validate-correctness] witnesslint: $WITNESS (format $WVERSION)"
 if "$LINT_PY" "$SVW/linter/witnesslinter.py" \
         --witness "$WITNESS" "$PROGRAM" \
-        --expectCorrectnessWitness --expectedWitnessVersion 2.0 >/dev/null 2>&1; then
+        --expectCorrectnessWitness --expectedWitnessVersion "$WVERSION" >/dev/null 2>&1; then
     echo "LINT_OK"
 else
     echo "LINT_WARN (non-conformant or flag unsupported; continuing to CPAchecker)"

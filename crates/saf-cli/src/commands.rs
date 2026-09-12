@@ -914,11 +914,14 @@ pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
             }
         }
     } else if outcome.verdict.starts_with("true") {
-        // Witness-required sound TRUE (rank 2: no-overflow) — write the YAML-2.0
-        // `invariant_set` correctness witness. The verdict was already gated on an
-        // in-process CPAchecker confirmation of THIS witness, so writing it can
-        // never turn a right verdict wrong. A bare `true` with no correctness
-        // witness (e.g. termination, no-data-race) writes nothing (unchanged).
+        // Witness-required sound TRUE — write the `invariant_set` correctness
+        // witness. Two arms reach here with different gating, and the difference
+        // matters: rank-2 no-overflow was already gated on an in-process CPAchecker
+        // confirmation of THIS witness, whereas termination emits its 2.1 witness
+        // UNGATED, because its verdict is a standalone structural proof and an
+        // unconfirmed-but-correct TRUE scores 0 rather than -32. Either way, writing
+        // a witness can never turn a right verdict wrong. A bare `true` with no
+        // correctness witness (e.g. no-data-race) writes nothing (unchanged).
         if let Some(correctness) = &outcome.correctness {
             match correctness.to_yaml_string() {
                 Ok(yaml) => match std::fs::write(&args.witness, yaml) {
@@ -5502,8 +5505,9 @@ fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
 /// The `termination` TRUE strategy (plan 201, R7 — SAF's first sound-TRUE arm).
 ///
 /// A purely-static structural proof over the already-ingested AIR — no
-/// compile-of-original, no execution, no witness (termination TRUE is
-/// witness-not-required in SV-COMP 2026). Emits a bare `true` iff
+/// compile-of-original and no execution. Emits `true` plus an empty format-**2.1**
+/// `invariant_set` correctness witness (required for `C.termination.*` in SV-COMP
+/// 2027; it was witness-not-required in 2026) iff
 /// [`saf_svcomp::program_structurally_terminates`] holds (loop-free reachable CFGs
 /// ∧ acyclic reachable call graph ∧ no reachable indirect call ∧ allowlisted
 /// externals); otherwise `unknown`. Never emits `false`.
@@ -5527,11 +5531,23 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     }
 
     if proven {
+        // SV-COMP 2027 requires a 2.1-or-higher correctness witness for every
+        // `C.termination.*` base category (it was "2.1 (demo mode)" = free in 2026).
+        // Emitting none scored 0 on all 36 of SAF's dedup-weighted termination
+        // clusters. `program_structurally_terminates` proves "no loop in the
+        // reachable CFG, acyclic reachable call graph", so there is no loop
+        // invariant and no ranking function to state: the empty `invariant_set` is
+        // the accurate content, and the validator re-proves termination unaided.
+        //
+        // Purely additive: the verdict is unchanged and is NOT gated on the witness
+        // confirming. An unconfirmed-but-correct TRUE scores 0, never -32, so a
+        // rejected witness costs exactly what emitting nothing costs today and
+        // cannot make a right verdict wrong.
         VerdictOutcome {
             verdict: saf_svcomp::termination_verdict().to_string(),
             witness: None,
             graphml: None,
-            correctness: None,
+            correctness: Some(saf_svcomp::InvariantSetWitness::empty_2_1(ctx.meta)),
         }
     } else {
         unknown_outcome()

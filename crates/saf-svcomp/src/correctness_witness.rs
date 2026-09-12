@@ -17,7 +17,10 @@
 
 use serde::Serialize;
 
-use crate::witness_yaml::{LocationOut, Metadata, WitnessMeta, build_metadata_seeded};
+use crate::witness_yaml::{
+    FORMAT_VERSION_2_1, LocationOut, Metadata, WitnessMeta, build_metadata_seeded,
+    build_metadata_versioned,
+};
 
 /// Render an integer interval `[lo, hi]` on a `bits`-wide variable `name` as a
 /// side-effect-free C expression, dropping type-trivial bounds (Goblint's
@@ -164,7 +167,38 @@ impl InvariantSetWitness {
         }
     }
 
-    /// Serialize to a YAML 2.0 witness document (a one-entry list). Deterministic.
+    /// Assemble an **empty** `invariant_set` witness declaring format **2.1**.
+    ///
+    /// SV-COMP 2027 requires a 2.1-or-higher correctness witness for every
+    /// `C.termination.*` base category; a 2.0 document is rejected outright by the
+    /// validator's 2.1 parser, so the version is load-bearing, not cosmetic.
+    ///
+    /// Empty is the honest content for a `program_structurally_terminates` proof:
+    /// that proof is "the reachable CFG has no loop and the reachable call graph is
+    /// acyclic", which carries no loop invariant and no ranking function, because
+    /// there is no loop to rank. The validator re-establishes termination on its own.
+    ///
+    /// SAF still DECIDES the verdict — this is a witness, not a delegation — but it
+    /// is deliberately not a SAF-native termination *argument*, and should not be
+    /// described as one. A program whose reachable CFG SAF proves loop-free but the
+    /// validator does not (e.g. a dead CIL `while` that SAF's reachability prunes)
+    /// simply goes unconfirmed and scores 0, exactly as emitting nothing does today.
+    #[must_use]
+    pub fn empty_2_1(meta: &WitnessMeta) -> Self {
+        Self {
+            entry: CorrectnessEntry {
+                entry_type: "invariant_set",
+                metadata: build_metadata_versioned(
+                    meta,
+                    b"empty-invariant-set",
+                    FORMAT_VERSION_2_1,
+                ),
+                content: Vec::new(),
+            },
+        }
+    }
+
+    /// Serialize to a YAML witness document (a one-entry list). Deterministic.
     ///
     /// # Errors
     /// Returns `Err` if `serde_yaml` fails to serialize the witness.
@@ -276,6 +310,91 @@ mod tests {
     #[test]
     fn assemble_rejects_empty() {
         assert!(InvariantSetWitness::assemble(&meta(), &[]).is_err());
+    }
+
+    #[test]
+    fn empty_2_1_declares_format_2_1_and_no_invariants() {
+        // The version is load-bearing: SV-COMP 2027 requires "2.1 or higher" for
+        // every `C.termination.*` base category, and the validator's 2.1 parser
+        // rejects a 2.0 document outright rather than tolerating it.
+        let yaml = InvariantSetWitness::empty_2_1(&meta())
+            .to_yaml_string()
+            .unwrap();
+        assert!(yaml.contains("format_version: '2.1'"), "{yaml}");
+        assert!(yaml.contains("entry_type: invariant_set"), "{yaml}");
+        assert!(yaml.contains("content: []"), "{yaml}");
+        assert!(!yaml.contains("loop_invariant"), "{yaml}");
+    }
+
+    #[test]
+    fn empty_2_0_is_unchanged_by_the_2_1_addition() {
+        // Every pre-existing caller (the rank-2 no-overflow arm) must keep emitting
+        // byte-identical 2.0 witnesses.
+        let yaml = InvariantSetWitness::empty(&meta())
+            .to_yaml_string()
+            .unwrap();
+        assert!(yaml.contains("format_version: '2.0'"), "{yaml}");
+    }
+
+    #[test]
+    fn empty_2_1_is_byte_stable_and_distinct_from_2_0() {
+        let a = InvariantSetWitness::empty_2_1(&meta())
+            .to_yaml_string()
+            .unwrap();
+        let b = InvariantSetWitness::empty_2_1(&meta())
+            .to_yaml_string()
+            .unwrap();
+        assert_eq!(a, b, "witness bytes must be deterministic");
+        let v20 = InvariantSetWitness::empty(&meta())
+            .to_yaml_string()
+            .unwrap();
+        assert_ne!(a, v20, "2.0 and 2.1 witnesses must not collide");
+        // ...including their uuids, since the version is folded into the seed.
+        let uuid = |s: &str| {
+            s.lines()
+                .find(|l| l.trim_start().starts_with("uuid:"))
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(uuid(&a), uuid(&v20), "uuid must distinguish the versions");
+    }
+
+    #[test]
+    fn golden_empty_2_1_layout() {
+        let yaml = InvariantSetWitness::empty_2_1(&meta())
+            .to_yaml_string()
+            .unwrap();
+        let masked: String = yaml
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("uuid:") {
+                    "    uuid: <UUID>"
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = "\
+- entry_type: invariant_set
+  metadata:
+    format_version: '2.1'
+    uuid: <UUID>
+    creation_time: 2024-01-01T00:00:00Z
+    producer:
+      name: SAF
+      version: 0.1.0
+    task:
+      input_files:
+      - prog.c
+      input_file_hashes:
+        prog.c: unknown
+      specification: SPEC
+      data_model: ILP32
+      language: C
+  content: []
+";
+        assert_eq!(masked.trim_end(), expected.trim_end(), "\n{yaml}");
     }
 
     #[test]

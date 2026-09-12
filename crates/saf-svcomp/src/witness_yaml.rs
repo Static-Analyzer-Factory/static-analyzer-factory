@@ -28,7 +28,17 @@ use sha2::{Digest, Sha256};
 
 use crate::property_kind::{DataModel, Language};
 
+/// Default YAML witness format version. Violation witnesses and the 2.0-era
+/// correctness witnesses keep emitting this; the termination correctness arm asks
+/// for [`FORMAT_VERSION_2_1`] instead, because SV-COMP 2027 requires "2.1 or
+/// higher" for every `C.termination.*` base category.
 const FORMAT_VERSION: &str = "2.0";
+/// Format 2.1, required for termination correctness witnesses in SV-COMP 2027.
+/// 2.1 adds the `loop_transition_invariant` / `location_transition_invariant`
+/// invariant types and the `ext_c_expression` format — the encoding a ranking
+/// argument uses. An empty `invariant_set` is valid in 2.1 exactly as in 2.0
+/// (`content` has no `minItems`).
+pub(crate) const FORMAT_VERSION_2_1: &str = "2.1";
 const PRODUCER_NAME: &str = "SAF";
 /// Fixed creation timestamp: witness bytes must be byte-identical for identical
 /// inputs (NFR-DET-001), so the emitter never reads the wall clock.
@@ -335,6 +345,17 @@ fn waypoint_out(wp: &SourceWaypoint) -> WaypointOut {
 /// content (e.g. an `invariant_set` witness vs a `violation_sequence` for the
 /// same program) produce distinct uuids; violation witnesses pass `&[]`.
 pub(crate) fn build_metadata_seeded(meta: &WitnessMeta, extra_seed: &[u8]) -> Metadata {
+    build_metadata_versioned(meta, extra_seed, FORMAT_VERSION)
+}
+
+/// As [`build_metadata_seeded`], but declaring an explicit `format_version`. The
+/// version participates in the uuid seed, so the same program witnessed at 2.0 and
+/// at 2.1 gets distinct — still deterministic — uuids.
+pub(crate) fn build_metadata_versioned(
+    meta: &WitnessMeta,
+    extra_seed: &[u8],
+    format_version: &'static str,
+) -> Metadata {
     let hash = compute_file_hash(&meta.input_file);
     let basename = meta
         .input_file
@@ -361,9 +382,10 @@ pub(crate) fn build_metadata_seeded(meta: &WitnessMeta, extra_seed: &[u8]) -> Me
     seed.extend_from_slice(meta.specification.as_bytes());
     seed.extend_from_slice(meta.producer_version.as_bytes());
     seed.extend_from_slice(extra_seed);
+    seed.extend_from_slice(format_version.as_bytes());
 
     Metadata {
-        format_version: FORMAT_VERSION,
+        format_version,
         uuid: deterministic_uuid(&seed),
         creation_time: FIXED_CREATION_TIME,
         producer: Producer {
