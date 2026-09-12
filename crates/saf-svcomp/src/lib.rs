@@ -38,6 +38,7 @@ pub mod slicing;
 mod ssa_encode;
 pub mod summaries;
 pub mod termination;
+pub mod termination_witness;
 pub mod witness_lower;
 pub mod witness_yaml;
 
@@ -55,7 +56,9 @@ pub use conc_shim::{
     synthesize_conc_shim_driver,
 };
 pub use correctness_driver::{build_interval_invariant_witness, source_has_openmp};
-pub use correctness_witness::{InvariantSetWitness, SourceInvariant, interval_to_c_expr};
+pub use correctness_witness::{
+    InvariantKind, InvariantSetWitness, SourceInvariant, interval_to_c_expr,
+};
 pub use memsafety::{
     AsanHit, asan_class_to_subproperty, lower_memsafety_hit, memsafety_verdict, parse_asan_report,
 };
@@ -82,6 +85,7 @@ pub use se_interp::{enumerate_concolic_flip_seeds, enumerate_se_candidates};
 pub use termination::{
     is_known_returning_external, program_structurally_terminates, termination_verdict,
 };
+pub use termination_witness::build_ranking_witness;
 pub use witness_lower::{
     lower_candidate, lower_must_reach, lower_reach_error_target, span_to_location,
 };

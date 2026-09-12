@@ -123,13 +123,41 @@ const Z3_SEED: u32 = 42;
 /// checks `cfg_has_loops` first); a loop-free function is handled upstream.
 #[must_use]
 pub fn loops_are_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg) -> bool {
+    rank_loops(func, module, cfg).is_some()
+}
+
+/// One loop's ranking outcome, tagged with its header block so a witness can be
+/// placed at the right source location.
+#[derive(Debug, Clone)]
+pub struct LoopRanking {
+    /// The loop header — the block whose source line carries the `while`/`for`/`do`.
+    pub header: BlockId,
+    /// What ranked it, and whether the artifact survived extraction.
+    pub ranked: Ranked,
+}
+
+/// Rank every natural loop of `func`, returning one [`LoopRanking`] per loop, or
+/// `None` if any loop could not be ranked.
+///
+/// `loops_are_ranked` is exactly `rank_loops(..).is_some()`. The set of programs
+/// SAF proves is therefore unchanged by witness support — the only difference is
+/// that the ranking functions now come back instead of being dropped on the floor.
+pub fn rank_loops(func: &AirFunction, module: &AirModule, cfg: &Cfg) -> Option<Vec<LoopRanking>> {
     // Fast path: a reducible CFG with one latch per header — the full existing
     // machinery applies (path-sensitive multipath model with a havoc fallback that
     // also covers nested loops).
     if let Some(loops) = extract_natural_loops(func, cfg) {
         // Every natural loop must be ranked; any failure (unmodelable loop, or Z3
         // `Unsat`/`Unknown`) abstains the whole function.
-        return loops.iter().all(|li| loop_is_ranked(func, module, cfg, li));
+        return loops
+            .iter()
+            .map(|li| {
+                loop_ranking(func, module, cfg, li).map(|ranked| LoopRanking {
+                    header: li.header,
+                    ranked,
+                })
+            })
+            .collect();
     }
     // Additive fallback: a reducible CFG where some header has **more than one**
     // back-edge (a `continue`, or a short-circuit `while (a && b)`). The single-
@@ -137,12 +165,19 @@ pub fn loops_are_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg) -> bo
     // lexicographic function over *all* its back-edge transitions (multi-latch
     // soundness: see [`build_multipath_model_multi`]). Irreducible CFGs are still
     // rejected here (⇒ abstain).
-    match extract_multilatch_loops(func, cfg) {
-        Some(loops) => loops
-            .iter()
-            .all(|ml| multilatch_loop_is_ranked(func, module, cfg, ml)),
-        None => false,
-    }
+    let loops = extract_multilatch_loops(func, cfg)?;
+    loops
+        .iter()
+        .map(|ml| {
+            multilatch_loop_is_ranked(func, module, cfg, ml).then_some(LoopRanking {
+                header: ml.header,
+                // The multi-latch route ranks with a lexicographic function over
+                // several back-edge transitions; that tuple is not recovered yet,
+                // so the proof stands without a witness artifact.
+                ranked: Ranked::Opaque,
+            })
+        })
+        .collect()
 }
 
 /// A natural loop identified by a header and **all** of its back-edge latches
@@ -265,10 +300,34 @@ fn multilatch_loop_is_ranked(
 /// models an inner loop's effect as havoc and handles the common counter loops.
 /// Both are complete, sound termination proofs (Farkas over a superset relation),
 /// so a `true` here never ranks a non-terminating loop.
+fn loop_ranking(
+    func: &AirFunction,
+    module: &AirModule,
+    cfg: &Cfg,
+    li: &LoopInfo,
+) -> Option<Ranked> {
+    // Proof order is unchanged: the path-sensitive model first, the havoc model as
+    // the fallback. Only the havoc model currently hands back a scalar ranking
+    // function, so when multipath is what proved the loop we ALSO try the (cheaper)
+    // havoc model purely to obtain a witness artifact. That extra attempt cannot
+    // change the verdict — the loop is already proven at that point — and a failure
+    // just leaves the ranking opaque.
+    if multipath_ranked(func, module, cfg, li) {
+        let artifact = build_loop_model(func, module, li)
+            .and_then(|model| synthesize_ranking_function(&model));
+        return Some(match artifact {
+            Some(r @ Ranked::With(_)) => r,
+            _ => Ranked::Opaque,
+        });
+    }
+    let model = build_loop_model(func, module, li)?;
+    synthesize_ranking_function(&model)
+}
+
+/// Boolean view of [`loop_ranking`], retained for callers that only need the proof.
+#[cfg(test)]
 fn loop_is_ranked(func: &AirFunction, module: &AirModule, cfg: &Cfg, li: &LoopInfo) -> bool {
-    multipath_ranked(func, module, cfg, li)
-        || build_loop_model(func, module, li)
-            .is_some_and(|model| synthesize_ranking_function(&model))
+    loop_ranking(func, module, cfg, li).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -1777,7 +1836,89 @@ fn constraint_to_z3(
 /// requirements. For a requirement `region ⇒ L ≥ k`, Farkas gives the identity
 /// `L(z) − k = Σⱼ λⱼ·exprⱼ(z) + s` with `λ, s ≥ 0`; matching coefficients
 /// per symbol and the constant term yields purely linear constraints.
-fn synthesize_ranking_function(model: &LoopModel) -> bool {
+/// A synthesized linear ranking function `f(x) = Σ coeff[v]·v + constant`, with
+/// `region ⇒ f ≥ 0` and `region ⇒ f(x) − f(x′) ≥ 1`. The coefficients come
+/// straight out of the Farkas system's Z3 model.
+///
+/// Only the terms matter for a witness: the constant cancels on both sides of the
+/// transition relation `f(prev) > f(cur)`, and `δ` is subsumed by integrality.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankingFunction {
+    /// Non-zero coefficients, keyed by the SSA value they multiply.
+    pub terms: BTreeMap<ValueId, i64>,
+    /// The additive constant (kept for diagnostics; irrelevant to the relation).
+    pub constant: i64,
+}
+
+impl RankingFunction {
+    /// A ranking function with no symbols cannot express a decrease. That happens
+    /// when the region is infeasible and Farkas proves anything — the termination
+    /// proof stands (an unreachable loop terminates) but there is nothing to
+    /// witness, so callers should treat this as opaque.
+    #[must_use]
+    pub fn is_trivial(&self) -> bool {
+        self.terms.is_empty()
+    }
+}
+
+/// The outcome of a ranking synthesis. `Some(_)` means PROVEN; the variant says
+/// only whether the proof's artifact could be recovered for a witness.
+///
+/// Keeping these apart is what makes witness emission recall-neutral: extraction
+/// failing must never turn a proven `true` into an abstain.
+#[derive(Debug, Clone)]
+pub enum Ranked {
+    /// Proven, and the ranking function was recovered.
+    With(RankingFunction),
+    /// Proven, but the Z3 model could not be read back (coefficient wider than
+    /// `i64`, or a const absent from the model). No witness; verdict unaffected.
+    Opaque,
+}
+
+impl Ranked {
+    /// The recovered ranking function, if any.
+    #[must_use]
+    pub fn function(&self) -> Option<&RankingFunction> {
+        match self {
+            Self::With(f) => Some(f),
+            Self::Opaque => None,
+        }
+    }
+}
+
+/// Read a satisfied solver's model back into a [`RankingFunction`].
+///
+/// `model_completion = true`: a coefficient the constraints leave free still needs
+/// a concrete value, and any completion is as sound as another — every model of
+/// the Farkas system is a valid ranking function.
+fn extract_ranking(
+    solver: &z3::Solver,
+    coeff: &BTreeMap<ValueId, z3::ast::Int>,
+    c0: &z3::ast::Int,
+) -> Ranked {
+    let Some(m) = solver.get_model() else {
+        return Ranked::Opaque;
+    };
+    let mut terms = BTreeMap::new();
+    for (v, ast) in coeff {
+        let Some(k) = m.eval(ast, true).and_then(|e| e.as_i64()) else {
+            return Ranked::Opaque;
+        };
+        if k != 0 {
+            terms.insert(*v, k);
+        }
+    }
+    let Some(constant) = m.eval(c0, true).and_then(|e| e.as_i64()) else {
+        return Ranked::Opaque;
+    };
+    let f = RankingFunction { terms, constant };
+    if f.is_trivial() {
+        return Ranked::Opaque;
+    }
+    Ranked::With(f)
+}
+
+fn synthesize_ranking_function(model: &LoopModel) -> Option<Ranked> {
     // Template symbols may carry a ranking coefficient; the universe is every
     // symbol appearing in the region / transition (for the per-symbol identity).
     let template: BTreeSet<ValueId> = model
@@ -1852,9 +1993,7 @@ fn synthesize_ranking_function(model: &LoopModel) -> bool {
     // Per-symbol coefficient identities.
     for m in &universe {
         // Requirement A: coeff_f(m) == Σ λ^A aⱼ(m).
-        let Some(ra) = region_coeff(&lam_a, m) else {
-            return false;
-        };
+        let ra = region_coeff(&lam_a, m)?;
         solver.assert(coeff_f(m).eq(ra));
 
         // Requirement B: L_B coeff(m) == Σ λ^B aⱼ(m).
@@ -1863,39 +2002,34 @@ fn synthesize_ranking_function(model: &LoopModel) -> bool {
             let ci = coeff_f(i);
             let indicator = i128::from(i == m);
             let in_next = next_i.terms.get(m).copied().unwrap_or(0);
-            let Some(k) = i128_to_i64(indicator - in_next) else {
-                return false;
-            };
+            let k = i128_to_i64(indicator - in_next)?;
             lb_m += &ci * z3::ast::Int::from_i64(k);
         }
-        let Some(rb) = region_coeff(&lam_b, m) else {
-            return false;
-        };
+        let rb = region_coeff(&lam_b, m)?;
         solver.assert(lb_m.eq(rb));
     }
 
     // Constant-term inequalities: const_L − k − Σ λ bⱼ ≥ 0.
     // Requirement A: c0 − 0 − Σ λ^A bⱼ ≥ 0.
-    let Some(const_a) = region_const(&lam_a) else {
-        return false;
-    };
-    solver.assert((c0 - const_a).ge(zero()));
+    let const_a = region_const(&lam_a)?;
+    solver.assert((&c0 - const_a).ge(zero()));
 
     // Requirement B: (−Σ_i c_i·next_i.const) − δ − Σ λ^B bⱼ ≥ 0.
     let mut lb_const = zero();
     for (i, next_i) in &model.state {
         let ci = coeff_f(i);
-        let Some(k) = i128_to_i64(-next_i.constant) else {
-            return false;
-        };
+        let k = i128_to_i64(-next_i.constant)?;
         lb_const += &ci * z3::ast::Int::from_i64(k);
     }
-    let Some(const_b) = region_const(&lam_b) else {
-        return false;
-    };
+    let const_b = region_const(&lam_b)?;
     solver.assert((lb_const - delta - const_b).ge(zero()));
 
-    matches!(solver.check(), z3::SatResult::Sat)
+    // Sat IS the termination proof. Reading the model back is best-effort on top
+    // of it and can only downgrade the WITNESS, never the verdict.
+    if !matches!(solver.check(), z3::SatResult::Sat) {
+        return None;
+    }
+    Some(extract_ranking(&solver, &coeff, &c0))
 }
 
 /// Narrow an `i128` to `i64`, or `None` if it does not fit (⇒ abstain).

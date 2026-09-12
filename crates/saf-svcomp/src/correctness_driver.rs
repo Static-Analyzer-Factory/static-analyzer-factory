@@ -16,7 +16,9 @@ use saf_analysis::cfg::Cfg;
 use saf_core::air::{AirBlock, AirModule, Operation};
 use saf_core::ids::ValueId;
 
-use crate::correctness_witness::{InvariantSetWitness, SourceInvariant, interval_to_c_expr};
+use crate::correctness_witness::{
+    InvariantKind, InvariantSetWitness, SourceInvariant, interval_to_c_expr,
+};
 use crate::witness_lower::span_to_location;
 use crate::witness_yaml::WitnessMeta;
 
@@ -108,6 +110,7 @@ pub fn build_interval_invariant_witness(
                 column,
                 function: Some(func.name.clone()),
                 value: exprs.join(" && "),
+                kind: InvariantKind::Loop,
             });
         }
     }
@@ -122,7 +125,7 @@ pub fn build_interval_invariant_witness(
 /// symbols only (post-mem2reg these sit on promoted phis + function params — the
 /// `%`-free source names, unlike `DisplayResolver`, which `%`-prefixes and falls
 /// back to hex for anonymous temporaries).
-fn build_value_names(module: &AirModule) -> BTreeMap<ValueId, String> {
+pub(crate) fn build_value_names(module: &AirModule) -> BTreeMap<ValueId, String> {
     let mut names = BTreeMap::new();
     for func in &module.functions {
         for param in &func.params {
@@ -143,7 +146,7 @@ fn build_value_names(module: &AirModule) -> BTreeMap<ValueId, String> {
 
 /// A loop whose header block itself performs a call re-evaluates a function-call
 /// guard each iteration (`while(f())`); its keyword column is unmatchable.
-fn header_has_function_call(block: &AirBlock) -> bool {
+pub(crate) fn header_has_function_call(block: &AirBlock) -> bool {
     block.instructions.iter().any(|i| {
         matches!(
             i.op,
@@ -156,7 +159,7 @@ fn header_has_function_call(block: &AirBlock) -> bool {
 /// spanned instruction in the header block (phis carry no span post-mem2reg; the
 /// guard `icmp`/`br` sits on the loop-keyword line), and the column is the
 /// leftmost non-ws char of that source line (NOT the guard's dbg column).
-fn loop_head_location(
+pub(crate) fn loop_head_location(
     module: &AirModule,
     block: &AirBlock,
     src_lines: &[&str],
@@ -174,7 +177,7 @@ fn loop_head_location(
 
 /// `true` iff `name` is a C identifier (rejects the `%<hex>` fallback the display
 /// resolver returns for an un-named/anonymous SSA value).
-fn is_c_identifier(name: &str) -> bool {
+pub(crate) fn is_c_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}

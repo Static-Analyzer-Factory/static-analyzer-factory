@@ -18,8 +18,8 @@
 use serde::Serialize;
 
 use crate::witness_yaml::{
-    FORMAT_VERSION_2_1, LocationOut, Metadata, WitnessMeta, build_metadata_seeded,
-    build_metadata_versioned,
+    FORMAT_VERSION_2_0, FORMAT_VERSION_2_1, LocationOut, Metadata, WitnessMeta,
+    build_metadata_seeded, build_metadata_versioned,
 };
 
 /// Render an integer interval `[lo, hi]` on a `bits`-wide variable `name` as a
@@ -75,6 +75,47 @@ fn signed_max(bits: u8) -> i128 {
     }
 }
 
+/// Which YAML-2.1 invariant type an entry carries.
+///
+/// `Loop` is the 2.0-era state invariant (`region ⇒ P(x)`). `LoopTransition` is
+/// new in 2.1 and is how a *termination* argument is expressed: a relation between
+/// the current state and any previous state at the same loop head, written with the
+/// `\at(x, AnyPrev)` extension keyword. There is no `ranking_function` key in the
+/// schema — a ranking function is ENCODED INTO a transition invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvariantKind {
+    /// `type: loop_invariant`, `format: c_expression`.
+    Loop,
+    /// `type: loop_transition_invariant`, `format: ext_c_expression`.
+    LoopTransition,
+}
+
+impl InvariantKind {
+    fn type_str(self) -> &'static str {
+        match self {
+            Self::Loop => "loop_invariant",
+            Self::LoopTransition => "loop_transition_invariant",
+        }
+    }
+
+    /// `ext_c_expression` is what unlocks `\at(...)`; a plain `c_expression`
+    /// carrying `\at` is rejected.
+    fn format_str(self) -> &'static str {
+        match self {
+            Self::Loop => "c_expression",
+            Self::LoopTransition => "ext_c_expression",
+        }
+    }
+
+    /// The minimum format version an entry of this kind forces on the document.
+    fn min_format_version(self) -> &'static str {
+        match self {
+            Self::Loop => "2.0",
+            Self::LoopTransition => "2.1",
+        }
+    }
+}
+
 /// A single loop-head invariant to emit: a source location (column ALWAYS
 /// present — CPAchecker 4.2.2 crashes if it is omitted) + a C expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +130,9 @@ pub struct SourceInvariant {
     pub function: Option<String>,
     /// The side-effect-free C expression (e.g. `0 <= i && i <= 1000000`).
     pub value: String,
+    /// State invariant or transition invariant. Drives `type`, `format`, and the
+    /// document's `format_version`.
+    pub kind: InvariantKind,
 }
 
 /// An assembled YAML 2.0 correctness (`invariant_set`) witness, ready to serialize.
@@ -115,6 +159,7 @@ impl InvariantSetWitness {
         // distinct, still-deterministic uuids.
         let mut seed = Vec::new();
         for inv in invariants {
+            seed.push(u8::from(inv.kind == InvariantKind::LoopTransition));
             seed.extend_from_slice(inv.file_name.as_bytes());
             seed.extend_from_slice(&inv.line.to_le_bytes());
             seed.extend_from_slice(&inv.column.to_le_bytes());
@@ -125,11 +170,11 @@ impl InvariantSetWitness {
             seed.push(0);
         }
 
-        let content = invariants
+        let content: Vec<InvariantWrap> = invariants
             .iter()
             .map(|inv| InvariantWrap {
                 invariant: InvariantOut {
-                    kind: "loop_invariant",
+                    kind: inv.kind.type_str(),
                     location: LocationOut::new(
                         inv.file_name.clone(),
                         inv.line,
@@ -137,15 +182,28 @@ impl InvariantSetWitness {
                         inv.function.clone(),
                     ),
                     value: inv.value.clone(),
-                    format: "c_expression",
+                    format: inv.kind.format_str(),
                 },
             })
             .collect();
 
+        // A transition invariant is a 2.1 construct; declaring 2.0 while carrying
+        // one makes the document self-contradictory and the validator's 2.0 parser
+        // rejects it outright. Take the max over the entries rather than asking the
+        // caller to keep the two in sync.
+        let version = if invariants
+            .iter()
+            .any(|i| i.kind.min_format_version() == FORMAT_VERSION_2_1)
+        {
+            FORMAT_VERSION_2_1
+        } else {
+            FORMAT_VERSION_2_0
+        };
+
         Ok(Self {
             entry: CorrectnessEntry {
                 entry_type: "invariant_set",
-                metadata: build_metadata_seeded(meta, &seed),
+                metadata: build_metadata_versioned(meta, &seed, version),
                 content,
             },
         })
@@ -304,6 +362,14 @@ mod tests {
             column: 3,
             function: Some("main".to_string()),
             value: value.to_string(),
+            kind: InvariantKind::Loop,
+        }
+    }
+
+    fn trans(value: &str) -> SourceInvariant {
+        SourceInvariant {
+            kind: InvariantKind::LoopTransition,
+            ..inv(value)
         }
     }
 

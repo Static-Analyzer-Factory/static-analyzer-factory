@@ -33,6 +33,8 @@ use crate::property_kind::{DataModel, Language};
 /// for [`FORMAT_VERSION_2_1`] instead, because SV-COMP 2027 requires "2.1 or
 /// higher" for every `C.termination.*` base category.
 const FORMAT_VERSION: &str = "2.0";
+/// Same string, re-exported for callers that must pick a version explicitly.
+pub(crate) const FORMAT_VERSION_2_0: &str = FORMAT_VERSION;
 /// Format 2.1, required for termination correctness witnesses in SV-COMP 2027.
 /// 2.1 adds the `loop_transition_invariant` / `location_transition_invariant`
 /// invariant types and the `ext_c_expression` format — the encoding a ranking

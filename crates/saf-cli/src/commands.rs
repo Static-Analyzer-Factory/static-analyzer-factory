@@ -5543,11 +5543,20 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         // confirming. An unconfirmed-but-correct TRUE scores 0, never -32, so a
         // rejected witness costs exactly what emitting nothing costs today and
         // cannot make a right verdict wrong.
+        // Prefer a REAL termination argument: one `loop_transition_invariant` per
+        // ranked loop, rendered from the Farkas coefficients `ranking.rs` now hands
+        // back. Falls back to the empty `invariant_set` when nothing renders — a
+        // loop-free proof (nothing to rank), a lexicographic rank (not expressible
+        // as one transition invariant), or a symbol with no C name.
+        let correctness = std::fs::read_to_string(ctx.input)
+            .ok()
+            .and_then(|src| saf_svcomp::build_ranking_witness(ctx.module, &src, ctx.meta))
+            .unwrap_or_else(|| saf_svcomp::InvariantSetWitness::empty_2_1(ctx.meta));
         VerdictOutcome {
             verdict: saf_svcomp::termination_verdict().to_string(),
             witness: None,
             graphml: None,
-            correctness: Some(saf_svcomp::InvariantSetWitness::empty_2_1(ctx.meta)),
+            correctness: Some(correctness),
         }
     } else {
         unknown_outcome()
