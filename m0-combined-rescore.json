@@ -1,0 +1,23 @@
+{
+  "rules_edition": "SV-COMP 2027",
+  "source": "m0a-2027-pertask.jsonl with the fresh 0B termination run spliced in",
+  "false_alarms": 0,
+  "wrong_true": 0,
+  "n": 55690,
+  "confirmed_score_weighted": 127,
+  "per_property_weighted": {
+    "no-data-race": 9,
+    "no-overflow": 34,
+    "termination": 17,
+    "unreach-call": 52,
+    "valid-memsafety": 15
+  },
+  "confirmed_score_weighted_version_aware": 124,
+  "per_property_weighted_version_aware": {
+    "no-data-race": 9,
+    "no-overflow": 34,
+    "termination": 17,
+    "unreach-call": 49,
+    "valid-memsafety": 15
+  }
+}
