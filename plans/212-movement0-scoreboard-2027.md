@@ -1,6 +1,7 @@
 # Plan 212 — Movement 0: score against the 2027 rulebook (defends 36 weighted)
 
-**Status:** **0A LANDED 2026-09-12.** 0B designed, not started.
+**Status:** **0A LANDED 2026-09-12. 0B slice 1 LANDED 2026-09-12** (+17 weighted).
+0B slice 2 (ranking-function witnesses, 19 clusters) scoped, not started.
 **Branch:** `movement0/scoreboard-2027`, cut off `lever1/cbmc-loop-free` @ `038e4122`.
 **Track:** TRUE-side. Movement 0 of 4 — **nothing else in the sequence may start before this lands.**
 **Design source:** `plans/211` §5.1(d), §5.2, §5.3. Memory: `svcomp-2027-witness-rules-50pts-at-risk`.
@@ -38,6 +39,50 @@ have killed the plan on a passing result.
 
 Three §1–§2 claims corrected in place below. §3's four claims were **refuted by
 measurement** — see the `0B — MEASURED CORRECTIONS` block.
+
+---
+
+## MEASURED RESULT — slice 0B part 1, 2026-09-12
+
+`termination_strategy` now emits an empty format-**2.1** `invariant_set` alongside its
+verdict (commit `39ef150f`). Full 2,395-task termination sweep with `--confirm-witness`:
+
+| | before | after |
+|---|---:|---:|
+| termination weighted clusters | 0 | **17** of 36 |
+| tasks confirmed | 0 | 266 of 806 |
+| **total weighted, version-blind** | **110** | **127** |
+| total weighted, version-aware | 107 | 124 |
+| `false_alarms` / `wrong_true` | 0 / 0 | **0 / 0** |
+
+`raw_score` and the TrueCorrect count are identical to the 2026-09-11 dump (1612 / 806),
+so there is no verdict drift — the change is purely additive, exactly as designed.
+
+**Beat the forecast.** Scouting predicted 10 clusters (the loop-free-only bucket). The
+empty witness also carried the three clusters written off as recursion-only needing 2.1
+`function_contract` entries — `recursive-simple` (58 tasks), `recursive` (10),
+`termination-memory-linkedlists` (1) — plus several mixed ones.
+
+**The remaining 19 clusters all have loops**, which an empty invariant set cannot
+describe. In descending size: `product-lines` 178, `seq-mthreaded` 57,
+`termination-restricted-15` 46, `termination-memory-alloca` 43, `loop-acceleration` 19,
+`loops` 18, `loop-lit` 14, `loop-invgen` 9, `loop-simple` 8, `bitvector` 7,
+`array-industry-pattern` 6, `loop-crafted` 6, `array-memsafety` 5, `loop-new` 5,
+`loop-invariants` 3, `reducercommutativity` 3, `array-examples` 2,
+`termination-dietlibc` 1, `termination-nla` 1. That is slice 2's exact worklist.
+
+**Two bugs fixed on the way**, both of which would have corrupted any earlier measurement:
+`validate_correctness_witness.sh` hardcoded `--expectedWitnessVersion 2.0` (so every 2.1
+witness linted as non-conformant — this alone moved the end-to-end result from LINT_WARN to
+LINT_OK), and `.svtools/CPAchecker-4.2.2-unix/lib/native/x86_64-linux/{z3,ltl3ba}` ship
+without exec bits while `bin/cpachecker --version` still passes. `ltl3ba` is precisely what
+termination validation uses.
+
+**Honest framing, which matters more than the number.** An empty invariant set means the
+validator re-proves termination unaided. SAF decides the verdict — this is a witness, not
+a delegation, and it is inside the no-delegation rule — but these 17 points are witness
+plumbing, not SAF-native termination reasoning. Slice 2 is where the actual argument gets
+emitted.
 
 ---
 
