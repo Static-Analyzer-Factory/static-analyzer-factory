@@ -1,7 +1,8 @@
 # Plan 212 — Movement 0: score against the 2027 rulebook (defends 36 weighted)
 
-**Status:** **0A LANDED 2026-09-12. 0B slice 1 LANDED 2026-09-12** (+17 weighted).
-0B slice 2 (ranking-function witnesses, 19 clusters) scoped, not started.
+**Status:** **MOVEMENT 0 COMPLETE 2026-09-12/13.** 0A + 0B slices 1-3 landed; termination
+recovered to **27 of 36** clusters, which an oracle probe shows is the CEILING of the best
+available tool. Score 151 (wrong) -> 110 (correct) -> **137**.
 **Branch:** `movement0/scoreboard-2027`, cut off `lever1/cbmc-loop-free` @ `038e4122`.
 **Track:** TRUE-side. Movement 0 of 4 — **nothing else in the sequence may start before this lands.**
 **Design source:** `plans/211` §5.1(d), §5.2, §5.3. Memory: `svcomp-2027-witness-rules-50pts-at-risk`.
@@ -83,6 +84,78 @@ validator re-proves termination unaided. SAF decides the verdict — this is a w
 a delegation, and it is inside the no-delegation rule — but these 17 points are witness
 plumbing, not SAF-native termination reasoning. Slice 2 is where the actual argument gets
 emitted.
+
+---
+
+## MEASURED RESULT — slice 0B parts 2-3, and the CEILING, 2026-09-13
+
+Two more slices landed, then an oracle probe established that there is nothing further to
+win here with the tooling that exists.
+
+| slice | what it emits | termination clusters | total weighted |
+|---|---|---:|---:|
+| (before 0B) | nothing | 0 of 36 | 110 |
+| 1 — empty `invariant_set` | witness plumbing | 17 | 127 |
+| 2 — scalar ranking function | `Σ cv*\at(v,AnyPrev) > Σ cv*v` | 25 | 135 |
+| 3 — lexicographic tuple | nested `>` / `>=` disjunction | **27** | **137** |
+
+`false_alarms == 0`, `wrong_true == 0` and `TrueCorrect == 806` held across every slice —
+recall is neutral by construction (`loops_are_ranked` is now exactly
+`rank_loops(..).is_some()`), and zero clusters were ever lost.
+
+### The remaining 9 clusters are blocked by the VALIDATOR, not by SAF
+
+CPAchecker 4.2.2 can itself PRODUCE 2.1 termination witnesses
+(`config/lassoRankerAnalysis.properties`, `witness.yamlexporter.witnessVersions=V2d1`).
+Used as an oracle over all 19 loop-bearing clusters — produce a witness, then feed it
+straight back to its own validator — it reconfirms **10 of 19**:
+
+> `termination-restricted-15`, `loop-acceleration`, `loops`, `loop-lit`, `loop-simple`,
+> `bitvector`, `loop-crafted`, `loop-new`, `loop-invariants`, `termination-nla`
+
+**SAF now confirms exactly those 10, the identical set** — and without the
+`termination.ignoreOverflowsForUnsignedVariables=true` knob the oracle needed for 4 of
+them (`bitvector`, `loop-invariants`, `loop-acceleration`, `loop-crafted`), which
+CPAchecker itself flags as potentially UNSOUND. So SAF is at the ceiling of the best
+available tool, reached by a sounder route.
+
+Why the other 9 drop, measured rather than assumed:
+
+| cluster | tasks | oracle result |
+|---|---:|---|
+| `product-lines` | 178 | 0/29 proved even at 600 s — LassoRanker cannot build a ranking relation over CIL string literals (`Cannot handle term (__string__ 1)`) |
+| `seq-mthreaded` | 57 | exports a witness, never reconfirms |
+| `termination-memory-alloca` | 43 | no witness ever produced |
+| `loop-invgen` | 9 | 8 witnesses, 0 reconfirm |
+| `array-industry-pattern`, `array-memsafety`, `reducercommutativity`, `array-examples`, `termination-dietlibc` | 17 | no witness ever produced |
+
+Two further hard limits found, both in the validator:
+
+* **Nested loops are unscorable.** 0 of 15 oracle fixtures whose entries sit at strictly
+  increasing columns in one function reconfirmed; all 15 hit
+  `IllegalArgumentException: Not supported interface` in
+  `TransitionInvariantUtils.makeStatesEquivalent` — a CPAchecker 4.2.2 **crash**, not a
+  witness defect, and not fixable from the witness side.
+* **product-lines does not time out on budget.** Re-run at SV-COMP's real 300 s
+  correctness-witness limit: still no verdict line at all. The earlier "it's a budget
+  problem" hypothesis is refuted.
+
+### What the probe validated about the implementation
+
+* **`.c` vs `.i` is CLEAN** — no repeat of the 13,419-task funnel bug. SAF's `Span`s refer
+  to the `.i` whenever the `.yml` names the `.i` (sv-benchmarks `.i` files carry no
+  preprocessor linemarkers, checked across all 501), which is exactly the file the
+  validator is handed. 4 `.i`-named tasks traced end-to-end and CONFIRMED.
+* **Phi naming is 100%** — 339 of 339 loop-header phis across 87 tasks in 19 clusters
+  recover a C identifier. The feared "phi symbol leak" is a non-issue; the sole exception,
+  `termination-memory-alloca`, has no header phi to name at all.
+* **The column is never wrong** — 0 of 189 headers had the keyword on the reported line at
+  a different column, and a TAB counts as exactly one column.
+* **One residual defect, worth 0 weighted points.** 10.7% of emitted entries land on a
+  line with NO loop keyword: the header phi's `!dbg` points at a local's declaration, 1-5
+  lines above the loop. A one-line anchor change fixes it, but every affected cluster is
+  either already confirmed (dedup caps it at 1) or blocked for another reason — so it buys
+  per-task cleanliness, not points. Fix it for hygiene, not for score.
 
 ---
 
