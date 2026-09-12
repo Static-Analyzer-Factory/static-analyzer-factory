@@ -227,6 +227,41 @@ fn blocks_reaching(to: BlockId, cfg: &Cfg) -> BTreeSet<BlockId> {
 /// composition) confirm every candidate downstream, so this can only ever change
 /// latency, never a verdict.
 fn enumerate_paths(from: BlockId, to: BlockId, cfg: &Cfg, max_paths: usize) -> Vec<Vec<BlockId>> {
+    enumerate_paths_bounded(from, to, cfg, max_paths, MAX_QUEUED_BLOCKS)
+}
+
+/// Memory budget for the BFS frontier, counted in queued `BlockId`s (~16 bytes each,
+/// so ~64 MB of path data).
+///
+/// `max_paths` bounds the RESULT vector, not the search. On a CFG where complete
+/// paths are only discovered at the very end — a long chain of diamonds, which is
+/// exactly the `eca-rers2012` state-machine shape — BFS holds 2^k full path clones at
+/// level k and never reaches the `max_paths` break, so the frontier grows without
+/// limit. Measured before this bound existed: **19 GB of resident memory on a 22 KB
+/// source**, ending in an OOM kill that produced no output at all (1,641 tasks, 2.9%
+/// of a full run, died this way and were scored as unattributable errors).
+const MAX_QUEUED_BLOCKS: usize = 4_000_000;
+
+/// [`enumerate_paths`] with an explicit frontier budget (a seam for testing the
+/// bound; production callers use [`MAX_QUEUED_BLOCKS`]).
+///
+/// When the budget is exhausted the search stops EXTENDING paths but keeps draining
+/// what is already queued, so the result degrades to a prefix of the unbounded BFS
+/// order rather than collapsing to nothing. Whenever the budget is not reached the
+/// output is byte-identical to the unbounded search.
+///
+/// Curtailing the search can only lose candidates, never invent one: every caller
+/// (BMC base/incremental, the Z3 path checker, R4 interproc composition) confirms
+/// each candidate by concrete native replay downstream, so a missing path costs
+/// recall and can never produce a wrong verdict — the same argument the reaching
+/// prune above relies on.
+fn enumerate_paths_bounded(
+    from: BlockId,
+    to: BlockId,
+    cfg: &Cfg,
+    max_paths: usize,
+    max_queued_blocks: usize,
+) -> Vec<Vec<BlockId>> {
     if from == to {
         return vec![vec![from]];
     }
@@ -239,12 +274,14 @@ fn enumerate_paths(from: BlockId, to: BlockId, cfg: &Cfg, max_paths: usize) -> V
 
     let mut result = Vec::new();
     let mut queue: VecDeque<Vec<BlockId>> = VecDeque::new();
+    let mut queued_blocks = 1usize;
     queue.push_back(vec![from]);
 
     while let Some(path) = queue.pop_front() {
         if result.len() >= max_paths {
             break;
         }
+        queued_blocks = queued_blocks.saturating_sub(path.len());
 
         let current = *path.last().expect("path is non-empty from queue");
 
@@ -269,7 +306,8 @@ fn enumerate_paths(from: BlockId, to: BlockId, cfg: &Cfg, max_paths: usize) -> V
                     if result.len() >= max_paths {
                         break;
                     }
-                } else {
+                } else if queued_blocks + new_path.len() <= max_queued_blocks {
+                    queued_blocks += new_path.len();
                     queue.push_back(new_path);
                 }
             }
@@ -472,7 +510,7 @@ mod assume_tests {
 
 #[cfg(test)]
 mod enumerate_prune_tests {
-    use super::{blocks_reaching, enumerate_paths};
+    use super::{MAX_QUEUED_BLOCKS, blocks_reaching, enumerate_paths, enumerate_paths_bounded};
     use crate::cfg::Cfg;
     use saf_core::ids::{BlockId, FunctionId};
     use std::collections::{BTreeMap, BTreeSet};
@@ -551,6 +589,58 @@ mod enumerate_prune_tests {
             }
         }
         result
+    }
+
+    /// `n` diamonds in series: 2^n distinct entry->exit paths, and BFS discovers NO
+    /// complete path until the final level, so what grows is the FRONTIER, not the
+    /// result vector. This is the `eca-rers2012` state-machine shape that drove SAF
+    /// to 19 GB of RSS on a 22 KB source until the kernel OOM-killed it.
+    fn diamond_chain(n: u128) -> (Cfg, BlockId, BlockId) {
+        let mut edges: Vec<(u128, Vec<u128>)> = Vec::new();
+        for i in 0..n {
+            let (a, l, r, z) = (3 * i, 3 * i + 1, 3 * i + 2, 3 * i + 3);
+            edges.push((a, vec![l, r]));
+            edges.push((l, vec![z]));
+            edges.push((r, vec![z]));
+        }
+        edges.push((3 * n, vec![]));
+        let refs: Vec<(u128, &[u128])> = edges.iter().map(|(b, s)| (*b, s.as_slice())).collect();
+        (cfg_from(&refs), BlockId::new(0), BlockId::new(3 * n))
+    }
+
+    #[test]
+    fn frontier_memory_is_bounded_on_an_exploding_cfg() {
+        // `max_paths` bounds the RESULT vector only. Without a frontier bound the
+        // queue holds 2^k full path clones at level k, so a deep chain exhausts
+        // memory long before `max_paths` results ever accumulate.
+        let (cfg, from, to) = diamond_chain(12); // 4096 paths
+        let unbounded = enumerate_paths_bounded(from, to, &cfg, 4096, usize::MAX);
+        let bounded = enumerate_paths_bounded(from, to, &cfg, 4096, 64);
+        assert_eq!(unbounded.len(), 4096, "the CFG really does have 2^12 paths");
+        assert!(
+            bounded.len() < unbounded.len(),
+            "a tight frontier budget must curtail the search (got {} of {})",
+            bounded.len(),
+            unbounded.len()
+        );
+    }
+
+    #[test]
+    fn frontier_bound_is_inert_when_it_is_not_reached() {
+        // The bound must be a pure memory backstop: on any CFG whose frontier fits,
+        // the returned paths are byte-identical to the unbounded search, so ordinary
+        // tasks see no behaviour change at all.
+        let cfg = cfg_from(&[(0, &[1, 2]), (1, &[3]), (2, &[3]), (3, &[])]);
+        let (from, to) = (BlockId::new(0), BlockId::new(3));
+        assert_eq!(
+            enumerate_paths_bounded(from, to, &cfg, 10, usize::MAX),
+            enumerate_paths_bounded(from, to, &cfg, 10, MAX_QUEUED_BLOCKS),
+        );
+        let (cfg, from, to) = diamond_chain(6);
+        assert_eq!(
+            enumerate_paths_bounded(from, to, &cfg, 64, usize::MAX),
+            enumerate_paths(from, to, &cfg, 64),
+        );
     }
 
     #[test]
