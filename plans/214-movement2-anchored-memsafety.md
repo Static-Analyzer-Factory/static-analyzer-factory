@@ -1,6 +1,6 @@
 # Plan 214 — Movement 2: the Anchored-Object `valid-memsafety` prover (+8..16 weighted)
 
-**Status:** DESIGNED; the de-risking spike is ~70% already run in Python. Blocked on [`plans/213`](213-movement1-soundness-and-de-delegation.md) (it needs `universe.rs`).
+**Status:** DESIGNED; the de-risking spike is ~70% already run in Python. Blocked on [`plans/213`](213-movement1-soundness-and-de-delegation.md) (it needs `universe.rs`). **Scope grew by one property — see the folded-in note in §0.**
 **Branch:** cut `movement2/anchored-memsafety` off `movement1/sound-then-cut`.
 **Track:** TRUE-side. Movement 2 of 4 — **the first offensive movement.**
 **Design source:** `plans/211` §5.2, §5.5, §5.6. Memory: `saf-plan-211-design`, `svcomp-2027-witness-rules-50pts-at-risk`.
@@ -21,6 +21,50 @@ confirmed **0 of 5** of SAF's existing proofs.
 
 Per `plans/211` §5.2, 55 of the 180 unsolved TRUE clusters are verdict-only and this
 property is 43 of them.
+
+> ### FOLDED IN FROM MOVEMENT 0 — take `valid-memcleanup` in the same movement
+>
+> 2027 makes `C.valid-memcleanup.*` the **only** base category in the entire table that is
+> "not supported" on BOTH columns: neither a TRUE nor a FALSE needs a witness. It is the
+> highest points-per-witness-effort row on the board, and it is currently invisible because
+> SAF's manifest omits the property.
+>
+> **It is opt-in, not excluded.** `scripts/svcomp_split.py`'s `DEFAULT_PROPERTIES` lists
+> five properties and its comment says "`valid-memcleanup` is opt-in via `--properties`".
+> So step one is re-running the split with it enabled — no code, just a flag. The corpus
+> has **93 tasks across 10 group dirs** (`uthash-2.0.2` 27, `Juliet_Test` 24,
+> `forester-heap` 15, `list-properties` 7, `heap-manipulation` 5, `list-ext3-properties` 4,
+> `memsafety` 4, `verifythis` 4, +2 more), in base categories
+> `C.valid-memcleanup.Main` (← Heap, Juliet, LinkedLists, VerifyThis-Loops,
+> VerifyThis-Recursive) and `C.valid-memcleanup.SoftwareSystems-uthash`.
+>
+> **Anchored-Object gets it almost free, and for a principled reason.** §1's obligation 1
+> rejects any reachable `malloc`/`calloc`/`realloc`/`free`/`alloca`, so the provable set is
+> exactly the heap-free programs — and a program that never allocates cannot leak. The
+> memcleanup proof is therefore the memsafety proof's own precondition, discharged by the
+> same reachable-universe walk. Expect the incremental cost to be a property-routing arm
+> plus tests, not a second prover.
+>
+> Two caveats, both from Movement 0's ledger: the denominator `398` quoted in `plans/211`
+> §1 is understated because it omits this property, so re-derive it; and the 93 tasks'
+> expected verdicts must be checked before claiming upside — a `valid-memcleanup` TRUE is
+> only worth +2 where the task's expected verdict is actually `true`.
+
+> ### FOLDED IN FROM MOVEMENT 0 — run the oracle probe before building
+>
+> Movement 0B's ranking-witness slice landed on the EXACT ceiling of CPAchecker's own
+> producer+validator pipeline (10 of 19 clusters), and that ceiling was discoverable in
+> ~45 minutes of probing *before* ~750 lines of Rust. Generalise the method: **before
+> building a prover for a cluster set, check whether the best available tool can already
+> do it, and let that set the estimate.**
+>
+> This movement is the one case where the probe's usual form does not apply — memsafety
+> TRUE is verdict-only in 2027, so there is no validator to satisfy and no witness to
+> reconfirm. That is precisely why it is the strongest target, and it should be stated as
+> such rather than assumed. What IS worth probing cheaply: run a mature memsafety prover
+> over the 43 unsolved clusters to bound how many are provable AT ALL by anyone. A cluster
+> no tool can prove is one the Anchored-Object domain will not prove either, and knowing
+> that before slicing converts the `+8..16` range into a measured number.
 
 ## 1. The design — Anchored-Object
 

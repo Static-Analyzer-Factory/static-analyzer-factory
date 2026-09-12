@@ -184,16 +184,42 @@ script on the VM. **Sections 2-4 above contain numbers this session overturned**
 against the wrong rulebook (§5.1(d)), and its own sentinels are not yet sound enough to
 stand without the CPAchecker gate the mandate requires us to remove (§5.1(c)). So:
 
-| | movement | plan | size | weighted effect |
-|---|---|---|---|---|
-| 0 | re-derive the scoreboard from the 2027 rules; emit a 2.1 termination witness | [`plans/212`](212-movement0-scoreboard-2027.md) | S | **defends 36** |
-| 1 | three domain fixes + universe gate, then cut the delegation | [`plans/213`](213-movement1-soundness-and-de-delegation.md) | S/M | ~0, but buys legitimacy and a trustworthy baseline |
-| 2 | the Anchored-Object `valid-memsafety` prover | [`plans/214`](214-movement2-anchored-memsafety.md) | M | **+8 to +16** (prototype already reaches 13 of 43 clusters) |
-| 3 | `no-overflow` precision, re-scoped after Movement 1 re-baselines the funnel | [`plans/215`](215-movement3-nooverflow-precision.md) | M | +5 to +10 |
+| | movement | plan | size | weighted effect | blocked on |
+|---|---|---|---|---|---|
+| 0 | ~~re-derive the scoreboard; emit a 2.1 termination witness~~ | [`plans/212`](212-movement0-scoreboard-2027.md) | S | **DONE 2026-09-13: 151 → 110 → 137** | — |
+| 1 | three domain fixes + universe gate, then cut the delegation | [`plans/213`](213-movement1-soundness-and-de-delegation.md) | S/M | ~0, but buys legitimacy and a trustworthy baseline | — (0 landed) |
+| 2 | the Anchored-Object `valid-memsafety` **+ `valid-memcleanup`** prover | [`plans/214`](214-movement2-anchored-memsafety.md) | M | **+8 to +16**, plus an unmeasured memcleanup slice | M1 (`universe.rs`) |
+| 3 | `no-overflow` precision, re-scoped after M1 re-baselines the funnel | [`plans/215`](215-movement3-nooverflow-precision.md) | M | +5 to +10, and now with a MEASURED low prior | M1 |
+| **4** | **FALSE-side witness upgrade: `no-data-race` GraphML→2.2, Concurrency version floor** | [`plans/216`](216-movement4-false-witness-2.2.md) | **S** | **+8, measured** | **nothing** |
+| **5** | **submission readiness — archive, bench-defs MR, CI** | [`plans/217`](217-movement5-submission-readiness.md) | S/M | **0 — and without it every other movement is worth 0** | **nothing** |
 
-Movements 0 and 1 are not optional and not reorderable: 0 because every A/B until it
-lands is steering on a number that is 41 too high (MEASURED; the estimate here was ~36), 1 because cutting the delegation
-before the soundness fixes costs roughly **−160 weighted against a score of 110**
+> ### RE-RANKED 2026-09-13, once the deadlines were verified
+>
+> Registration is **2026-10-08** and tool submission **2026-10-20**
+> (`svcomp-2027-deadlines-verified`; `dates.php` 404s, the dates live on `index.php`).
+> That is 25 and 37 days. The original 1 → 2 → 3 ordering puts a **zero-point** movement
+> first and blocks both offensive ones behind it, so on that ordering nothing that scores
+> AND nothing that submits happens before the gate.
+>
+> Movements 4 and 5 were added from Movement 0's findings and are both **unblocked**:
+>
+> * **5 first, or in parallel.** It is the only item with a hard external deadline that
+>   nothing can move. A submitted 137 beats an unsubmitted 145.
+> * **4 next.** +8 measured, on verdicts SAF already emits correctly — the work is witness
+>   FORMAT, not proving. Best points-per-day on the board.
+> * **1, 2, 3 after**, in that order, as post-gate work. 1 is still not optional: it
+>   discharges the no-delegation mandate, and 2 and 3 both need it. But it buys ~0 points,
+>   so it should not consume the pre-deadline window.
+>
+> One method finding worth applying to 2 and 3: Movement 0B hit the EXACT ceiling of
+> CPAchecker's own producer+validator pipeline, and that ceiling was discoverable in ~45
+> minutes of probing before ~750 lines of Rust. **Probe the oracle ceiling before building
+> a prover for a cluster set**, and let it replace the estimate. Folded into both plans.
+
+Movements 0 and 1 are not optional and not reorderable relative to each other: 0 because
+every A/B until it landed was steering on a number 41 too high (MEASURED; the estimate
+here was ~36), 1 because cutting the delegation
+before the soundness fixes costs roughly **−160 weighted against a score of 137**
 (the figure was computed against the pre-2027 scoreboard's 151; the sign and the
 conclusion are unchanged, only the denominator).
 

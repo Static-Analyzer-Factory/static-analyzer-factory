@@ -23,6 +23,39 @@ external correctness-witness validator, in a budget cut to 300 s — and that va
 confirmed **0 of 5** of the clusters SAF already proves
 (`saf-validator-ceiling-true-side`). Movement 2's 43 clusters have no such gate.
 
+> ### FOLDED IN FROM MOVEMENT 0 — the validator ceiling is now MEASURED, and it is binding
+>
+> `saf-validator-ceiling-true-side`'s 0-of-5 was a worrying signal. Movement 0B turned the
+> same question into a method and a hard number on the termination population, and the
+> result transfers directly to this movement's premise.
+>
+> **The method.** CPAchecker 4.2.2 can PRODUCE the witness format it validates
+> (`config/lassoRankerAnalysis.properties` for termination 2.1; find the analogous exporter
+> for `no-overflow` correctness). Run it in prove mode with witness export over the target
+> clusters, feed each witness straight back to its own validator, and record TRUE/UNKNOWN.
+> That yields a per-cluster CEILING before any prover work: **if the oracle cannot
+> produce-and-reconfirm a cluster, SAF cannot score it either.**
+>
+> **The result on termination.** The oracle reconfirmed 10 of 19 loop-bearing clusters.
+> SAF, after Movement 0B, confirms exactly those 10 — the identical set — and without the
+> `ignoreOverflowsForUnsignedVariables` knob the oracle needed for 4 of them and which
+> CPAchecker itself flags as potentially unsound. So SAF was already at the tool ceiling,
+> and the 9 remaining clusters were never an emitter gap.
+>
+> **Two hard limits found, both plausibly live here too.** (a) `product-lines` — 178 tasks,
+> the single largest cluster — is unprovable by the oracle at ANY budget, including
+> SV-COMP's real 300 s, because LassoRanker cannot build a ranking relation over CIL string
+> literals. (b) **Nested loops crash the validator outright**:
+> `IllegalArgumentException: Not supported interface` in
+> `TransitionInvariantUtils.makeStatesEquivalent`, 0 of 15 fixtures, not fixable from the
+> witness side.
+>
+> **Make this blocking, alongside §1's re-baseline.** Run the oracle probe over the 61
+> unsolved `no-overflow` clusters BEFORE scoping any slice, and replace the `+5..10`
+> estimate with what it measures. Given 0-of-5 on the clusters SAF already proves, the
+> honest prior is that this movement's ceiling is low and it should be re-ranked BELOW
+> Movement 4 (`plans/216`, +8 on the FALSE side, unblocked) and Movement 2.
+
 So: real prover work, sequenced behind the work that cannot be blocked from outside.
 
 ## 1. Re-baseline FIRST (blocking)

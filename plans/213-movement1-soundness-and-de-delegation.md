@@ -1,6 +1,6 @@
 # Plan 213 — Movement 1: make SAF's own verdict trustworthy, then cut the delegation
 
-**Status:** DESIGNED, not started. Blocked on [`plans/212`](212-movement0-scoreboard-2027.md) landing.
+**Status:** DESIGNED, not started. **Unblocked** — `plans/212` LANDED 2026-09-13 (score 151 → 110 → 137).
 **Branch:** cut `movement1/sound-then-cut` off `movement0/scoreboard-2027`.
 **Track:** TRUE-side. Movement 1 of 4. **Expected weighted effect: ~0.** It buys legitimacy and a trustworthy baseline, not points. Say so when reporting it.
 **Design source:** `plans/211` §5.1(a), §5.1(c), §5.4. Memories: `saf-refine-eq-false-bug`, `saf-unsigned-refine-unsoundness`, `saf-prover-full-soundness-sweep`.
@@ -14,8 +14,41 @@ Discharge the §1 mandate of `plans/211`: **SAF must never delegate a verdict.**
 confirms, which makes those results computable by CPAchecker alone.
 
 The gate cannot simply be deleted. It is currently **masking a real unsoundness in SAF's
-own prover**, and cutting it today costs roughly **−160 weighted against a score of 151**.
+own prover**, and cutting it today costs roughly **−160 weighted against a score of 137**
+(the figure was computed against the pre-2027 scoreboard's 151; the sign and conclusion are
+unchanged, only the denominator — see `saf-score-137-under-2027-rules`).
 So this movement is 80% hardening and 20% deletion.
+
+> ### FOLDED IN FROM MOVEMENT 0 — a second delegation, on the MEASUREMENT side
+>
+> This movement hunts delegation in the VERDICT. Movement 0's adversarial review found the
+> same disease in the SCOREBOARD, and it inflates the number this movement will be judged
+> against.
+>
+> **`scripts/validate_witness.sh` Stage 4 "confirms" a witness by having CBMC re-verify the
+> PROGRAM. The witness is never passed to CBMC.** So a `CONFIRMED` from that stage means
+> "CBMC agrees the bug is real", not "a validator accepted SAF's witness" — which is
+> exactly the substitution this movement exists to eliminate, one layer out.
+>
+> Measured exposure on the only available sample (255 of 940 at-risk unreach-call rows):
+> **−2 weighted**, losing `nla-digbench|unreach-call` and
+> `recursified_loop-invariants|unreach-call`. The control flip rate was 33% (66/200). The
+> memsafety half (5,405 CONFIRMED rows, 7 of whose 15 clusters are single-row) is
+> **entirely unmeasured**, so −2 is a floor, not an estimate.
+>
+> **Add as slice 1-0, before any prover fix:** run the eval with `SAF_SKIP_CBMC=1` (or
+> equivalent) over the full memsafety + unreach populations and publish the delta. Record
+> WHICH validator confirmed each row in the per-task dump so this can never again be
+> invisible. Until then, 137 is the correct 2027 re-score of the dump but is **not
+> defensible as "SAF's honest score"**, and saying so is part of this movement's
+> deliverable.
+>
+> **Also fold in the authoritative re-run.** 137 is a re-score of the 2026-09-11 run
+> spliced with a fresh termination sweep, not a single end-to-end pass. It cannot see any
+> cluster newly solved since then — notably by `d2ee9313` (the 19 GB → 244 MB OOM fix).
+> This movement needs a clean baseline anyway after changing the abstract domain, so run
+> the full 55,690-task eval ONCE here and let it serve both purposes. Budget ~24 h at
+> `--jobs 8`; the exact reproduction command is in `plans/212` §2.
 
 ## 1. The measured exposure
 
