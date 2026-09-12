@@ -50,6 +50,13 @@ from pathlib import Path
 
 SAF = os.environ.get("SAF_BIN", "target/release/saf")
 VALIDATE_SH = os.environ.get("SAF_VALIDATE_WITNESS", "scripts/validate_witness.sh")
+# The TRUE-side counterpart: CPAchecker `correctness-witness-validation.properties`
+# over SAF's YAML-2.0 `invariant_set` witness. Until this was wired in, the harness
+# validated VIOLATION witnesses only, so every TRUE row was `witness: None` and
+# `confirmed_score` returned 0 for the two witness-required properties no matter how
+# good the witness was — understating the score rather than measuring it.
+CORRECTNESS_VALIDATE_SH = os.environ.get(
+    "SAF_VALIDATE_CORRECTNESS_WITNESS", "scripts/validate_correctness_witness.sh")
 VERDICT_RE = re.compile(r"^(true|false\(([a-z0-9-]+)\)|unknown)$")
 
 # TRUE is scored on the verdict alone (no correctness witness required) for these
@@ -198,13 +205,31 @@ def run_verify(task: dict, src: str, prp: str, timeout: int,
     return line, dur, err_tail
 
 
+def witness_validator_for(kind: str, prop: str) -> str | None:
+    """Which validator script should confirm this verdict's witness, or `None` when the
+    verdict is scored without one (so running a validator would be wasted wall-clock).
+
+    Mirrors `confirmed_score`: a FALSE needs a confirmed VIOLATION witness, a TRUE on
+    `unreach-call` / `no-overflow` needs a confirmed CORRECTNESS witness, and a TRUE on
+    the verdict-only properties needs nothing. FALSE keeps its historical behaviour of
+    always being validated — even for `no-data-race`, where the score does not require
+    it — so dumps stay comparable across runs.
+    """
+    if kind == "false":
+        return VALIDATE_SH
+    if kind == "true" and prop not in TRUE_WITNESS_NOT_REQUIRED:
+        return CORRECTNESS_VALIDATE_SH
+    return None
+
+
 def confirm_witness(task: dict, src: str, prp: str, witness: str | None,
-                    timeout: int) -> str:
-    """Validate an emitted violation witness. Returns CONFIRMED / NOT_CONFIRMED /
-    LINT_FAIL / LINT_ONLY (validator unavailable) / TIMEOUT / NO_WITNESS / ERROR."""
+                    timeout: int, validator: str = VALIDATE_SH) -> str:
+    """Validate an emitted witness with `validator` (violation or correctness). Returns
+    CONFIRMED / NOT_CONFIRMED / LINT_FAIL / LINT_ONLY (validator unavailable) /
+    TIMEOUT / NO_WITNESS / ERROR."""
     if not witness or not os.path.exists(witness):
         return "NO_WITNESS"
-    cmd = ["bash", VALIDATE_SH, witness, src, prp, task["data_model"]]
+    cmd = ["bash", validator, witness, src, prp, task["data_model"]]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -282,7 +307,8 @@ def load_manifest(path: Path, only_prop: str | None, sample: int) -> list[dict]:
 
 
 def eval_one(task: dict, svb: Path, timeout: int, confirm: bool,
-             confirm_timeout: int, max_rss_mb: int = 0) -> dict:
+             confirm_timeout: int, max_rss_mb: int = 0,
+             correctness_confirm_timeout: int | None = None) -> dict:
     prp = resolve_prp(svb, task["property"])
     # Resolve a PORTABLE source path against --svb (relative → works both on the host
     # and inside the Docker container where the repo is at /workspace). Falls back to
@@ -293,8 +319,14 @@ def eval_one(task: dict, svb: Path, timeout: int, confirm: bool,
         line, dur, err_tail = run_verify(task, src, prp, timeout, w, max_rss_mb)
         kind, sub = classify(line)
         wstatus = None
-        if confirm and kind == "false":
-            wstatus = confirm_witness(task, src, prp, w, confirm_timeout)
+        validator = witness_validator_for(kind, task["property"]) if confirm else None
+        if validator:
+            # A correctness witness is re-verified from scratch by CPAchecker
+            # (k-induction), which is slower than violation validation and needs its
+            # own, larger budget — sharing the FALSE-side one truncated it.
+            budget = (confirm_timeout if validator == VALIDATE_SH
+                      else (correctness_confirm_timeout or confirm_timeout))
+            wstatus = confirm_witness(task, src, prp, w, budget, validator)
     outcome = raw_outcome(kind, task["expected"])
     # Keep SAF's stderr tail only where it's diagnostically useful (an abstain, a
     # miss, a crash) — not on clean scoring verdicts — to bound the dump size.
@@ -398,8 +430,14 @@ def main() -> int:
                     help="stride-sample N per property (0 = all tasks)")
     ap.add_argument("--timeout", type=int, default=60, help="--timeout per task (s)")
     ap.add_argument("--confirm-witness", action="store_true",
-                    help="validate each emitted FALSE witness (needed for CONFIRMED score)")
+                    help="validate each emitted witness — a VIOLATION witness for a FALSE, and a "
+                         "CORRECTNESS witness for a TRUE on unreach-call / no-overflow (needed for "
+                         "CONFIRMED score; TRUE on the verdict-only properties needs no witness)")
     ap.add_argument("--confirm-timeout", type=int, default=150)
+    ap.add_argument("--correctness-confirm-timeout", type=int, default=240,
+                    help="separate budget for CORRECTNESS-witness validation, which re-proves the "
+                         "program from scratch (CPAchecker k-induction, itself --timelimit 150s) and "
+                         "so does not fit in the violation-side budget")
     ap.add_argument("--jobs", type=int, default=1, help="parallel verify workers")
     ap.add_argument("-o", "--out", default=None, help="write JSON summary to file")
     ap.add_argument("--group-weight", action="store_true",
@@ -425,7 +463,8 @@ def main() -> int:
 
     def work(t):
         return eval_one(t, svb, args.timeout, args.confirm_witness,
-                        args.confirm_timeout, args.max_rss_mb)
+                        args.confirm_timeout, args.max_rss_mb,
+                        args.correctness_confirm_timeout)
 
     # Crash-resilient: append each result as it completes (flushed) to a `.partial`
     # sidecar, so a mid-run failure (e.g. ENOSPC) never loses the whole run — the

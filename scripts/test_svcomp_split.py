@@ -13,7 +13,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from svcomp_split import (  # noqa: E402
     assign_groups, origin_group, stable_key, category_root, is_reasoning_task)
-from svcomp_split_eval import weighted_confirmed_summary  # noqa: E402
+from svcomp_split_eval import (  # noqa: E402
+    weighted_confirmed_summary, witness_validator_for)
 
 
 def _synthetic_tasks():
@@ -143,6 +144,33 @@ def test_weighted_confirmed_caps_positives_per_cluster_keeps_penalties():
     assert w["per_property_weighted"]["unreach-call"]["confirmed_clusters"] == 1
     # raising the cap lets a big cluster count more (up to cap)
     assert weighted_confirmed_summary(res, cap=3)["confirmed_score_weighted"] == 3 + 1 - 16
+
+
+def test_true_on_witness_required_properties_uses_the_correctness_validator():
+    """unreach-call / no-overflow TRUE score 2 only with a CONFIRMED *correctness*
+    witness, so the harness must actually run the correctness validator on them.
+    Before this existed the harness validated FALSE only, so every TRUE row was
+    `witness: None` and scored 0 no matter how good the witness was."""
+    for prop in ("unreach-call", "no-overflow"):
+        v = witness_validator_for("true", prop)
+        assert v is not None and v.endswith("validate_correctness_witness.sh"), (prop, v)
+
+
+def test_true_on_verdict_only_properties_needs_no_validator():
+    """termination / valid-memsafety / valid-memcleanup / no-data-race TRUE are scored
+    on the verdict alone — validating them would be wasted wall-clock."""
+    for prop in ("termination", "valid-memsafety", "valid-memcleanup", "no-data-race"):
+        assert witness_validator_for("true", prop) is None, prop
+
+
+def test_false_still_uses_the_violation_validator():
+    v = witness_validator_for("false", "unreach-call")
+    assert v is not None and v.endswith("validate_witness.sh"), v
+
+
+def test_non_scoring_verdicts_need_no_validator():
+    for kind in ("unknown", "timeout", "error"):
+        assert witness_validator_for(kind, "unreach-call") is None, kind
 
 
 def _run_all():
