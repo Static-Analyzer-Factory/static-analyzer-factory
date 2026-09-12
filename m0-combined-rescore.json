@@ -4,19 +4,19 @@
   "false_alarms": 0,
   "wrong_true": 0,
   "n": 55690,
-  "confirmed_score_weighted": 127,
+  "confirmed_score_weighted": 137,
   "per_property_weighted": {
     "no-data-race": 9,
     "no-overflow": 34,
-    "termination": 17,
+    "termination": 27,
     "unreach-call": 52,
     "valid-memsafety": 15
   },
-  "confirmed_score_weighted_version_aware": 124,
+  "confirmed_score_weighted_version_aware": 134,
   "per_property_weighted_version_aware": {
     "no-data-race": 9,
     "no-overflow": 34,
-    "termination": 17,
+    "termination": 27,
     "unreach-call": 49,
     "valid-memsafety": 15
   }
