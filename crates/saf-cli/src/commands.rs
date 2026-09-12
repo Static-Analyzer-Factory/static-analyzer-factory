@@ -863,28 +863,13 @@ pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Run compile -> ingest -> strategy on a worker thread under a wall-clock
-    // budget. On timeout (or a worker panic, which drops the sender) emit the
-    // safe `unknown` and exit 0, gracefully beating BenchExec's SIGKILL. The
-    // watchdog only ever yields UNKNOWN, so it can never produce an unsound
-    // verdict.
-    let input = args.input.clone();
-    let specification = prp_text.trim().to_string();
-    let deadline = std::time::Duration::from_secs(args.timeout);
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _worker = std::thread::spawn(move || {
-        let _ = tx.send(run_verdict(&input, data_model, property, specification));
-    });
-
-    let outcome = if let Ok(o) = rx.recv_timeout(deadline) {
-        o
-    } else {
-        eprintln!(
-            "saf verify: analysis exceeded {}s budget (or worker failed) -> unknown",
-            args.timeout
-        );
-        unknown_outcome()
-    };
+    let outcome = run_verdict_under_budget(
+        args.input.clone(),
+        data_model,
+        property,
+        prp_text.trim().to_string(),
+        std::time::Duration::from_secs(args.timeout),
+    );
 
     // Write the violation witness ONLY for a `false` verdict received before the
     // deadline — never on timeout/unknown/true — so a witness is emitted only
@@ -1358,6 +1343,21 @@ struct VerifyCtx<'a> {
     stub: &'a Path,
     tempdir: &'a Path,
     clang: &'a str,
+    /// When the caller's wall-clock watchdog will give up and emit `unknown`. Stages
+    /// that shell out to a long-running external tool consult this so they finish
+    /// INSIDE the budget instead of being `SIGKILLed` with the task (see
+    /// [`cpachecker_timelimit`]). Stages with their own deterministic cost bound
+    /// ignore it.
+    deadline: std::time::Instant,
+}
+
+impl VerifyCtx<'_> {
+    /// Whole seconds left before the watchdog fires (0 once it has passed).
+    fn remaining_secs(&self) -> u64 {
+        self.deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs()
+    }
 }
 
 /// A per-property `propose -> concrete-confirm -> witness` pipeline.
@@ -1380,11 +1380,47 @@ fn strategy_for(property: saf_svcomp::Property) -> Option<StrategyFn> {
 /// Shared orchestration: compile -> ingest -> build witness metadata -> dispatch
 /// to the property strategy. Any internal failure maps to `unknown` (diagnostic
 /// on stderr); never errors, so the caller keeps exit code 0.
+/// Run compile -> ingest -> strategy on a worker thread under a wall-clock `budget`.
+/// On overrun (or a worker panic, which drops the sender) emit the safe `unknown` and
+/// exit 0, gracefully beating `BenchExec`'s SIGKILL. The watchdog only ever yields
+/// UNKNOWN, so it can never produce an unsound verdict.
+///
+/// The budget's absolute deadline is also handed to the strategy, so a stage that
+/// shells out to a long-running external tool can size its own timeout to fit inside
+/// it rather than be killed with the task (see [`cpachecker_timelimit`]).
+fn run_verdict_under_budget(
+    input: PathBuf,
+    data_model: saf_svcomp::DataModel,
+    property: saf_svcomp::Property,
+    specification: String,
+    budget: std::time::Duration,
+) -> VerdictOutcome {
+    let deadline = std::time::Instant::now() + budget;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _worker = std::thread::spawn(move || {
+        let _ = tx.send(run_verdict(
+            &input,
+            data_model,
+            property,
+            specification,
+            deadline,
+        ));
+    });
+    rx.recv_timeout(budget).unwrap_or_else(|_| {
+        eprintln!(
+            "saf verify: analysis exceeded {}s budget (or worker failed) -> unknown",
+            budget.as_secs()
+        );
+        unknown_outcome()
+    })
+}
+
 fn run_verdict(
     input: &Path,
     data_model: saf_svcomp::DataModel,
     property: saf_svcomp::Property,
     specification: String,
+    deadline: std::time::Instant,
 ) -> VerdictOutcome {
     let Some(strategy) = strategy_for(property) else {
         return unknown_outcome();
@@ -1430,6 +1466,7 @@ fn run_verdict(
         stub: &stub,
         tempdir: dir.path(),
         clang: &clang,
+        deadline,
     };
     strategy(&ctx)
 }
@@ -5106,6 +5143,33 @@ fn overflow_nondet_assumes(
     assumes
 }
 
+/// The in-process `CPAchecker` gate's own wall-clock cap, used when the task budget
+/// is generous (SV-COMP allows 900s per task).
+const CPACHECKER_TIMELIMIT_SECS: u64 = 150;
+/// Reserve for `CPAchecker`'s JVM teardown plus our own result parse, so the gate
+/// finishes INSIDE the task budget rather than being killed with it.
+const CPACHECKER_TIMELIMIT_MARGIN_SECS: u64 = 5;
+/// Below this there is no point paying JVM startup — it would only burn the tail of
+/// the budget and still abstain.
+const CPACHECKER_TIMELIMIT_MIN_SECS: u64 = 10;
+
+/// How long the in-process `CPAchecker` gate may run given `remaining_secs` of task
+/// budget, or `None` when too little is left to bother.
+///
+/// The gate is a blocking `Command::output()` with no Rust-side timeout, so
+/// `CPAchecker`'s own `--timelimit` is the ONLY bound on it. Hard-coding
+/// [`CPACHECKER_TIMELIMIT_SECS`] therefore guaranteed that, under any task budget
+/// tighter than it (the eval harness runs at `--timeout 60`), the watchdog would
+/// SIGKILL the whole task mid-gate — discarding every verdict the other stages had
+/// already produced. Clamping keeps the gate inside the budget so a TRUE attempt can
+/// never cost a FALSE result.
+#[must_use]
+fn cpachecker_timelimit(remaining_secs: u64) -> Option<u64> {
+    let usable = remaining_secs.saturating_sub(CPACHECKER_TIMELIMIT_MARGIN_SECS);
+    let limit = usable.min(CPACHECKER_TIMELIMIT_SECS);
+    (limit >= CPACHECKER_TIMELIMIT_MIN_SECS).then_some(limit)
+}
+
 /// Locate a bundled `CPAchecker`-4.2.2 home for the in-process no-overflow TRUE
 /// confirmation gate: `$SAF_CPACHECKER`, else an ancestor of the running binary
 /// joined with `.svtools/CPAchecker-4.2.2-unix`, else `./.svtools/...`.
@@ -5183,6 +5247,12 @@ fn cpachecker_confirms_no_overflow(ctx: &VerifyCtx, witness_path: &Path) -> bool
     if std::fs::write(&prp, &ctx.meta.specification).is_err() {
         return false;
     }
+    let Some(limit) = cpachecker_timelimit(ctx.remaining_secs()) else {
+        eprintln!(
+            "saf verify: too little task budget left for the CPAchecker gate -> no-overflow TRUE abstains"
+        );
+        return false;
+    };
     let out_dir = ctx.tempdir.join("saf_cpa_confirm");
     match Command::new(cpa.join("bin/cpachecker"))
         .arg("--config")
@@ -5195,7 +5265,7 @@ fn cpachecker_confirms_no_overflow(ctx: &VerifyCtx, witness_path: &Path) -> bool
         .arg("--option")
         .arg("witness.checkProgramHash=false")
         .arg("--timelimit")
-        .arg("150s")
+        .arg(format!("{limit}s"))
         .arg("--output-path")
         .arg(&out_dir)
         .arg(ctx.input)
@@ -5289,6 +5359,12 @@ fn cpachecker_confirms_unreach(ctx: &VerifyCtx, witness_path: &Path) -> bool {
     if std::fs::write(&prp, &ctx.meta.specification).is_err() {
         return false;
     }
+    let Some(limit) = cpachecker_timelimit(ctx.remaining_secs()) else {
+        eprintln!(
+            "saf verify: too little task budget left for the CPAchecker gate -> unreach-call TRUE abstains"
+        );
+        return false;
+    };
     let out_dir = ctx.tempdir.join("saf_cpa_confirm_unreach");
     match Command::new(cpa.join("bin/cpachecker"))
         .arg("--config")
@@ -5301,7 +5377,7 @@ fn cpachecker_confirms_unreach(ctx: &VerifyCtx, witness_path: &Path) -> bool {
         .arg("--option")
         .arg("witness.checkProgramHash=false")
         .arg("--timelimit")
-        .arg("150s")
+        .arg(format!("{limit}s"))
         .arg("--output-path")
         .arg(&out_dir)
         .arg(ctx.input)
@@ -7434,6 +7510,31 @@ mod verify_tests {
         );
     }
 
+    // --- CPAchecker gate budget clamp --------------------------------------
+
+    #[test]
+    fn cpachecker_timelimit_uses_the_full_cap_when_the_budget_is_generous() {
+        // SV-COMP gives 900s per task, so the gate keeps its own 150s cap.
+        assert_eq!(cpachecker_timelimit(900), Some(CPACHECKER_TIMELIMIT_SECS));
+    }
+
+    #[test]
+    fn cpachecker_timelimit_clamps_to_a_tight_task_budget() {
+        // The eval harness runs at --timeout 60. Asking CPAchecker for 150s there
+        // guarantees the whole task is SIGKILLed mid-gate, losing every verdict the
+        // other stages would have produced; clamp to what is actually left.
+        assert_eq!(cpachecker_timelimit(60), Some(55));
+        assert_eq!(cpachecker_timelimit(20), Some(15));
+    }
+
+    #[test]
+    fn cpachecker_timelimit_declines_when_too_little_budget_remains() {
+        // Starting a JVM with a handful of seconds left only burns the remainder.
+        assert_eq!(cpachecker_timelimit(12), None);
+        assert_eq!(cpachecker_timelimit(5), None);
+        assert_eq!(cpachecker_timelimit(0), None);
+    }
+
     // --- overflow loop-free boundary injection -----------------------------
 
     /// A defined `main` with a two-block CFG back-edge (`b0 -> b1 -> b0`) — a
@@ -7656,6 +7757,7 @@ mod verify_tests {
             stub: Path::new("/dev/null"),
             tempdir: dir.path(),
             clang: "clang",
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(900),
         };
         let hit = saf_svcomp::OverflowHit {
             file: "t.c".to_string(),
@@ -7743,6 +7845,7 @@ mod verify_tests {
             stub: Path::new("/dev/null"),
             tempdir: dir.path(),
             clang: "clang",
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(900),
         };
         // Fault at line 7 (`base + base`, after the loop). Only the line-2
         // unconditional read may bind; the line-4 in-loop read (never executed under
@@ -7797,6 +7900,7 @@ mod verify_tests {
             stub: Path::new("/dev/null"),
             tempdir: dir.path(),
             clang: "clang",
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(900),
         };
         let hit = saf_svcomp::OverflowHit {
             file: "m.c".to_string(),
