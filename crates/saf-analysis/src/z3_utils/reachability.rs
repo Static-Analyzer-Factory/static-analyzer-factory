@@ -242,6 +242,23 @@ fn enumerate_paths(from: BlockId, to: BlockId, cfg: &Cfg, max_paths: usize) -> V
 /// of a full run, died this way and were scored as unattributable errors).
 const MAX_QUEUED_BLOCKS: usize = 4_000_000;
 
+/// Announce (at most once per process) that the frontier budget curtailed a search.
+///
+/// Diagnostic only — it changes no verdict. It exists because the budget is the ONLY
+/// way this enumerator's results can differ from the unbounded version, so "did any
+/// task hit it?" is exactly the question a recall-regression audit must answer, and
+/// answering it by grepping one stderr line is far cheaper than a blind full-corpus
+/// A/B.
+fn report_frontier_budget_reached() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "saf: path-enumeration frontier budget ({MAX_QUEUED_BLOCKS} blocks) reached -> search curtailed"
+        );
+    }
+}
+
 /// [`enumerate_paths`] with an explicit frontier budget (a seam for testing the
 /// bound; production callers use [`MAX_QUEUED_BLOCKS`]).
 ///
@@ -309,6 +326,8 @@ fn enumerate_paths_bounded(
                 } else if queued_blocks + new_path.len() <= max_queued_blocks {
                     queued_blocks += new_path.len();
                     queue.push_back(new_path);
+                } else {
+                    report_frontier_budget_reached();
                 }
             }
         }
