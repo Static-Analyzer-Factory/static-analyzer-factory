@@ -34,6 +34,10 @@ test: ## Run all tests (Rust + Python, cached)
 test-rust: ## Run Rust tests only (no Python rebuild)
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c "cargo nextest run --workspace --exclude saf-python"
 
+test-toolinfo: ## Test the BenchExec tool-info module (RED until the SPDX holder is set)
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c \
+		"python3 -m pytest benchexec/tools/test_saf.py -q"
+
 test-python: ## Run Python tests only (assumes extension is built)
 	docker compose run --rm dev sh -c "pytest python/tests/ -v"
 
@@ -210,6 +214,22 @@ test-svcomp-json: ## Run SV-COMP benchmarks with JSON output (AGGRESSIVE=1 suppo
 
 clean-svcomp: ## Remove compiled SV-COMP bitcode
 	rm -rf tests/benchmarks/sv-benchmarks/.compiled
+
+# --- SV-COMP Submission Archive ---
+# Assembles dist/saf-verify.zip from an explicit allow-list, then verifies the
+# finished zip against fm-tools' rules and runs smoketest.sh on the unpacked
+# copy. Runs inside the dev container because that is where target/release/saf
+# (a named volume) and clang-18/opt-18 live; `target/release/saf` cannot be a
+# make prerequisite from the host for the same reason, so the script itself
+# fails loudly when the binary is missing.
+#
+# Build the binary first:
+#   docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev cargo build --release -p saf-cli
+
+.PHONY: svcomp-archive
+
+svcomp-archive: ## Build the reproducible SV-COMP tool archive (dist/saf-verify.zip)
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev bash scripts/make_svcomp_archive.sh
 
 # --- Juliet Benchmark Suite (NIST CWE Test Suite) ---
 # Precision/Recall/F1 scoring per CWE category
