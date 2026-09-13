@@ -1,0 +1,93 @@
+# PROPOSED fm-tools entry for SAF, to be added as data/saf.yml in
+# https://gitlab.com/sosy-lab/benchmarking/fm-tools
+#
+# Every value marked "REPLACE-ME" (and the two 0000-... placeholders) must be
+# filled in by a human before the merge request is opened; see
+# submission/REGISTRATION.md for the list and for why CI rejects each of them.
+#
+# Key order is fixed by ci/check-data.py:validate_property_order().
+# Do not reorder.
+id: saf
+name: SAF
+description: |
+  SAF (Static Analyzer Factory) is a verifier for C, written in Rust, that is a
+  bug finder first. Its strength is refuting specifications: an LLVM-IR frontend
+  feeds an abstract-interpretation core (intervals, octagons, pointer and
+  value-flow analyses) that narrows the search, and candidate violations are then
+  driven to a concrete counterexample by SAF's own bounded model checker (SSA
+  encoding into bit-precise SMT solved by a statically linked Z3), a symbolic
+  interpreter, and a coverage-guided fuzzer with targeted input generation. A
+  candidate is only reported as a violation after it has been replayed natively:
+  SAF compiles the original program with clang-18 plus the synthesized inputs and
+  observes the failure under AddressSanitizer, UndefinedBehaviorSanitizer, or
+  ThreadSanitizer, and only then emits a violation witness. On the proof side SAF
+  is deliberately conservative and abstains: it answers "true" only for the small
+  set of tasks its abstract domains and linear ranking functions can discharge
+  soundly, and prints "unknown" everywhere else rather than guess. SAF bundles no
+  other verifier.
+input_languages:
+  - C
+project_url: https://github.com/Static-Analyzer-Factory/static-analyzer-factory
+repository_url: https://github.com/Static-Analyzer-Factory/static-analyzer-factory
+spdx_license_identifier: MIT
+benchexec_toolinfo_module: benchexec.tools.saf
+fmtools_format_version: "2.0"
+fmtools_entry_maintainers:
+  - REPLACE-ME-gitlab-username   # must resolve at https://gitlab.com/api/v4/users?username=...
+
+maintainers:
+  - orcid: 0000-0000-0000-0000   # REPLACE-ME: real ORCID, pattern ^[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9X]$
+    name: REPLACE-ME Maintainer Name
+    institution: REPLACE-ME Institution
+    country: REPLACE-ME Country
+    url:
+
+versions:
+  - version: "svcomp27"
+    doi: 10.5281/zenodo.0000000   # REPLACE-ME: version DOI of the published Zenodo record
+    benchexec_toolinfo_options: []
+    required_ubuntu_packages:
+      - clang-18
+      - libc6-dev-i386
+      - libclang-rt-18-dev
+      - libffi8
+      - libgcc-s1
+      - libstdc++6
+      - libtinfo6
+      - libzstd1
+      - llvm-18
+      - zlib1g
+    base_container_images:
+      - docker.io/ubuntu:24.04
+
+competition_participations:
+  - competition: "SV-COMP 2027"
+    track: "Verification"
+    tool_version: "svcomp27"
+    jury_member:
+      orcid: 0000-0000-0000-0000   # REPLACE-ME
+      name: REPLACE-ME Jury Member
+      institution: REPLACE-ME Institution
+      country: REPLACE-ME Country
+      url:
+    participants:
+      - orcid: 0000-0000-0000-0000   # REPLACE-ME
+        name: REPLACE-ME Participant
+
+techniques:
+  - Abstract Interpretation
+  - Bit-Precise Analysis
+  - Bounded Model Checking
+  - Concurrency Support
+  - Fuzzing
+  - Guidance by Coverage Measures
+  - Numeric Interval Analysis
+  - Portfolio
+  - Ranking Functions
+  - Symbolic Execution
+  - Targeted Input Generation
+
+frameworks_solvers:
+  - Z3
+
+literature: []

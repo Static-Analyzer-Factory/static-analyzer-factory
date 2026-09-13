@@ -1,0 +1,67 @@
+Proposed edit to https://gitlab.com/sosy-lab/sv-comp/bench-defs
+File: benchmark-defs/category-structure.yml  (base: main @ 2026-09-13)
+
+Adds SAF's 26 opt-in base categories. SAF joins NO meta category, i.e. `saf`
+is deliberately absent from every `categories.<Meta>.verifiers:` list, so it is
+scored only in these base categories and contributes to no Overall ranking.
+
+Why opt_in and not opt_out: competition-scripts/test/create-benchdefs.py
+purge_categories() (lines 374-397) builds the set of categories a tool runs in as
+    union(leaf categories of every meta category whose verifiers/validators list
+          contains the tool)
+  | cs["opt_in"].get(tool_name, [])
+and then deletes every <tasks> element whose name is not in that set. The word
+"opt_out" never appears in create-benchdefs.py; opt_out is consumed only by
+check-categories.py / the scoring scripts. For a tool in no meta category,
+opt_in is therefore the ONLY thing that produces <tasks> blocks.
+
+Verified locally (see submission/REGISTRATION.md section 6):
+  * `git apply --check` against benchmark-defs/category-structure.yml @ main: OK
+  * every one of the 26 entries appears in some meta category's `categories:`
+    list, so check-categories.py::_check_info_consistency does not fire
+    "Category used in opt_in, but missing in meta categories"
+  * running the real create-benchdefs.py with this structure + the proposed
+    data/saf.yml emits benchmark-defs/saf.xml with 5 rundefinitions and exactly
+    26 <tasks> blocks; without this hunk it prints
+    "Skipping saf for language C because: No rundefinitions left in benchmark
+    definition" and writes no file at all.
+
+Apply with:  git apply submission/category-structure.diff
+(everything above the first '---' line is ignored by git apply / patch)
+
+--- a/benchmark-defs/category-structure.yml	2026-09-13 04:18:06
++++ b/benchmark-defs/category-structure.yml	2026-09-13 04:18:06
+@@ -948,6 +948,33 @@
+   racerf:
+     - C.no-data-race.Concurrency
+     - C.no-data-race.Huawei-Concurrency-Challenges
++  saf:
++    - C.no-data-race.Concurrency
++    - C.no-overflow.Juliet
++    - C.no-overflow.Main
++    - C.termination.BitVectors
++    - C.termination.MainControlFlow
++    - C.termination.MainHeap
++    - C.termination.Other
++    - C.unreach-call.Arrays
++    - C.unreach-call.BitVectors
++    - C.unreach-call.Concurrency
++    - C.unreach-call.ControlFlow
++    - C.unreach-call.ECA
++    - C.unreach-call.Floats
++    - C.unreach-call.Hardware
++    - C.unreach-call.Heap
++    - C.unreach-call.Loops
++    - C.unreach-call.ProductLines
++    - C.unreach-call.Recursive
++    - C.unreach-call.Sequentialized
++    - C.unreach-call.SoftwareSystems-AWS-C-Common
++    - C.unreach-call.SoftwareSystems-Other
++    - C.valid-memsafety.Arrays
++    - C.valid-memsafety.Heap
++    - C.valid-memsafety.Juliet
++    - C.valid-memsafety.LinkedLists
++    - C.valid-memsafety.Other
+   seal:
+     - C.valid-memsafety.LinkedLists
+   sv-sanitizers:
