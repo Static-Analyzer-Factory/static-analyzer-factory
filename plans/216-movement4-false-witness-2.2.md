@@ -1,6 +1,36 @@
 # Plan 216 — Movement 4: the FALSE-side witness upgrade (+8 weighted)
 
-**Status:** DESIGNED, not started. **Unblocked** — depends on nothing.
+> # 🛑 PROBE COMPLETE 2026-09-13 — DO NOT BUILD. The +8 is UNREACHABLE in 2027.
+>
+> The §2 oracle probe below was run (~20 min, no Rust written) and it says stop:
+>
+> 1. **`witnesslint` cannot confirm anything.** Upstream
+>    `benchexec/tools/witnesslint.py::determine_result` returns `result.RESULT_DONE`,
+>    never a `false(...)` status. Confirmation needs a validator reporting the SAME
+>    STATUS as the verifier, so a linter is structurally incapable of it.
+> 2. **The YAML (v2) violation track does not even COVER these targets.**
+>    `witnesslint-validate-violation-witnesses-v2` declares no `no-data-race`
+>    rundefinition at all, and zero `C.unreach-call.Concurrency` task blocks. The three
+>    real violation validators (`cpachecker`, `dartagnan`, `uautomizer`) are all on the
+>    v1 track and all consume `witness.graphml`.
+> 3. **No in-flight 2027 branch fixes it** — all eight bench-defs branches, including
+>    ones from 2026-09-01 and 2026-09-03, list only `witnesslint` on `C.Concurrency`.
+>
+> So a perfectly-formed 2.2 witness for either target has nowhere to be validated, and
+> the emitter would produce artifacts no 2027 validator ever reads.
+>
+> **The corollary is worth raising with the organizers rather than engineering around:**
+> SAF's EXISTING GraphML 1.0 `no-data-race` witnesses are exactly what the v1
+> infrastructure validates. They score 0 only because the rules page marks GraphML
+> legacy. The rules demand a format with no validator; the format with validators the
+> rules forbid. **As configured, no tool can score a `no-data-race` FALSE in 2027.**
+>
+> Re-check before submission — if a v2 violation validator appears, or the v2
+> rundefinitions are extended, this verdict flips and the plan is live again.
+> Evidence and repro: memory `saf-movement4-concurrency-validator-gap`.
+
+**Status:** PROBED 2026-09-13 → **BLOCKED on competition infrastructure, not on us.**
+Was: "DESIGNED, not started. Unblocked — depends on nothing".
 **Branch:** cut `movement4/false-witness-2.2` off `movement0/scoreboard-2027`.
 **Track:** **FALSE-side.** The only movement in the sequence that is.
 **Design source:** Movement 0A's measured ledger (`plans/212`, commit `12eb25b9`) and
