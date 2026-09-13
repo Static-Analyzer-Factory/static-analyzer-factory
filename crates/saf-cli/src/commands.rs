@@ -1346,21 +1346,6 @@ struct VerifyCtx<'a> {
     stub: &'a Path,
     tempdir: &'a Path,
     clang: &'a str,
-    /// When the caller's wall-clock watchdog will give up and emit `unknown`. Stages
-    /// that shell out to a long-running external tool consult this so they finish
-    /// INSIDE the budget instead of being `SIGKILLed` with the task (see
-    /// [`cpachecker_timelimit`]). Stages with their own deterministic cost bound
-    /// ignore it.
-    deadline: std::time::Instant,
-}
-
-impl VerifyCtx<'_> {
-    /// Whole seconds left before the watchdog fires (0 once it has passed).
-    fn remaining_secs(&self) -> u64 {
-        self.deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .as_secs()
-    }
 }
 
 /// A per-property `propose -> concrete-confirm -> witness` pipeline.
@@ -1388,9 +1373,10 @@ fn strategy_for(property: saf_svcomp::Property) -> Option<StrategyFn> {
 /// exit 0, gracefully beating `BenchExec`'s SIGKILL. The watchdog only ever yields
 /// UNKNOWN, so it can never produce an unsound verdict.
 ///
-/// The budget's absolute deadline is also handed to the strategy, so a stage that
-/// shells out to a long-running external tool can size its own timeout to fit inside
-/// it rather than be killed with the task (see [`cpachecker_timelimit`]).
+/// The budget is NOT threaded into the strategy: SAF shells out to no long-running
+/// external tool (it bundles no SV-COMP participant), and every stage that can run
+/// long -- fuzzing, native replay, concurrency shims -- carries its own deterministic
+/// cost bound plus a local `Instant` safety valve.
 fn run_verdict_under_budget(
     input: PathBuf,
     data_model: saf_svcomp::DataModel,
@@ -1398,16 +1384,9 @@ fn run_verdict_under_budget(
     specification: String,
     budget: std::time::Duration,
 ) -> VerdictOutcome {
-    let deadline = std::time::Instant::now() + budget;
     let (tx, rx) = std::sync::mpsc::channel();
     let _worker = std::thread::spawn(move || {
-        let _ = tx.send(run_verdict(
-            &input,
-            data_model,
-            property,
-            specification,
-            deadline,
-        ));
+        let _ = tx.send(run_verdict(&input, data_model, property, specification));
     });
     rx.recv_timeout(budget).unwrap_or_else(|_| {
         eprintln!(
@@ -1423,7 +1402,6 @@ fn run_verdict(
     data_model: saf_svcomp::DataModel,
     property: saf_svcomp::Property,
     specification: String,
-    deadline: std::time::Instant,
 ) -> VerdictOutcome {
     let Some(strategy) = strategy_for(property) else {
         return unknown_outcome();
@@ -1469,7 +1447,6 @@ fn run_verdict(
         stub: &stub,
         tempdir: dir.path(),
         clang: &clang,
-        deadline,
     };
     strategy(&ctx)
 }
@@ -1616,25 +1593,6 @@ fn fuzz_confirm(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     if witness.is_none() {
         eprintln!(
             "saf verify: FALSE (fuzz replay-confirmed) but witness unconstructible -> emitting false without a witness"
-        );
-    }
-    Some(VerdictOutcome {
-        verdict: format!("false({})", Property::UnreachCall.name()),
-        witness,
-        graphml: None,
-        correctness: None,
-    })
-}
-
-/// CBMC lever wrapper: adapt [`cbmc_confirm_false`] to the routed
-/// `Option<VerdictOutcome>` shape.
-fn cbmc_confirm(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
-    use saf_svcomp::Property;
-    let candidate = cbmc_confirm_false(ctx)?;
-    let witness = build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, &candidate));
-    if witness.is_none() {
-        eprintln!(
-            "saf verify: FALSE (CBMC replay-confirmed) but witness unconstructible -> emitting false without a witness"
         );
     }
     Some(VerdictOutcome {
@@ -1919,7 +1877,6 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             saf_svcomp::Lever::Bmc => bmc_confirm(ctx, &config),
             saf_svcomp::Lever::Se => se_confirm(ctx, &config),
             saf_svcomp::Lever::Fuzz => fuzz_confirm(ctx),
-            saf_svcomp::Lever::Cbmc => cbmc_confirm(ctx),
         };
         if let Some(outcome) = outcome {
             return outcome;
@@ -2394,184 +2351,6 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
 
     eprintln!("saf verify: blind fuzz exhausted (no confirmed reach_error) -> unknown");
     None
-}
-
-/// The CBMC loop-unwinding bound (`--unwind k`), overridable via `$SAF_CBMC_UNWIND`.
-///
-/// This — not the outer wall-clock safety valve — is the DETERMINISTIC cost bound
-/// (the lever's cost-gate contract): the SAT instance size is a function of `k`, so
-/// the search and therefore the verdict is reproducible across machines. A shallow
-/// reachable violation is found well inside the safety-valve timeout; a genuinely
-/// deep one is missed *consistently* (a recall cost, never a soundness one).
-fn cbmc_unwind() -> u32 {
-    std::env::var("SAF_CBMC_UNWIND")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|k| *k > 0)
-        .unwrap_or(saf_svcomp::DEFAULT_UNWIND)
-}
-
-/// Outer wall-clock cap on a single CBMC invocation — a pathological-slowness
-/// SAFETY VALVE only, NOT the cost gate (that is [`cbmc_unwind`]). Generous by
-/// default so it trips only on a genuine SAT hang; on either a hang or a clean
-/// `SUCCESSFUL` the outcome is the same (no trace → abstain), so the timeout never
-/// changes a FALSE into anything but an abstain. Overridable via `$SAF_CBMC_TIMEOUT`
-/// (seconds).
-fn cbmc_timeout() -> std::time::Duration {
-    let secs = std::env::var("SAF_CBMC_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(30);
-    std::time::Duration::from_secs(secs)
-}
-
-/// Resolve the provisioned CBMC install directory (containing `cbmc` +
-/// `libminisat.so.2`) from `$SAF_CBMC`, defaulting to the bind-mount path the
-/// validator uses. Returns `None` (→ CBMC stage no-ops) when the binary is absent.
-fn resolve_cbmc() -> Option<std::path::PathBuf> {
-    let home = std::env::var("SAF_CBMC").unwrap_or_else(|_| "/workspace/.svtools/cbmc".to_string());
-    let bin = std::path::Path::new(&home).join("cbmc");
-    if bin.is_file() {
-        Some(std::path::PathBuf::from(home))
-    } else {
-        None
-    }
-}
-
-/// CBMC bit-precise oracle confirmer for `unreach-call` (Stage 6, last resort).
-///
-/// Runs the provisioned CBMC on the ORIGINAL program with a fixed `--unwind k`,
-/// `--no-standard-checks` (so only the `reach_error` assertion / no-body failure is
-/// a target — R1) and `--stop-on-fail --trace`; parses the counterexample's
-/// `__VERIFIER_nondet_*` return values into a concrete input vector (in nondet-call
-/// order); and RE-CONFIRMS that vector through the existing native-replay gate
-/// ([`replay_confirms_false`]) on the original program. Returns the confirmed
-/// [`saf_svcomp::FalseCandidate`], or `None` (abstain) on any gate miss / missing
-/// binary / no counterexample / non-reproduction. CBMC is only an oracle — the
-/// native replay is the sole arbiter, so a spurious model can never yield a wrong
-/// FALSE (R6).
-fn cbmc_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
-    use std::process::{Command, Stdio};
-
-    // Gate 1: a reach_error site to reach.
-    let error_sites = saf_svcomp::reach_error_call_sites(ctx.module);
-    let &reach_error_inst = error_sites.first()?;
-
-    // Gate 2: the cheap, deterministic structural pre-filter (scalar-integer nondet
-    // AND no float/pointer nondet).
-    if !saf_svcomp::cbmc_precheck(ctx.module) {
-        return None;
-    }
-
-    // Gate 3: the CBMC binary must be provisioned (degrade to no-op otherwise).
-    let cbmc_home = resolve_cbmc()?;
-    let cbmc_bin = cbmc_home.join("cbmc");
-
-    let unwind = cbmc_unwind();
-    // CBMC's own data-model flag (mirrors the task's declared ILP32/LP64, R3).
-    let dm_flag = match ctx.data_model {
-        saf_svcomp::DataModel::ILP32 => "--ILP32",
-        saf_svcomp::DataModel::LP64 => "--LP64",
-    };
-    let trace_out = ctx.tempdir.join("saf_cbmc.trace");
-    let Ok(out) = std::fs::File::create(&trace_out) else {
-        return None;
-    };
-
-    let mut cmd = Command::new(&cbmc_bin);
-    cmd.arg(dm_flag)
-        .arg("--unwind")
-        .arg(unwind.to_string())
-        // Only the property's own violation event is a target: disable CBMC's
-        // incidental default checks (overflow / bounds / pointer / div-by-zero) so
-        // --stop-on-fail lands on the reach_error assertion, not an unrelated trap
-        // (R1). A path that reaches reach_error only via signed overflow still gets
-        // rejected downstream: the native replay compiles with
-        // -fsanitize-trap=signed-integer-overflow and traps before the sentinel.
-        .arg("--no-standard-checks")
-        .arg("--stop-on-fail")
-        .arg("--trace")
-        // Speed: drop functions trivially unreachable from main.
-        .arg("--drop-unused-functions")
-        .arg(ctx.input)
-        .env("LD_LIBRARY_PATH", &cbmc_home)
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(Stdio::null());
-
-    let mut child = harden_replay_spawn(&mut cmd).spawn().ok()?;
-
-    // Poll to the safety-valve timeout; a hang is killed with its whole group.
-    let timeout = cbmc_timeout();
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    kill_replay_group(&mut child);
-                    eprintln!("saf verify: CBMC oracle timed out (unwind {unwind}) -> unknown");
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(_) => return None,
-        }
-    }
-
-    let trace = std::fs::read_to_string(&trace_out).ok()?;
-    // The trace reports raw nondet reads by SOURCE LINE (a simple `x = f();` read is
-    // assigned directly to `x` with no `return_value` temp — the load-bearing
-    // per-iteration loop inputs), so parse guided by a source-line map of the
-    // original program (CBMC runs on the original .c, so its line numbers match).
-    let source = std::fs::read_to_string(ctx.input).ok()?;
-    let line_map = saf_svcomp::nondet_line_map(&source);
-    let nondet_sequence = saf_svcomp::parse_cbmc_trace(&trace, &line_map);
-    if nondet_sequence.is_empty() {
-        // No counterexample within the bound (SUCCESSFUL / no nondet in the trace)
-        // -> abstain.
-        return None;
-    }
-    eprintln!(
-        "saf verify: CBMC oracle proposed a {}-value nondet vector (unwind {unwind}); re-confirming natively",
-        nondet_sequence.len()
-    );
-
-    let candidate = saf_svcomp::FalseCandidate {
-        reach_error_inst,
-        block_path: Vec::new(),
-        assignments: std::collections::BTreeMap::new(),
-        nondet_sequence,
-    };
-    match replay_confirms_false(
-        ctx.input,
-        ctx.data_model,
-        ctx.stub,
-        ctx.tempdir,
-        ctx.clang,
-        // Offset the replay index well past every earlier batch so temp files
-        // never collide.
-        5 * MAX_REPLAY_CANDIDATES,
-        &candidate,
-    ) {
-        Ok(true) => {
-            eprintln!(
-                "saf verify: CBMC-proposed vector re-confirmed reach_error -> false(unreach-call)"
-            );
-            Some(candidate)
-        }
-        Ok(false) => {
-            eprintln!(
-                "saf verify: CBMC-proposed vector did not re-confirm deterministically -> unknown"
-            );
-            None
-        }
-        Err(e) => {
-            eprintln!("saf verify: CBMC re-confirm errored: {e:#} -> unknown");
-            None
-        }
-    }
 }
 
 /// Per-schedule wall-clock cap for the concurrency atomic-thread replay. Short: the
@@ -5146,307 +4925,34 @@ fn overflow_nondet_assumes(
     assumes
 }
 
-/// The in-process `CPAchecker` gate's own wall-clock cap, used when the task budget
-/// is generous (SV-COMP allows 900s per task).
-const CPACHECKER_TIMELIMIT_SECS: u64 = 150;
-/// Reserve for `CPAchecker`'s JVM teardown plus our own result parse, so the gate
-/// finishes INSIDE the task budget rather than being killed with it.
-const CPACHECKER_TIMELIMIT_MARGIN_SECS: u64 = 5;
-/// Below this there is no point paying JVM startup — it would only burn the tail of
-/// the budget and still abstain.
-const CPACHECKER_TIMELIMIT_MIN_SECS: u64 = 10;
-
-/// How long the in-process `CPAchecker` gate may run given `remaining_secs` of task
-/// budget, or `None` when too little is left to bother.
+/// Rank-2 `no-overflow` TRUE: DISABLED, deliberately.
 ///
-/// The gate is a blocking `Command::output()` with no Rust-side timeout, so
-/// `CPAchecker`'s own `--timelimit` is the ONLY bound on it. Hard-coding
-/// [`CPACHECKER_TIMELIMIT_SECS`] therefore guaranteed that, under any task budget
-/// tighter than it (the eval harness runs at `--timeout 60`), the watchdog would
-/// SIGKILL the whole task mid-gate — discarding every verdict the other stages had
-/// already produced. Clamping keeps the gate inside the budget so a TRUE attempt can
-/// never cost a FALSE result.
-#[must_use]
-fn cpachecker_timelimit(remaining_secs: u64) -> Option<u64> {
-    let usable = remaining_secs.saturating_sub(CPACHECKER_TIMELIMIT_MARGIN_SECS);
-    let limit = usable.min(CPACHECKER_TIMELIMIT_SECS);
-    (limit >= CPACHECKER_TIMELIMIT_MIN_SECS).then_some(limit)
-}
-
-/// Locate a bundled `CPAchecker`-4.2.2 home for the in-process no-overflow TRUE
-/// confirmation gate: `$SAF_CPACHECKER`, else an ancestor of the running binary
-/// joined with `.svtools/CPAchecker-4.2.2-unix`, else `./.svtools/...`.
-fn resolve_cpachecker() -> Option<PathBuf> {
-    const REL: &str = ".svtools/CPAchecker-4.2.2-unix";
-    if let Some(p) = std::env::var_os("SAF_CPACHECKER") {
-        let p = PathBuf::from(p);
-        if p.join("bin/cpachecker").is_file() {
-            return Some(p);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        for anc in exe.ancestors() {
-            let c = anc.join(REL);
-            if c.join("bin/cpachecker").is_file() {
-                return Some(c);
-            }
-        }
-    }
-    let c = PathBuf::from(REL);
-    if c.join("bin/cpachecker").is_file() {
-        return Some(c);
-    }
+/// The sound-interval sentinel ([`saf_analysis::absint::prove_no_signed_overflow`])
+/// PROPOSES a proof, but on its own it is not wrong-TRUE-safe: a sweep over the full
+/// expected-FALSE population measured 7 wrong TRUEs from SAF's sentinels. The proposal
+/// therefore required an independent confirmer, and the only one to hand was a bundled
+/// `CPAchecker`.
+///
+/// SAF ships no tool that is itself an SV-COMP participant (user decision 2026-09-13),
+/// so that confirmer is gone and nothing is left to make the proposal sound. SAF
+/// ABSTAINS rather than emit an unvalidated TRUE -- a missed TRUE scores 0, a wrong one
+/// scores -32. Measured price of this decision: -12 dedup-weighted.
+///
+/// Movement 1 (`plans/213`) fixes the two absint bug classes behind those wrong TRUEs;
+/// when it lands this becomes a SAF-native proof needing no external gate.
+fn try_overflow_true(_ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     None
 }
 
-/// `true` iff clang reports a compile-time integer-overflow warning for
-/// `ctx.input` — an overflowing CONSTANT expression clang folds away, leaving no IR
-/// arithmetic for the sentinel to see (a measured wrong-TRUE class). `-fsyntax-only`
-/// (no codegen). Fail-closed: on any probe error, returns `true` (abstain) so a
-/// fold we cannot rule out never yields a wrong `true`.
-fn overflow_source_constant_folds(ctx: &VerifyCtx) -> bool {
-    use std::process::{Command, Stdio};
-    let m = match ctx.data_model {
-        saf_svcomp::DataModel::ILP32 => "-m32",
-        saf_svcomp::DataModel::LP64 => "-m64",
-    };
-    match Command::new(ctx.clang)
-        .args(["-fsyntax-only", "-Wno-everything", "-Winteger-overflow", m])
-        .arg("-include")
-        .arg(ctx.stub)
-        .arg(ctx.input)
-        .stdout(Stdio::null())
-        .output()
-    {
-        Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr);
-            err.contains("integer-overflow") || err.contains("overflow in expression")
-        }
-        Err(_) => true, // fail-closed
-    }
-}
-
-/// Run real `CPAchecker`'s overflow correctness-witness validation on `witness_path`
-/// against `ctx.input`, in process. `true` iff `CPAchecker`'s raw verdict is
-/// `Verification result: TRUE`. Fail-closed: `CPAchecker` absent / errored / any
-/// non-TRUE verdict (`FALSE`/`UNKNOWN`/timeout) ⇒ `false` ⇒ the caller abstains.
-/// This is the SOUNDNESS gate — the sentinel is only a filter; `CPAchecker` (the
-/// SV-COMP reference overflow analysis) has the final say on the `true` verdict.
-fn cpachecker_confirms_no_overflow(ctx: &VerifyCtx, witness_path: &Path) -> bool {
-    use std::process::{Command, Stdio};
-    let Some(cpa) = resolve_cpachecker() else {
-        eprintln!(
-            "saf verify: CPAchecker not found (set SAF_CPACHECKER) -> no-overflow TRUE abstains"
-        );
-        return false;
-    };
-    let config = cpa.join("config/correctness-witness-validation--overflow.properties");
-    let bit = match ctx.data_model {
-        saf_svcomp::DataModel::ILP32 => "--32",
-        saf_svcomp::DataModel::LP64 => "--64",
-    };
-    // `ctx.meta.specification` is the raw no-overflow `.prp` text; write it for --spec.
-    let prp = ctx.tempdir.join("saf_nooverflow_spec.prp");
-    if std::fs::write(&prp, &ctx.meta.specification).is_err() {
-        return false;
-    }
-    let Some(limit) = cpachecker_timelimit(ctx.remaining_secs()) else {
-        eprintln!(
-            "saf verify: too little task budget left for the CPAchecker gate -> no-overflow TRUE abstains"
-        );
-        return false;
-    };
-    let out_dir = ctx.tempdir.join("saf_cpa_confirm");
-    match Command::new(cpa.join("bin/cpachecker"))
-        .arg("--config")
-        .arg(&config)
-        .arg("--witness")
-        .arg(witness_path)
-        .arg("--spec")
-        .arg(&prp)
-        .arg(bit)
-        .arg("--option")
-        .arg("witness.checkProgramHash=false")
-        .arg("--timelimit")
-        .arg(format!("{limit}s"))
-        .arg("--output-path")
-        .arg(&out_dir)
-        .arg(ctx.input)
-        .stdin(Stdio::null())
-        .output()
-    {
-        Ok(o) => {
-            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
-            s.push_str(&String::from_utf8_lossy(&o.stderr));
-            s.contains("Verification result: TRUE")
-        }
-        Err(e) => {
-            eprintln!("saf verify: CPAchecker invocation failed: {e} -> no-overflow TRUE abstains");
-            false
-        }
-    }
-}
-
-/// Rank-2 sound `no-overflow` TRUE attempt: propose (sound interval sentinel) →
-/// emit an `invariant_set` witness → CONFIRM in process with real `CPAchecker`.
-/// Returns `Some(true + correctness witness)` ONLY on a `CPAchecker`-confirmed
-/// no-overflow proof; `None` to fall through to the FALSE / unknown path. NEVER
-/// emits `false`. Every gate is fail-closed; the TRUE authority (sound absint +
-/// `CPAchecker`) is STRICTLY separate from the FALSE authority (`UBSan`).
-fn try_overflow_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
-    let source = std::fs::read_to_string(ctx.input).ok()?;
-    // (1) OpenMP: the frontend drops `#pragma omp`, so the AIR loses parallelism.
-    if saf_svcomp::source_has_openmp(&source) {
-        return None;
-    }
-    // (2) Reachable thread spawn: a sequential interval proof is unsound under
-    //     concurrency (the same gate the UBSan FALSE path uses).
-    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
-    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
-        return None;
-    }
-    // (3) Compile-time constant overflow clang folds away (no IR arithmetic to see).
-    if overflow_source_constant_folds(ctx) {
-        return None;
-    }
-    // Sentinel: prove EVERY reachable signed add/sub/mul in-bounds over the
-    // converged interval solution (fail-closed on any TOP/absent/unmodeled op).
-    if !matches!(
-        saf_analysis::absint::prove_no_signed_overflow(ctx.module),
-        saf_analysis::absint::NoOverflowProof::Proven
-    ) {
-        return None;
-    }
-    // Correctness witness: SAF's converged loop invariants, or an empty
-    // invariant_set for a loop-free program (CPAchecker re-proves it).
-    let witness = saf_svcomp::build_interval_invariant_witness(ctx.module, &source, ctx.meta)
-        .unwrap_or_else(|| saf_svcomp::InvariantSetWitness::empty(ctx.meta));
-    let yaml = witness.to_yaml_string().ok()?;
-    let witness_path = ctx.tempdir.join("saf_overflow_correctness.yml");
-    std::fs::write(&witness_path, &yaml).ok()?;
-    // FINAL GATE: real CPAchecker overflow-witness validation (fail-closed).
-    if !cpachecker_confirms_no_overflow(ctx, &witness_path) {
-        return None;
-    }
-    Some(VerdictOutcome {
-        verdict: "true".to_string(),
-        witness: None,
-        graphml: None,
-        correctness: Some(witness),
-    })
-}
-
-/// Run real `CPAchecker`'s GENERIC correctness-witness validation on `witness_path`
-/// against `ctx.input`, in process. `true` iff `CPAchecker`'s raw verdict is
-/// `Verification result: TRUE`. Fail-closed: `CPAchecker` absent / errored / any
-/// non-TRUE verdict (`FALSE`/`UNKNOWN`/timeout) ⇒ `false` ⇒ the caller abstains.
-/// This is the rank-3 SOUNDNESS gate — the interval error-block-⊥ sentinel is only a
-/// FILTER; `CPAchecker` (an SV-COMP reference verifier) has the final say on `true`.
-/// Uses the GENERIC `correctness-witness-validation.properties` config (NOT the
-/// `--overflow` one) + the raw unreach-call `.prp` (`ctx.meta.specification`).
-fn cpachecker_confirms_unreach(ctx: &VerifyCtx, witness_path: &Path) -> bool {
-    use std::process::{Command, Stdio};
-    let Some(cpa) = resolve_cpachecker() else {
-        eprintln!(
-            "saf verify: CPAchecker not found (set SAF_CPACHECKER) -> unreach-call TRUE abstains"
-        );
-        return false;
-    };
-    let config = cpa.join("config/correctness-witness-validation.properties");
-    let bit = match ctx.data_model {
-        saf_svcomp::DataModel::ILP32 => "--32",
-        saf_svcomp::DataModel::LP64 => "--64",
-    };
-    // `ctx.meta.specification` is the raw unreach-call `.prp` text; write it for --spec.
-    let prp = ctx.tempdir.join("saf_unreach_spec.prp");
-    if std::fs::write(&prp, &ctx.meta.specification).is_err() {
-        return false;
-    }
-    let Some(limit) = cpachecker_timelimit(ctx.remaining_secs()) else {
-        eprintln!(
-            "saf verify: too little task budget left for the CPAchecker gate -> unreach-call TRUE abstains"
-        );
-        return false;
-    };
-    let out_dir = ctx.tempdir.join("saf_cpa_confirm_unreach");
-    match Command::new(cpa.join("bin/cpachecker"))
-        .arg("--config")
-        .arg(&config)
-        .arg("--witness")
-        .arg(witness_path)
-        .arg("--spec")
-        .arg(&prp)
-        .arg(bit)
-        .arg("--option")
-        .arg("witness.checkProgramHash=false")
-        .arg("--timelimit")
-        .arg(format!("{limit}s"))
-        .arg("--output-path")
-        .arg(&out_dir)
-        .arg(ctx.input)
-        .stdin(Stdio::null())
-        .output()
-    {
-        Ok(o) => {
-            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
-            s.push_str(&String::from_utf8_lossy(&o.stderr));
-            s.contains("Verification result: TRUE")
-        }
-        Err(e) => {
-            eprintln!(
-                "saf verify: CPAchecker invocation failed: {e} -> unreach-call TRUE abstains"
-            );
-            false
-        }
-    }
-}
-
-/// Rank-3 sound `unreach-call` TRUE attempt: propose (sound interval error-block-⊥
-/// sentinel, cost-guarded) → emit an `invariant_set` witness (SAF's loop invariants
-/// when renderable, else empty — `CPAchecker` re-proves) → CONFIRM in process with
-/// real `CPAchecker` (GENERIC correctness config). Returns `Some(true + correctness
-/// witness)` ONLY on a `CPAchecker`-confirmed proof; `None` to fall through to the
-/// EXISTING FALSE path. NEVER emits `false`. Every gate is fail-closed; the TRUE
-/// authority (sound absint + `CPAchecker`) is STRICTLY separate from the FALSE
-/// authority (must-reach / native replay).
-fn try_unreach_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
-    let source = std::fs::read_to_string(ctx.input).ok()?;
-    // (1) OpenMP: the frontend drops `#pragma omp`, so the AIR loses parallelism.
-    if saf_svcomp::source_has_openmp(&source) {
-        return None;
-    }
-    // (2) Reachable thread spawn: a sequential interval proof is unsound under
-    //     concurrency (the same gate the FALSE path uses below).
-    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
-    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
-        return None;
-    }
-    // Sentinel (cost-guarded internally): prove EVERY reach_error site's block is ⊥
-    // over the converged interval solution (fail-closed on any doubt / oversized
-    // module — the giant eca/ldv programs that would starve the FALSE path).
-    if !matches!(
-        saf_svcomp::prove_unreachable(ctx.module),
-        saf_svcomp::UnreachProof::Proven
-    ) {
-        return None;
-    }
-    // Correctness witness: SAF's converged loop invariants, or an empty invariant_set
-    // for a loop-free / unrenderable program (CPAchecker re-proves it).
-    let witness = saf_svcomp::build_interval_invariant_witness(ctx.module, &source, ctx.meta)
-        .unwrap_or_else(|| saf_svcomp::InvariantSetWitness::empty(ctx.meta));
-    let yaml = witness.to_yaml_string().ok()?;
-    let witness_path = ctx.tempdir.join("saf_unreach_correctness.yml");
-    std::fs::write(&witness_path, &yaml).ok()?;
-    // FINAL GATE: real CPAchecker correctness-witness validation (fail-closed).
-    if !cpachecker_confirms_unreach(ctx, &witness_path) {
-        return None;
-    }
-    Some(VerdictOutcome {
-        verdict: "true".to_string(),
-        witness: None,
-        graphml: None,
-        correctness: Some(witness),
-    })
+/// Rank-3 `unreach-call` TRUE: DISABLED, deliberately.
+///
+/// Same reasoning as [`try_overflow_true`]: the interval error-block-bottom sentinel
+/// proposes, but only a bundled `CPAchecker` could confirm, and SAF ships no SV-COMP
+/// participant. SAF abstains. Measured price: 3 tasks, folded into the -12 above.
+///
+/// Re-enabled by Movement 1 (`plans/213`) as a SAF-native proof.
+fn try_unreach_true(_ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    None
 }
 
 /// The `no-overflow` strategy: **TRUE-first** (rank 2 — a sound interval proof
@@ -7535,31 +7041,6 @@ mod verify_tests {
         );
     }
 
-    // --- CPAchecker gate budget clamp --------------------------------------
-
-    #[test]
-    fn cpachecker_timelimit_uses_the_full_cap_when_the_budget_is_generous() {
-        // SV-COMP gives 900s per task, so the gate keeps its own 150s cap.
-        assert_eq!(cpachecker_timelimit(900), Some(CPACHECKER_TIMELIMIT_SECS));
-    }
-
-    #[test]
-    fn cpachecker_timelimit_clamps_to_a_tight_task_budget() {
-        // The eval harness runs at --timeout 60. Asking CPAchecker for 150s there
-        // guarantees the whole task is SIGKILLed mid-gate, losing every verdict the
-        // other stages would have produced; clamp to what is actually left.
-        assert_eq!(cpachecker_timelimit(60), Some(55));
-        assert_eq!(cpachecker_timelimit(20), Some(15));
-    }
-
-    #[test]
-    fn cpachecker_timelimit_declines_when_too_little_budget_remains() {
-        // Starting a JVM with a handful of seconds left only burns the remainder.
-        assert_eq!(cpachecker_timelimit(12), None);
-        assert_eq!(cpachecker_timelimit(5), None);
-        assert_eq!(cpachecker_timelimit(0), None);
-    }
-
     // --- overflow loop-free boundary injection -----------------------------
 
     /// A defined `main` with a two-block CFG back-edge (`b0 -> b1 -> b0`) — a
@@ -7782,7 +7263,6 @@ mod verify_tests {
             stub: Path::new("/dev/null"),
             tempdir: dir.path(),
             clang: "clang",
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(900),
         };
         let hit = saf_svcomp::OverflowHit {
             file: "t.c".to_string(),
@@ -7870,7 +7350,6 @@ mod verify_tests {
             stub: Path::new("/dev/null"),
             tempdir: dir.path(),
             clang: "clang",
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(900),
         };
         // Fault at line 7 (`base + base`, after the loop). Only the line-2
         // unconditional read may bind; the line-4 in-loop read (never executed under
@@ -7925,7 +7404,6 @@ mod verify_tests {
             stub: Path::new("/dev/null"),
             tempdir: dir.path(),
             clang: "clang",
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(900),
         };
         let hit = saf_svcomp::OverflowHit {
             file: "m.c".to_string(),

@@ -16,7 +16,6 @@
 pub mod assert_site;
 pub mod bmc;
 pub mod bmc_incremental;
-pub mod cbmc;
 pub mod conc_replay;
 pub mod conc_seq;
 pub mod conc_shim;
@@ -25,6 +24,7 @@ pub mod correctness_witness;
 pub mod fast_paths;
 pub mod fuzz;
 pub mod memsafety;
+pub mod nondet;
 pub mod overflow;
 pub mod portfolio;
 pub mod promote;
@@ -43,7 +43,6 @@ pub mod witness_lower;
 pub mod witness_yaml;
 
 pub use bmc::enumerate_bmc_candidates;
-pub use cbmc::{DEFAULT_UNWIND, NondetSite, cbmc_precheck, nondet_line_map, parse_cbmc_trace};
 pub use conc_replay::{
     ReplayPlan, conc_replay_schedulable, replay_plans, synthesize_conc_replay_driver,
 };
@@ -62,6 +61,7 @@ pub use correctness_witness::{
 pub use memsafety::{
     AsanHit, asan_class_to_subproperty, lower_memsafety_hit, memsafety_verdict, parse_asan_report,
 };
+pub use nondet::{NondetSite, nondet_line_map};
 pub use overflow::{
     NondetAssume, OverflowHit, lower_overflow_hit, lower_overflow_hit_enriched, overflow_verdict,
     parse_ubsan_overflow,

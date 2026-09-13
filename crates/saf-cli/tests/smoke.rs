@@ -271,23 +271,27 @@ fn verify_true_simple_is_unknown() {
     verify_unreach("unreach_true_simple.c").stdout("unknown\n");
 }
 
-/// Rank-3 sound TRUE (END-TO-END MILESTONE): `x > 0 && x < 0` is a contradiction
-/// over a nondet value, so the interval sentinel proves the `reach_error` block ⊥
-/// and the in-process CPAchecker confirmation gate agrees → `saf verify` emits
-/// `true` and writes an `invariant_set` correctness witness. (The guards are over a
-/// nondet value, so they survive as real `icmp`s the interval refinement can prune,
-/// unlike a constant-folded `if (0)`.)
+/// Rank-3 TRUE is DISABLED, so even a cleanly provable contradiction abstains.
+///
+/// `x > 0 && x < 0` is a contradiction over a nondet value and the interval sentinel
+/// still proves the `reach_error` block ⊥ — but the sentinel alone is not
+/// wrong-TRUE-safe, its only confirmer was a bundled CPAchecker, and SAF ships no
+/// SV-COMP participant. So `saf verify` abstains. This is the DELIBERATE price of
+/// that decision; see `try_unreach_true`. Movement 1 (`plans/213`) makes the proof
+/// SAF-native, and this assertion flips back to `true` then.
 #[test]
 #[ignore]
-fn verify_unreach_true_infeasible() {
-    verify_unreach("unreach_true_infeasible.c").stdout("true\n");
+fn verify_unreach_true_infeasible_abstains_without_a_native_prover() {
+    verify_unreach("unreach_true_infeasible.c").stdout("unknown\n");
 }
 
-/// Rank-3 wrong-TRUE guard (soundness): `signextension-1` is a genuine FALSE task
-/// the interval sentinel WRONGLY proves (it cannot model the sign/unsigned
-/// conversions that satisfy the error guard), but the in-process CPAchecker gate
-/// REJECTS it, so `saf verify` must NOT emit `true` — it falls through to the FALSE
-/// pipeline. ILP32 (the task's declared data model).
+/// Rank-3 wrong-TRUE guard (soundness), and now the load-bearing regression for the
+/// disabled TRUE arm: `signextension-1` is a genuine FALSE task the interval sentinel
+/// WRONGLY proves (it cannot model the sign/unsigned conversions that satisfy the
+/// error guard). It used to be caught by the in-process CPAchecker gate; today the
+/// TRUE arm abstains outright. Either way `saf verify` must NOT emit `true`.
+/// **If anyone re-enables `try_unreach_true` before fixing that absint bug, this test
+/// is what fires.** ILP32 (the task's declared data model).
 #[test]
 #[ignore]
 fn verify_unreach_wrongprove_is_not_true() {
@@ -355,21 +359,20 @@ fn verify_recursion_false_alarm_is_unknown() {
         .stderr(predicate::str::contains("candidate(s) enumerated"));
 }
 
-/// LOOP-FREE CBMC-oracle over-approximation: `cbmc_precheck` admits acyclic
-/// programs, and CBMC runs with `--no-standard-checks`, so it models `x + y` as
-/// wrapping and PROPOSES the overflowing vector. The native replay compiles with
-/// `-fsanitize-trap=signed-integer-overflow`, traps at the addition and never
-/// reaches the sentinel → `unknown`. The stderr assertion pins the replay gate as
-/// the SOLE arbiter (R6) for the loop-free population: short-circuit it and this
-/// fixture becomes a false alarm. Needs the provisioned CBMC (`$SAF_CBMC`).
+/// A loop-free fixture on which an over-approximating oracle would propose an
+/// overflowing vector that the native replay then refuses.
+///
+/// This was the CBMC lever's regression: CBMC ran with `--no-standard-checks`, modelled
+/// `x + y` as wrapping, and proposed a vector the `-fsanitize-trap=signed-integer-overflow`
+/// replay trapped on. The lever is gone (CBMC is an SV-COMP participant and SAF bundles
+/// no competitor), so no lever proposes anything here and the verdict is `unknown` for
+/// the simpler reason. Kept because the fixture still pins the invariant that matters:
+/// **whatever proposes a vector, the native replay is the SOLE arbiter (R6)** — this
+/// must never become a false alarm.
 #[test]
 #[ignore]
-fn verify_loopfree_cbmc_overapprox_is_unknown() {
-    verify_unreach("false_alarm_cbmc_loopfree.c")
-        .stdout("unknown\n")
-        .stderr(predicate::str::contains(
-            "CBMC-proposed vector did not re-confirm deterministically",
-        ));
+fn verify_loopfree_overapprox_is_never_a_false_alarm() {
+    verify_unreach("false_alarm_cbmc_loopfree.c").stdout("unknown\n");
 }
 
 /// A task that DEFINES its own `reach_error` (via `__assert_fail`) — the
@@ -862,14 +865,17 @@ fn verify_overflow_guarded_is_false() {
     verify_overflow("overflow_false_guarded.c", "LP64").stdout("false(no-overflow)\n");
 }
 
-/// A safe, PROVABLE program: rank-2 sound no-overflow TRUE — the interval sentinel
-/// proves every reachable signed op in-bounds (the guard bounds `x` to [1,99]
-/// before `x+1`), and the emitted witness is confirmed in-process by real
-/// CPAchecker -> `true`. (Before rank 2 this was `unknown`.)
+/// Rank-2 no-overflow TRUE is DISABLED, so a safe, provable program still abstains.
+///
+/// The interval sentinel does prove every reachable signed op in-bounds (the guard
+/// bounds `x` to [1,99] before `x+1`), but proving is not enough on its own — see
+/// `try_overflow_true`. This is the single largest line item in the -12 weighted the
+/// no-competitor-tools decision costs, and it flips back to `true` when Movement 1
+/// (`plans/213`) makes the proof sound without an external confirmer.
 #[test]
 #[ignore]
-fn verify_overflow_safe_provable_is_true() {
-    verify_overflow("overflow_true_safe.c", "LP64").stdout("true\n");
+fn verify_overflow_safe_provable_abstains_without_a_native_prover() {
+    verify_overflow("overflow_true_safe.c", "LP64").stdout("unknown\n");
 }
 
 /// A confirmed overflow FALSE writes a YAML 2.0 violation witness whose target is the
@@ -889,22 +895,30 @@ fn verify_overflow_false_writes_witness() {
     );
 }
 
-/// A rank-2 no-overflow TRUE writes a YAML-2.0 `invariant_set` CORRECTNESS witness
-/// (the artifact CPAchecker confirmed in-process before the verdict was emitted).
+/// With the rank-2 TRUE arm disabled, an abstaining run writes NO correctness witness.
+///
+/// The `invariant_set` builder itself is untouched and still unit-tested in
+/// `saf-svcomp`; what is asserted here is that SAF does not leave a stray witness file
+/// beside an `unknown` verdict, which would confuse the competition's `<resultfiles>`
+/// collection into validating a witness for a result SAF never claimed.
 #[test]
 #[ignore]
-fn verify_overflow_true_writes_correctness_witness() {
+fn verify_overflow_abstain_writes_no_correctness_witness() {
     let dir = tempfile::tempdir().unwrap();
     let w = dir.path().join("w.yml");
-    verify_overflow_witness("overflow_true_safe.c", "LP64", &w).stdout("true\n");
-    let yaml = std::fs::read_to_string(&w).expect("correctness witness written for a true verdict");
-    assert!(yaml.contains("entry_type: invariant_set"), "{yaml}");
+    verify_overflow_witness("overflow_true_safe.c", "LP64", &w).stdout("unknown\n");
+    assert!(
+        !w.exists(),
+        "an abstaining verdict must not leave a witness file behind"
+    );
 }
 
 /// SOUNDNESS REGRESSION (wrong-TRUE=0): a COMPILE-TIME constant overflow that clang
 /// folds away (no IR arithmetic for the sentinel to see) must NEVER yield `true`.
-/// The TRUE arm abstains (the `-Winteger-overflow` probe fires, and the CPAchecker
-/// gate would reject anyway); the UBSan FALSE path then confirms the overflow.
+/// The TRUE arm is disabled outright, so it cannot yield `true` by any route; the
+/// UBSan FALSE path then confirms the overflow. (Before the no-competitor-tools
+/// decision this was guarded by a `-Winteger-overflow` probe plus the CPAchecker
+/// gate; both are gone, and the assertion below is what still pins the behaviour.)
 #[test]
 #[ignore]
 fn verify_overflow_constant_fold_is_not_true() {

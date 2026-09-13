@@ -4,7 +4,7 @@
 //! The `unreach-call` strategy in `saf-cli` runs a *tail* of solver levers after
 //! the cheap must-reach / native-replay stages: the fixed-`k` + incremental BMC
 //! engine, the forward symbolic-execution engine, the blind byte-stream fuzzer,
-//! and the bit-precise CBMC oracle. Historically these ran in ONE hard-coded order
+//! lever. Historically these ran in ONE hard-coded order
 //! on every task. This module extracts a handful of **cheap, deterministic AIR
 //! Booleans** once per task and turns them into an ordered [`Lever`] plan, so each
 //! task is routed to a *ranked, pruned* sequence instead of the static one.
@@ -30,7 +30,7 @@
 //!    change *latency*, never a verdict: soundness is preserved by construction.
 //!
 //! The default plan (no discriminating feature) is byte-identical to the historical
-//! order `[Bmc, Se, Fuzz, Cbmc]`, so the common case is a zero-behaviour-change
+//! order `[Bmc, Se, Fuzz]`, so the common case is a zero-behaviour-change
 //! refactor. The feature vector is also the substrate a later arm can learn a
 //! ranking over from solved-by labels.
 
@@ -49,8 +49,6 @@ pub enum Lever {
     Se,
     /// Blind byte-stream greybox fuzzer (`crate::fuzz`).
     Fuzz,
-    /// Bit-precise CBMC oracle (`crate::cbmc`).
-    Cbmc,
 }
 
 impl Lever {
@@ -61,27 +59,22 @@ impl Lever {
     /// enumerate zero candidates. Pruning a non-applicable lever is therefore
     /// verdict-preserving.
     ///
-    /// - `Bmc` / `Fuzz` / `Cbmc`: all need a fuzzable nondet input to have anything
-    ///   to pin/drive (BMC's per-site gate, the fuzzer's gate and
-    ///   [`crate::cbmc::cbmc_precheck`] all require it).
+    /// - `Bmc` / `Fuzz`: both need a fuzzable nondet input to have anything to
+    ///   pin/drive (BMC's per-site gate and the fuzzer's gate both require it).
     /// - `Se`: additionally needs a reachable loop — it only fires on a
     ///   `reach_error` function with a CFG cycle, so it is `false` on a loop-free
     ///   program.
     ///
-    /// `Cbmc` is deliberately NOT gated on a loop: its SAT backend also cracks the
-    /// acyclic wide-conjunction *constraint-problem* class (`xcsp`), where every
-    /// cheaper lever abstains. It runs last in the plan, so the extra reach costs
-    /// latency only on tasks nothing else solved.
     #[must_use]
     fn applicable(self, f: UnreachFeatures) -> bool {
         match self {
             // The blind fuzzer now also drives float/double nondet, so it applies
-            // whenever ANY fuzzable nondet is present. BMC/SE/CBMC are integer
+            // whenever ANY fuzzable nondet is present. BMC/SE are integer
             // (bitvector) solvers with no float model, so they stay gated on an
             // integer nondet input — a float-only program yields no candidates from
             // them, so pruning them is verdict-preserving.
             Lever::Fuzz => f.fuzzable_nondet || f.float_nondet,
-            Lever::Bmc | Lever::Cbmc => f.fuzzable_nondet,
+            Lever::Bmc => f.fuzzable_nondet,
             Lever::Se => f.fuzzable_nondet && f.has_loop,
         }
     }
@@ -132,7 +125,7 @@ impl UnreachFeatures {
 
 /// Build the ordered, pruned lever plan for an `unreach-call` task.
 ///
-/// The base order is the historical `[Bmc, Se, Fuzz, Cbmc]`; a non-linear nondet
+/// The base order is the historical `[Bmc, Se, Fuzz]`; a non-linear nondet
 /// guard promotes `Fuzz` to the front. Non-applicable levers are then dropped. The
 /// result is deterministic (a pure function of `f`).
 #[must_use]
@@ -140,10 +133,10 @@ pub fn plan_unreach(f: UnreachFeatures) -> Vec<Lever> {
     // Base ranking. Promote the fuzzer ahead of the Z3 engines only for the
     // non-linear-guard class they stall on; otherwise keep the cheap->expensive
     // default so the common case is unchanged.
-    let base: [Lever; 4] = if f.nonlinear_nondet_guard {
-        [Lever::Fuzz, Lever::Bmc, Lever::Se, Lever::Cbmc]
+    let base: [Lever; 3] = if f.nonlinear_nondet_guard {
+        [Lever::Fuzz, Lever::Bmc, Lever::Se]
     } else {
-        [Lever::Bmc, Lever::Se, Lever::Fuzz, Lever::Cbmc]
+        [Lever::Bmc, Lever::Se, Lever::Fuzz]
     };
     base.into_iter().filter(|l| l.applicable(f)).collect()
 }
@@ -456,24 +449,21 @@ mod tests {
             has_loop: true,
             nonlinear_nondet_guard: false,
         };
-        assert_eq!(
-            plan_unreach(f),
-            vec![Lever::Bmc, Lever::Se, Lever::Fuzz, Lever::Cbmc]
-        );
+        assert_eq!(plan_unreach(f), vec![Lever::Bmc, Lever::Se, Lever::Fuzz]);
     }
 
     #[test]
-    fn loop_free_prunes_se_but_keeps_cbmc() {
+    fn loop_free_prunes_se() {
         let f = UnreachFeatures {
             fuzzable_nondet: true,
             float_nondet: false,
             has_loop: false,
             nonlinear_nondet_guard: false,
         };
-        // SE needs a CFG cycle -> dropped. CBMC is a whole-program bit-precise
+        // SE needs a CFG cycle -> dropped. The remaining levers are
         // solver whose value on a loop-free program is the constraint solve, not
         // unwinding, so it is RETAINED (last, after the cheaper levers abstain).
-        assert_eq!(plan_unreach(f), vec![Lever::Bmc, Lever::Fuzz, Lever::Cbmc]);
+        assert_eq!(plan_unreach(f), vec![Lever::Bmc, Lever::Fuzz]);
     }
 
     #[test]
@@ -508,10 +498,7 @@ mod tests {
             has_loop: true,
             nonlinear_nondet_guard: true,
         };
-        assert_eq!(
-            plan_unreach(f),
-            vec![Lever::Fuzz, Lever::Bmc, Lever::Se, Lever::Cbmc]
-        );
+        assert_eq!(plan_unreach(f), vec![Lever::Fuzz, Lever::Bmc, Lever::Se]);
     }
 
     #[test]
@@ -522,8 +509,8 @@ mod tests {
             has_loop: false,
             nonlinear_nondet_guard: true,
         };
-        // Fuzz promoted, then BMC; SE pruned (loop-free), CBMC retained last.
-        assert_eq!(plan_unreach(f), vec![Lever::Fuzz, Lever::Bmc, Lever::Cbmc]);
+        // Fuzz promoted, then BMC; SE pruned (loop-free).
+        assert_eq!(plan_unreach(f), vec![Lever::Fuzz, Lever::Bmc]);
     }
 
     #[test]

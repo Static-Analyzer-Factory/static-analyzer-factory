@@ -527,9 +527,12 @@ fn defined_inst_count(module: &AirModule) -> usize {
 /// the whole program regardless of how the function is called. Property-level gates
 /// (OpenMP source text, reachable thread spawn) are the caller's responsibility.
 ///
-/// NOTE (rank-3): the sentinel is a FILTER; a wrong `Proven` from an absint
-/// unsoundness bug is caught downstream by the in-process CPAchecker confirmation
-/// gate (the FINAL verdict authority). This function emits no verdict.
+/// NOTE (rank-3): the sentinel is a FILTER, and a KNOWN-UNSOUND one — it returns a
+/// wrong `Proven` on at least the sign/unsigned-conversion class. It used to be
+/// backstopped by an in-process CPAchecker confirmation gate; SAF now bundles no
+/// SV-COMP participant, so there is no backstop and `try_unreach_true` abstains
+/// unconditionally. **Do not wire this into a verdict** until Movement 1
+/// (`plans/213`) fixes the underlying bugs. This function emits no verdict.
 #[must_use]
 pub fn prove_unreachable(module: &AirModule) -> UnreachProof {
     // Cost guard (fail-closed to Abstain): skip the expensive solve on giant / dense
@@ -2715,9 +2718,10 @@ mod must_reach_tests {
 #[cfg(test)]
 mod prove_unreachable_tests {
     //! Rank-3 read-out core (`prove_unreachable`) — the SOUND rule (error block
-    //! PRESENT and ⊥, never absence) + fail-closed gates. The full PROVE→confirm
-    //! pipeline (incl. the wrong-TRUE class the interval absint gets wrong) is
-    //! covered by the in-process-CPAchecker e2e in `saf-cli/tests/smoke.rs`.
+    //! PRESENT and ⊥, never absence) + fail-closed gates. The wrong-TRUE class the
+    //! interval absint gets wrong is pinned by
+    //! `verify_unreach_wrongprove_is_not_true` in `saf-cli/tests/smoke.rs`, which is
+    //! now the regression guarding the disabled TRUE arm.
     use super::*;
     use saf_core::air::{AirBlock, AirFunction, BinaryOp, Constant, Instruction};
     use saf_core::ids::ModuleId;
