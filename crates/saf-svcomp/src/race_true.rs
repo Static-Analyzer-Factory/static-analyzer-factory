@@ -154,6 +154,24 @@ pub fn race_true_verdict() -> &'static str {
 /// effect is modeled explicitly by the lockset dataflow, so they are inert to the
 /// *external-effect* gate. The modeled spawn/join/init/attr/exit helpers are also
 /// listed (single-threaded init before spawn; join only adds happens-before).
+/// Externals a race-freedom proof may admit.
+///
+/// Two ways in: the race-inert allowlist, or a libc routine whose accesses the
+/// access-collection loop models explicitly (`printf`/`strcpy`/…) and which
+/// therefore participates in the conflict scan rather than hiding from it.
+/// Anything else could conceal a spawn, a lock, or an access.
+pub(crate) const RACE_EXTERNAL_POLICY: crate::universe::ExternalPolicy =
+    crate::universe::ExternalPolicy {
+        name: "race-inert",
+        admits: race_admits_external,
+    };
+
+/// Backing predicate for [`RACE_EXTERNAL_POLICY`]. A named fn rather than a closure
+/// so the const is unambiguous.
+fn race_admits_external(name: &str) -> bool {
+    is_race_inert_external(name) || libc_model(name).is_some()
+}
+
 #[must_use]
 pub fn is_race_inert_external(name: &str) -> bool {
     if name.starts_with("__VERIFIER_nondet_") {
@@ -489,30 +507,20 @@ pub fn undefined_userfn_names(module: &AirModule) -> BTreeSet<String> {
 /// abstain (the reason string is for diagnostics only, never affects the verdict).
 #[allow(clippy::too_many_lines)]
 fn race_free_classify(module: &AirModule) -> Result<(), String> {
-    // (T) a defined `main`.
-    let Some(main_func) = module
+    // FAST PATH ONLY. `universe::reachable_universe` below is the authoritative
+    // entry/completeness gate; this exists solely so a module with no entry point
+    // does not pay for the points-to analysis first. Keep the reason string
+    // identical to the one `universe` emits, so the diagnostic is stable whichever
+    // arm rejects.
+    if !module
         .functions
         .iter()
-        .find(|f| f.name == "main" && !f.is_declaration)
-    else {
-        return Err("no-defined-main".into());
-    };
-    let main_id = main_func.id;
-
-    // Global constructors/destructors run outside main's call graph and could
-    // spawn or race — abstain if any exist (defense-in-depth, as termination does).
-    if module
-        .globals
-        .iter()
-        .any(|g| g.name == "llvm.global_ctors" || g.name == "llvm.global_dtors")
+        .any(|f| f.name == "main" && !f.is_declaration)
     {
-        return Err("global-ctors-dtors".into());
+        return Err("no-defined-main".into());
     }
 
     let cg = CallGraph::build(module);
-    if cg.node_for_function(main_id).is_none() {
-        return Err("main-not-in-callgraph".into());
-    }
 
     // Points-to (Andersen, over-approximate) + MTA thread/concurrency model. MTA's
     // thread-entry discovery is PTA-driven, so it is a SOUND *superset* of the real
@@ -548,44 +556,24 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
     // *interprocedurally* over this whole tree — not just `main`'s own body — so the
     // ubiquitous driver idiom (`main` calls `module_init()` which spawns, then
     // `module_exit()` which joins) is reasoned about soundly.
-    let main_tree = reachable_functions(&cg, main_id);
-    let mut reachable_fids: BTreeSet<FunctionId> = main_tree.clone();
-    for tctx in threads.values() {
-        reachable_fids.extend(reachable_functions(&cg, tctx.entry_function));
-    }
-
-    // (E) every reachable external must be race-inert; (I) no reachable defined
-    // body may contain a `CallIndirect` (an unresolved target could hide a spawn,
-    // an access, a lock, or a non-modeled sync primitive); (CFG) no dropped
-    // terminator. Checked over the FULL reachable set (main + every thread body).
-    for func in &module.functions {
-        if !reachable_fids.contains(&func.id) {
-            continue;
-        }
-        if func.is_declaration {
-            // A modeled memory-touching libc external (`printf`/`strcpy`/…) is
-            // admitted: its accesses are generated in the access-collection loop
-            // and participate in the conflict scan (fail-closed on an unmodelable
-            // format there). Everything else not on the race-inert allowlist forces
-            // abstain (an unmodeled external could hide a spawn/lock/access).
-            if !is_race_inert_external(&func.name) && libc_model(&func.name).is_none() {
-                return Err(format!("non-inert-external:{}", func.name));
-            }
-            continue;
-        }
-        for block in &func.blocks {
-            if block.terminator().is_none() {
-                return Err("dropped-terminator".into());
-            }
-            if block
-                .instructions
-                .iter()
-                .any(|inst| matches!(inst.op, Operation::CallIndirect { .. }))
-            {
-                return Err(format!("reachable-indirect-call:{}", func.name));
-            }
-        }
-    }
+    // The reachable universe: `main`'s tree ∪ every discovered thread body, with
+    // (E) every reachable external race-inert, (I) no reachable indirect call, and
+    // (CFG) no dropped terminator — checked over the FULL set, main + every thread.
+    // Shared with `termination` and, per `plans/214`, the memsafety prover.
+    //
+    // A thread body is generally NOT reachable from `main` in the call graph
+    // (`pthread_create` is opaque), which is why the discovered entries are passed
+    // in as additional roots rather than inferred here.
+    let roots: BTreeSet<FunctionId> = threads.values().map(|t| t.entry_function).collect();
+    let uni = crate::universe::reachable_universe(
+        module,
+        &cg,
+        &RACE_EXTERNAL_POLICY,
+        &crate::universe::ThreadRoots::Also(roots),
+    )?;
+    let main_id = uni.main;
+    let main_tree = uni.main_tree;
+    let reachable_fids = uni.reachable;
 
     let has_reachable_spawn = reachable_spawns(module, &reachable_fids);
 

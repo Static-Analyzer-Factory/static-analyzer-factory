@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 use saf_analysis::callgraph::{CallGraph, CallGraphNode};
 use saf_analysis::cfg::Cfg;
 use saf_analysis::graph_algo::{dfs, tarjan_scc};
-use saf_core::air::{AirModule, Operation};
+use saf_core::air::AirModule;
 use saf_core::ids::FunctionId;
 
 use crate::fast_paths::cfg_has_loops;
@@ -45,6 +45,18 @@ use crate::fast_paths::cfg_has_loops;
 /// (`qsort`/`bsearch`/`atexit`) and potentially-blocking I/O (`read`/`recv`/
 /// `scanf`-family) are deliberately excluded. The `exit`/`abort`/`__assert_fail`
 /// family does not *return* but *halts* the program, which is termination.
+/// Externals a termination proof may admit: those known to always return.
+///
+/// Deliberately different from the race and memsafety policies — `malloc` and
+/// `memcpy` always return (so termination admits them) but neither is race-inert
+/// nor memory-safe. That divergence is the whole reason `reachable_universe` is
+/// parameterised by a policy rather than hard-coding one allowlist.
+pub(crate) const TERM_EXTERNAL_POLICY: crate::universe::ExternalPolicy =
+    crate::universe::ExternalPolicy {
+        name: "known-returning",
+        admits: is_known_returning_external,
+    };
+
 #[must_use]
 pub fn is_known_returning_external(name: &str) -> bool {
     // All typed __VERIFIER_nondet_* generators return a value immediately.
@@ -112,25 +124,12 @@ pub fn termination_verdict() -> &'static str {
 /// reachable indirect call, or non-allowlisted reachable external.
 #[must_use]
 pub fn program_structurally_terminates(module: &AirModule) -> bool {
-    // (T) a defined `main`.
-    let Some(main_func) = module
+    // FAST PATH ONLY: skip promotion on a module with no entry point.
+    // `universe::reachable_universe` below is the authoritative gate.
+    if !module
         .functions
         .iter()
-        .find(|f| f.name == "main" && !f.is_declaration)
-    else {
-        return false;
-    };
-    let main_id = main_func.id;
-
-    // Code that runs OUTSIDE main's call graph — global constructors
-    // (`llvm.global_ctors`, run before main) and destructors (`llvm.global_dtors`,
-    // run after main returns) — can loop forever. R7 only checks
-    // reachable-from-main, so abstain if any static initializer/finalizer exists
-    // (else e.g. `__attribute__((constructor)) void c(){for(;;);}` would be a −32).
-    if module
-        .globals
-        .iter()
-        .any(|g| g.name == "llvm.global_ctors" || g.name == "llvm.global_dtors")
+        .any(|f| f.name == "main" && !f.is_declaration)
     {
         return false;
     }
@@ -148,8 +147,27 @@ pub fn program_structurally_terminates(module: &AirModule) -> bool {
 
     let cg = CallGraph::build(module);
 
+    // (T/C/E/I/CFG) The shared reachable-universe gate: defined `main`, no global
+    // ctors/dtors, and over every function reachable from `main` — each external
+    // known-terminating, no indirect call, no dropped terminator.
+    //
+    // `ThreadRoots::MainOnly` is legal here ONLY because `ALLOWLISTED_EXTERNALS`
+    // does not list any spawn primitive, so a threaded program is rejected by (E)
+    // before its thread bodies could matter. That used to be an unwritten
+    // corollary; `reachable_universe` now CHECKS it, and adding `pthread_create`
+    // to the allowlist would fail loudly instead of silently hiding thread code.
+    let Ok(uni) = crate::universe::reachable_universe(
+        module,
+        &cg,
+        &TERM_EXTERNAL_POLICY,
+        &crate::universe::ThreadRoots::MainOnly,
+    ) else {
+        return false;
+    };
+    let main_id = uni.main;
+
     // Node-level reachability from `main` (so `External` and `IndirectPlaceholder`
-    // nodes on reachable paths are visible to the (I)/(E) checks below).
+    // nodes on reachable paths are visible to the (I)/(A) checks below).
     let reachable_nodes: BTreeSet<CallGraphNode> = match cg.node_for_function(main_id) {
         Some(main_node) => {
             let mut set: BTreeSet<CallGraphNode> = dfs(main_node, &cg).into_iter().collect();
@@ -177,36 +195,11 @@ pub fn program_structurally_terminates(module: &AirModule) -> bool {
         .chain(std::iter::once(main_id))
         .collect();
 
-    // (E) every reachable external declaration must be known-terminating; plus a
-    // second-form (I) check that no reachable defined body contains a `CallIndirect`.
-    for func in &module.functions {
-        if !reachable_fids.contains(&func.id) {
-            continue;
-        }
-        if func.is_declaration {
-            if !is_known_returning_external(&func.name) {
-                return false;
-            }
-            continue;
-        }
-        for block in &func.blocks {
-            // (CFG completeness) a reachable defined block with no recognized
-            // terminator means the frontend DROPPED an unsupported terminator
-            // (e.g. `indirectbr`/`callbr` → `mapping.rs` catch-all `Ok(None)`),
-            // leaving the block edge-less. Loop detection would then miss a
-            // computed-goto/asm-goto back-edge ⇒ a −32. Abstain instead.
-            if block.terminator().is_none() {
-                return false;
-            }
-            if block
-                .instructions
-                .iter()
-                .any(|inst| matches!(inst.op, Operation::CallIndirect { .. }))
-            {
-                return false;
-            }
-        }
-    }
+    // (E)/(CFG) and the body-level (I) check are the shared gate's job now — see
+    // the `reachable_universe` call above. What stays here is the NODE-level (I)
+    // check, which is termination-specific: the (A) acyclicity analysis below needs
+    // the DIRECT call graph to be complete over the reachable set, a stronger
+    // requirement than universe completeness (CLAUDE.md redline #8).
 
     // (A) Every reachable call-graph SCC is either a single non-recursive node
     // (acyclic), a single **self-recursive** function whose recursion admits a

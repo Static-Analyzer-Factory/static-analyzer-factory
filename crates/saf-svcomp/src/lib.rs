@@ -39,6 +39,7 @@ mod ssa_encode;
 pub mod summaries;
 pub mod termination;
 pub mod termination_witness;
+pub mod universe;
 pub mod witness_lower;
 pub mod witness_yaml;
 

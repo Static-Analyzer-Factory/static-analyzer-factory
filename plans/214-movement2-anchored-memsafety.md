@@ -181,3 +181,99 @@ Only on a PASS. Mirror `prove_no_overflow_cmd` / `prove_unreachable_cmd`:
 - **`plans/211` §5.2 previously reported 95 concurrent clusters; the real figure is 50.**
   Classify by `Concurrency.set` membership, never by grepping sources for `pthread_create`
   (that sweeps in `Sequentialized.set` and ldv drivers scored as sequential).
+
+---
+
+# SPIKE RESULT (2026-09-16) — **PASS**, and two corrections to this plan
+
+Artifacts on the VM: `scripts/m2_anchor_prototype.py` (the finished prototype),
+`m2-FINAL-yield.jsonl`, `m2-FINAL-false.jsonl`. Every number below was re-verified
+directly from those files, not taken from a report.
+
+## The gate
+
+| §2 criterion | required | **measured** |
+|---|---|---|
+| concurrent clusters yielding, bounds obligation ON | ≥ 7 of 16 | **10 of 16** |
+| expected-FALSE `valid-memsafety` tasks surviving | 0 | **0 of 10,087** |
+
+Yielding concurrent clusters: `pthread-wmm` 225/283, `weaver` 76/174, `goblint-regression`
+35/116, `pthread` 22/41, `pthread-theta` 13/13, `pthread-ext` 9/34, `pthread-atomic` 8/8,
+`ldv-races` 4/11, `pthread-deagle` 2/4, `pthread-C-DAC` 1/4. Plus one sequential = 11
+clusters, 408 of 1,099 expected-TRUE tasks proved.
+
+Obligations 2 and 3 are demonstrably live in that run: `llvm.memset` 1,026,
+`llvm.memcpy` 208, `llvm.memmove` 208 (obligation 2), `gep-out-of-bounds` 330
+(obligation 3), `non-inert-external` 1,005, `reachable-indirect-call` 112.
+
+**KILL(a) does not fire** (10 > 7). **KILL(b) does not fire**: the escapes that existed
+were closed by ONE domain restriction, not by stacking ad-hoc gates.
+
+**Verdict-only confirmed independently.** All 10 base categories the yield population
+occupies return `witness_required=False` from `svcomp_witness_rules::true_witness_requirement`
+— Concurrency included. There is no validator to satisfy and no witness to emit.
+
+## ⚠️ CORRECTION 1 — §2's prescribed IR recipe is ACTIVELY HARMFUL
+
+§2 mandates `opt-18 -passes=sroa,mem2reg,instcombine`. Measured survivors
+(= would-be wrong TRUEs) by pipeline, obligations 2+3 on, globals gate off:
+
+```
+  sroa,mem2reg,instcombine   11
+  sroa,mem2reg                8
+  mem2reg                     2   <- SAF's own production pipeline
+  (no opt)                    0
+```
+
+`sroa` and `instcombine` EXPLOIT the undefined behaviour the prover exists to detect:
+they rewrite a genuinely unsafe access into one that looks safe, turning an
+expected-FALSE task into a wrong TRUE. **Use `mem2reg` alone — which is already what
+`compile_to_ir` does.** No frontend change is required; this plan's §2 recipe should
+simply be deleted.
+
+## ⚠️ CORRECTION 2 — "without mem2reg the -O0 pointer spill defeats anchoring outright"
+
+§2 states this as a required deliverable. It is **false for the concurrent clusters**:
+concurrent-cluster yield is **10 of 16 under all four pipelines above**, because those
+clusters anchor on GLOBALS and on `pthread_t` slots, not on promoted stack pointers. It
+is true for the sequential clusters, which drop 3 → 1 without the passes. Since the
+concurrent clusters are the prize, the premise does not bind.
+
+## The one real design change: GLOBALS_ONLY
+
+The zero-survivor result requires restricting anchor BASES to globals
+(`M2_GLOBALS_ONLY=1`, the prototype's default). Reason: clang hoists every block-scoped C
+local to a function-entry `alloca`, and without lifetime intrinsics the C scope is simply
+gone from the IR — so `{ int y; p = &y; } *p = 1;` is indistinguishable from an in-scope
+access, and the prover would answer TRUE on a use-after-scope FALSE task. A global is live
+for the whole program, so restricting the base kind removes the question entirely.
+
+This is a **tightening of obligation 1** — from "proves only heap-free programs" to
+"heap-free AND stack-anchor-free" — not a new ad-hoc gate, which is why it does not trip
+KILL(b). §1's `ObjBase` should drop the `Stack(ValueId)` variant in the first increment.
+Verified: all 5 `memsafety-ext3/scopes*` expected-FALSE tasks are rejected under
+production `mem2reg` + GLOBALS_ONLY.
+
+## Re-cut the estimate: +6..11, not +8..16
+
+The measured prototype ceiling in the sound configuration is **11 clusters = +11
+weighted**, BEFORE any SAF-side attrition (the real universe gate is stricter than the
+prototype's, the AIR is lossier than raw LLVM IR, and the Rust port will lose more).
+§5's own caveat applies. `+8..16` is above the evidence at the top end.
+
+## A weaker denominator than the headline suggests
+
+Of the 10,087 expected-FALSE rows, only **2,422 are in a 2027 base category**; 7,656 are
+`Unused_Juliet`-only and 9 have no `.set` at all. Survivors among the live 2,422 are also
+**0**, so the verdict stands — but the statistical power against the corpus that actually
+scores is 2,422, not 10,087. (The population is 10,087 rather than §2's 10,014 because the
+prototype's `parse_yml` was fixed: it had matched only *quoted* `input_files` and was
+silently skipping tasks.)
+
+## Latency, unbudgeted by this plan
+
+§4 sets a +2% CPU bar. A spawn-admitting universe requires Andersen PTA + ICFG + MTA per
+task (`race_true.rs:519-539`). `race_true` pays that on 1,031 `no-data-race` tasks; this
+prover would pay it on **20,570**. Gate it behind a cheap syntactic spawn pre-check so the
+majority-sequential population skips PTA entirely, or the bar is missed on plumbing rather
+than on proving.
