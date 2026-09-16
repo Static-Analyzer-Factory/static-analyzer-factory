@@ -41,6 +41,18 @@ pub struct AbstractInterpDiagnostics {
     pub converged: bool,
     /// Number of functions analyzed.
     pub functions_analyzed: u64,
+    /// Whether the converged solution passed the POST-FIXPOINT CHECK: on every
+    /// unconditional edge `B -> S` out of a reachable block, `transfer(B) <=
+    /// state[S]`. `false` means the solution UNDER-approximates somewhere, so no
+    /// `prove`-style sentinel may reason about it. (plans/213)
+    #[serde(default = "default_true")]
+    pub fixpoint_verified: bool,
+}
+
+/// Serde default for [`AbstractInterpDiagnostics::fixpoint_verified`]: a dump
+/// written before the field existed predates the check, not a failure of it.
+fn default_true() -> bool {
+    true
 }
 
 impl AbstractInterpResult {
@@ -144,6 +156,7 @@ impl AbstractInterpResult {
             narrowing_iterations_performed: self.diag.narrowing_iterations_performed,
             converged: self.diag.converged,
             functions_analyzed: self.diag.functions_analyzed,
+            fixpoint_verified: self.diag.fixpoint_verified,
         }
     }
 

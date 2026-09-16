@@ -865,17 +865,18 @@ fn verify_overflow_guarded_is_false() {
     verify_overflow("overflow_false_guarded.c", "LP64").stdout("false(no-overflow)\n");
 }
 
-/// Rank-2 no-overflow TRUE is DISABLED, so a safe, provable program still abstains.
+/// Rank-2 no-overflow TRUE is a SAF-NATIVE proof: a safe, provable program is `true`.
 ///
-/// The interval sentinel does prove every reachable signed op in-bounds (the guard
-/// bounds `x` to [1,99] before `x+1`), but proving is not enough on its own — see
-/// `try_overflow_true`. This is the single largest line item in the -12 weighted the
-/// no-competitor-tools decision costs, and it flips back to `true` when Movement 1
-/// (`plans/213`) makes the proof sound without an external confirmer.
+/// This is the flip the disabled-arm version of this test predicted. The interval
+/// sentinel proves every reachable signed op in-bounds (the guard bounds `x` to
+/// [1,99] before `x+1`), and since Movement 1 (`plans/213`) that proof stands on its
+/// own — no external confirmer, no SV-COMP participant anywhere in the verdict.
+/// This arm is the whole of the -12 dedup-weighted the no-competitor-tools decision
+/// cost, recovered natively.
 #[test]
 #[ignore]
-fn verify_overflow_safe_provable_abstains_without_a_native_prover() {
-    verify_overflow("overflow_true_safe.c", "LP64").stdout("unknown\n");
+fn verify_overflow_safe_provable_is_true() {
+    verify_overflow("overflow_true_safe.c", "LP64").stdout("true\n");
 }
 
 /// A confirmed overflow FALSE writes a YAML 2.0 violation witness whose target is the
@@ -895,30 +896,54 @@ fn verify_overflow_false_writes_witness() {
     );
 }
 
-/// With the rank-2 TRUE arm disabled, an abstaining run writes NO correctness witness.
+/// A sound no-overflow TRUE writes the `invariant_set` CORRECTNESS witness.
 ///
-/// The `invariant_set` builder itself is untouched and still unit-tested in
-/// `saf-svcomp`; what is asserted here is that SAF does not leave a stray witness file
-/// beside an `unknown` verdict, which would confuse the competition's `<resultfiles>`
-/// collection into validating a witness for a result SAF never claimed.
+/// This matters for score, not just tidiness: under the SV-COMP 2027 rules every
+/// `C.no-overflow.*` base category needs a CONFIRMED 2.0+ correctness witness, so a
+/// `true` with no witness scores 0 — the verdict alone is worth nothing. (It is
+/// never -32, so emitting a witness can only help.)
+///
+/// Replaces the pre-Movement-1 version, which asserted that the then-DISABLED arm
+/// left no witness beside its `unknown`. That fixture now returns `true`, and no
+/// remaining no-overflow fixture abstains, so the stray-file property is pinned
+/// below on a FALSE verdict instead.
 #[test]
 #[ignore]
-fn verify_overflow_abstain_writes_no_correctness_witness() {
+fn verify_overflow_true_writes_correctness_witness() {
     let dir = tempfile::tempdir().unwrap();
     let w = dir.path().join("w.yml");
-    verify_overflow_witness("overflow_true_safe.c", "LP64", &w).stdout("unknown\n");
+    verify_overflow_witness("overflow_true_safe.c", "LP64", &w).stdout("true\n");
+    let yaml = std::fs::read_to_string(&w).expect("correctness witness written for a true verdict");
+    assert!(yaml.contains("entry_type: invariant_set"), "{yaml}");
+}
+
+/// A `false(no-overflow)` verdict writes a VIOLATION witness and never leaves a
+/// stray `invariant_set` behind.
+///
+/// Keeps the property the pre-Movement-1 abstain test existed to protect: SAF must
+/// not leave a correctness witness beside a result it never claimed, which would
+/// send the competition's `<resultfiles>` collection off to validate the wrong
+/// thing. Asserted on a FALSE verdict now that the TRUE arm is live.
+#[test]
+#[ignore]
+fn verify_overflow_false_writes_no_correctness_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().join("w.yml");
+    verify_overflow_witness("overflow_false_add.c", "LP64", &w).stdout("false(no-overflow)\n");
+    let yaml = std::fs::read_to_string(&w).expect("violation witness written for a false verdict");
     assert!(
-        !w.exists(),
-        "an abstaining verdict must not leave a witness file behind"
+        !yaml.contains("invariant_set"),
+        "a FALSE verdict must not emit a correctness witness:\n{yaml}"
     );
 }
 
 /// SOUNDNESS REGRESSION (wrong-TRUE=0): a COMPILE-TIME constant overflow that clang
 /// folds away (no IR arithmetic for the sentinel to see) must NEVER yield `true`.
-/// The TRUE arm is disabled outright, so it cannot yield `true` by any route; the
-/// UBSan FALSE path then confirms the overflow. (Before the no-competitor-tools
-/// decision this was guarded by a `-Winteger-overflow` probe plus the CPAchecker
-/// gate; both are gone, and the assertion below is what still pins the behaviour.)
+/// The sentinel proves it vacuously — there is no arithmetic left to check — so the
+/// TRUE arm is guarded by `overflow_source_constant_folds`, SAF's own clang
+/// `-Winteger-overflow` probe, which sees the overflow in the SOURCE. The UBSan
+/// FALSE path then confirms it. Measured: without that gate this task and two
+/// siblings in `signedintegeroverflow-regression` are wrong PROVEs. (plans/213)
 #[test]
 #[ignore]
 fn verify_overflow_constant_fold_is_not_true() {

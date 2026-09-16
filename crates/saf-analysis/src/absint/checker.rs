@@ -1134,6 +1134,32 @@ pub fn prove_no_signed_overflow(module: &AirModule) -> NoOverflowProof {
     prove_no_signed_overflow_with_result(module, &result)
 }
 
+/// Would this instruction have forced the no-overflow sentinel to discharge an
+/// obligation, had its program point been analysed?
+///
+/// Used by the completeness gate in [`prove_no_signed_overflow_with_result`]: an
+/// instruction with no abstract state is only safe to skip when it could not have
+/// carried an obligation in the first place. Mirrors the `match` in that function
+/// exactly — signed add/sub/mul are checked, shl/sdiv/srem are unmodelled
+/// fail-closed abstains, and an indirect call may reach un-analysed code. Keep the
+/// two in sync: an op that gains an obligation there must gain one here, or the
+/// gate silently stops covering it. (plans/213)
+fn carries_overflow_obligation(op: &Operation) -> bool {
+    match op {
+        Operation::BinaryOp { kind } => matches!(
+            kind,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Shl
+                | BinaryOp::SDiv
+                | BinaryOp::SRem
+        ),
+        Operation::CallIndirect { .. } => true,
+        _ => false,
+    }
+}
+
 /// Prove no-overflow over a PRE-COMPUTED converged solution. See
 /// [`NoOverflowProof`] for the fail-closed contract. Proves the SIGNED-ARITHMETIC
 /// overflow property (add/sub/mul in-bounds; abstain on shl/sdiv/srem); integer
@@ -1151,6 +1177,16 @@ pub fn prove_no_signed_overflow_with_result(
     if !result.diagnostics().converged {
         return NoOverflowProof::Abstain("not-converged".to_string());
     }
+    // POST-FIXPOINT GATE (fail-closed, plans/213). `converged` only says the
+    // worklist drained; it does NOT say the solution satisfies
+    // `transfer(B) <= state[S]` on every edge. Six distinct defects were measured
+    // that each broke that property while still reporting `converged`, and every
+    // one produced a wrong TRUE by shrinking a variable's range below the values
+    // the program really takes. Refuse to reason about an under-approximated
+    // solution at all.
+    if !result.diagnostics().fixpoint_verified {
+        return NoOverflowProof::Abstain("fixpoint-unverified".to_string());
+    }
     let constant_map = build_constant_map(module);
 
     for func in &module.functions {
@@ -1159,9 +1195,31 @@ pub fn prove_no_signed_overflow_with_result(
         }
         for block in &func.blocks {
             for inst in &block.instructions {
-                // Only REACHED instructions matter; None ⇒ the absint proved this
-                // point unreachable (sound over-approx) ⇒ cannot overflow here.
+                // COMPLETENESS GATE (plans/213). The old rule here was
+                // `None ⇒ the absint proved this point unreachable ⇒ skip`. That
+                // is FALSE, and it was a wrong-TRUE generator.
+                //
+                // `fixpoint.rs` PRE-SEEDS every block with ⊥ before iterating, so
+                // a block the analysis never visited is indistinguishable from one
+                // a branch condition genuinely refuted. Any of several things
+                // leaves a REACHABLE block unvisited: a wrong SCCP dead-block
+                // verdict, an under-approximated loop-head phi, the iteration cap.
+                // When that happens the obligations in that block are not
+                // discharged, they are silently DROPPED.
+                //
+                // Measured: on `openssl-simplified/s3_srvr_1a.cil` (ground-truth
+                // FALSE) all FOUR `add`s are absent, so `Proven` was returned
+                // having checked ZERO arithmetic instructions. Its operands come
+                // from `__VERIFIER_nondet_int`, so had the block been visited the
+                // answer would have been `top-or-bottom-operand`.
+                //
+                // So: absence is not unreachability. Fail closed on any
+                // instruction that would have carried an obligation, and keep
+                // skipping the ones that never could (loads, stores, bitwise ops).
                 let Some(state) = result.state_at_inst(inst.id) else {
+                    if carries_overflow_obligation(&inst.op) {
+                        return NoOverflowProof::Abstain("unvisited-arith".to_string());
+                    }
                     continue;
                 };
                 match &inst.op {

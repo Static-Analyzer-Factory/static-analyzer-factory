@@ -34,6 +34,14 @@ test: ## Run all tests (Rust + Python, cached)
 test-rust: ## Run Rust tests only (no Python rebuild)
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c "cargo nextest run --workspace --exclude saf-python"
 
+test-ignored: ## Run the #[ignore]d LLVM-dependent suite (needs clang-18/opt-18)
+	# `cargo nextest run --workspace` does NOT run these, and nothing else in the
+	# repo passes --run-ignored, so before this target the whole #[ignore]d suite --
+	# including `verify_unreach_wrongprove_is_not_true`, the guard that fires if a
+	# TRUE arm is re-enabled before the absint is sound -- never executed. (plans/213)
+	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c \
+		"cargo nextest run --workspace --exclude saf-python --run-ignored all"
+
 test-toolinfo: ## Test the BenchExec tool-info module (RED until the SPDX holder is set)
 	docker compose run --rm -e SKIP_MATURIN_BUILD=1 dev sh -c \
 		"python3 -m pytest benchexec/tools/test_saf.py -q"

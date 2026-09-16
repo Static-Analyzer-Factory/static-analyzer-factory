@@ -1438,6 +1438,20 @@ pub fn propagate_refinement_to_loc_memory(
     }
 }
 
+/// Is it sound to refine this UNSIGNED comparison with the SIGNED refiners?
+///
+/// Only when both operands are provably non-negative. `Interval` is
+/// `{lo, hi, bits}` with no signedness tag, so `0xFFFFFFFF` and `-1` are the
+/// same 32-bit element; the signed refiners would order them as `-1 < 1` where
+/// C orders them `1 <u 0xFFFFFFFF`, and the resulting bottom would declare a
+/// reachable branch dead. On the non-negative half of the range the two orders
+/// agree, which is precisely the condition `Interval::icmp_ult` and its three
+/// siblings already test before delegating to their signed counterparts.
+/// (plans/213 §2b)
+fn unsigned_order_matches_signed(lhs: &Interval, rhs: &Interval) -> bool {
+    !lhs.is_bottom() && !rhs.is_bottom() && lhs.lo() >= 0 && rhs.lo() >= 0
+}
+
 /// Apply branch condition refinement on a `CondBr`.
 ///
 /// Given the condition value (result of an ICmp), refines the operands
@@ -1506,18 +1520,46 @@ pub fn refine_branch_condition(
             Some(lhs.refine_eq_false(&rhs)),
             Some(rhs.refine_eq_false(&lhs)),
         ),
-        // Unsigned comparisons
+        // Unsigned comparisons. `Interval` carries no signedness tag, so an
+        // unsigned value >= 2^(bits-1) and a negative signed value are the SAME
+        // domain element. Handing such an element to the SIGNED refiners can
+        // manufacture a bottom for a REACHABLE edge, and the LHS-bottom rule
+        // below then declares the whole branch infeasible -- which
+        // `prove_unreachable` reports as a proof. That is a wrong TRUE, worth
+        // -32 and uncapped by the per-cluster dedup.
+        //
+        // Mirror the guard the EVALUATION twins already carry
+        // (`Interval::icmp_ult` / `icmp_ule` / `icmp_ugt` / `icmp_uge`): the
+        // unsigned order and the signed order coincide exactly when both
+        // operands are provably non-negative. Outside that, refine nothing.
+        // (plans/213 §2b)
         (BinaryOp::ICmpUlt, true) | (BinaryOp::ICmpUge, false) => {
-            (Some(lhs.refine_slt_true(&rhs)), None)
+            if unsigned_order_matches_signed(&lhs, &rhs) {
+                (Some(lhs.refine_slt_true(&rhs)), None)
+            } else {
+                (None, None)
+            }
         }
         (BinaryOp::ICmpUlt, false) | (BinaryOp::ICmpUge, true) => {
-            (Some(lhs.refine_slt_false(&rhs)), None)
+            if unsigned_order_matches_signed(&lhs, &rhs) {
+                (Some(lhs.refine_slt_false(&rhs)), None)
+            } else {
+                (None, None)
+            }
         }
         (BinaryOp::ICmpUle, true) | (BinaryOp::ICmpUgt, false) => {
-            (Some(lhs.refine_sle_true(&rhs)), None)
+            if unsigned_order_matches_signed(&lhs, &rhs) {
+                (Some(lhs.refine_sle_true(&rhs)), None)
+            } else {
+                (None, None)
+            }
         }
         (BinaryOp::ICmpUgt, true) | (BinaryOp::ICmpUle, false) => {
-            (Some(lhs.refine_sle_false(&rhs)), None)
+            if unsigned_order_matches_signed(&lhs, &rhs) {
+                (Some(lhs.refine_sle_false(&rhs)), None)
+            } else {
+                (None, None)
+            }
         }
         // Non-comparison ops: no refinement
         _ => (None, None),
@@ -2344,6 +2386,138 @@ mod tests {
         let x = refined.get(vid(1), 32);
         assert!(x.is_singleton());
         assert_eq!(x.lo(), 42);
+    }
+
+    // =========================================================================
+    // plans/213 §2b -- UNSIGNED comparisons must not be refined with the SIGNED
+    // refiners. `Interval` carries no signedness tag, so an unsigned value
+    // >= 2^31 and a negative signed value are the SAME domain element. The
+    // evaluation twin `Interval::icmp_ult` guards on `lo >= 0` and falls back to
+    // ⊤; the refinement side has no such guard, so it can manufacture a spurious
+    // ⊥. `refine_branch_condition` turns an LHS ⊥ into `AbstractState::bottom()`,
+    // declaring a REACHABLE branch infeasible -- which `prove_unreachable` then
+    // reports as a proof. That is a wrong TRUE, worth -32 and uncapped by dedup.
+    // =========================================================================
+
+    /// RED. `unsigned 1 < (int)-1` is TRUE in C: the usual arithmetic conversions
+    /// make `-1` into `0xFFFFFFFF`. The branch is REACHABLE. Signed refinement
+    /// instead asks for `[1,1] < [-1,-1]`, gets ⊥, and kills the branch.
+    /// Witness: `bitvector-regression/implicitunsignedconversion-1` (ground-truth
+    /// FALSE, currently a wrong PROVE).
+    #[test]
+    fn branch_refinement_ult_negative_rhs_is_not_bottom() {
+        let mut state = AbstractState::new();
+        state.set(vid(1), Interval::singleton(1, 32)); // unsigned 1
+        state.set(vid(2), Interval::singleton(-1, 32)); // (int)-1 == 0xFFFFFFFF
+
+        let cond_inst = make_binop_inst(100, BinaryOp::ICmpUlt, 1, 2, 3);
+        let constant_map = BTreeMap::new();
+
+        let refined = refine_branch_condition(&cond_inst, &state, &constant_map, true);
+
+        assert!(
+            !refined.is_unreachable(),
+            "1 <u 0xFFFFFFFF is TRUE in C; the branch is reachable"
+        );
+    }
+
+    /// RED. `for (a = 0; a < uint32_max - 1; ++a)` where `uint32_max = 0xffffffff`:
+    /// the bound is `0xfffffffe`, which in the signless domain is `-2`. Signed
+    /// refinement of `[0,0] < [-2,-2]` is ⊥, so the whole loop body -- and the
+    /// error inside it -- is declared dead.
+    /// Witness: `loop-simple/deep-nested` (ground-truth FALSE, wrong PROVE).
+    #[test]
+    fn branch_refinement_ult_uint_max_bound_is_not_bottom() {
+        let mut state = AbstractState::new();
+        state.set(vid(1), Interval::singleton(0, 32)); // a = 0
+        state.set(vid(2), Interval::singleton(-2, 32)); // 0xfffffffe
+
+        let cond_inst = make_binop_inst(100, BinaryOp::ICmpUlt, 1, 2, 3);
+        let constant_map = BTreeMap::new();
+
+        let refined = refine_branch_condition(&cond_inst, &state, &constant_map, true);
+
+        assert!(
+            !refined.is_unreachable(),
+            "0 <u 0xfffffffe is TRUE in C; the loop body is reachable"
+        );
+    }
+
+    /// RED. The same hole on the `>=` spelling: `1 >=u 0xFFFFFFFF` is FALSE, so
+    /// the FALSE edge is reachable. `(ICmpUge, false)` shares an arm with
+    /// `(ICmpUlt, true)`, so it must be guarded too.
+    #[test]
+    fn branch_refinement_uge_false_negative_rhs_is_not_bottom() {
+        let mut state = AbstractState::new();
+        state.set(vid(1), Interval::singleton(1, 32));
+        state.set(vid(2), Interval::singleton(-1, 32));
+
+        let cond_inst = make_binop_inst(100, BinaryOp::ICmpUge, 1, 2, 3);
+        let constant_map = BTreeMap::new();
+
+        let refined = refine_branch_condition(&cond_inst, &state, &constant_map, false);
+
+        assert!(
+            !refined.is_unreachable(),
+            "!(1 >=u 0xFFFFFFFF) is TRUE; the branch is reachable"
+        );
+    }
+
+    /// RED. `ICmpUgt` with a negative (= huge unsigned) LHS: `0xFFFFFFFF >u 1` is
+    /// TRUE, so the branch is reachable. Signed refinement asks `[-1,-1] > [1,1]`
+    /// and produces ⊥.
+    #[test]
+    fn branch_refinement_ugt_negative_lhs_is_not_bottom() {
+        let mut state = AbstractState::new();
+        state.set(vid(1), Interval::singleton(-1, 32)); // 0xFFFFFFFF
+        state.set(vid(2), Interval::singleton(1, 32));
+
+        let cond_inst = make_binop_inst(100, BinaryOp::ICmpUgt, 1, 2, 3);
+        let constant_map = BTreeMap::new();
+
+        let refined = refine_branch_condition(&cond_inst, &state, &constant_map, true);
+
+        assert!(
+            !refined.is_unreachable(),
+            "0xFFFFFFFF >u 1 is TRUE in C; the branch is reachable"
+        );
+    }
+
+    /// GUARD, must stay green. When BOTH operands are provably non-negative the
+    /// unsigned order and the signed order coincide, which is exactly the case
+    /// `Interval::icmp_ult` still delegates on. The fix must keep refining here --
+    /// dropping this would trade a soundness bug for a recall cliff.
+    #[test]
+    fn branch_refinement_ult_both_nonnegative_still_refines() {
+        let mut state = AbstractState::new();
+        state.set(vid(1), Interval::new(0, 100, 32));
+        state.set(vid(2), Interval::singleton(50, 32));
+
+        let cond_inst = make_binop_inst(100, BinaryOp::ICmpUlt, 1, 2, 3);
+        let constant_map = BTreeMap::new();
+
+        let refined = refine_branch_condition(&cond_inst, &state, &constant_map, true);
+
+        let x = refined.get(vid(1), 32);
+        assert_eq!(x.lo(), 0);
+        assert_eq!(x.hi(), 49);
+    }
+
+    /// GUARD, must stay green. A genuinely infeasible SIGNED edge must still go to
+    /// ⊥ -- the §2b fix is scoped to the UNSIGNED arms and must not weaken signed
+    /// refinement, which is what §2a relies on.
+    #[test]
+    fn branch_refinement_slt_infeasible_still_bottoms() {
+        let mut state = AbstractState::new();
+        state.set(vid(1), Interval::singleton(10, 32));
+        state.set(vid(2), Interval::singleton(5, 32));
+
+        let cond_inst = make_binop_inst(100, BinaryOp::ICmpSlt, 1, 2, 3);
+        let constant_map = BTreeMap::new();
+
+        let refined = refine_branch_condition(&cond_inst, &state, &constant_map, true);
+
+        assert!(refined.is_unreachable(), "10 < 5 is unsatisfiable");
     }
 
     // =========================================================================

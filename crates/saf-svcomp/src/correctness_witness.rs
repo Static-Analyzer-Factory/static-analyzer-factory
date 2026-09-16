@@ -212,8 +212,8 @@ impl InvariantSetWitness {
     /// Assemble an **empty** `invariant_set` witness (no invariants). Valid for a
     /// loop-free program whose safety the validator (`CPAchecker`) re-proves on its
     /// own — SAF still must soundly DECIDE `true` and emit a well-formed witness.
-    /// Used by the rank-2 `no-overflow` TRUE arm for loop-free proofs; the verdict
-    /// is separately gated on in-process `CPAchecker` confirmation of this witness.
+    /// Used by the rank-2 `no-overflow` TRUE arm for loop-free proofs. The verdict
+    /// is decided entirely by SAF's own sentinel — nothing outside SAF gates it.
     #[must_use]
     pub fn empty(meta: &WitnessMeta) -> Self {
         Self {

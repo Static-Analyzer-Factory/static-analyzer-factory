@@ -89,6 +89,18 @@ pub struct FixpointDiagnostics {
     pub converged: bool,
     /// Number of functions analyzed.
     pub functions_analyzed: u64,
+    /// Whether the converged solution passed the POST-FIXPOINT CHECK.
+    ///
+    /// `true` means: on every unconditional edge `B -> S` out of a reachable
+    /// block, the state `B` exits with is contained in the state stored for `S`.
+    /// That is the defining property of a sound fixpoint solution, and it is what
+    /// every `prove`-style sentinel silently assumes.
+    ///
+    /// `false` means the stored solution is an UNDER-approximation somewhere: some
+    /// block's state is strictly smaller than what its predecessors actually imply,
+    /// so a variable's range excludes values the program really takes. Reasoning on
+    /// it produces wrong TRUEs. See the check in `solve_function_impl`. (plans/213)
+    pub fixpoint_verified: bool,
 }
 
 impl Default for FixpointDiagnostics {
@@ -99,6 +111,7 @@ impl Default for FixpointDiagnostics {
             narrowing_iterations_performed: 0,
             converged: true,
             functions_analyzed: 0,
+            fixpoint_verified: true,
         }
     }
 }
@@ -485,27 +498,29 @@ fn solve_function_impl(
                                             .or_default()
                                             .extend(refinements);
                                     }
-                                } else if succs.len() == 2 {
-                                    // Both branches feasible but only two successors —
-                                    // persist refinements when the successor has exactly
-                                    // one predecessor so re-applying after join is safe.
-                                    let _ = other_target;
-                                    let pred_count = cfg
-                                        .predecessors_of(*succ_id)
-                                        .map_or(0, std::collections::BTreeSet::len);
-                                    let mut refinements = BTreeMap::new();
-                                    collect_refinements(
-                                        &current_state,
-                                        &propagated_state,
-                                        &mut refinements,
-                                    );
-                                    if pred_count <= 1 && !refinements.is_empty() {
-                                        block_refinements
-                                            .entry(*succ_id)
-                                            .or_default()
-                                            .extend(refinements);
-                                    }
                                 }
+                                // REMOVED (plans/213 M3). There used to be a second
+                                // collection site here, persisting refinements whenever
+                                // `succs.len() == 2 && pred_count <= 1`.
+                                //
+                                // `pred_count <= 1` guarantees there is no JOIN at the
+                                // successor. It does NOT guarantee that the value arriving
+                                // on that single edge is STABLE across fixpoint iterations,
+                                // and that is what persistence actually needs. A branch
+                                // predicate (`s != 8496`) is an edge invariant; the
+                                // INTERVAL it produced given one iteration's pre-state is
+                                // not.
+                                //
+                                // Measured: on a loop dispatch chain it clamped the state
+                                // variable from the correct `[8467, 2147483647]` back to
+                                // iteration-1's `[8467, 8495]`. That under-approximation
+                                // turned a reachable `add nsw` overflow into a wrong
+                                // no-overflow TRUE (-32, uncapped) and a reachable error
+                                // into a wrong PROVE. The completeness gate cannot catch
+                                // it: the instruction IS visited, its state is just wrong.
+                                // Witnesses: `loop-simple/deep-nested` and
+                                // `tests/programs/c/svcomp/overflow_false_stale_refinement.c`.
+                                let _ = other_target;
                             }
                         }
                     }
@@ -729,6 +744,49 @@ fn solve_function_impl(
                 ctx,
                 Some(&reached),
             );
+        }
+
+        // ------------------------------------------------------------------
+        // POST-FIXPOINT CHECK (plans/213)
+        // ------------------------------------------------------------------
+        // A sound solution must satisfy `transfer(B) ⊑ state[S]` on every edge
+        // `B -> S`. Everything in this file assumes that; nothing verified it. Six
+        // separate defects were found that each broke it in a different way (a
+        // stale cached refinement, a mis-folded SCCP constant, a widening
+        // artifact...), and each one silently produced a wrong TRUE because a
+        // sentinel reasoned about a range the program escapes. Enumerating them
+        // one at a time does not converge — so check the PROPERTY instead of
+        // hunting the causes.
+        //
+        // Checked on EVERY edge, conditional ones included, by replaying the
+        // solver's own `refine_for_successor`. Reusing that function rather than
+        // re-deriving the edge condition is deliberate: a checker that computed
+        // refinement its own way could disagree with the solver for reasons of its
+        // own, and every disagreement would be a false abstain. Restricting to
+        // unconditional edges was tried first and proved INERT — the
+        // under-approximations that matter sit on the refined dispatch edges of a
+        // loop, not on its back-edges.
+        //
+        // One-sided: a violation is conclusive evidence of under-approximation,
+        // while passing does not prove the whole solution sound. It is a net, not
+        // a proof.
+        let verify_term = block.terminator();
+        if let Some(succs) = cfg.successors_of(block.id) {
+            for succ_id in succs {
+                let propagated = refine_for_successor(
+                    verify_term,
+                    *succ_id,
+                    &current_state,
+                    &cond_inst_map,
+                    constant_map,
+                );
+                let target_state = block_entry_states
+                    .get(succ_id)
+                    .map_or_else(AbstractState::bottom, PartitionedState::merge_all);
+                if !propagated.leq(&target_state) {
+                    diag.fixpoint_verified = false;
+                }
+            }
         }
     }
 
@@ -1262,17 +1320,27 @@ pub(crate) fn apply_refinements(
     }
     for (vid, refinement) in refinements {
         if let Some(current) = state.get_opt(*vid) {
+            // CONFIRM-ONLY (plans/213 M3). A persisted refinement is an interval
+            // derived from an EARLIER, smaller pre-state. Narrowing the current
+            // value with it is an UNDER-approximation, and an under-approximated
+            // state is a wrong-TRUE generator — it can shrink a variable's range
+            // below the values it really takes, so an overflow check or an error
+            // block is judged against a range the program escapes.
+            //
+            // The pre-existing guard here already refused the BOTTOM case with the
+            // comment "don't make state unreachable due to a stale refinement from
+            // a prior iteration", so staleness was known. But bottom is only the
+            // extreme; the OVERLAPPING case is the dangerous one, because it looks
+            // like a legitimate narrowing. So apply a persisted refinement only
+            // when it CONFIRMS what the state already says, never when it tightens.
             let met = current.meet(refinement);
-            if !met.is_bottom() {
+            if !met.is_bottom() && met == *current {
                 state.set(*vid, met);
             }
-            // If meet is bottom, keep the current value (don't make state unreachable
-            // due to a stale refinement from a prior iteration).
         }
-        // If the ValueId isn't in the state (implicitly top), apply the refinement
-        else if !refinement.is_top() {
-            state.set(*vid, refinement.clone());
-        }
+        // A ValueId absent from the state is implicitly TOP. Imposing a cached
+        // interval on it is the same under-approximation, one step worse — there
+        // is not even a current value to agree with.
     }
 }
 

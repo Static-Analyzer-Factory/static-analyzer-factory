@@ -863,6 +863,21 @@ impl Interval {
         }
         // If other is a singleton and equals one of our bounds, we can refine
         if other.is_singleton() {
+            // `self == other` is asserted FALSE. When `self` is the SAME
+            // singleton, no concrete value satisfies the edge at all, so the
+            // edge is infeasible and the sound answer is bottom. Both arms
+            // below are guarded by `self.lo < self.hi`, which a singleton never
+            // satisfies, so without this case an equal singleton falls through
+            // to `self.clone()` and a provably dead branch stays alive. That is
+            // the `error-reachable` wall: `(ICmpEq, false)` is exactly what
+            // clang emits for `if (!(cond)) { reach_error(); }` (plans/213 §2a).
+            //
+            // `bits` must match. `Interval` carries no signedness tag, so bounds
+            // from different widths are not comparable; requiring equal widths
+            // can only make this MORE conservative, never less.
+            if self.bits == other.bits && self.lo == other.lo && self.hi == other.hi {
+                return Self::make_bottom(self.bits);
+            }
             if self.lo == other.lo && self.lo < self.hi {
                 return Self::new(self.lo + 1, self.hi, self.bits);
             }
@@ -1477,6 +1492,52 @@ mod tests {
         let r = a.refine_eq_false(&b);
         assert_eq!(r.lo(), 6);
         assert_eq!(r.hi(), 10);
+    }
+
+    /// RED (plans/213 §2a). `x != c` when `x` is already known to be exactly `c`
+    /// is unsatisfiable, so the edge is infeasible and the refinement must be ⊥.
+    /// Both refinement arms are guarded by `self.lo < self.hi`, so an EQUAL
+    /// singleton falls through to `self.clone()` and the branch survives. This is
+    /// the `error-reachable` wall: `(ICmpEq, false)` is exactly what clang emits
+    /// for the canonical SV-COMP `if (!(cond)) { reach_error(); }`.
+    #[test]
+    fn refine_eq_false_equal_singletons_is_bottom() {
+        let a = Interval::singleton(0, 32);
+        let b = Interval::singleton(0, 32);
+        assert!(a.refine_eq_false(&b).is_bottom());
+    }
+
+    /// Same shape at a non-zero constant, to pin that the fix is about singleton
+    /// EQUALITY and not about zero specifically.
+    #[test]
+    fn refine_eq_false_equal_singletons_nonzero_is_bottom() {
+        let a = Interval::singleton(42, 32);
+        let b = Interval::singleton(42, 32);
+        assert!(a.refine_eq_false(&b).is_bottom());
+    }
+
+    /// GUARD against over-fixing: DISTINCT singletons satisfy `!=` perfectly
+    /// well, so the refinement must leave `self` alone rather than go to ⊥.
+    /// A ⊥ here would declare a reachable branch dead — a wrong TRUE.
+    #[test]
+    fn refine_eq_false_distinct_singletons_unchanged() {
+        let a = Interval::singleton(3, 32);
+        let b = Interval::singleton(5, 32);
+        let r = a.refine_eq_false(&b);
+        assert!(!r.is_bottom());
+        assert_eq!(r.lo(), 3);
+        assert_eq!(r.hi(), 3);
+    }
+
+    /// GUARD: a singleton refined against a WIDER interval that contains it is
+    /// not refinable in the interval domain, but it is certainly not ⊥.
+    #[test]
+    fn refine_eq_false_singleton_vs_range_unchanged() {
+        let a = Interval::singleton(5, 32);
+        let b = Interval::new(0, 10, 32);
+        let r = a.refine_eq_false(&b);
+        assert!(!r.is_bottom());
+        assert_eq!(r.lo(), 5);
     }
 
     // =========================================================================

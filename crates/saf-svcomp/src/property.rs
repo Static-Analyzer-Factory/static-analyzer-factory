@@ -550,6 +550,16 @@ pub fn prove_unreachable(module: &AirModule) -> UnreachProof {
     if !result.diagnostics().converged {
         return UnreachProof::Abstain("not-converged".to_string());
     }
+    // POST-FIXPOINT GATE (fail-closed, plans/213). `converged` only says the
+    // worklist drained; it does NOT say the solution satisfies
+    // `transfer(B) <= state[S]` on every edge. Six distinct defects were measured
+    // that each broke that property while still reporting `converged`, and every
+    // one produced a wrong TRUE by shrinking a variable's range below the values
+    // the program really takes. Refuse to reason about an under-approximated
+    // solution at all.
+    if !result.diagnostics().fixpoint_verified {
+        return UnreachProof::Abstain("fixpoint-unverified".to_string());
+    }
     // Enumerate every located error call site (func, block, inst), deterministically.
     let mut sites: Vec<(FunctionId, BlockId, InstId)> = Vec::new();
     for name in REACH_ERROR_NAMES {

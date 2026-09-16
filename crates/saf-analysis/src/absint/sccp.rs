@@ -10,8 +10,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use saf_core::air::{AirFunction, AirModule, BinaryOp, CastKind, Constant, Operation};
-use saf_core::ids::{BlockId, ValueId};
+use saf_core::air::{AirFunction, AirModule, AirType, BinaryOp, CastKind, Constant, Operation};
+use saf_core::ids::{BlockId, TypeId, ValueId};
 
 // =============================================================================
 // Lattice
@@ -89,12 +89,26 @@ pub struct SccpResult {
 pub fn run_sccp_module(module: &AirModule) -> SccpResult {
     let read_only_globals = build_read_only_globals(module);
 
+    // Signed result widths, so an arithmetic fold can be normalised back to the
+    // value's OWN width. This is the same lattice invariant `evaluate_cast`
+    // protects, and `evaluate_binary` violated it: it computes in `i128`, which
+    // does not wrap where the value does. (plans/213 M2)
+    let int_widths: BTreeMap<TypeId, u8> = module
+        .types
+        .iter()
+        .filter_map(|(tid, ty)| match ty {
+            AirType::Integer { bits } => u8::try_from(*bits).ok().map(|b| (*tid, b)),
+            _ => None,
+        })
+        .collect();
+
     let mut result = SccpResult::default();
     for func in &module.functions {
         if func.is_declaration {
             continue;
         }
-        let func_result = run_sccp_function(func, &module.constants, &read_only_globals);
+        let func_result =
+            run_sccp_function_with_widths(func, &module.constants, &read_only_globals, &int_widths);
         result.constants.extend(func_result.constants);
         result.dead_blocks.extend(func_result.dead_blocks);
     }
@@ -159,10 +173,24 @@ fn build_read_only_globals(module: &AirModule) -> BTreeMap<ValueId, SccpValue> {
 /// The `read_only_globals` map provides constant values for globals that are
 /// never stored to — `Load` from these addresses returns the init value.
 #[must_use]
+/// Back-compat entry point: no type-width table, so any arithmetic fold whose
+/// result width is unknown drops to `Bottom` rather than claiming a value the
+/// program may not hold. Prefer [`run_sccp_function_with_widths`].
 pub fn run_sccp_function(
     func: &AirFunction,
     module_constants: &BTreeMap<ValueId, Constant>,
     read_only_globals: &BTreeMap<ValueId, SccpValue>,
+) -> SccpResult {
+    run_sccp_function_with_widths(func, module_constants, read_only_globals, &BTreeMap::new())
+}
+
+/// SCCP over one function, with the module's integer result widths so binary
+/// folds can be normalised to the value's own width (plans/213 M2).
+pub fn run_sccp_function_with_widths(
+    func: &AirFunction,
+    module_constants: &BTreeMap<ValueId, Constant>,
+    read_only_globals: &BTreeMap<ValueId, SccpValue>,
+    int_widths: &BTreeMap<TypeId, u8>,
 ) -> SccpResult {
     // Value lattice: all values start at Top (unknown).
     let mut values: BTreeMap<ValueId, SccpValue> = BTreeMap::new();
@@ -218,6 +246,7 @@ pub fn run_sccp_function(
                         &mut executable_edges,
                         &mut executable_blocks,
                         &mut cfg_worklist,
+                        int_widths,
                     );
                 }
             }
@@ -244,6 +273,7 @@ pub fn run_sccp_function(
                             &mut executable_edges,
                             &mut executable_blocks,
                             &mut cfg_worklist,
+                            int_widths,
                         );
                     }
                 }
@@ -346,6 +376,58 @@ fn mark_edge_executable(
 // NOTE: This function implements the SCCP instruction evaluation for all
 // AIR operations as a single cohesive unit. Splitting would obscure the algorithm.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Restore the lattice invariant [`evaluate_cast`] documents: the `i128` inside a
+/// [`SccpValue::Constant`] is the SIGNED interpretation of the value at its OWN
+/// bit-width.
+///
+/// [`evaluate_binary`] computes in `i128` with `wrapping_*`, which wraps at 128
+/// bits — not where the value actually wraps. So `add i32 -2147483648,
+/// -2147483648` yields `-4294967296`, a value no `i32` can hold, whose true value
+/// is `0`. A constant that lies makes `CondBr` mark a LIVE block dead, and
+/// `prove_unreachable` then reads the pre-seeded ⊥ as a proof. Witness:
+/// `tests/programs/c/svcomp/unreach_false_wrapped_add.c`. (plans/213 M2)
+///
+/// * Comparisons already produce a normal `i1` 0/1.
+/// * `And`/`Or`/`Xor` of two operands already normalised at width `b` stay within
+///   `b` — their `i128` sign-extensions agree bit for bit — so they need nothing.
+/// * `Add`/`Sub`/`Mul`/`SDiv`/`SRem` can leave the width and must be wrapped.
+///
+/// Where the width is unknown no claim is justified, so the fold drops to
+/// `Bottom` — this lattice's "overdetermined". That is the same conservative
+/// escape the `ZExt` arm of `evaluate_cast` uses, and `Bottom` can only REMOVE
+/// blocks from `dead_blocks`, never add them, so it cannot manufacture a ⊥.
+fn normalize_binary_result(kind: BinaryOp, v: SccpValue, bits: Option<u8>) -> SccpValue {
+    if !matches!(
+        kind,
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::SDiv | BinaryOp::SRem
+    ) {
+        return v;
+    }
+    let SccpValue::Constant(c) = v else {
+        return v;
+    };
+    let Some(b) = bits else {
+        return SccpValue::Bottom;
+    };
+    if !(1..128).contains(&b) {
+        return SccpValue::Bottom;
+    }
+    let mask = (1i128 << b) - 1;
+    let masked = c & mask;
+    let sign_bit = 1i128 << (b - 1);
+    SccpValue::Constant(if masked & sign_bit == 0 {
+        masked
+    } else {
+        masked | !mask
+    })
+}
+
+// One SSA-value dispatch over every AIR operation, so it is inherently wide and
+// long; splitting it would scatter the lattice rules that must stay legible as a
+// unit. `int_widths` is the tenth parameter, added so a binary fold can be
+// normalised to its result width (plans/213 M2) — the alternative, a context
+// struct, would be threaded through only this one call site.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn evaluate_instruction(
     inst: &saf_core::air::Instruction,
     block_id: BlockId,
@@ -356,6 +438,7 @@ fn evaluate_instruction(
     executable_edges: &mut BTreeSet<(BlockId, BlockId)>,
     executable_blocks: &mut BTreeSet<BlockId>,
     cfg_worklist: &mut VecDeque<BlockId>,
+    int_widths: &BTreeMap<TypeId, u8>,
 ) {
     match &inst.op {
         // -----------------------------------------------------------------
@@ -383,7 +466,11 @@ fn evaluate_instruction(
                 if inst.operands.len() >= 2 {
                     let lhs = lookup_value(inst.operands[0], values, module_constants);
                     let rhs = lookup_value(inst.operands[1], values, module_constants);
-                    let result = evaluate_binary(*kind, lhs, rhs);
+                    let result = normalize_binary_result(
+                        *kind,
+                        evaluate_binary(*kind, lhs, rhs),
+                        inst.result_type.and_then(|t| int_widths.get(&t).copied()),
+                    );
                     update_value(dst, result, values, ssa_worklist);
                 } else {
                     update_value(dst, SccpValue::Bottom, values, ssa_worklist);
@@ -599,18 +686,51 @@ fn evaluate_binary(kind: BinaryOp, lhs: SccpValue, rhs: SccpValue) -> SccpValue 
 
 /// Evaluate a cast operation when the source may be constant.
 ///
-/// For `ZExt`, `SExt`, and `Bitcast`, the integer value passes through
-/// (SCCP uses `i128` which can represent all AIR integer widths).
-/// For `Trunc`, we apply a bit mask to correctly model narrowing casts
-/// (e.g., truncating `i128` value 256 to `i8` yields 0, not 256).
+/// **Lattice invariant:** the `i128` inside a [`SccpValue::Constant`] is the
+/// SIGNED interpretation of the value at its OWN bit-width. Every arm below
+/// exists to preserve that; breaking it is a wrong-TRUE generator, not merely an
+/// imprecision (plans/213).
+///
+/// Why it is that severe: a mis-folded constant lets [`evaluate_binary`] decide
+/// an `ICmp` whose real value is unknown. A `CondBr` on a constant condition
+/// marks one edge non-executable, so every block behind it is collected as dead;
+/// `fixpoint.rs` skips a dead block BEFORE propagating to its successors, so a
+/// live successor keeps the ⊥ every block is pre-seeded with; and
+/// `prove_unreachable` reads that ⊥ as a proof the error is unreachable.
+///
+/// * `SExt` and integer `Bitcast` preserve the signed value, so they really are
+///   pass-throughs.
+/// * `ZExt` does **not**: `zext i16 -1 to i32` is 65535. Computing that needs the
+///   SOURCE width, and `Operation::Cast` carries only `target_bits`. A
+///   non-negative source is unchanged by zero-extension and still folds; a
+///   negative one cannot be folded soundly and drops to `Bottom`
+///   (overdetermined), which is this lattice's "unknown".
+/// * `Trunc` keeps the low `bits` and then REINTERPRETS them as a signed value of
+///   that width: `trunc i32 -1 to i16` is −1, and `trunc i32 255 to i8` is −1,
+///   because `0xFF` as a signed `i8` is −1.
 fn evaluate_cast(kind: CastKind, src: SccpValue, target_bits: Option<u8>) -> SccpValue {
     match kind {
-        CastKind::ZExt | CastKind::SExt | CastKind::Bitcast => src,
+        CastKind::SExt | CastKind::Bitcast => src,
+        CastKind::ZExt => match src {
+            // Cannot zero-extend without the source width; refuse to fold.
+            SccpValue::Constant(v) if v < 0 => SccpValue::Bottom,
+            _ => src,
+        },
         CastKind::Trunc => match (src, target_bits) {
-            (SccpValue::Constant(v), Some(bits)) if bits < 128 => {
-                SccpValue::Constant(v & ((1i128 << bits) - 1))
+            (SccpValue::Constant(v), Some(bits)) if (1..128).contains(&bits) => {
+                let mask = (1i128 << bits) - 1;
+                let masked = v & mask;
+                let sign_bit = 1i128 << (bits - 1);
+                SccpValue::Constant(if masked & sign_bit == 0 {
+                    masked
+                } else {
+                    masked | !mask
+                })
             }
-            // No target_bits info or non-constant — pass through unchanged.
+            // A constant we cannot narrow soundly must not keep its wider value:
+            // `trunc <unknown width>` of 256 is not 256.
+            (SccpValue::Constant(_), _) => SccpValue::Bottom,
+            // Top / Bottom carry no value to corrupt.
             _ => src,
         },
         // Float-to-int, ptr-to-int, etc. — not folded.
@@ -755,20 +875,27 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_cast_trunc_preserves_in_range_value() {
-        // 255 truncated to i8 stays 255 (255 & 0xFF = 255)
+    fn evaluate_cast_trunc_reinterprets_in_range_value_as_signed() {
+        // CORRECTED (plans/213): 255 truncated to i8 is NOT 255. The low 8 bits
+        // are `0xFF`, and this lattice stores the SIGNED interpretation at the
+        // value's own width, so the result is -1. The old expectation encoded the
+        // very invariant violation that let a mis-folded constant kill a live
+        // branch and turn a reachable error into a wrong PROVE.
         assert_eq!(
             evaluate_cast(CastKind::Trunc, SccpValue::Constant(255), Some(8)),
-            SccpValue::Constant(255)
+            SccpValue::Constant(-1)
         );
     }
 
     #[test]
-    fn evaluate_cast_trunc_no_target_bits_passes_through() {
-        // Without target_bits info, value passes through unchanged
+    fn evaluate_cast_trunc_no_target_bits_refuses_to_fold() {
+        // CORRECTED (plans/213): passing an un-narrowable constant through is
+        // unsound -- `trunc` of 256 is 0 at i8 and 256 at i16, so keeping 256
+        // asserts a value the program may not have. Without the width the only
+        // sound answer is `Bottom` (this lattice's "unknown").
         assert_eq!(
             evaluate_cast(CastKind::Trunc, SccpValue::Constant(256), None),
-            SccpValue::Constant(256)
+            SccpValue::Bottom
         );
     }
 
@@ -799,6 +926,102 @@ mod tests {
         assert_eq!(
             evaluate_cast(CastKind::Bitcast, SccpValue::Constant(42), Some(64)),
             SccpValue::Constant(42)
+        );
+    }
+
+    // =========================================================================
+    // plans/213 -- SCCP cast folding must preserve the lattice invariant
+    // "the i128 in `SccpValue::Constant` is the SIGNED interpretation of the
+    // value at its OWN width".
+    //
+    // Breaking it is not merely imprecise, it is a WRONG TRUE generator. A
+    // mis-folded constant makes `evaluate_binary` decide an ICmp that is really
+    // unknown; `CondBr` with a constant condition then marks one edge
+    // non-executable and every block behind it DEAD; `fixpoint.rs` skips dead
+    // blocks BEFORE propagating to their successors, so a live successor keeps
+    // the ⊥ every block is pre-seeded with; and `prove_unreachable` reads that ⊥
+    // as a proof that the error is unreachable. -32 points, uncapped by dedup.
+    // =========================================================================
+
+    /// RED. `zext i16 -1 to i32` is **65535**, not −1. `evaluate_cast` is handed
+    /// only `target_bits`, never the SOURCE width, so it cannot compute the
+    /// zero-extended value — and must therefore refuse to fold rather than pass
+    /// the signed value through. Witness: `bitvector-regression/signextension-1`.
+    #[test]
+    fn evaluate_cast_zext_of_negative_does_not_pass_through() {
+        assert_ne!(
+            evaluate_cast(CastKind::ZExt, SccpValue::Constant(-1), Some(32)),
+            SccpValue::Constant(-1),
+            "zext of a negative constant is NOT the same signed value"
+        );
+    }
+
+    /// RED, the same hole reached through a narrow unsigned type: LLVM stores
+    /// `unsigned char c = 200` as `i8 -56`, so `zext i8 -56 to i32` must not fold
+    /// to −56 (the real value is 200).
+    #[test]
+    fn evaluate_cast_zext_of_narrow_negative_does_not_pass_through() {
+        assert_ne!(
+            evaluate_cast(CastKind::ZExt, SccpValue::Constant(-56), Some(32)),
+            SccpValue::Constant(-56)
+        );
+    }
+
+    /// RED. `trunc i32 -1 to i16` is **−1**, not 65535: the low 16 bits are
+    /// `0xFFFF`, whose SIGNED i16 interpretation is −1. Masking without
+    /// sign-normalising leaves a value that no longer means what the lattice says
+    /// it means. Witness: `m1probe/t1.c`.
+    #[test]
+    fn evaluate_cast_trunc_sign_normalizes_negative() {
+        assert_eq!(
+            evaluate_cast(CastKind::Trunc, SccpValue::Constant(-1), Some(16)),
+            SccpValue::Constant(-1)
+        );
+    }
+
+    /// RED, the other direction: a POSITIVE wide constant whose low bits have the
+    /// sign bit set truncates to a NEGATIVE narrow value. `trunc i32 65535 to i16`
+    /// is −1.
+    #[test]
+    fn evaluate_cast_trunc_wraps_positive_to_negative() {
+        assert_eq!(
+            evaluate_cast(CastKind::Trunc, SccpValue::Constant(65535), Some(16)),
+            SccpValue::Constant(-1)
+        );
+    }
+
+    /// RED. `trunc i32 200 to i8` is −56 (`0xC8` as signed i8), not 200.
+    #[test]
+    fn evaluate_cast_trunc_byte_sign_boundary() {
+        assert_eq!(
+            evaluate_cast(CastKind::Trunc, SccpValue::Constant(200), Some(8)),
+            SccpValue::Constant(-56)
+        );
+    }
+
+    /// GUARD, must stay green. Zero-extending a NON-negative constant really is
+    /// the identity, and that is the overwhelmingly common case — the fix must
+    /// not cost this precision.
+    #[test]
+    fn evaluate_cast_zext_of_nonnegative_still_passes_through() {
+        assert_eq!(
+            evaluate_cast(CastKind::ZExt, SccpValue::Constant(42), Some(64)),
+            SccpValue::Constant(42)
+        );
+        assert_eq!(
+            evaluate_cast(CastKind::ZExt, SccpValue::Constant(0), Some(8)),
+            SccpValue::Constant(0)
+        );
+    }
+
+    /// GUARD, must stay green. `SExt` DOES preserve the signed value, so it is a
+    /// genuine pass-through even for negatives. This is what makes
+    /// `loop-simple`-style `sext` programs analyse correctly today.
+    #[test]
+    fn evaluate_cast_sext_of_negative_still_passes_through() {
+        assert_eq!(
+            evaluate_cast(CastKind::SExt, SccpValue::Constant(-1), Some(32)),
+            SccpValue::Constant(-1)
         );
     }
 }

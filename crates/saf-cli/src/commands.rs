@@ -915,12 +915,10 @@ pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
         }
     } else if outcome.verdict.starts_with("true") {
         // Witness-required sound TRUE — write the `invariant_set` correctness
-        // witness. Two arms reach here with different gating, and the difference
-        // matters: rank-2 no-overflow was already gated on an in-process CPAchecker
-        // confirmation of THIS witness, whereas termination emits its 2.1 witness
-        // UNGATED, because its verdict is a standalone structural proof and an
-        // unconfirmed-but-correct TRUE scores 0 rather than -32. Either way, writing
-        // a witness can never turn a right verdict wrong. A bare `true` with no
+        // witness. Both arms that reach here (rank-2 no-overflow, termination) emit
+        // it UNGATED: the verdict is decided by SAF's own sentinel, and an
+        // unconfirmed-but-correct TRUE scores 0 rather than -32, so writing a
+        // witness can never turn a right verdict wrong. A bare `true` with no
         // correctness witness (e.g. no-data-race) writes nothing (unchanged).
         if let Some(correctness) = &outcome.correctness {
             match correctness.to_yaml_string() {
@@ -1612,11 +1610,10 @@ fn fuzz_confirm(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
 /// verdict — a `false` is still returned when the witness cannot be constructed (e.g.
 /// a missing span), it just scores 0 like `unknown`.
 ///
-/// Rank-3 (TRUE-first): before the FALSE pipeline, attempt a sound `unreach-call`
-/// TRUE via [`try_unreach_true`] — a cost-guarded, fail-closed interval
-/// error-block-⊥ proof gated on in-process `CPAchecker` confirmation. It emits `true`
-/// ONLY on a confirmed proof, else returns `None` and the (unchanged) FALSE pipeline
-/// runs. The TRUE authority is STRICTLY separate from the FALSE authority.
+/// Rank-3 (TRUE-first): before the FALSE pipeline, [`try_unreach_true`] would
+/// attempt a sound `unreach-call` TRUE. It is currently DISABLED and always returns
+/// `None` — see its doc comment — so the FALSE pipeline always runs. The TRUE
+/// authority is STRICTLY separate from the FALSE authority.
 // NOTE: staged unreach-call strategy (Stage 1 must-reach → Stage 2/3 replay) kept
 // as one cohesive unit; splitting the stages across helpers would obscure the
 // fail-closed control flow.
@@ -1624,9 +1621,9 @@ fn fuzz_confirm(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
 fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     use saf_svcomp::Property;
 
-    // Rank-3 sound TRUE (fail-closed to the FALSE path on any doubt): a
-    // CPAchecker-confirmed error-unreachability proof. Cost-guarded + cheap-gated so
-    // it never starves the FALSE path (SAF's core recall) on giant programs.
+    // Rank-3 sound TRUE (fail-closed to the FALSE path on any doubt). DISABLED:
+    // `prove_unreachable` is still unsound on a loop-head under-approximation and
+    // the arm is worth 0 weighted, so it always returns None here.
     if let Some(outcome) = try_unreach_true(ctx) {
         return outcome;
     }
@@ -4925,38 +4922,149 @@ fn overflow_nondet_assumes(
     assumes
 }
 
-/// Rank-2 `no-overflow` TRUE: DISABLED, deliberately.
+/// Does the SOURCE contain a compile-time constant overflow that clang folds away?
 ///
-/// The sound-interval sentinel ([`saf_analysis::absint::prove_no_signed_overflow`])
-/// PROPOSES a proof, but on its own it is not wrong-TRUE-safe: a sweep over the full
-/// expected-FALSE population measured 7 wrong TRUEs from SAF's sentinels. The proposal
-/// therefore required an independent confirmer, and the only one to hand was a bundled
-/// `CPAchecker`.
+/// `(2147483647 + 1) - 23` is a ground-truth-FALSE `no-overflow` task, but clang
+/// evaluates it during parsing, so NO arithmetic instruction survives into the IR
+/// and the interval sentinel proves "no reachable signed op can overflow" —
+/// vacuously and wrongly. The overflow is only visible in the SOURCE, so that is
+/// where it is detected: clang's own `-Winteger-overflow`, which fires exactly on
+/// this class.
 ///
-/// SAF ships no tool that is itself an SV-COMP participant (user decision 2026-09-13),
-/// so that confirmer is gone and nothing is left to make the proposal sound. SAF
-/// ABSTAINS rather than emit an unvalidated TRUE -- a missed TRUE scores 0, a wrong one
-/// scores -32. Measured price of this decision: -12 dedup-weighted.
+/// Fail-closed: if clang cannot be spawned at all, report `true` (an overflow may
+/// be hiding) so the TRUE arm abstains rather than guesses.
 ///
-/// Movement 1 (`plans/213`) fixes the two absint bug classes behind those wrong TRUEs;
-/// when it lands this becomes a SAF-native proof needing no external gate.
-fn try_overflow_true(_ctx: &VerifyCtx) -> Option<VerdictOutcome> {
-    None
+/// This is SAF's OWN clang invocation, not a delegated verdict — clang is a
+/// compiler, not an SV-COMP participant, and it decides nothing about the property.
+/// It answers one syntactic question and the sentinel still does all the proving.
+/// (plans/213 §2 class 2. Originally added in `e5a82e41`, removed with the
+/// `CPAchecker` gate in `e5265281`, restored here because the TRUE arm is live again
+/// and the class is real: measured 3 wrong PROVEs in
+/// `signedintegeroverflow-regression` without it.)
+fn overflow_source_constant_folds(ctx: &VerifyCtx) -> bool {
+    use std::process::{Command, Stdio};
+    let m = match ctx.data_model {
+        saf_svcomp::DataModel::ILP32 => "-m32",
+        saf_svcomp::DataModel::LP64 => "-m64",
+    };
+    match Command::new(ctx.clang)
+        .args(["-fsyntax-only", "-Wno-everything", "-Winteger-overflow", m])
+        .arg("-include")
+        .arg(ctx.stub)
+        .arg(ctx.input)
+        .stdout(Stdio::null())
+        .output()
+    {
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            err.contains("integer-overflow") || err.contains("overflow in expression")
+        }
+        Err(_) => true, // fail-closed
+    }
 }
 
-/// Rank-3 `unreach-call` TRUE: DISABLED, deliberately.
+/// Rank-2 `no-overflow` TRUE — a SAF-NATIVE proof, gated only by SAF's own checks.
 ///
-/// Same reasoning as [`try_overflow_true`]: the interval error-block-bottom sentinel
-/// proposes, but only a bundled `CPAchecker` could confirm, and SAF ships no SV-COMP
-/// participant. SAF abstains. Measured price: 3 tasks, folded into the -12 above.
+/// This arm was disabled in `e5265281` because its final gate was a bundled
+/// `CPAchecker`, and SAF ships no tool that is itself an SV-COMP participant. That
+/// gate was also masking real unsoundness in SAF's own sentinel, so deleting it
+/// alone would have traded -12 dedup-weighted for a fistful of -32s. Movement 1
+/// (`plans/213`) fixed the underlying bugs, so the proof now stands on its own:
 ///
-/// Re-enabled by Movement 1 (`plans/213`) as a SAF-native proof.
+/// * `Interval::refine_eq_false` returns ⊥ for equal singletons (§2a),
+/// * unsigned comparisons are no longer refined with the SIGNED refiners unless
+///   both operands are provably non-negative (§2b),
+/// * SCCP's cast folding preserves the "signed value at its own width" invariant,
+///   so it no longer marks live blocks dead,
+/// * and `prove_no_signed_overflow` now FAILS CLOSED on an obligation whose
+///   program point the fixpoint never visited, instead of silently skipping it.
+///
+/// Four gates run before the sentinel, all SAF's own, all fail-closed. Order is
+/// cheapest-first; every one of them is load-bearing and was measured:
+///   1. OpenMP in the source — the frontend drops `#pragma omp`, so the AIR loses
+///      the parallelism and a sequential proof would be unsound.
+///   2. A reachable thread spawn — same reason, via the call graph.
+///   3. A constant overflow clang folded away — invisible in the IR (3 measured).
+///   4. The sentinel itself, which abstains on any TOP/⊥/unmodelled/unvisited op.
+///
+/// The correctness witness is SAF's converged interval fixpoint, or an empty
+/// `invariant_set` when no named loop-head invariant survives. Under the 2027 rules
+/// every `C.no-overflow.*` base category needs a CONFIRMED 2.0+ correctness
+/// witness, so an unconfirmed one scores 0 — but never -32, so emitting it can
+/// only help. NOTHING outside SAF decides this verdict.
+fn try_overflow_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    let source = std::fs::read_to_string(ctx.input).ok()?;
+    // (1) OpenMP: the frontend drops `#pragma omp`, so the AIR loses parallelism.
+    if saf_svcomp::source_has_openmp(&source) {
+        return None;
+    }
+    // (2) Reachable thread spawn: a sequential interval proof is unsound under
+    //     concurrency (the same gate the UBSan FALSE path uses).
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        return None;
+    }
+    // (3) Compile-time constant overflow clang folds away (no IR arithmetic to see).
+    if overflow_source_constant_folds(ctx) {
+        return None;
+    }
+    // (4) Sentinel: prove EVERY reachable signed add/sub/mul in-bounds over the
+    //     converged interval solution (fail-closed on any TOP/absent/unmodelled op).
+    if !matches!(
+        saf_analysis::absint::prove_no_signed_overflow(ctx.module),
+        saf_analysis::absint::NoOverflowProof::Proven
+    ) {
+        return None;
+    }
+    // Correctness witness: SAF's converged loop invariants, or an empty
+    // `invariant_set` for a loop-free program.
+    let witness = saf_svcomp::build_interval_invariant_witness(ctx.module, &source, ctx.meta)
+        .unwrap_or_else(|| saf_svcomp::InvariantSetWitness::empty(ctx.meta));
+    Some(VerdictOutcome {
+        verdict: "true".to_string(),
+        witness: None,
+        graphml: None,
+        correctness: Some(witness),
+    })
+}
+
+/// Rank-3 `unreach-call` TRUE: STILL DISABLED, and the reason has changed.
+///
+/// It was disabled in `e5265281` because its only confirmer was a bundled
+/// `CPAchecker`. Movement 1 (`plans/213`) re-enabled the sibling
+/// [`try_overflow_true`] as a SAF-native proof, but NOT this one, because
+/// `prove_unreachable` is still measurably unsound and the arm is worth nothing.
+///
+/// **Why it is worth nothing.** All 3 `unreach-call` TRUEs this arm emitted across
+/// 22,631 tasks land in clusters that are already at the per-cluster dedup cap, so
+/// its marginal contribution is **0 weighted** — the whole -12 the tool removal
+/// cost was `no-overflow`. There is no score argument for taking any risk here.
+///
+/// **Why it is still unsound.** A sweep over all 4,324 ground-truth-FALSE
+/// `unreach-call` tasks still finds a wrong PROVE (`loop-simple/deep-nested`). The
+/// mechanism is NOT the two bugs Movement 1 fixed, nor the SCCP cast folding it
+/// also fixed: the interval fixpoint UNDER-APPROXIMATES a loop-head phi, so a
+/// dispatch arm that is really reachable is refuted and the error block keeps the ⊥
+/// every block is pre-seeded with. `prove_unreachable` cannot tell that ⊥ from a
+/// genuinely refuted one. Minimal repro: a 3-state `while(1)` machine — with states
+/// `8466/8496/8512` it wrongly PROVEs, with states `0/1/2` it correctly abstains,
+/// so it is a widening-threshold artifact.
+///
+/// The no-overflow sibling is safe from the same bug because its sentinel now fails
+/// closed on an obligation whose program point was never visited
+/// (`ABSTAIN:unvisited-arith`). `prove_unreachable` has no equivalent, because a ⊥
+/// error block is exactly what its proof LOOKS like — it would need the fixpoint to
+/// record which blocks it actually visited.
+///
+/// Do not re-enable this until that under-approximation is fixed and the full
+/// expected-FALSE sweep returns 0 PROVEs. `verify_unreach_wrongprove_is_not_true`
+/// in `crates/saf-cli/tests/smoke.rs` is the regression that fires if anyone does.
 fn try_unreach_true(_ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     None
 }
 
-/// The `no-overflow` strategy: **TRUE-first** (rank 2 — a sound interval proof
-/// gated on in-process `CPAchecker` confirmation) then the R6 FALSE pipeline
+/// The `no-overflow` strategy: **TRUE-first** (rank 2 — a SAF-native sound
+/// interval proof, no external confirmer) then the R6 FALSE pipeline
 /// (confirmer-first, propose-free `UBSan` replay). Mirrors [`memsafety_strategy`] for
 /// the FALSE half; no sub-property, so a FALSE is always `false(no-overflow)`.
 fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
