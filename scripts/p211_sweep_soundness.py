@@ -30,7 +30,15 @@ from concurrent.futures import ThreadPoolExecutor
 
 SAF = os.environ.get("SAF_BIN", "./target/release/saf")
 SVB = os.environ.get("SAF_SVB", "tests/benchmarks/sv-benchmarks/c")
-SUBCMD = {"unreach-call": "prove-unreachable", "no-overflow": "prove-no-overflow"}
+SUBCMD = {
+    "unreach-call": "prove-unreachable",
+    "no-overflow": "prove-no-overflow",
+    # plans/214 Movement 2. The key is the `.prp` STEM, as it appears in the
+    # per-task dump's `property` field -- `valid-memsafety`, not `memsafety`
+    # (which `plans/214` §4 writes). Keying it wrong makes the filter below
+    # match zero rows and print a vacuous "PROVE = 0" pass.
+    "valid-memsafety": "memsafe-prove",
+}
 
 
 def resolve_source(rel_yml: str) -> str | None:
