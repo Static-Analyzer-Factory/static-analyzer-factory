@@ -1,7 +1,27 @@
-# Plan 214 — Movement 2: the Anchored-Object `valid-memsafety` prover (+8..16 weighted)
+# Plan 214 — Movement 2: the Anchored-Object `valid-memsafety` prover (~~+8..16~~ → **+10 measured**)
 
-**Status:** DESIGNED; the de-risking spike is ~70% already run in Python. Blocked on [`plans/213`](213-movement1-soundness-and-de-delegation.md) (it needs `universe.rs`). **Scope grew by one property — see the folded-in note in §0.**
-**Branch:** cut `movement2/anchored-memsafety` off `movement1/sound-then-cut`.
+**Status:** **IMPLEMENTED 2026-09-16 (memsafety half) — see [`214-movement2-RESULTS.md`](214-movement2-RESULTS.md).**
+132 → 142 dedup-weighted, `false_alarms = 0`, `wrong_true = 0`. The `valid-memcleanup`
+fold-in in §0 is **still open**.
+
+> ### ⚠️ Read the RESULTS file before this one
+>
+> Implementing this plan proved **eight** of its instructions wrong, each marked
+> **⚠️ CORRECTED 2026-09-16** below. The originals are left in place — this is a record
+> of what was decided — but do not act on them. These four are the ones that would have
+> done real damage:
+>
+> | § | said | actually |
+> |---|---|---|
+> | SPIKE RESULT, Correction 1 | "No frontend change is required" | **false** — and the failure mode is a wrong TRUE |
+> | §1 / GLOBALS_ONLY | drop `ObjBase::Stack` | costs **378 of 408** provable tasks |
+> | §3.4 | emit "like `termination_strategy`" | that emits a correctness witness; use `race_true_outcome` |
+> | §4 | sweep key `memsafety` | the key is `valid-memsafety`; the wrong one measures **zero rows** |
+
+**Original status:** DESIGNED; the de-risking spike is ~70% already run in Python. Blocked on [`plans/213`](213-movement1-soundness-and-de-delegation.md) (it needs `universe.rs`). **Scope grew by one property — see the folded-in note in §0.**
+**Branch:** ~~cut `movement2/anchored-memsafety` off `movement1/sound-then-cut`~~ — landed
+directly on `movement5/submission` (`7a47408b` / `c8e28b3a` / `a7259970`), then `svcomp`
+fast-forwarded to match.
 **Track:** TRUE-side. Movement 2 of 4 — **the first offensive movement.**
 **Design source:** `plans/211` §5.2, §5.5, §5.6. Memory: `saf-plan-211-design`, `svcomp-2027-witness-rules-50pts-at-risk`.
 
@@ -76,6 +96,15 @@ Thread-**insensitive**, syntactic, fail-closed. Modelled on `termination.rs` exa
 enum ObjBase { Global(ValueId), Stack(ValueId /* the Alloca */) }
 struct Anchor { base: ObjBase, offset: i64 }   // flat lattice, explicit ⊥ = "not anchored"
 ```
+
+> **⚠️ CORRECTED 2026-09-16 — this domain is not implementable on AIR.** `Operation::Gep`
+> carries a `FieldPath` of type-descent steps with *no element type*, and a
+> constant-expression GEP over a global is resolved during ingestion to that global's bare
+> `ValueId`. Measured: `arr[5] = 1` and `arr[500] = 1` produce **structurally identical
+> AIR**. An `offset` lattice would therefore read every out-of-bounds constant access as
+> in-bounds at offset 0 — a wrong TRUE. What shipped is the sound residue: *an address is
+> anchored only when it **is** a global or a stack slot — offset zero by construction —
+> and every instruction that could move an address off its base is rejected outright.*
 Joining two different bases gives ⊥. **A `Load` result never anchors** — this single rule
 is what makes the prover safe against dangling pointers, aliasing, and interference: a
 pointer that came out of memory can never be the subject of a discharged obligation.
@@ -108,6 +137,16 @@ pieces are `crates/saf-core/src/layout.rs` (`size_of` over `AirType` — the AIR
 carries `StructField::byte_offset` / `byte_size` and `total_size`, so this is mechanical;
 `Opaque`, `Array{count: None}` and any missing offset return `None` ⇒ abstain) and the
 anchor propagation itself.
+
+> **⚠️ CORRECTED 2026-09-16.** `layout.rs` already existed (513 lines, 28 tests) and is
+> **not usable here**: it answers *confidently wrong* in three cases, each an
+> over-estimate, which is the wrong-proof direction. `alloc_size` returns `Some(0)` — a
+> definite answer — for a struct whose layout computation FAILED (the `Opaque`-sub-field
+> fallback in `type_intern.rs`), sizes a pointer from `target_pointer_width` (hardcoded to
+> 8 by the LLVM frontend, while ~every SV-COMP task is ILP32), and floors floats at 4
+> bytes. `memsafe::exact_size_of` replaces it, accepting only types whose size is exact
+> and width-independent. Four *additive* frontend signals were also needed — see the
+> RESULTS file §0.
 
 ## 2. Slice A — finish the spike (1 engineer-day, still zero Rust)
 
@@ -148,6 +187,9 @@ tasks, not a sample.
 Only on a PASS. Mirror `prove_no_overflow_cmd` / `prove_unreachable_cmd`:
 
 1. `crates/saf-core/src/layout.rs` — `size_of` / `gep_byte_offset`.
+   > **⚠️ CORRECTED 2026-09-16.** `gep_byte_offset` cannot be written: `FieldPath` carries
+   > no element type, so there is no byte offset to compute. `layout.rs` is bypassed
+   > entirely (see §1's correction). Nothing was added to it.
 2. `crates/saf-svcomp/src/memsafe.rs` — `prove_memsafe(&AirModule) -> MemSafeProof`
    (`Proven | Abstain(String)`), consuming `universe::reachable_universe` with the
    memsafety `ExternalPolicy`.
@@ -156,17 +198,40 @@ Only on a PASS. Mirror `prove_no_overflow_cmd` / `prove_unreachable_cmd`:
    unchanged. **Add the subcommand to both scripts' `SUBCMD` maps.**
 4. Only then wire a TRUE arm into `memsafety_strategy`. It emits **no witness** —
    verdict-only — so the path is `VerdictOutcome { verdict: "true", correctness: None, .. }`,
-   like `termination_strategy`.
+   like ~~`termination_strategy`~~ **`race_true_outcome`**.
+   > **⚠️ CORRECTED 2026-09-16.** `termination_strategy` is NOT verdict-only — under the
+   > 2027 rules `C.termination.*` requires a 2.1+ correctness witness, so it emits
+   > `correctness: Some(..)`. The verdict-only exemplar is `race_true_outcome`
+   > (`commands.rs`), and `svcomp_witness_rules.py` confirms
+   > `TRUE_WITNESS_RULE["valid-memsafety"] = {_DEFAULT: None}`.
+   >
+   > Also **order the TRUE arm AFTER the ASan FALSE confirmer**, not before. The two are
+   > disjoint by construction, but that is an argument rather than a mechanism — running
+   > the confirmer first makes the argument being wrong cost recall instead of −32.
 
 ## 4. Merge gate
 
-- [ ] `p211_sweep_soundness.py memsafety` = **0 PROVEs** over all 10,014 expected-FALSE.
-- [ ] Full 55,690-task run: `false_alarms == 0`, `wrong_true == 0`, weighted **+8 or
-      better** over the post-Movement-1 baseline.
-- [ ] Latency: memsafety is 20,570 tasks; keep the added CPU under +2% (Lever #1's bar was
+- [x] `p211_sweep_soundness.py valid-memsafety` = **0 PROVEs** over all 10,087 expected-FALSE.
+      > **⚠️ CORRECTED 2026-09-16.** The key is `valid-memsafety` — the `.prp` stem, as it
+      > appears in the per-task dump's `property` field. Keying `SUBCMD` on `memsafety`
+      > matches **zero rows** and prints a vacuous `PROVE = 0` PASS: an instrument that
+      > silently measures nothing. The population is 10,087, not 10,014.
+- [x] ~~Full 55,690-task run~~ **property-scoped run**: `false_alarms == 0`,
+      `wrong_true == 0`, weighted **+10** over the post-Movement-1 baseline (132 → 142).
+      > **⚠️ CORRECTED 2026-09-16.** The full run is ~10 h and 96% of its CPU goes to tasks
+      > that end `Unknown`; `unreach-call` alone is 75% and this change cannot reach it.
+      > `svcomp_split_eval.py --property valid-memsafety` (20,570 tasks, ~4 h) spliced into
+      > the baseline is the same evidence at a quarter of the cost — see
+      > `scripts/m2_memsafety_gate.sh` and `scripts/m2_splice.py`.
+- [x] Latency: memsafety is 20,570 tasks; keep the added CPU under +2% (Lever #1's bar was
       +0.4%). The prover is syntactic and PTA-bounded, so this should be easy — measure it
-      anyway, per `saf-lever1-cbmc-loop-free`.
-- [ ] `make lint` clean, TDD-green.
+      anyway, per `saf-lever1-cbmc-loop-free`. **Measured +0.26% (+8 ms/task) against a bar
+      that works out to 69.7 ms/task.**
+- [x] `make lint` clean, TDD-green. **2728 pass, clippy/fmt clean, zero new `#[ignore]`d
+      failures (control-run verified at `5f274d13`).**
+- [x] **ADDED:** `unreach-call` blast-radius control — interning a global's type perturbs
+      `absint::build_obj_type_map`. 1 flip in 1,500 (a gain, inside that property's noise
+      floor).
 
 ## 5. Risks and honest caveats
 
@@ -228,8 +293,33 @@ occupies return `witness_required=False` from `svcomp_witness_rules::true_witnes
 `sroa` and `instcombine` EXPLOIT the undefined behaviour the prover exists to detect:
 they rewrite a genuinely unsafe access into one that looks safe, turning an
 expected-FALSE task into a wrong TRUE. **Use `mem2reg` alone — which is already what
-`compile_to_ir` does.** No frontend change is required; this plan's §2 recipe should
+`compile_to_ir` does.** ~~No frontend change is required~~; this plan's §2 recipe should
 simply be deleted.
+
+> ### ⚠️ CORRECTED 2026-09-16 — "no frontend change is required" is FALSE
+>
+> The first half stands: `compile_to_ir` already runs `mem2reg` alone and no change to the
+> IR *recipe* is needed. The conclusion does not. **Four lines of C:** these two programs
+> produce **structurally identical AIR** —
+>
+> ```c
+> int arr[100];  int main(void){ arr[5]   = 1; }   /* in bounds */
+> int arr[100];  int main(void){ arr[500] = 1; }   /* 2000 bytes past a 400-byte object */
+> ```
+>
+> Both become `store → @arr`. So does a store 4096 bytes past a 4-byte global, and one
+> 100,000 bytes past a 400-byte array via `inttoptr (add (ptrtoint @g), N)` — all arrive
+> anchored at **offset 0**, with no GEP, no cast and no marker. Five losses, each verified:
+> `AirGlobal.value_type` is never set by the LLVM frontend (so a global has **no size**);
+> aggregate types are never interned; `Operation::Gep` carries no element type; constant
+> pointer expressions collapse to the base `ValueId` (`extract_at_name` takes the *first*
+> `@` in the printed text); and **AIR silently deletes instructions it cannot model**, with
+> only a `tracing::warn!` — so "no dereference appears in the AIR" is not evidence that
+> none occurs.
+>
+> Four **additive** frontend signals fixed it, none changing any existing consumer:
+> `AirGlobal.value_type`, `IngestFidelity::{collapsed_const_ptr_expr, dropped_instruction}`
+> on `AirBundle`, and `ALLOCA_EXACT_SIZE_KEY`. See the RESULTS file §0.
 
 ## ⚠️ CORRECTION 2 — "without mem2reg the -O0 pointer spill defeats anchoring outright"
 
@@ -250,9 +340,26 @@ for the whole program, so restricting the base kind removes the question entirel
 
 This is a **tightening of obligation 1** — from "proves only heap-free programs" to
 "heap-free AND stack-anchor-free" — not a new ad-hoc gate, which is why it does not trip
-KILL(b). §1's `ObjBase` should drop the `Stack(ValueId)` variant in the first increment.
-Verified: all 5 `memsafety-ext3/scopes*` expected-FALSE tasks are rejected under
-production `mem2reg` + GLOBALS_ONLY.
+KILL(b). ~~§1's `ObjBase` should drop the `Stack(ValueId)` variant in the first
+increment.~~ Verified: all 5 `memsafety-ext3/scopes*` expected-FALSE tasks are rejected
+under production `mem2reg` + GLOBALS_ONLY.
+
+> ### ⚠️ CORRECTED 2026-09-16 — do NOT drop `ObjBase::Stack`
+>
+> The *reasoning* above is right and the *instruction* is too strong. Implemented as
+> "reject any reachable `alloca`", it cost **378 of the 408 provable tasks** for zero
+> soundness gain — yield collapsed to 13 tasks in 1 cluster.
+>
+> The distinction the prototype's flag elides: a stack slot must not **derive** an anchor,
+> but it may **be** one. The use-after-scope hazard (`{ int y; p = &y; } *p = 1;`) requires
+> the address to escape its block through a pointer variable — a store then a load — and
+> **a load result never anchors**, so the dereference is rejected before scope is ever in
+> question. A *direct* access to a slot's own `ValueId` can only appear inside the function
+> whose activation owns the frame, where the object is live.
+>
+> Keeping `Stack` does need an exact size, and `Operation::Alloca { size_bytes }` cannot
+> supply one — it reports 8 bytes for every float and pointer, over-stating a 1-byte local.
+> Hence the fourth frontend signal, `ALLOCA_EXACT_SIZE_KEY`. Yield: 13/1 → **408/11**.
 
 ## Re-cut the estimate: +6..11, not +8..16
 
