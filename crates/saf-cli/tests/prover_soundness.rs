@@ -206,6 +206,5 @@ fn does_not_prove_no_overflow_on_frozen_dispatch_phi() {
 #[test]
 #[ignore]
 fn still_proves_no_overflow_after_the_sccp_revisit_fix() {
-    prove_no_overflow("overflow_true_safe.c", "ILP32")
-        .stdout(predicate::str::starts_with("PROVE"));
+    prove_no_overflow("overflow_true_safe.c", "ILP32").stdout(predicate::str::starts_with("PROVE"));
 }
