@@ -172,3 +172,40 @@ fn does_not_prove_unreachable_under_wrapped_add() {
     prove_unreachable("unreach_false_wrapped_add.c")
         .stdout(predicate::str::starts_with("PROVE").not());
 }
+
+// ---------------------------------------------------------------------------
+// M4 — SCCP must re-visit a block's phis when a NEW EDGE reaches it
+// ---------------------------------------------------------------------------
+
+/// The last of the seven Movement-1 mechanisms, and the only one that stayed
+/// open long enough to reach production as a live wrong TRUE.
+///
+/// `mark_edge_executable` scheduled a block only when the BLOCK became newly
+/// executable, never when a new EDGE arrived at one already executable. A `Phi`
+/// meets over the edges executable *when it is evaluated*, so the join phi
+/// carrying `s` froze at the value it had before the deepest dispatch arm's edge
+/// existed. SCCP published that frozen singleton, the interval solver adopted it
+/// via `constant_map`, and the sentinel proved an `INT_MAX * 2` it never saw.
+///
+/// RED before the fix: this printed `PROVE`, and `saf verify --property
+/// no-overflow` printed `true`, on a program that overflows. −32 points, uncapped.
+#[test]
+#[ignore]
+fn does_not_prove_no_overflow_on_frozen_dispatch_phi() {
+    prove_no_overflow("overflow_false_dispatch_chain.c", "ILP32")
+        .stdout(predicate::str::starts_with("PROVE").not());
+}
+
+/// GUARD: re-visiting phis makes them less constant, which could have paid for
+/// M4 with the whole `no-overflow` TRUE arm — 33 of SAF's 142 dedup-weighted
+/// points. A fix that closed M4 by making everything abstain would be a bad trade
+/// dressed as a soundness win, so pin a program that must keep PROVEing.
+///
+/// Measured A/B over 200 stride-sampled expected-TRUE `no-overflow` tasks:
+/// PROVE 8 → 8, the only delta being one task moving between two abstain reasons.
+#[test]
+#[ignore]
+fn still_proves_no_overflow_after_the_sccp_revisit_fix() {
+    prove_no_overflow("overflow_true_safe.c", "ILP32")
+        .stdout(predicate::str::starts_with("PROVE"));
+}

@@ -356,8 +356,24 @@ fn update_value(
     }
 }
 
-/// Mark a CFG edge executable. If the target block is newly reached, add it
-/// to the CFG worklist.
+/// Mark a CFG edge executable and schedule the target for (re-)evaluation.
+///
+/// Scheduling on a newly-executable BLOCK is not enough: a `Phi` meets only over
+/// the incoming edges that are executable *at the moment it is evaluated*
+/// (see the `Operation::Phi` arm), so when a NEW EDGE reaches a block that was
+/// already executable, that block's phis were computed over a strictly smaller
+/// edge set and are now stale. Wegman-Zadeck requires re-visiting them; dropping
+/// that obligation freezes a phi at whatever it meant on its first evaluation.
+///
+/// This was mechanism "M4" (`plans/213-movement1-RESULTS.md`), and it reached
+/// production as a **wrong TRUE**. A dispatch chain
+/// `s=8466 -> 8496 -> 8512 -> INT_MAX` froze its join phi at the value it had
+/// before the deepest arm's edge became executable, SCCP published that frozen
+/// singleton, the interval solver adopted it through `constant_map`, and
+/// `saf verify --property no-overflow` answered `true` on a program that
+/// overflows. The literal incoming values never wake the SSA worklist either —
+/// module literals are seeded once and never re-pushed — so the edge set is the
+/// only thing that can trigger the re-visit.
 fn mark_edge_executable(
     from: BlockId,
     to: BlockId,
@@ -365,9 +381,11 @@ fn mark_edge_executable(
     blocks: &mut BTreeSet<BlockId>,
     worklist: &mut VecDeque<BlockId>,
 ) {
-    edges.insert((from, to));
-    if blocks.insert(to) {
-        // Block was not previously executable — schedule it.
+    let edge_is_new = edges.insert((from, to));
+    let block_is_new = blocks.insert(to);
+    // Either condition obliges a visit: a new block has never been evaluated, and
+    // a new edge invalidates the phis of one that has.
+    if block_is_new || edge_is_new {
         worklist.push_back(to);
     }
 }
