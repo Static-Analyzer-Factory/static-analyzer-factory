@@ -1362,6 +1362,68 @@ impl AirModule {
 // Bundle
 // =============================================================================
 
+/// What ingestion could **not** faithfully represent.
+///
+/// A sound TRUE prover reasons "no violation appears in the AIR". That is only
+/// evidence of "no violation exists" when the AIR is a faithful picture of the
+/// program — so the two known ways a frontend loses information *in a direction
+/// that can hide a violation* have to be visible, not silent. Both flags are
+/// therefore **sticky and module-wide**: once set, a prover must abstain.
+///
+/// Neither flag is an error. Every consumer that does not reason about addresses
+/// can, and does, ignore them; they exist so that the ones which do can fail
+/// closed instead of reading a lossy AIR as a clean one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestFidelity {
+    /// A constant pointer **expression** was resolved to a base global's
+    /// `ValueId`, discarding the offset it applied.
+    ///
+    /// `getelementptr inbounds ([100 x i32], ptr @g, i64 0, i64 500)` and a bare
+    /// `ptr @g` become the *same* `ValueId`, because `FieldPath` carries type
+    /// descent steps and has no way to express "N bytes past the object". The
+    /// same collapse happens for `inttoptr`/`ptrtoint`/`bitcast` constant
+    /// expressions. An address-reasoning prover that did not know this would read
+    /// an out-of-bounds store as an in-bounds one at offset 0 — a wrong TRUE.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapsed_const_ptr_expr: bool,
+
+    /// An instruction was **dropped** because the frontend could not model it,
+    /// and dropping it may have discarded a memory effect.
+    ///
+    /// Covers the unsupported-opcode catch-all (`va_arg`, `landingpad`, `callbr`,
+    /// …) and the lossy `Skip` intrinsics (`llvm.va_start`/`va_copy`, which write
+    /// through a caller-supplied `va_list`, and the open-ended
+    /// `llvm.experimental.*` family). Pure-metadata skips — `llvm.dbg.*`,
+    /// `llvm.lifetime.*`, `llvm.assume` — do **not** set this: they discard
+    /// nothing a memory-safety argument depends on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dropped_instruction: bool,
+}
+
+impl IngestFidelity {
+    /// Is this AIR a faithful enough picture to support an address-level proof?
+    ///
+    /// Takes `&self` so it can also serve as serde's `skip_serializing_if` — a
+    /// faithful ingestion then serializes to exactly the bytes it did before this
+    /// field existed, leaving every snapshot and external consumer untouched.
+    #[must_use]
+    pub const fn is_faithful(&self) -> bool {
+        !self.collapsed_const_ptr_expr && !self.dropped_instruction
+    }
+}
+
+/// `Instruction::extensions` key holding an alloca's **exact** object size in
+/// bytes, as a JSON unsigned integer.
+///
+/// Distinct from `Operation::Alloca { size_bytes }` on purpose. That field is a
+/// best-effort hint and is allowed to be wrong: the LLVM frontend reports 8 bytes
+/// for every float and every pointer, which over-states a 4-byte `float`, a
+/// 2-byte `half`, and every pointer slot on an `ILP32` target. This key is
+/// present ONLY when the size is exact, so a consumer deciding whether an access
+/// fits inside an object can fail closed on its absence. An over-stated object
+/// size makes a bounds check pass when it should fail.
+pub const ALLOCA_EXACT_SIZE_KEY: &str = "llvm.alloca_exact_size";
+
 /// The bundle produced by a frontend's `ingest()` call.
 ///
 /// Contains the full AIR module plus metadata needed for caching and
@@ -1376,19 +1438,43 @@ pub struct AirBundle {
 
     /// The AIR module.
     pub module: AirModule,
+
+    /// What this ingestion could not faithfully represent. Provenance, like
+    /// `frontend_id` — it describes the *conversion*, not the program, which is
+    /// why it lives on the bundle rather than on [`AirModule`].
+    #[serde(default, skip_serializing_if = "IngestFidelity::is_faithful")]
+    pub fidelity: IngestFidelity,
 }
 
 impl AirBundle {
     /// Current schema version.
     pub const SCHEMA_VERSION: &'static str = "0.1.0";
 
-    /// Create a new bundle.
+    /// Create a new bundle, asserting a fully faithful ingestion.
+    ///
+    /// Frontends that can lose information must use [`AirBundle::with_fidelity`];
+    /// defaulting to "faithful" is safe here only because a frontend that never
+    /// sets the flags is one that never drops or collapses anything.
     #[must_use]
     pub fn new(frontend_id: impl Into<String>, module: AirModule) -> Self {
         Self {
             frontend_id: frontend_id.into(),
             schema_version: Self::SCHEMA_VERSION.to_string(),
             module,
+            fidelity: IngestFidelity::default(),
+        }
+    }
+
+    /// Create a new bundle recording what the conversion could not represent.
+    #[must_use]
+    pub fn with_fidelity(
+        frontend_id: impl Into<String>,
+        module: AirModule,
+        fidelity: IngestFidelity,
+    ) -> Self {
+        Self {
+            fidelity,
+            ..Self::new(frontend_id, module)
         }
     }
 }

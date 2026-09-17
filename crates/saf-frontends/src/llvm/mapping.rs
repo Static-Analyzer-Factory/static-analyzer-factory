@@ -103,6 +103,9 @@ pub(crate) struct MappingContext<'ctx> {
     /// fan-outs without field-sensitive stack/heap analysis makes large
     /// fp-table programs (tmux, bash) several times slower.
     pub decompose_pointer_arrays: bool,
+    /// What this conversion could not faithfully represent. Accumulated as the
+    /// module is walked and handed to [`saf_core::air::AirBundle::with_fidelity`].
+    pub fidelity: saf_core::air::IngestFidelity,
     /// Phantom data for the context lifetime.
     _phantom: std::marker::PhantomData<&'ctx ()>,
 }
@@ -129,6 +132,7 @@ impl MappingContext<'_> {
             seq_counter: 0,
             const_cache: FxHashMap::default(),
             decompose_pointer_arrays: std::env::var("SAF_DECOMPOSE_POINTER_ARRAYS").is_ok(),
+            fidelity: saf_core::air::IngestFidelity::default(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -332,6 +336,26 @@ impl MappingContext<'_> {
         // ConstantAggregate, etc.) — fall back to the text-based path. Common
         // named-global and scalar-int cases were already handled above.
         let repr = value.print_to_string().to_string();
+
+        // FIDELITY. Everything reaching here is an UNNAMED constant — a bare
+        // `@g` reference has a name and already returned via TYPED FAST PATH 1.
+        // So if this text still mentions a global, it is a constant EXPRESSION
+        // over one, and every path below resolves it to that global's BASE
+        // `ValueId`: `decompose_constant_gep` drops the pointer-level index it
+        // cannot express as a `FieldPath` step, and when it declines (a
+        // non-aggregate initializer, a single-index GEP, an unparseable index)
+        // `extract_global_name_from_repr` simply returns the base. The offset is
+        // gone either way, so `&g[500]` and `&g[0]` become indistinguishable —
+        // and `inttoptr (add (ptrtoint @g), N)` collapses the same way, since
+        // `extract_at_name` takes the first `@` in the text.
+        //
+        // That is correct for the alias analysis this path was built for, but an
+        // address-level prover must not read the collapse as "offset 0". Record
+        // it. Deliberately coarse: one flag for the whole module, set on any such
+        // expression whether or not it was decomposed.
+        if repr.contains('@') {
+            self.fidelity.collapsed_const_ptr_expr = true;
+        }
 
         // Decompose constant-expression GEPs into globals with aggregate initializers.
         // A constant GEP like `ptr getelementptr inbounds ([2 x i32], ptr @a, i64 0, i64 1)`
@@ -614,7 +638,7 @@ pub fn convert_module(
     air_module.target_pointer_width = 8;
     air_module.rebuild_function_index();
 
-    Ok(AirBundle::new("llvm", air_module))
+    Ok(AirBundle::with_fidelity("llvm", air_module, ctx.fidelity))
 }
 
 /// Convert an LLVM global to an AIR global.
@@ -633,6 +657,19 @@ fn convert_global(global: GlobalValue<'_>, ctx: &mut MappingContext<'_>) -> Opti
 
     let mut air_global = AirGlobal::new(value_id, obj_id, name);
     air_global.is_constant = global.is_constant();
+
+    // The global's POINTEE type — `@g = global [100 x i32]` interns `[100 x i32]`,
+    // not `ptr`. This is the only record anywhere in AIR of how large a global
+    // object is: `AirGlobal` carries no size, and a `zeroinitializer` initializer
+    // carries none either. Without it a prover cannot check an access width
+    // against the object it lands in.
+    //
+    // Types the interner cannot size exactly come back `Opaque` (notably a named
+    // struct, which LLVM prints as a bare `%struct.S` with no body), and
+    // `layout::alloc_size` then returns `None` — abstain, which is the safe
+    // direction.
+    let ty_str = global.get_value_type().print_to_string().to_string();
+    air_global.value_type = Some(ctx.type_interner.parse_llvm_type_string(&ty_str));
 
     // Try to convert initializer.
     // Decompose array initializers whenever the element type is or contains a
@@ -1221,6 +1258,11 @@ fn convert_instruction(
         // Catch-all for unsupported instructions
         _ => {
             tracing::warn!("Unsupported LLVM instruction: {:?}", opcode);
+            // FIDELITY: the instruction vanishes from the AIR. `va_arg` reads
+            // through the va_list, `landingpad`/`resume`/`callbr` redirect
+            // control flow — an analysis that enumerates AIR instructions has no
+            // way to know anything was here. See `IngestFidelity`.
+            ctx.fidelity.dropped_instruction = true;
             return Ok(None);
         }
     };
@@ -1274,6 +1316,26 @@ fn convert_instruction(
         air_inst
             .extensions
             .insert("llvm.nsw".to_string(), serde_json::Value::Bool(true));
+    }
+
+    // An alloca's object size, recorded ONLY when it is exact.
+    //
+    // `Operation::Alloca { size_bytes }` is not usable by anything that must fail
+    // closed: `type_size_bytes_typed` returns 8 for every float and every pointer,
+    // so `alloca float` reports 8 bytes for a 4-byte object and every pointer
+    // alloca is doubled on an `ILP32` target. Those are OVER-estimates, and an
+    // over-estimated object size makes a bounds check pass when it should fail.
+    //
+    // Rather than change `size_bytes` — which existing consumers read as a
+    // best-effort hint — this records a second, stricter value under its own key.
+    // Absent means "no exact size available", which a prover must read as abstain.
+    if matches!(air_inst.op, Operation::Alloca { .. }) {
+        if let Some(n) = exact_alloca_size_bytes(inst) {
+            air_inst.extensions.insert(
+                saf_core::air::ALLOCA_EXACT_SIZE_KEY.to_string(),
+                serde_json::Value::from(n),
+            );
+        }
     }
 
     // Extract debug info
@@ -1345,7 +1407,14 @@ fn convert_intrinsic_call(
     ctx: &mut MappingContext<'_>,
 ) -> Result<Option<Instruction>, LlvmError> {
     match classify_intrinsic(intrinsic_name) {
-        IntrinsicMapping::Skip => Ok(None),
+        IntrinsicMapping::Skip => {
+            // FIDELITY: most skips are pure metadata and lose nothing, but a few
+            // write through a caller-supplied pointer. See `skip_is_lossy`.
+            if super::intrinsics::skip_is_lossy(intrinsic_name) {
+                ctx.fidelity.dropped_instruction = true;
+            }
+            Ok(None)
+        }
 
         IntrinsicMapping::MapTo(intrinsic_op) => {
             let operands = collect_operands(inst, ctx);
@@ -2000,6 +2069,55 @@ fn extract_alloca_size_bytes(inst: InstructionValue<'_>) -> Option<u64> {
         1
     };
     Some(elem_size * count)
+}
+
+/// An alloca's object size in bytes, or `None` when it cannot be computed
+/// **exactly**.
+///
+/// The contract is the opposite of [`extract_alloca_size_bytes`]'s: that one is a
+/// best-effort hint and is allowed to be wrong, this one must never over-report.
+/// A consumer deciding whether an access fits inside the object needs the latter,
+/// because an over-estimate turns an out-of-bounds access into an in-bounds one.
+fn exact_alloca_size_bytes(inst: InstructionValue<'_>) -> Option<u64> {
+    let elem_ty = inst.get_allocated_type().ok()?;
+    let elem_size = exact_type_size_bytes(&elem_ty)?;
+    let count: u64 = if inst.get_num_operands() > 0 {
+        match inst.get_operand(0).and_then(operand_as_value) {
+            Some(BasicValueEnum::IntValue(iv)) if iv.is_const() => {
+                iv.get_zero_extended_constant()?
+            }
+            // A variable-length alloca has no static size at all.
+            Some(BasicValueEnum::IntValue(_)) => return None,
+            _ => 1,
+        }
+    } else {
+        1
+    };
+    elem_size.checked_mul(count)
+}
+
+/// The byte size of an inkwell type when it is exact, else `None`.
+///
+/// Deliberately narrow. Excluded, each for a stated reason:
+/// * `FloatType` — inkwell exposes no bit width, and the existing fallback of 8
+///   over-reports `half` (2) and `float` (4);
+/// * `PointerType` — target-dependent, and SV-COMP's `ILP32` tasks really do have
+///   4-byte pointers while the AIR's `target_pointer_width` is hardcoded to 8;
+/// * `StructType` — the true size needs field alignment and tail padding, which
+///   need a `TargetData` this conversion does not hold;
+/// * `VectorType` / scalable vectors — alignment-dependent.
+///
+/// Widening this set is a soundness change for every consumer, not a tuning knob.
+fn exact_type_size_bytes(ty: &inkwell::types::BasicTypeEnum<'_>) -> Option<u64> {
+    use inkwell::types::BasicTypeEnum as B;
+    match ty {
+        B::IntType(it) => Some(u64::from(it.get_bit_width()).div_ceil(8)),
+        B::ArrayType(at) => {
+            let elem = exact_type_size_bytes(&at.get_element_type())?;
+            elem.checked_mul(u64::from(at.len()))
+        }
+        _ => None,
+    }
 }
 
 /// Compute the byte size of an inkwell type. Returns None for types we cannot

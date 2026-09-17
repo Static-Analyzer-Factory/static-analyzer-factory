@@ -63,6 +63,12 @@ impl Frontend for AirJsonFrontend {
             frontend_id: self.frontend_id().to_string(),
             schema_version: json_bundle.schema_version,
             module,
+            // AIR-JSON is a faithful round-trip of an already-converted module:
+            // it neither collapses constant pointer expressions nor drops
+            // instructions, so there is nothing of its own to report. Any loss
+            // happened in whichever frontend produced the JSON, and is not
+            // recoverable from it.
+            fidelity: saf_core::air::IngestFidelity::default(),
         })
     }
 

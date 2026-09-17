@@ -41,6 +41,31 @@ impl IntrinsicOp {
     }
 }
 
+/// Does skipping `name` discard a possible **memory effect**?
+///
+/// Most [`IntrinsicMapping::Skip`] entries are pure metadata — `llvm.dbg.*`,
+/// `llvm.lifetime.*`, `llvm.assume`, `llvm.annotation.*` — and dropping them loses
+/// nothing a memory-safety argument rests on. These are different: they write
+/// through a caller-supplied pointer, or belong to an open-ended family whose
+/// members have not been enumerated. A prover that concludes "the AIR contains no
+/// dereference here" must be told when one was silently removed.
+///
+/// Erring towards `true` costs only recall, so anything unenumerated belongs here.
+#[must_use]
+pub fn skip_is_lossy(name: &str) -> bool {
+    // `va_start`/`va_copy` initialise a `va_list` by writing through the pointer
+    // argument; `va_end` does not write and is genuinely inert.
+    name == "llvm.va_start"
+        || name == "llvm.va_copy"
+        // An open-ended family: members are added upstream without review here,
+        // and several (`llvm.experimental.gc.*`, the vector-predication set) do
+        // touch memory.
+        || name.starts_with("llvm.experimental.")
+        // Rewinds the stack pointer, which can end the lifetime of objects a
+        // later access still names.
+        || name.starts_with("llvm.stackrestore")
+}
+
 /// Classify an LLVM intrinsic by name.
 ///
 /// Uses pattern-based matching on intrinsic name prefixes.
