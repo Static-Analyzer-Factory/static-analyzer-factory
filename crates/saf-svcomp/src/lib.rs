@@ -23,6 +23,7 @@ pub mod correctness_driver;
 pub mod correctness_witness;
 pub mod fast_paths;
 pub mod fuzz;
+pub mod memsafe;
 pub mod memsafety;
 pub mod nondet;
 pub mod overflow;

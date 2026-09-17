@@ -41,6 +41,7 @@ fn main() -> anyhow::Result<()> {
         Commands::EmitCorrectnessWitness(args) => commands::emit_correctness_witness(&args),
         Commands::ProveNoOverflow(args) => commands::prove_no_overflow_cmd(&args),
         Commands::ProveUnreachable(args) => commands::prove_unreachable_cmd(&args),
+        Commands::MemsafeProve(args) => commands::memsafe_prove_cmd(&args),
         Commands::Query(args) => commands::query(&args),
         Commands::Export(args) => commands::export(&args),
         Commands::Schema(args) => commands::schema(&args),

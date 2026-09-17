@@ -366,6 +366,10 @@ pub enum Commands {
     /// interval fixpoint; print `PROVE` or `ABSTAIN:<reason>`. Emits NO verdict
     /// and is NOT wired into `verify` (rank-3 measurement only).
     ProveUnreachable(ProveUnreachableArgs),
+    /// [dev/spike] Run the sound Anchored-Object `valid-memsafety` prover; print
+    /// `PROVE` or `ABSTAIN:<reason>`. Emits NO verdict and is NOT wired into
+    /// `verify` (`plans/214` Movement 2 measurement only).
+    MemsafeProve(MemsafeProveArgs),
     /// Query analysis results.
     Query(QueryArgs),
     /// Export graphs or findings.
@@ -465,6 +469,18 @@ pub struct ProveNoOverflowArgs {
 /// `ABSTAIN:<reason>`; emits no verdict and never touches the `verify` path.
 #[derive(Args)]
 pub struct ProveUnreachableArgs {
+    /// The C program (`.c` or preprocessed `.i`).
+    #[arg(required = true)]
+    pub input: PathBuf,
+
+    /// Data model; selects clang `-m32`/`-m64` and the LLVM target.
+    #[arg(long, value_enum, default_value_t = CliDataModel::Ilp32)]
+    pub data_model: CliDataModel,
+}
+
+/// Arguments for `saf memsafe-prove` (dev/spike, `plans/214` Movement 2).
+#[derive(Args)]
+pub struct MemsafeProveArgs {
     /// The C program (`.c` or preprocessed `.i`).
     #[arg(required = true)]
     pub input: PathBuf,
@@ -1062,6 +1078,38 @@ pub fn prove_unreachable_cmd(args: &ProveUnreachableArgs) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// `saf memsafe-prove` (dev/spike, `plans/214` Movement 2): compile → ingest →
+/// run the Anchored-Object `valid-memsafety` prover. Prints exactly one line:
+/// `PROVE` or `ABSTAIN:<reason>`. Emits NO verdict; `strategy_for` / `verify` /
+/// the witness write-gate are untouched.
+///
+/// Unlike the two interval sentinels above there is **no** OpenMP or thread
+/// pre-gate here: the Anchored-Object obligations are syntactic properties of the
+/// SSA pointer graph and static layout, so no interleaving can invalidate one, and
+/// the concurrent population is the whole point of the movement. Thread *bodies*
+/// are brought into the universe by the prover itself.
+///
+/// # Errors
+/// Returns `Err` if the stub header is missing, or compilation / ingestion fails.
+pub fn memsafe_prove_cmd(args: &MemsafeProveArgs) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let data_model: saf_svcomp::DataModel = args.data_model.into();
+    let stub = resolve_svcomp_stub()
+        .context("bundled SV-COMP stub header (share/saf/stubs/sv-comp-stubs.h) not found")?;
+    let dir = tempfile::tempdir().context("create tempdir")?;
+    let ir =
+        compile_to_ir(&args.input, data_model, &stub, dir.path()).context("compile to LLVM IR")?;
+    let bundle = driver::AnalysisDriver::ingest(&[ir], CliFrontend::Llvm).context("ingest IR")?;
+
+    // `bundle.fidelity` — not a default — is what makes the proof honest about
+    // what ingestion could not represent. See `saf_core::air::IngestFidelity`.
+    match saf_svcomp::memsafe::prove_memsafe(&bundle.module, bundle.fidelity) {
+        saf_svcomp::memsafe::MemSafeProof::Proven => println!("PROVE"),
+        saf_svcomp::memsafe::MemSafeProof::Abstain(reason) => println!("ABSTAIN:{reason}"),
+    }
+    Ok(())
+}
+
 /// Clang / opt binaries matching the LLVM this binary links against, overridable
 /// via `$SAF_CLANG` / `$SAF_OPT`.
 #[cfg(feature = "llvm-22")]
@@ -1340,6 +1388,14 @@ struct VerifyCtx<'a> {
     input: &'a Path,
     data_model: saf_svcomp::DataModel,
     module: &'a saf_core::air::AirModule,
+    /// What the ingestion that produced `module` could NOT faithfully represent.
+    ///
+    /// Carried alongside the module rather than derived from it, because neither
+    /// loss it records is visible in the instruction stream: a collapsed constant
+    /// pointer expression looks like an ordinary base-address reference, and a
+    /// dropped instruction looks like nothing at all. A TRUE prover reasoning
+    /// "no violation appears in the AIR" must be able to ask.
+    fidelity: saf_core::air::IngestFidelity,
     meta: &'a saf_svcomp::WitnessMeta,
     stub: &'a Path,
     tempdir: &'a Path,
@@ -1441,6 +1497,7 @@ fn run_verdict(
         input,
         data_model,
         module: &bundle.module,
+        fidelity: bundle.fidelity,
         meta: &meta,
         stub: &stub,
         tempdir: dir.path(),
@@ -3964,12 +4021,45 @@ fn memsafety_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
                 correctness: None,
             }
         }
-        Ok(None) => {
-            eprintln!("saf verify: ASan replay reproduced no memsafety violation -> unknown");
-            unknown_outcome()
-        }
+        // No violation reproduced, or the replay itself failed. Only NOW try to
+        // prove the property. Ordering the TRUE arm AFTER the FALSE confirmer is
+        // deliberate: the two are disjoint by construction (obligation 1 rejects
+        // every allocator, and every ASan-confirmable class needs either an
+        // allocation or an address the Anchored-Object obligations refuse to
+        // anchor), but that is an argument, not a mechanism. Running the
+        // confirmer first means a reproduced violation always wins, so the
+        // argument being wrong costs recall rather than a -32 wrong TRUE.
+        Ok(None) => memsafety_true_or_unknown(
+            ctx,
+            "saf verify: ASan replay reproduced no memsafety violation",
+        ),
         Err(e) => {
-            eprintln!("saf verify: ASan replay errored: {e:#} -> unknown");
+            memsafety_true_or_unknown(ctx, &format!("saf verify: ASan replay errored: {e:#}"))
+        }
+    }
+}
+
+/// The `valid-memsafety` TRUE arm (`plans/214` Movement 2): the Anchored-Object
+/// prover, or `unknown`.
+///
+/// Emits **no witness**. `C.valid-memsafety.*` is "not supported" in the 2027
+/// correctness-witness column for every base category — Concurrency included, which
+/// is unique among the five properties — so the verdict scores on its own and there
+/// is no validator to satisfy. Same shape as [`race_true_outcome`], and unlike
+/// `termination_strategy`, which does need a 2.1+ correctness witness.
+fn memsafety_true_or_unknown(ctx: &VerifyCtx, why_no_false: &str) -> VerdictOutcome {
+    match saf_svcomp::memsafe::prove_memsafe(ctx.module, ctx.fidelity) {
+        saf_svcomp::memsafe::MemSafeProof::Proven => {
+            eprintln!("{why_no_false}; Anchored-Object proof succeeded -> true");
+            VerdictOutcome {
+                verdict: saf_svcomp::memsafe::memsafe_verdict().to_string(),
+                witness: None,
+                graphml: None,
+                correctness: None,
+            }
+        }
+        saf_svcomp::memsafe::MemSafeProof::Abstain(reason) => {
+            eprintln!("{why_no_false}; Anchored-Object abstained ({reason}) -> unknown");
             unknown_outcome()
         }
     }
@@ -7367,6 +7457,9 @@ mod verify_tests {
             input: &src,
             data_model: DataModel::LP64,
             module: &module,
+            // These tests build a module by hand rather than by ingestion, so
+            // nothing was collapsed or dropped: the default IS the truth here.
+            fidelity: saf_core::air::IngestFidelity::default(),
             meta: &meta,
             stub: Path::new("/dev/null"),
             tempdir: dir.path(),
@@ -7454,6 +7547,9 @@ mod verify_tests {
             input: &src,
             data_model: DataModel::LP64,
             module: &module,
+            // These tests build a module by hand rather than by ingestion, so
+            // nothing was collapsed or dropped: the default IS the truth here.
+            fidelity: saf_core::air::IngestFidelity::default(),
             meta: &meta,
             stub: Path::new("/dev/null"),
             tempdir: dir.path(),
@@ -7508,6 +7604,9 @@ mod verify_tests {
             input: &src,
             data_model: DataModel::LP64,
             module: &module,
+            // These tests build a module by hand rather than by ingestion, so
+            // nothing was collapsed or dropped: the default IS the truth here.
+            fidelity: saf_core::air::IngestFidelity::default(),
             meta: &meta,
             stub: Path::new("/dev/null"),
             tempdir: dir.path(),
