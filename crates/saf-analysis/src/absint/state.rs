@@ -133,6 +133,17 @@ impl AbstractState {
 
     /// Store an interval to a memory location.
     ///
+    /// Forget any interval recorded for `value`, restoring it to the implicit
+    /// ⊤ that an absent key denotes (see the type-level docs).
+    ///
+    /// Distinct from `set(value, top)`: [`AbstractState::leq`] compares only keys
+    /// present in BOTH states, so an absent key is skipped while an explicit ⊤ is
+    /// compared and fails against any concrete interval. A caller that wants a
+    /// value excluded from comparison needs this, not the former.
+    pub fn remove_value(&mut self, value: ValueId) {
+        self.values.remove(&value);
+    }
+
     /// Records that the memory pointed to by `ptr` contains `interval`.
     pub fn store(&mut self, ptr: ValueId, interval: Interval) {
         if !self.unreachable {

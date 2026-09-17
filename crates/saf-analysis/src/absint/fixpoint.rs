@@ -287,6 +287,33 @@ pub fn solve_abstract_interp_with_context(
         if !func_diag.converged {
             diagnostics.converged = false;
         }
+        // DELIBERATELY NOT AGGREGATED — `func_diag.fixpoint_verified` is dropped
+        // here, so the module-level flag keeps its `Default` value of `true` and
+        // both consumers (`checker.rs`'s `ABSTAIN:fixpoint-unverified` on the
+        // `no-overflow` TRUE path, `property.rs`'s on `unreach-call`) are dead
+        // branches. That was an ACCIDENT when plan 213 §8 shipped the check — its
+        // reported "fires on no task in the 55,690-task population" measured
+        // nothing, because it could not fire on any program. It is now a DECISION,
+        // measured 2026-09-17:
+        //
+        //   connecting it costs -1 weighted and 27 correct TRUE verdicts
+        //   (`true_emitted` 188 -> 161) across 8 clusters — float-benchs 7,
+        //   loop-lit 5, loop-simple 5, seq-mthreaded 5, ... — over the full
+        //   9,063-task `no-overflow` gate, at `false_alarms`/`wrong_true` = 0 on
+        //   both sides. Pure recall loss, no soundness gain.
+        //
+        // And it does not buy what it was written for. Verified by reverting the
+        // SCCP phi-revisit fix and re-running: the check does NOT catch mechanism
+        // M4 — n=4 still PROVEs. §8 predicted exactly that ("a post-fixpoint check
+        // cannot detect a SELF-CONSISTENT under-approximation"), and M4 is one.
+        //
+        // Before connecting it, three false positives were found and fixed in the
+        // check below (see its comments): it compared the branch condition's own
+        // `i1`, skipped `propagate_loc_memory_for_edge`, and compared unnormalised
+        // interval bounds. Those took it from firing on 177 of 200 expected-TRUE
+        // tasks to 48. Anyone finishing this should start by diagnosing those
+        // remaining 48 — the flag is one line away from live, and the line is
+        // deliberately absent.
     }
 
     diagnostics.narrowing_iterations_performed = config.narrowing_iterations;
@@ -773,13 +800,75 @@ fn solve_function_impl(
         let verify_term = block.terminator();
         if let Some(succs) = cfg.successors_of(block.id) {
             for succ_id in succs {
-                let propagated = refine_for_successor(
+                let mut propagated = refine_for_successor(
                     verify_term,
                     *succ_id,
                     &current_state,
                     &cond_inst_map,
                     constant_map,
                 );
+                // Replay the solver's `loc_memory` propagation too. The
+                // propagation loop does `refine_for_successor` and THEN
+                // `propagate_loc_memory_for_edge` before storing a successor's
+                // entry state; a check that performs only the first compares a
+                // state the solver never built. `leq` covers `loc_memory`, so the
+                // omission fired on every program whose branch refinements reach a
+                // stack slot — the `-O0` alloca pattern, i.e. most of them.
+                if let Some(pta) = ctx.pta {
+                    propagate_loc_memory_for_edge(
+                        &mut propagated,
+                        block,
+                        block.id,
+                        *succ_id,
+                        &current_state,
+                        pta,
+                        func,
+                        &blocks_with_loads,
+                    );
+                }
+
+                // Do not hold the solver to the BRANCH CONDITION's own `i1`.
+                //
+                // `refine_for_successor` refines the operands a condition
+                // constrains; it deliberately leaves the condition VALUE alone.
+                // The stored successor entry states do carry a value for it — and
+                // carry the SAME one on both the then- and else-edge, so it is not
+                // an edge refinement at all — which means comparing it pits the
+                // check against a value it does not model. That is the one thing
+                // the comment above says not to do, and it made the check fire on
+                // every non-constant `CondBr`, i.e. every loop: 177 of 200
+                // expected-TRUE `no-overflow` tasks, and
+                // `while (i < 10) { x = x + 1; i = i + 1; }`.
+                //
+                // Dropping it costs nothing this check is for. An
+                // under-approximation that matters is a DATA value escaping its
+                // computed range (M4's `s` was an `i32` reaching `INT_MAX`); a
+                // one-bit condition cannot carry one.
+                if let Some(term) = verify_term {
+                    if matches!(term.op, Operation::CondBr { .. }) {
+                        if let Some(cond) = term.operands.first() {
+                            propagated.remove_value(*cond);
+                        }
+                    }
+                }
+                // Normalise every propagated interval to its OWN bit width before
+                // comparing. The replay can produce bounds outside what the value's
+                // width can hold — `[0, i128::MAX]` tagged `i32` is common — while
+                // the solver's stored state has been through `join`/`widen` and is
+                // clamped. The two denote the SAME set of `i32` values, but `leq`
+                // compares raw bounds, so the unclamped one is not contained and the
+                // check reports a violation that does not exist.
+                //
+                // This was the dominant false positive: it fired on Juliet helpers
+                // like `printBytesLine` and `decodeHexChars` in almost every task.
+                for (k, v) in propagated.entries().clone() {
+                    let top = Interval::make_top(v.bits());
+                    let clamped =
+                        Interval::new(v.lo().max(top.lo()), v.hi().min(top.hi()), v.bits());
+                    if clamped != v {
+                        propagated.set(k, clamped);
+                    }
+                }
                 let target_state = block_entry_states
                     .get(succ_id)
                     .map_or_else(AbstractState::bottom, PartitionedState::merge_all);
