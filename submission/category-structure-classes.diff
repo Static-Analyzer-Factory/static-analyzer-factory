@@ -1,0 +1,87 @@
+Proposed edit to https://gitlab.com/sosy-lab/sv-comp/bench-defs
+File: benchmark-defs/category-structure.yml  (base: main @ 22caeaa, fetched 2026-10-09)
+
+Adds 'saf' to the verifiers of the six C classes and the three Overall rankings,
+so SAF runs every sub-category of those classes and receives class and Overall
+scores (a tool outside every class has no class or Overall entry). Abstaining
+(unknown) in a sub-category scores 0 and is never penalised. Supersedes the
+opt_in-only draft of 2026-09-13; with class membership no opt_in entry is needed.
+
+Apply with:  git apply submission/category-structure-classes.diff
+
+diff --git a/benchmark-defs/category-structure.yml b/benchmark-defs/category-structure.yml
+index f68429e..c4287f9 100644
+--- a/benchmark-defs/category-structure.yml
++++ b/benchmark-defs/category-structure.yml
+@@ -62,6 +62,7 @@ categories:
+       - pesco
+       - pinaka
+       - re3ver
++      - saf
+       - svf-svc
+       - symbiotic
+       - theta
+@@ -132,6 +133,7 @@ categories:
+       - nacpa
+       - pesco
+       - predatorhp
++      - saf
+       - sv-sanitizers
+       - svf-svc
+       - symbiotic
+@@ -195,6 +197,7 @@ categories:
+       - ogchecker
+       - pesco
+       - pichecker
++      - saf
+       - symbiotic
+       - theta
+       - thorn
+@@ -240,6 +243,7 @@ categories:
+       - nacpa
+       - pesco
+       - pinaka
++      - saf
+       - sv-sanitizers
+       - symbiotic
+       - theta
+@@ -306,6 +310,7 @@ categories:
+       - pesco
+       - pinaka
+       - proton
++      - saf
+       - symbiotic
+       - theta
+       - thorn
+@@ -378,6 +383,7 @@ categories:
+       - mopsa
+       - nacpa
+       - pesco
++      - saf
+       - svf-svc
+       - symbiotic
+       - theta
+@@ -495,6 +501,7 @@ categories:
+       - mopsa
+       - nacpa
+       - pesco
++      - saf
+       - symbiotic
+       - theta
+       - thorn
+@@ -560,6 +567,7 @@ categories:
+       - mopsa
+       - nacpa
+       - pesco
++      - saf
+       - symbiotic
+       - theta
+       - thorn
+@@ -606,6 +614,7 @@ categories:
+       - mopsa
+       - nacpa
+       - pesco
++      - saf
+       - symbiotic
+       - theta
+       - thorn

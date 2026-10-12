@@ -4,9 +4,9 @@
 
 | date | milestone | days left |
 |---|---|---:|
-| **2026-10-08** | tool **registration** — the merge requests must EXIST | **25** |
-| **2026-10-20** | tool **submission** — all CI checks must SUCCEED | **37** |
-| 2026-11-03 | verification tasks frozen | 51 |
+| **2026-10-12** | tool **registration** — the fm-tools MR for `data/saf.yml` must EXIST (date re-read from sv-comp.sosy-lab.org/2027 on 2026-10-07; earlier drafts said 10-08) | **3** |
+| **2026-10-20** | tool **submission** — all CI checks must SUCCEED | **13** |
+| 2026-11-03 | verification tasks frozen | 27 |
 
 **Score SAF would submit today: 123 dedup-weighted**, `false_alarms == 0`,
 `wrong_true == 0`. See §5 for the caveat on that number.
@@ -101,3 +101,71 @@ the one measurement this movement did not do.
 * The work on `movement5/submission` is **uncommitted**, per the standing "never auto-commit"
   rule. The archive is therefore built from a dirty tree and corresponds to no commit SHA.
 * Movement 4 (plans/216, +8 weighted, FALSE-side witness 2.2) is not started.
+
+## 7. Update 2026-10-09 (plan 219–222 session)
+
+* Archive rebuilt from the current binary (witness fixes + the unreach-call TRUE prover):
+  `dist/saf-verify.zip`, 24.0 MiB, sha256 `b9111e392483addcbc62cabb43beb255ed92faa60e8db5caa633af90f5e595bc`,
+  smoke test 4/4. `python -m benchexec.test_tool_info saf --tool-directory <unpacked>` passes
+  structurally (the host's missing `libffi.so.8` is covered by `libffi8` in `required_ubuntu_packages`).
+* Registration = the fm-tools MR for `data/saf.yml`, deadline **2026-10-12** (live page).
+* Class membership: use `submission/category-structure-classes.diff` (adds `saf` to the verifiers of
+  the six C classes and the three Overall rankings; verified to apply to bench-defs `main` @ `22caeaa`).
+  A tool in no class has no class or Overall score; abstaining in a sub-category costs nothing.
+* The exhaustive TRUE prover's wrong-TRUE audit: 0 PROVE on all 4,324 expected-FALSE tasks (first
+  engine); the merging engine's audit is at 2,944 / 4,324 with 0 PROVE at the time of writing
+  (`results/svcomp26/debug/final_sweep.log`). Publish the Zenodo record once it reads 4,324 / 0.
+
+## 8. 2026-10-09 — registration MR opened
+
+fm-tools **MR !1166**: https://gitlab.com/sosy-lab/benchmarking/fm-tools/-/merge_requests/1166
+(fork `leeewee/fm-tools`, branch `add-saf`). Remaining for a green pipeline by 2026-10-20: publish the
+Zenodo record for `10.5281/zenodo.23251564` (reserved, unpublished), merge the BenchExec tool-info PR.
+Then the bench-defs MR (`submission/category-structure-classes.diff`) and the jury e-mail.
+
+## 9. 2026-10-10 — TRUE provers landed (plan 222 §2f–§2i); archive must be regenerated
+
+- **Engine** (`crates/saf-svcomp/src/unreach_prove.rs`): flat guarded merging, lazy exhaustive pass, loop-header
+  fixpoint (explicit enumeration of concrete header states), simultaneous phi semantics (a latent soundness bug,
+  found by the audit, fixed), and a second goal — `no-overflow` — reusing the executor with exact wrap predicates
+  at `nsw` arithmetic. `verify`'s `no-overflow` TRUE arm now runs this engine after the interval sentinel.
+- **Witnesses**: `build_interval_invariant_witness` now emits bounds only for a header's own integer phis and
+  parameters; CPAchecker's "invalid invariant" rejections (4/24 sampled) are gone (18/24 confirmed, 0 FALSE).
+- **Audits (every one 0 wrong TRUE)**: unreach-call 4,324/4,324 expected-FALSE on the phi-fixed binary and again
+  on the final memory model; no-overflow 3,733/3,733. `false_alarms` unchanged (the FALSE arms were not touched).
+- **Measured on svcomp26 (20 s TRUE budget; competition gives ~140 s per pass)**: unreach-call TRUE
+  1,768/18,307 (was 1,325), no-overflow TRUE 2,697/5,330 (was 0). Rescored: raw 21,381; confirmed 16,932 if every
+  correctness witness confirms, 8,244 if none does; dedup-weighted 166 (was 153); **Overall-equivalent 13,536
+  upper / 7,726 lower, ≈ 12,000 realized** at the sampled confirmation rates (unreach 79 %, no-overflow 75 %).
+  Details and per-category tables: `plans/222` §2i; rescoring: `results/svcomp26/debug/rescore_both.py`.
+- **Action for the submitter**: `target/release/saf` (`45daa037…`) is rebuilt from the tree; regenerate
+  `dist/saf-verify.zip` with `make svcomp-archive` and upload THAT file to the reserved Zenodo record
+  — regenerated 2026-10-11 from the audited binary `464766c0` (plan 222 §2k–§2n, incl. the counterexample FALSE stage): `dist/saf-verify.zip` sha256 `bd28090b…` supersedes every earlier archive; this is the file to upload. Gates on it: unreach 0/4,324 and no-overflow 0/3,733 wrong TRUE, smoke 132/132; measured unreach TRUE 1,896/18,307, no-overflow TRUE 2,773/5,330, Overall-eq 14,036 upper / 7,947 lower (≈ 12,800 realized). All of this is uncommitted on `svcomp`.
+  — regenerated 2026-10-11 (later) from the audited binary `104e44de` (plan 222 §2n round 2/2b + §2o: engine FALSE stage with pinned externs, retries and stubs; signed-shift table + constant-shift source gate; IEEE floats and math builtins): `dist/saf-verify.zip` sha256 `5984ba6c90af7361f33530949adbb1d765b668f515adb7a3c118a1e57c9083f0` **supersedes `bd28090b…`; this is the file to upload.** Gates on it: unreach 0/4,324 and no-overflow 0/3,733 wrong TRUE, 540 expected-TRUE tasks 0 wrong FALSE, smoke 133/133; measured no-overflow TRUE 3,551/5,330, new FALSE 2,998/3,426, unreach TRUE ≥ 1,810/18,307 (float-engine sweep running) → Overall-eq 16,668 upper / 7,947 lower (≈ 60 % of the FALSE-side gap realized in a 60-witness validation sample). A local validator bug (no data model passed to CPAchecker/CBMC) was fixed in `scripts/validate_witness.sh`. Uncommitted on `svcomp`.
+
+## 10. 2026-10-11 (evening) — third audit-found wrong TRUE fixed; v13 gates running
+
+`audit_v12` (plan 222 §2p binary, never archived) found a wrong PROVE on `neural-networks/gcas_6_unsafe.c-amalgamation.i`
+(official `ReachSafety-Floats`-side category; the error is reachable, confirmed by native sampling). Cause and fix in
+plan 222 §2q: memory cells are now byte offsets (per-global `Layout` and per-GEP `llvm.gep_bytes` from the LLVM data
+layout; overlap-aware stores) instead of GEP-shaped structural paths. Release `6655bed3` is under `chain_v13a`
+(0 PROVE required over 4,324 + 3,733 expected-FALSE tasks, 0 wrong FALSE over 540 expected-TRUE, smoke) and then
+`chain_v13b` (18,307-task TRUE sweep). **Until v13a reports clean, the upload file stays `dist/saf-verify.zip`
+`5984ba6c…` (§9).** A v13 archive, if produced, supersedes it and carries the §2p/§2q gains (no-overflow TRUE
+3,730/5,330 on v12 vs 3,551 on v10; unreach TRUE to be measured).
+
+## 11. 2026-10-11 (night) — archive status: NONE shippable on disk; fourth soundness fix in the FALSE stage
+
+- `chain_v13a` on release `6655bed3` passed every gate except the known non-competition `ldv-consumption/todo/` PROVE
+  (recorded, §10): no-overflow TRUE 3,790/5,330, FALSE 3,049/3,426, Overall-eq 16,876 upper / 7,947 lower.
+- Its archive FAILED `smoketest.sh`: `smoke_unknown_unreach.c` → `false`. Cause: replay stubs for functions the task
+  declares but never defines returned the engine's pinned values (plan 222 §2r). Fixed so a called stub ends the
+  replay unconfirmed. This change is in the FALSE replay stage only; `chain_v14a` re-runs all gates on the rebuilt
+  release after the v13b TRUE sweep completes.
+- **`dist/saf-verify.zip` is currently absent.** The failed-smoke archive is kept as
+  `dist/UNVERIFIED-v13-smoke-failed-saf-verify.zip` (do not upload); the §9 archive `5984ba6c…` was overwritten by it
+  and cannot be regenerated (its binary is gone). `dist/saf-verify.zip.sha256` still names the older `bd28090b…`.
+  The next clean chain writes a new `dist/saf-verify.zip`; update this file and Zenodo only from that.
+- fm-tools MR !1166: all CI jobs `stuck_pending_no_matching_runners` (fork has no runners); `data/saf.yml` passes
+  every format/schema check locally; see the registration memory / message of 2026-10-11.
+

@@ -102,3 +102,7 @@ tests/benchmarks/incremental/*/.compiled/
 .svwitnesses/
 .svtools/
 /witness.yml
+
+# SV-COMP sweep outputs and side build directories (local only)
+/results/
+/target-s*/

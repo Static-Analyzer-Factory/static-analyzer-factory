@@ -8,7 +8,7 @@ cross-checked in memory note `svcomp-2027-deadlines-verified`):
 
 | Date | Gate |
 | --- | --- |
-| 2026-10-08 | Tool **registration** — the merge requests must exist |
+| 2026-10-12 | Tool **registration** — the merge requests must exist |
 | 2026-10-20 | Tool **submission** — all CI checks must be green |
 
 Everything below was derived by reading the live upstream sources on 2026-09-13
@@ -606,7 +606,7 @@ testing a different tree than CI will.
 | ASAP | Land the digit-first `--version` fix in SAF | nothing |
 | after the `--version` fix | Build the final archive, publish the Zenodo record, note the **version** DOI | archive build |
 | after Zenodo | Open fm-tools MR 1 with `data/saf.yml` | MR 0 merged (CI imports `benchexec.tools.saf`), DOI minted |
-| by **2026-10-08** | Both MR 1 and MR 2 must **exist** (registration = merge requests created) | — |
+| by **2026-10-12** | Both MR 1 and MR 2 must **exist** (registration = merge requests created) | — |
 | after MR 1 is merged | Open bench-defs MR 2 with the submodule bumped to that merge commit | MR 1 merged |
 | by **2026-10-20** | All CI green on both MRs | everything above |
 
