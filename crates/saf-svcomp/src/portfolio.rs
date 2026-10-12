@@ -224,6 +224,16 @@ fn is_float_op(kind: BinaryOp) -> bool {
             | BinaryOp::FCmpOge
             | BinaryOp::FCmpOlt
             | BinaryOp::FCmpOle
+            | BinaryOp::FCmpUeq
+            | BinaryOp::FCmpUne
+            | BinaryOp::FCmpUgt
+            | BinaryOp::FCmpUge
+            | BinaryOp::FCmpUlt
+            | BinaryOp::FCmpUle
+            | BinaryOp::FCmpOrd
+            | BinaryOp::FCmpUno
+            | BinaryOp::FCmpTrue
+            | BinaryOp::FCmpFalse
     )
 }
 
@@ -429,6 +439,16 @@ fn is_comparison(kind: BinaryOp) -> bool {
             | BinaryOp::FCmpOge
             | BinaryOp::FCmpOlt
             | BinaryOp::FCmpOle
+            | BinaryOp::FCmpUeq
+            | BinaryOp::FCmpUne
+            | BinaryOp::FCmpUgt
+            | BinaryOp::FCmpUge
+            | BinaryOp::FCmpUlt
+            | BinaryOp::FCmpUle
+            | BinaryOp::FCmpOrd
+            | BinaryOp::FCmpUno
+            | BinaryOp::FCmpTrue
+            | BinaryOp::FCmpFalse
     )
 }
 

@@ -17,8 +17,11 @@ saf-analysis = { workspace = true, features = ["z3-solver", "analysis-mta"] }
 # `bundled` build is shared with `saf-analysis`'s identical `z3` dependency, so it
 # adds no extra native build.
 z3 = { version = "0.19", features = ["bundled"] }
+# Raw FPA bindings for the exhaustive engine's IEEE float model (`unreach_prove::fpa`).
+z3-sys = "0.10"
 anyhow = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = "0.10"
 tracing = { workspace = true }

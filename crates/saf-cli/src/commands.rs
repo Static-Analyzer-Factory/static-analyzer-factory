@@ -1071,9 +1071,76 @@ pub fn prove_unreachable_cmd(args: &ProveUnreachableArgs) -> anyhow::Result<()> 
         return Ok(());
     }
 
-    match saf_svcomp::prove_unreachable(&bundle.module) {
-        saf_svcomp::UnreachProof::Proven => println!("PROVE"),
-        saf_svcomp::UnreachProof::Abstain(reason) => println!("ABSTAIN:{reason}"),
+    if unreach_prover_blocked_by_dropped(&bundle.module) {
+        println!("ABSTAIN:ingest-fidelity");
+        return Ok(());
+    }
+    // Two independent provers: the interval sentinel and the bounded-exhaustive
+    // exact-semantics engine. Either proof is a PROVE; both reasons are shown
+    // otherwise so a sweep can histogram them separately.
+    // `SAF_PROVE_SKIP_INTERVAL=1` skips the interval sentinel (a sweep knob: it
+    // proves ~0.2 % of the pool and can be slow on large modules).
+    let interval = if std::env::var_os("SAF_PROVE_SKIP_INTERVAL").is_some() {
+        "skipped".to_string()
+    } else {
+        match saf_svcomp::prove_unreachable(&bundle.module) {
+            saf_svcomp::UnreachProof::Proven => "PROVE".to_string(),
+            saf_svcomp::UnreachProof::Abstain(reason) => reason,
+        }
+    };
+    let budget = std::time::Duration::from_secs(unreach_prove_budget_secs());
+    // `SAF_PROVE_GOAL=no-overflow` runs the engine's no-overflow goal instead
+    // (sweep/audit knob for the `no-overflow` TRUE arm; the interval sentinel
+    // above is the unreach-call one and is best skipped then).
+    let no_overflow = std::env::var("SAF_PROVE_GOAL").is_ok_and(|g| g == "no-overflow");
+    // `SAF_PROVE_GOAL=valid-memsafety`: the engine's memory-safety goal (plan
+    // 222 §2s); every dropped intrinsic gates it (`llvm.stackrestore` ends
+    // object lifetimes, which this goal does reason about).
+    if std::env::var("SAF_PROVE_GOAL").is_ok_and(|g| g == "valid-memsafety") {
+        let Some(module) = compile_to_ir_memsafety(&args.input, data_model, &stub, dir.path())?
+        else {
+            println!("ABSTAIN:interval=skipped|exhaustive=ms-unmarked-stack-object");
+            return Ok(());
+        };
+        if module.dropped_unknown_opcode || !module.dropped_intrinsics.is_empty() {
+            println!("ABSTAIN:ingest-fidelity");
+            return Ok(());
+        }
+        let exhaustive = match saf_svcomp::prove_memsafety_exhaustive(&module, budget) {
+            saf_svcomp::ExhaustiveProof::Proven => "PROVE".to_string(),
+            saf_svcomp::ExhaustiveProof::Abstain(reason) => reason,
+        };
+        if exhaustive == "PROVE" {
+            println!("PROVE:exhaustive|interval=skipped");
+        } else {
+            println!("ABSTAIN:interval=skipped|exhaustive={exhaustive}");
+        }
+        return Ok(());
+    }
+    let clang = std::env::var("SAF_CLANG").unwrap_or_else(|_| DEFAULT_CLANG.to_string());
+    if no_overflow && overflow_source_constant_folds_in(&clang, data_model, &stub, &args.input) {
+        println!("ABSTAIN:interval={interval}|exhaustive=constant-folded-overflow");
+        return Ok(());
+    }
+    let proof = if no_overflow {
+        saf_svcomp::prove_no_overflow_exhaustive_shl(
+            &bundle.module,
+            budget,
+            signed_shift_locations(&clang, data_model, &stub, &args.input).as_ref(),
+        )
+    } else {
+        saf_svcomp::prove_unreach_exhaustive(&bundle.module, budget)
+    };
+    let exhaustive = match proof {
+        saf_svcomp::ExhaustiveProof::Proven => "PROVE".to_string(),
+        saf_svcomp::ExhaustiveProof::Abstain(reason) => reason,
+    };
+    if exhaustive == "PROVE" {
+        println!("PROVE:exhaustive|interval={interval}");
+    } else if interval == "PROVE" {
+        println!("PROVE:interval|exhaustive={exhaustive}");
+    } else {
+        println!("ABSTAIN:interval={interval}|exhaustive={exhaustive}");
     }
     Ok(())
 }
@@ -1248,6 +1315,10 @@ fn compile_to_ir_with(
             "-O0",
             "-Xclang",
             "-disable-O0-optnone",
+            // Keep clang's block names (`if.then`, `land.rhs`, …): the violation
+            // witness lowering reads the SOURCE branch value off them (plan 221
+            // §3 A3). Names only — no effect on the code SAF analyzes.
+            "-fno-discard-value-names",
             "-Wno-everything",
         ])
         .args(extra_clang_args)
@@ -1353,6 +1424,256 @@ fn compile_to_ir_termination(
     Ok(bundle.module)
 }
 
+/// The `valid-memsafety` engine's ingestion recipe (plan 222 §2s): clang's
+/// `-O1` code generation (which emits `llvm.lifetime.start/end` around every
+/// C object's scope) with every LLVM pass disabled, and no promotion. The
+/// lifetime intrinsics, which the frontend drops as metadata, are renamed to
+/// the declared functions [`saf_svcomp::LIFETIME_START`] /
+/// [`saf_svcomp::LIFETIME_END`] so the engine sees each block scope end.
+///
+/// `Ok(None)` (abstain) when a stack object has no lifetime markers and is not
+/// one whose C lifetime is the whole function — the return slot (`retval`),
+/// a parameter spill (`*.addr`) or an ABI coercion temporary (`coerce*`): a
+/// compound literal (`.compoundliteral`) or any unnamed / unknown temporary
+/// dies at the end of its block, which the IR would no longer say.
+fn compile_to_ir_memsafety(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    stub: &Path,
+    dir: &Path,
+) -> anyhow::Result<Option<saf_core::air::AirModule>> {
+    use anyhow::Context as _;
+    let ir = compile_to_ir_with(
+        input,
+        data_model,
+        stub,
+        dir,
+        &[
+            "-O1",
+            "-Xclang",
+            "-disable-llvm-passes",
+            "-fno-discard-value-names",
+        ],
+        // No promotion yet: the escaped locals are pinned first (below).
+        "verify",
+    )?;
+    let text = std::fs::read_to_string(&ir).context("read memsafety IR")?;
+    if memsafety_unmarked_object(&text) {
+        return Ok(None);
+    }
+    // Pin every local whose address escapes (anything but a direct load/store
+    // or its own lifetime marker), then promote the rest: `mem2reg` must not
+    // promote an escaped object after promoting the pointer that held it —
+    // that forwards a value through a dead object's slot and erases the
+    // dangling dereference itself (`memsafety-ext3/scopes1`).
+    let pinned = dir.join("memsafety-pinned.ll");
+    std::fs::write(&pinned, memsafety_pin_escaped(&text)).context("write pinned IR")?;
+    let opt_bin = std::env::var("SAF_OPT").unwrap_or_else(|_| DEFAULT_OPT.to_string());
+    let status = std::process::Command::new(&opt_bin)
+        .arg("-S")
+        .arg("-passes=mem2reg")
+        .arg(&pinned)
+        .arg("-o")
+        .arg(&pinned)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("failed to spawn {opt_bin}"))?;
+    anyhow::ensure!(
+        status.success(),
+        "{opt_bin} mem2reg failed on the pinned IR"
+    );
+    let text = std::fs::read_to_string(&pinned).context("read promoted IR")?;
+    let Some(text) = memsafety_rewrite_ir(&text) else {
+        return Ok(None);
+    };
+    let out = dir.join("memsafety.ll");
+    std::fs::write(&out, &text).context("write memsafety IR")?;
+    // Debug: keep a copy of the IR the engine sees.
+    if let Some(keep) = std::env::var_os("SAF_MEMSAFETY_KEEP_IR") {
+        let _ = std::fs::write(keep, &text);
+    }
+    let bundle = driver::AnalysisDriver::ingest(&[out], CliFrontend::Llvm)?;
+    Ok(Some(bundle.module))
+}
+
+/// Does a stack object of `text` lack lifetime markers while it may die
+/// before its function returns (see [`compile_to_ir_memsafety`])?
+fn memsafety_unmarked_object(text: &str) -> bool {
+    memsafety_rewrite_ir(text).is_none()
+}
+
+/// Is `c` part of an LLVM local name?
+fn llvm_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '-')
+}
+
+/// `text` with a `call void @__saf_keep(ptr %x)` after every alloca `%x` whose
+/// address is used other than as the address of a load or store or by its own
+/// lifetime marker, so `mem2reg` leaves it a stack object.
+fn memsafety_pin_escaped(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(text.len() + 256);
+    let mut func: Vec<&str> = Vec::new();
+    let flush = |func: &mut Vec<&str>, out: &mut String| {
+        let allocas: Vec<String> = func
+            .iter()
+            .filter_map(|l| {
+                let t = l.trim_start().strip_prefix('%')?;
+                let (name, rhs) = t.split_once(" = ")?;
+                rhs.starts_with("alloca ").then(|| name.to_string())
+            })
+            .collect();
+        let escaped: Vec<&String> = allocas
+            .iter()
+            .filter(|name| {
+                let needle = format!("%{name}");
+                func.iter().any(|l| {
+                    let t = l.trim_start();
+                    let mut from = 0;
+                    while let Some(i) = t[from..].find(&needle) {
+                        let at = from + i;
+                        let end = at + needle.len();
+                        from = end;
+                        if t[end..].chars().next().is_some_and(llvm_name_char) {
+                            continue; // a longer name
+                        }
+                        if t.starts_with(&format!("{needle} = alloca ")) {
+                            continue; // the definition
+                        }
+                        let before = &t[..at];
+                        let address_of_access = (t.starts_with("store ") || t.contains("= load "))
+                            && before.ends_with("ptr ")
+                            && t[end..]
+                                .trim_start()
+                                .chars()
+                                .next()
+                                .is_none_or(|c| c == ',');
+                        // `store` and `load` name the address last / after the
+                        // type; a stored VALUE `store ptr %x, ptr %p` is an escape.
+                        let is_store_value =
+                            t.starts_with("store ") && t[end..].trim_start().starts_with(", ptr ");
+                        // Lifetime markers and debug-info intrinsics are not
+                        // uses of the address.
+                        let lifetime = t.contains("@llvm.lifetime.") || t.contains("@llvm.dbg.");
+                        if lifetime || (address_of_access && !is_store_value) {
+                            continue;
+                        }
+                        return true;
+                    }
+                    false
+                })
+            })
+            .collect();
+        for l in func.drain(..) {
+            out.push_str(l);
+            out.push('\n');
+            let t = l.trim_start();
+            if let Some(name) = escaped
+                .iter()
+                .find(|n| t.starts_with(&format!("%{n} = alloca ")))
+            {
+                let _ = writeln!(out, "  call void @{}(ptr %{name})", saf_svcomp::KEEP_ALIVE);
+            }
+        }
+    };
+    for line in text.lines() {
+        if line.starts_with("define ") {
+            flush(&mut func, &mut out);
+            func.push(line);
+            continue;
+        }
+        if !func.is_empty() {
+            func.push(line);
+            if line == "}" {
+                flush(&mut func, &mut out);
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    flush(&mut func, &mut out);
+    let _ = writeln!(out, "declare void @{}(ptr)", saf_svcomp::KEEP_ALIVE);
+    out
+}
+
+/// The text half of [`compile_to_ir_memsafety`]: the marker check and the
+/// renaming. `None` when an unmarked stack object may die before its function
+/// returns.
+fn memsafety_rewrite_ir(text: &str) -> Option<String> {
+    use std::fmt::Write as _;
+    let mut allocas: Vec<(String, String)> = Vec::new();
+    let mut marked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let flush = |allocas: &mut Vec<(String, String)>,
+                 marked: &mut std::collections::BTreeSet<String>| {
+        let ok = allocas.iter().all(|(a, rhs)| {
+            marked.contains(a)
+                || a == "retval"
+                || a == "cleanup.dest.slot"
+                || a.rsplit_once('.').is_some_and(|(_, suffix)| suffix == "addr")
+                || a.starts_with("coerce")
+                // `__builtin_alloca(n)`: `%0 = alloca i8, i64 n` — lives until
+                // the function returns, like the C `alloca` it is.
+                || (a.chars().all(|c| c.is_ascii_digit()) && rhs.starts_with("alloca i8, i"))
+        });
+        allocas.clear();
+        marked.clear();
+        ok
+    };
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("define ") || t == "}" {
+            if !flush(&mut allocas, &mut marked) {
+                return None;
+            }
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix('%') {
+            if let Some((name, rhs)) = rest.split_once(" = ") {
+                if rhs.starts_with("alloca ") {
+                    allocas.push((name.trim_matches('"').to_string(), rhs.to_string()));
+                }
+            }
+        }
+        if let Some(i) = t.find("@llvm.lifetime.start.") {
+            if let Some(j) = t[i..].find("ptr %") {
+                let name: String = t[i + j + 5..]
+                    .chars()
+                    .take_while(|c| *c != ')' && *c != ',')
+                    .collect();
+                marked.insert(name.trim_matches('"').to_string());
+            }
+        }
+    }
+    if !flush(&mut allocas, &mut marked) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len() + 128);
+    for line in text.lines() {
+        if line.starts_with("declare void @llvm.lifetime.") {
+            continue;
+        }
+        let line = line
+            .replace(
+                "@llvm.lifetime.start.p0(",
+                &format!("@{}(", saf_svcomp::LIFETIME_START),
+            )
+            .replace(
+                "@llvm.lifetime.end.p0(",
+                &format!("@{}(", saf_svcomp::LIFETIME_END),
+            );
+        out.push_str(&line);
+        out.push('\n');
+    }
+    let _ = write!(
+        out,
+        "declare void @{}(i64, ptr)\ndeclare void @{}(i64, ptr)\n",
+        saf_svcomp::LIFETIME_START,
+        saf_svcomp::LIFETIME_END
+    );
+    Some(out)
+}
+
 /// The result of a verdict computation: the stdout line plus an optional
 /// violation witness (present only for a sound `false`).
 ///
@@ -1400,6 +1721,9 @@ struct VerifyCtx<'a> {
     stub: &'a Path,
     tempdir: &'a Path,
     clang: &'a str,
+    /// The task's wall-clock budget (`--timeout`): the TRUE arm takes its share
+    /// from it ([`unreach_prove_budget`]).
+    budget: std::time::Duration,
 }
 
 /// A per-property `propose -> concrete-confirm -> witness` pipeline.
@@ -1440,7 +1764,13 @@ fn run_verdict_under_budget(
 ) -> VerdictOutcome {
     let (tx, rx) = std::sync::mpsc::channel();
     let _worker = std::thread::spawn(move || {
-        let _ = tx.send(run_verdict(&input, data_model, property, specification));
+        let _ = tx.send(run_verdict(
+            &input,
+            data_model,
+            property,
+            specification,
+            budget,
+        ));
     });
     rx.recv_timeout(budget).unwrap_or_else(|_| {
         eprintln!(
@@ -1456,6 +1786,7 @@ fn run_verdict(
     data_model: saf_svcomp::DataModel,
     property: saf_svcomp::Property,
     specification: String,
+    budget: std::time::Duration,
 ) -> VerdictOutcome {
     let Some(strategy) = strategy_for(property) else {
         return unknown_outcome();
@@ -1502,12 +1833,20 @@ fn run_verdict(
         stub: &stub,
         tempdir: dir.path(),
         clang: &clang,
+        budget,
     };
     strategy(&ctx)
 }
 
 /// Assemble a violation witness from a lowered waypoint list, logging (but not
 /// failing the verdict) on any assembly error.
+/// The task's C text, for witness lowering (the `)` column of a
+/// `function_return` waypoint). `None` if unreadable — lowering then degrades
+/// toward a target-only witness rather than emitting a column-less waypoint.
+fn verify_source(ctx: &VerifyCtx) -> Option<String> {
+    std::fs::read_to_string(ctx.input).ok()
+}
+
 fn build_witness(
     ctx: &VerifyCtx,
     waypoints: Option<Vec<saf_svcomp::SourceWaypoint>>,
@@ -1568,8 +1907,14 @@ fn bmc_confirm(
             candidate,
         ) {
             Ok(true) => {
-                let witness =
-                    build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, candidate));
+                let witness = build_witness(
+                    ctx,
+                    saf_svcomp::lower_candidate(
+                        ctx.module,
+                        candidate,
+                        verify_source(ctx).as_deref(),
+                    ),
+                );
                 if witness.is_none() {
                     eprintln!(
                         "saf verify: FALSE (BMC replay-confirmed) but witness unconstructible -> emitting false without a witness"
@@ -1616,8 +1961,14 @@ fn se_confirm(
             candidate,
         ) {
             Ok(true) => {
-                let witness =
-                    build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, candidate));
+                let witness = build_witness(
+                    ctx,
+                    saf_svcomp::lower_candidate(
+                        ctx.module,
+                        candidate,
+                        verify_source(ctx).as_deref(),
+                    ),
+                );
                 if witness.is_none() {
                     eprintln!(
                         "saf verify: FALSE (SE replay-confirmed) but witness unconstructible -> emitting false without a witness"
@@ -1644,7 +1995,10 @@ fn se_confirm(
 fn fuzz_confirm(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     use saf_svcomp::Property;
     let candidate = fuzz_confirm_false(ctx)?;
-    let witness = build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, &candidate));
+    let witness = build_witness(
+        ctx,
+        saf_svcomp::lower_candidate(ctx.module, &candidate, verify_source(ctx).as_deref()),
+    );
     if witness.is_none() {
         eprintln!(
             "saf verify: FALSE (fuzz replay-confirmed) but witness unconstructible -> emitting false without a witness"
@@ -1678,9 +2032,8 @@ fn fuzz_confirm(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
 fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     use saf_svcomp::Property;
 
-    // Rank-3 sound TRUE (fail-closed to the FALSE path on any doubt). DISABLED:
-    // `prove_unreachable` is still unsound on a loop-head under-approximation and
-    // the arm is worth 0 weighted, so it always returns None here.
+    // Rank-3 sound TRUE (fail-closed to the FALSE path on any doubt): the
+    // bounded-exhaustive exact-semantics prover, see `try_unreach_true`.
     if let Some(outcome) = try_unreach_true(ctx) {
         return outcome;
     }
@@ -1752,6 +2105,60 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     // native replay. Only a run that actually reaches reach_error is a violation,
     // so the over-approximation's false alarms are filtered out (they do not
     // reproduce), and we still never emit `true`.
+    // The exhaustive engine's counterexample (exact semantics, every nondet read
+    // pinned) is the strongest candidate source; the Z3 path enumerator below
+    // stays as the fallback.
+    // Breadth-first first (a reactive loop's violation sits a few iterations
+    // in); when that finds no candidate at all within its budget, one
+    // depth-first search (a deep path behind a wide frontier).
+    let mut opts = saf_svcomp::CexOptions::default();
+    for attempt in 0..=cex_retries() {
+        let Some(candidate) = engine_false_candidate(ctx, false, &opts) else {
+            if opts.depth_first || attempt > 0 {
+                break;
+            }
+            opts.depth_first = true;
+            continue;
+        };
+        match replay_confirms_false(
+            ctx.input,
+            ctx.data_model,
+            ctx.stub,
+            ctx.tempdir,
+            ctx.clang,
+            MAX_REPLAY_CANDIDATES,
+            &candidate,
+        ) {
+            Ok(true) => {
+                let witness = build_witness(
+                    ctx,
+                    saf_svcomp::lower_candidate(
+                        ctx.module,
+                        &candidate,
+                        verify_source(ctx).as_deref(),
+                    ),
+                );
+                if witness.is_none() {
+                    eprintln!(
+                        "saf verify: FALSE (engine counterexample replay-confirmed) but witness unconstructible -> emitting false without a witness"
+                    );
+                }
+                return VerdictOutcome {
+                    verdict: format!("false({})", Property::UnreachCall.name()),
+                    witness,
+                    graphml: None,
+                    correctness: None,
+                };
+            }
+            Ok(false) => eprintln!(
+                "saf verify: engine counterexample did not replay (attempt {})",
+                attempt + 1
+            ),
+            Err(e) => eprintln!("saf verify: engine counterexample replay errored: {e:#}"),
+        }
+        opts.skip.insert(candidate.reach_error_inst);
+    }
+
     let config = saf_svcomp::PropertyAnalysisConfig {
         conservative: false,
         ..Default::default()
@@ -1768,8 +2175,14 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             candidate,
         ) {
             Ok(true) => {
-                let witness =
-                    build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, candidate));
+                let witness = build_witness(
+                    ctx,
+                    saf_svcomp::lower_candidate(
+                        ctx.module,
+                        candidate,
+                        verify_source(ctx).as_deref(),
+                    ),
+                );
                 if witness.is_none() {
                     eprintln!(
                         "saf verify: FALSE (replay-confirmed) but witness unconstructible -> emitting false without a witness"
@@ -1816,8 +2229,14 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             candidate,
         ) {
             Ok(true) => {
-                let witness =
-                    build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, candidate));
+                let witness = build_witness(
+                    ctx,
+                    saf_svcomp::lower_candidate(
+                        ctx.module,
+                        candidate,
+                        verify_source(ctx).as_deref(),
+                    ),
+                );
                 if witness.is_none() {
                     eprintln!(
                         "saf verify: FALSE (interproc replay-confirmed) but witness unconstructible -> emitting false without a witness"
@@ -1880,8 +2299,14 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
                 &candidate,
             ) {
                 Ok(true) => {
-                    let witness =
-                        build_witness(ctx, saf_svcomp::lower_candidate(ctx.module, &candidate));
+                    let witness = build_witness(
+                        ctx,
+                        saf_svcomp::lower_candidate(
+                            ctx.module,
+                            &candidate,
+                            verify_source(ctx).as_deref(),
+                        ),
+                    );
                     if witness.is_none() {
                         eprintln!(
                             "saf verify: FALSE (deterministic native run) but witness unconstructible -> emitting false without a witness"
@@ -3801,6 +4226,414 @@ fn push_float_replay_defs(s: &mut String, candidate: &saf_svcomp::FalseCandidate
 /// none were recorded); `__VERIFIER_assume` blocks assumed-false paths at runtime (so an assume-pruned
 /// error can never be a false confirmation); and `reach_error`/`__VERIFIER_error`
 /// drop the sentinel file and `_exit`.
+/// Budget of the engine's counterexample search in the FALSE portfolio
+/// (`SAF_CEX_BUDGET_S` overrides; a time-out only means "no candidate").
+fn cex_budget() -> std::time::Duration {
+    let secs = std::env::var("SAF_CEX_BUDGET_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(20);
+    std::time::Duration::from_secs(secs)
+}
+
+/// A replay candidate from the exhaustive engine's counterexample search
+/// (plan 222 §2n): the first feasible violation path with every nondet read
+/// pinned to its model value. `None` when the engine finds none in time.
+/// How many non-replaying engine candidates are passed over before the stage
+/// gives up (`SAF_CEX_RETRIES`, default 3): each retry asks the engine for the
+/// next feasible violation on the path, excluding the ones that did not replay.
+fn cex_retries() -> usize {
+    std::env::var("SAF_CEX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3)
+}
+
+fn engine_false_candidate(
+    ctx: &VerifyCtx,
+    overflow: bool,
+    opts: &saf_svcomp::CexOptions,
+) -> Option<saf_svcomp::FalseCandidate> {
+    let found =
+        saf_svcomp::find_counterexample_excluding(ctx.module, cex_budget(), overflow, opts)?;
+    if opts.depth_first || opts.check_shl {
+        eprintln!(
+            "saf verify: (counterexample search: depth_first={} check_shl={})",
+            opts.depth_first, opts.check_shl
+        );
+    }
+    eprintln!(
+        "saf verify: engine counterexample with {} pinned nondet reads -> replaying",
+        found.nondets.len()
+    );
+    if std::env::var_os("SAF_CEX_DEBUG").is_some() {
+        for (name, value, inst) in &found.nondets {
+            let span = saf_svcomp::find_inst_span(ctx.module, *inst);
+            eprintln!("saf verify:   pinned {name} = {value} at {span:?}");
+        }
+        let span = saf_svcomp::find_inst_span(ctx.module, found.error_inst);
+        eprintln!("saf verify:   violation at {span:?}");
+    }
+    Some(saf_svcomp::FalseCandidate {
+        reach_error_inst: found.error_inst,
+        block_path: found.block_path,
+        assignments: std::collections::BTreeMap::new(),
+        nondet_sequence: found
+            .nondets
+            .into_iter()
+            .map(|(func_name, value, inst)| saf_svcomp::NondetCall {
+                func_name,
+                value,
+                call_inst: Some(inst),
+            })
+            .collect(),
+    })
+}
+
+/// The `-Wl,--wrap=rand` definition the replay driver supplies when a
+/// candidate pins `rand()` values (the engine treats `rand` as a nondet read).
+fn rand_wrapper(candidate: &saf_svcomp::FalseCandidate) -> String {
+    use std::fmt::Write as _;
+    let pinned = |names: &[&str]| -> Vec<String> {
+        candidate
+            .nondet_sequence
+            .iter()
+            .filter(|n| names.contains(&n.func_name.as_str()))
+            .map(|n| format!("{}LL", n.value))
+            .collect()
+    };
+    // Every wrapped symbol is defined whether or not the candidate pins it
+    // (the link line always carries `--wrap`); unpinned calls fall through to
+    // the real function.
+    let mut out = String::new();
+    out.push_str("#include <stdarg.h>\n");
+    out.push_str("extern int __real_rand(void);\n");
+    out.push_str("extern void __real_srand(unsigned int);\n");
+    let rands = pinned(&["rand"]);
+    let _ = writeln!(
+        out,
+        "static long long __saf_arr_rand[] = {{ {} }};",
+        if rands.is_empty() {
+            "0".to_string()
+        } else {
+            rands.join(", ")
+        }
+    );
+    let _ = writeln!(out, "static unsigned long __saf_n_rand = {};", rands.len());
+    out.push_str("static unsigned long __saf_i_rand = 0;\n");
+    out.push_str("int __wrap_rand(void) { if (__saf_i_rand < __saf_n_rand) return (int)__saf_arr_rand[__saf_i_rand++]; return __saf_n_rand ? 0 : __real_rand(); }\n");
+    out.push_str("void __wrap_srand(unsigned int s) { if (!__saf_n_rand) __real_srand(s); }\n");
+    // `fscanf`: the engine pinned one value per integer conversion, in call
+    // order; the wrapper parses the same format and writes them through the
+    // pointer arguments with the conversion's width.
+    let scanned = pinned(&["fscanf", "__isoc99_fscanf"]);
+    let _ = writeln!(
+        out,
+        "static long long __saf_arr_fscanf[] = {{ {} }};",
+        if scanned.is_empty() {
+            "0".to_string()
+        } else {
+            scanned.join(", ")
+        }
+    );
+    let _ = writeln!(
+        out,
+        "static unsigned long __saf_n_fscanf = {};",
+        scanned.len()
+    );
+    out.push_str("static unsigned long __saf_i_fscanf = 0;\n");
+    out.push_str(FSCANF_WRAPPER_BODY);
+    out.push_str("extern int vfscanf(FILE *, const char *, va_list);\n");
+    out.push_str("int __wrap___isoc99_fscanf(FILE *f, const char *fmt, ...) { va_list ap; va_start(ap, fmt); int n = __saf_n_fscanf ? __saf_scan(fmt, ap) : vfscanf(f, fmt, ap); va_end(ap); return n; }\n");
+    out.push_str("int __wrap_fscanf(FILE *f, const char *fmt, ...) { va_list ap; va_start(ap, fmt); int n = __saf_n_fscanf ? __saf_scan(fmt, ap) : vfscanf(f, fmt, ap); va_end(ap); return n; }\n");
+    // The pinned externs (plan 222 §2n): each hands back its pinned results in
+    // call order, then zeros; unpinned ones call the real function.
+    let mut env_model = false;
+    for (name, ret, params, args) in saf_svcomp::PINNED_EXTERNS {
+        let vals = pinned(&[name]);
+        env_model |= !vals.is_empty();
+        let _ = writeln!(out, "extern {ret} __real_{name}({params});");
+        let _ = writeln!(
+            out,
+            "static long long __saf_arr_{name}[] = {{ {} }};",
+            if vals.is_empty() {
+                "0".to_string()
+            } else {
+                vals.join(", ")
+            }
+        );
+        let _ = writeln!(out, "static unsigned long __saf_n_{name} = {};", vals.len());
+        let _ = writeln!(out, "static unsigned long __saf_i_{name} = 0;");
+        let _ = writeln!(
+            out,
+            "{ret} __wrap_{name}({params}) {{ if (__saf_i_{name} < __saf_n_{name}) return ({ret})__saf_arr_{name}[__saf_i_{name}++]; return __saf_n_{name} ? ({ret})0 : __real_{name}({args}); }}"
+        );
+    }
+    // `fgets` pinned (by the engine) to "returned its buffer": the wrapper
+    // returns the (emptied) buffer without touching the stream. Under the
+    // modelled environment `close` is a no-op too: a pinned descriptor may
+    // be the harness's own stderr.
+    let fgets_model = !pinned(&["fgets"]).is_empty();
+    env_model |= fgets_model;
+    let _ = writeln!(
+        out,
+        "static int __saf_fgets_model = {};",
+        i32::from(fgets_model)
+    );
+    let _ = writeln!(
+        out,
+        "static int __saf_env_model = {};",
+        i32::from(env_model)
+    );
+    out.push_str("extern char *__real_fgets(char *, int, void *);\n");
+    out.push_str("char *__wrap_fgets(char *s, int n, void *f) { if (__saf_fgets_model) { if (n > 0) s[0] = 0; return s; } return __real_fgets(s, n, f); }\n");
+    out.push_str("extern int __real_close(int);\n");
+    out.push_str("int __wrap_close(int fd) { return __saf_env_model ? 0 : __real_close(fd); }\n");
+    out
+}
+
+/// The `-Wl,--wrap=…` flags matching [`rand_wrapper`]'s definitions.
+/// Link a replay harness, repairing the two failure modes a task's source can
+/// cause: an inlined `assert`/`reach_error` that clashes with the driver's
+/// (the "neutralizer" pass) and functions the task declares but never defines
+/// (the sequentialised `pals_*` reducers keep `node1..3` in a function table
+/// that is never called). For the latter the linker's "undefined reference to"
+/// lines name exactly the missing symbols, which get stubs appended to the
+/// driver so the harness links. A stub that is actually CALLED ends the replay
+/// without the sentinel: the function's semantics are unknown, so a path that
+/// runs it is not a confirmed counterexample (the archive smoke fixture
+/// `smoke_unknown_unreach.c` guards `if (opaque(x) == 42) reach_error();` —
+/// until 2026-10-11 the stub returned the engine's pinned 42 and "confirmed"
+/// it; soundness redline 4: a non-allowlisted external is indeterminate).
+/// `Ok(true)` iff the harness linked; `SAF_CEX_DEBUG` prints the final failure.
+fn link_replay_harness(
+    build: &dyn Fn(Option<&Path>) -> std::process::Command,
+    driver_src: &Path,
+    dir: &Path,
+    what: &str,
+) -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+    use std::fmt::Write as _;
+    use std::process::Stdio;
+    let run = |neutralizer: Option<&Path>| -> anyhow::Result<(bool, String)> {
+        let out = build(neutralizer)
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("failed to spawn clang for {what}"))?;
+        Ok((
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        ))
+    };
+    let mut neutralizer: Option<PathBuf> = None;
+    let mut stubbed = false;
+    let last_err: String;
+    loop {
+        let (ok, err) = run(None)?;
+        if ok {
+            return Ok(true);
+        }
+        if neutralizer.is_none() {
+            neutralizer = Some(write_assert_neutralizer(dir)?);
+        }
+        let (ok2, err2) = run(neutralizer.as_deref())?;
+        if ok2 {
+            return Ok(true);
+        }
+        if stubbed {
+            last_err = err2;
+            break;
+        }
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for text in [&err, &err2] {
+            for line in text.lines() {
+                if let Some(rest) = line.split("undefined reference to `").nth(1) {
+                    if let Some(name) = rest.split('\'').next() {
+                        if !name.is_empty()
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            names.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if names.is_empty() {
+            last_err = err2;
+            break;
+        }
+        // `long long` fills the whole return register, so any caller type
+        // compiles; the body never returns.
+        let mut stubs = String::from(
+            "\n/* functions the task declares but never defines (SAF replay stubs): calling one leaves modelled ground, so the replay ends unconfirmed */\n",
+        );
+        for n in &names {
+            let _ = writeln!(
+                stubs,
+                "long long {n}() {{ fputs(\"saf replay: undefined function {n} called -> not confirmed\\n\", stderr); _exit(97); }}"
+            );
+        }
+        let mut driver =
+            std::fs::read_to_string(driver_src).with_context(|| "re-reading driver")?;
+        driver.push_str(&stubs);
+        std::fs::write(driver_src, driver).with_context(|| "writing stubbed driver")?;
+        stubbed = true;
+    }
+    if std::env::var_os("SAF_CEX_DEBUG").is_some() {
+        eprintln!(
+            "saf verify: {what} driver {} did not link:\n{}",
+            driver_src.display(),
+            last_err.lines().take(12).collect::<Vec<_>>().join("\n")
+        );
+    }
+    Ok(false)
+}
+
+fn replay_wrap_flags() -> Vec<String> {
+    let mut flags: Vec<String> = [
+        "rand",
+        "srand",
+        "fscanf",
+        "__isoc99_fscanf",
+        "fgets",
+        "close",
+    ]
+    .iter()
+    .map(|n| format!("-Wl,--wrap={n}"))
+    .collect();
+    flags.extend(
+        saf_svcomp::PINNED_EXTERNS
+            .iter()
+            .map(|(n, ..)| format!("-Wl,--wrap={n}")),
+    );
+    flags
+}
+
+/// The format walker shared by the `fscanf` wrappers of [`rand_wrapper`].
+const FSCANF_WRAPPER_BODY: &str = "static int __saf_scan(const char *fmt, va_list ap) {\n\
+    int n = 0; const char *p = fmt;\n\
+    while (*p) {\n\
+        if (*p != '%') { p++; continue; }\n\
+        p++; if (*p == '%') { p++; continue; }\n\
+        int h = 0, l = 0, z = 0;\n\
+        while (*p == 'h' || *p == 'l' || *p == 'z') { if (*p == 'h') h++; else if (*p == 'l') l++; else z = 1; p++; }\n\
+        char c = *p; if (!c) break; p++;\n\
+        if (c == 'd' || c == 'i' || c == 'u' || c == 'x' || c == 'c') {\n\
+            void *dst = va_arg(ap, void *);\n\
+            long long v = __saf_i_fscanf < __saf_n_fscanf ? __saf_arr_fscanf[__saf_i_fscanf++] : 0;\n\
+            if (c == 'c' || h >= 2) *(char *)dst = (char)v;\n\
+            else if (h == 1) *(short *)dst = (short)v;\n\
+            else if (z) *(size_t *)dst = (size_t)v;\n\
+            else if (l == 0) *(int *)dst = (int)v;\n\
+            else if (l == 1) *(long *)dst = (long)v;\n\
+            else *(long long *)dst = v;\n\
+            n++;\n\
+        } else { (void)va_arg(ap, void *); }\n\
+    }\n\
+    return n;\n\
+}\n";
+
+/// Replay a pinned-input candidate under `-fsanitize=signed-integer-overflow`
+/// and report the first signed overflow `UBSan` prints (plan 222 §2n). The
+/// driver is the unreach one (nondet arrays, sentinel on `reach_error`), plus
+/// the `rand` wrapper; the hit is parsed exactly as in [`ubsan_confirm`].
+fn ubsan_replay_sequence(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    module: &saf_core::air::AirModule,
+    stub: &Path,
+    dir: &Path,
+    clang: &str,
+    candidate: &saf_svcomp::FalseCandidate,
+) -> anyhow::Result<Option<saf_svcomp::OverflowHit>> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+    let sentinel = dir.join("saf_cex.sentinel");
+    let driver_src = dir.join("saf_cex_driver.c");
+    let harness = dir.join("saf_cex_harness");
+    let errpath = dir.join("saf_cex_stderr.txt");
+    let mut driver = synthesize_driver(candidate, &sentinel);
+    driver.push_str(&rand_wrapper(candidate));
+    std::fs::write(&driver_src, driver).with_context(|| "writing counterexample driver")?;
+    let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
+    let build = |neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(clang);
+        cmd.args([
+            "-O0",
+            "-g",
+            "-fsanitize=signed-integer-overflow,shift-base",
+            "-fno-sanitize-recover=signed-integer-overflow,shift-base",
+            "-Wno-everything",
+        ])
+        .args(replay_wrap_flags())
+        .args(data_model.clang_flags())
+        .arg("-include")
+        .arg(stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include").arg(n);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(input)
+            .arg(&driver_src)
+            .arg("-lm")
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    let linked = link_replay_harness(&build, &driver_src, dir, "counterexample replay")?;
+    if let Some(dump) = std::env::var_os("SAF_CEX_DEBUG") {
+        eprintln!(
+            "saf verify: cex driver at {} linked={linked}",
+            driver_src.display()
+        );
+        let _ = std::fs::copy(&driver_src, std::path::PathBuf::from(dump));
+    }
+    if !linked {
+        return Ok(None);
+    }
+    let errfile = std::fs::File::create(&errpath).with_context(|| "creating UBSan stderr file")?;
+    let mut cmd = Command::new(&harness);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(errfile))
+        .env("UBSAN_OPTIONS", UBSAN_OPTS);
+    let mut child = harden_replay_spawn(&mut cmd)
+        .spawn()
+        .with_context(|| "spawning counterexample harness")?;
+    let timeout = replay_timeout();
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    kill_replay_group(&mut child);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e).context("waiting on counterexample harness"),
+        }
+    }
+    let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+    if std::env::var_os("SAF_CEX_DEBUG").is_some() {
+        eprintln!("saf verify: cex harness stderr:\n{report}");
+    }
+    match saf_svcomp::parse_ubsan_overflow(&report) {
+        Some(hit)
+            if saf_svcomp::fast_paths::overflow_hit_is_spurious_linear_accumulator(
+                module, hit.line, hit.column,
+            ) =>
+        {
+            Ok(None)
+        }
+        other => Ok(other),
+    }
+}
+
 fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) -> String {
     use std::fmt::Write as _;
 
@@ -3904,8 +4737,9 @@ fn replay_confirms_false(
     let driver_src = dir.join(format!("saf_driver_{idx}.c"));
     let harness = dir.join(format!("saf_harness_{idx}"));
 
-    std::fs::write(&driver_src, synthesize_driver(candidate, &sentinel))
-        .with_context(|| "writing replay driver")?;
+    let mut driver = synthesize_driver(candidate, &sentinel);
+    driver.push_str(&rand_wrapper(candidate));
+    std::fs::write(&driver_src, driver).with_context(|| "writing replay driver")?;
 
     let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
     // Two knobs vs a plain native compile (see fuzz_confirm_false): (a) a two-pass __VERIFIER_assert
@@ -3923,6 +4757,7 @@ fn replay_confirms_false(
             "-fsanitize=signed-integer-overflow",
             "-fsanitize-trap=signed-integer-overflow",
         ])
+        .args(replay_wrap_flags())
         .args(data_model.clang_flags())
         .arg("-include")
         .arg(stub);
@@ -3942,27 +4777,23 @@ fn replay_confirms_false(
             .stderr(Stdio::null());
         cmd
     };
-    let mut ok = build(None)
-        .status()
-        .with_context(|| format!("failed to spawn {clang} for native replay"))?
-        .success();
+    let ok = link_replay_harness(&build, &driver_src, dir, "native replay")?;
+    let debug = std::env::var_os("SAF_CEX_DEBUG").is_some();
     if !ok {
-        let neutralizer = write_assert_neutralizer(dir)?;
-        ok = build(Some(neutralizer.as_path()))
-            .status()
-            .with_context(|| format!("failed to spawn {clang} for native replay"))?
-            .success();
-    }
-    if !ok {
-        // Link/compile failure (e.g. the task inlines its own reach_error) —
-        // inconclusive, not a violation.
+        // Link/compile failure — inconclusive, not a violation.
         return Ok(false);
     }
 
     let mut cmd = Command::new(&harness);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    let errpath = dir.join(format!("saf_replay_{idx}.stderr"));
+    cmd.stdin(Stdio::null()).stdout(Stdio::null());
+    if debug {
+        let errfile =
+            std::fs::File::create(&errpath).with_context(|| "creating replay stderr file")?;
+        cmd.stderr(Stdio::from(errfile));
+    } else {
+        cmd.stderr(Stdio::null());
+    }
     let mut child = harden_replay_spawn(&mut cmd)
         .spawn()
         .with_context(|| "spawning replay harness")?;
@@ -3983,6 +4814,21 @@ fn replay_confirms_false(
         }
     }
 
+    if debug {
+        let err = std::fs::read_to_string(&errpath).unwrap_or_default();
+        eprintln!(
+            "saf verify: replay driver {} sentinel={} exit={:?} harness stderr:\n{}",
+            driver_src.display(),
+            sentinel.exists(),
+            child.try_wait().ok().flatten(),
+            err.lines().take(12).collect::<Vec<_>>().join("\n")
+        );
+        if let Some(dump) = std::env::var_os("SAF_CEX_DEBUG") {
+            if dump != "1" {
+                let _ = std::fs::copy(&driver_src, std::path::PathBuf::from(dump));
+            }
+        }
+    }
     // The sentinel is written only by our reach_error/__VERIFIER_error override,
     // so its presence is an irrefutable witness that the real run reached the
     // error call.
@@ -4059,8 +4905,62 @@ fn memsafety_true_or_unknown(ctx: &VerifyCtx, why_no_false: &str) -> VerdictOutc
             }
         }
         saf_svcomp::memsafe::MemSafeProof::Abstain(reason) => {
-            eprintln!("{why_no_false}; Anchored-Object abstained ({reason}) -> unknown");
-            unknown_outcome()
+            eprintln!("{why_no_false}; Anchored-Object abstained ({reason})");
+            if try_memsafety_engine_true(ctx) {
+                VerdictOutcome {
+                    verdict: saf_svcomp::memsafe::memsafe_verdict().to_string(),
+                    witness: None,
+                    graphml: None,
+                    correctness: None,
+                }
+            } else {
+                unknown_outcome()
+            }
+        }
+    }
+}
+
+/// The exact-semantics engine's `valid-memsafety` goal (plan 222 §2s), behind
+/// the same gates as the other engine TRUE arms (OpenMP, a reachable thread
+/// spawn, any dropped instruction or intrinsic). Verdict-only: no witness.
+fn try_memsafety_engine_true(ctx: &VerifyCtx) -> bool {
+    let Ok(source) = std::fs::read_to_string(ctx.input) else {
+        return false;
+    };
+    if saf_svcomp::source_has_openmp(&source) {
+        return false;
+    }
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        return false;
+    }
+    let module = match compile_to_ir_memsafety(ctx.input, ctx.data_model, ctx.stub, ctx.tempdir) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            eprintln!(
+                "saf verify: memsafety recipe: a stack object without lifetime markers -> unknown"
+            );
+            return false;
+        }
+        Err(e) => {
+            eprintln!("saf verify: memsafety recipe failed: {e:#} -> unknown");
+            return false;
+        }
+    };
+    if module.dropped_unknown_opcode || !module.dropped_intrinsics.is_empty() {
+        return false;
+    }
+    let budget = unreach_prove_budget(ctx.budget);
+    match saf_svcomp::prove_memsafety_exhaustive(&module, budget) {
+        saf_svcomp::ExhaustiveProof::Proven => {
+            eprintln!(
+                "saf verify: exhaustive memsafety prover PROVED every path memory-safe -> true"
+            );
+            true
+        }
+        saf_svcomp::ExhaustiveProof::Abstain(reason) => {
+            eprintln!("saf verify: exhaustive memsafety prover abstained ({reason}) -> unknown");
+            false
         }
     }
 }
@@ -4517,6 +5417,8 @@ fn asan_fuzz_pass(
             "-Wno-everything",
             "-Wl,--wrap=rand",
             "-Wl,--wrap=srand",
+            "-Wl,--wrap=fscanf",
+            "-Wl,--wrap=__isoc99_fscanf",
         ]);
         cmd.args(data_model.clang_flags()).arg("-include").arg(stub);
         if let Some(n) = neutralizer {
@@ -5019,7 +5921,10 @@ fn overflow_nondet_assumes(
 /// and the interval sentinel proves "no reachable signed op can overflow" —
 /// vacuously and wrongly. The overflow is only visible in the SOURCE, so that is
 /// where it is detected: clang's own `-Winteger-overflow`, which fires exactly on
-/// this class.
+/// this class, plus `-Wshift-overflow`/`-Wshift-sign-overflow` for a constant
+/// signed shift that leaves the type (`1 << 31`: `termination-bwb/display-bit*`
+/// expect FALSE for it, and the engine never sees a `shl` — found as 2 wrong
+/// PROVEs in `ovf_audit_v8` once unsigned shifts stopped masking them).
 ///
 /// Fail-closed: if clang cannot be spawned at all, report `true` (an overflow may
 /// be hiding) so the TRUE arm abstains rather than guesses.
@@ -5032,22 +5937,45 @@ fn overflow_nondet_assumes(
 /// and the class is real: measured 3 wrong PROVEs in
 /// `signedintegeroverflow-regression` without it.)
 fn overflow_source_constant_folds(ctx: &VerifyCtx) -> bool {
+    overflow_source_constant_folds_in(ctx.clang, ctx.data_model, ctx.stub, ctx.input)
+}
+
+/// [`overflow_source_constant_folds`] on explicit paths (shared with the dev
+/// `prove-unreachable` command's no-overflow goal, so sweeps and audits apply
+/// the gate `verify` applies).
+fn overflow_source_constant_folds_in(
+    clang: &str,
+    data_model: saf_svcomp::DataModel,
+    stub: &std::path::Path,
+    input: &std::path::Path,
+) -> bool {
     use std::process::{Command, Stdio};
-    let m = match ctx.data_model {
+    let m = match data_model {
         saf_svcomp::DataModel::ILP32 => "-m32",
         saf_svcomp::DataModel::LP64 => "-m64",
     };
-    match Command::new(ctx.clang)
-        .args(["-fsyntax-only", "-Wno-everything", "-Winteger-overflow", m])
+    match Command::new(clang)
+        .args([
+            "-fsyntax-only",
+            "-Wno-everything",
+            "-Winteger-overflow",
+            "-Wshift-overflow",
+            "-Wshift-sign-overflow",
+            m,
+        ])
         .arg("-include")
-        .arg(ctx.stub)
-        .arg(ctx.input)
+        .arg(stub)
+        .arg(input)
         .stdout(Stdio::null())
         .output()
     {
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
-            err.contains("integer-overflow") || err.contains("overflow in expression")
+            err.contains("integer-overflow")
+                || err.contains("overflow in expression")
+                || err.contains("shift-overflow")
+                || err.contains("shift-sign-overflow")
+                || err.contains("signed shift result")
         }
         Err(_) => true, // fail-closed
     }
@@ -5100,16 +6028,42 @@ fn try_overflow_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     }
     // (4) Sentinel: prove EVERY reachable signed add/sub/mul in-bounds over the
     //     converged interval solution (fail-closed on any TOP/absent/unmodelled op).
-    if !matches!(
+    //     Failing that, (5) the bounded-exhaustive exact-semantics engine (plan 222
+    //     §2g): the same executor as `try_unreach_true`, deciding a signed overflow
+    //     at every `nsw` operation instead of a `reach_error` call. Same dropped-
+    //     instruction gate, same budget, same audit duty (0 PROVE over the
+    //     expected-FALSE `no-overflow` tasks).
+    let interval_proven = matches!(
         saf_analysis::absint::prove_no_signed_overflow(ctx.module),
         saf_analysis::absint::NoOverflowProof::Proven
-    ) {
-        return None;
+    );
+    let mut states: Vec<saf_svcomp::HeaderStates> = Vec::new();
+    if !interval_proven {
+        if unreach_prover_blocked_by_dropped(ctx.module) {
+            return None;
+        }
+        let budget = unreach_prove_budget(ctx.budget);
+        let (proof, found) = saf_svcomp::prove_no_overflow_exhaustive_with_states_shl(
+            ctx.module,
+            budget,
+            signed_shift_locations(ctx.clang, ctx.data_model, ctx.stub, ctx.input).as_ref(),
+        );
+        match proof {
+            saf_svcomp::ExhaustiveProof::Proven => {
+                eprintln!(
+                    "saf verify: exhaustive no-overflow prover PROVED every path overflow-free -> true"
+                );
+                states = found;
+            }
+            saf_svcomp::ExhaustiveProof::Abstain(reason) => {
+                eprintln!("saf verify: exhaustive no-overflow prover abstained ({reason})");
+                return None;
+            }
+        }
     }
-    // Correctness witness: SAF's converged loop invariants, or an empty
-    // `invariant_set` for a loop-free program.
-    let witness = saf_svcomp::build_interval_invariant_witness(ctx.module, &source, ctx.meta)
-        .unwrap_or_else(|| saf_svcomp::InvariantSetWitness::empty(ctx.meta));
+    // Correctness witness: the exact header state sets of a fixpoint proof,
+    // SAF's converged loop invariants elsewhere, or an empty `invariant_set`.
+    let witness = saf_svcomp::build_correctness_witness(ctx.module, &source, ctx.meta, &states);
     Some(VerdictOutcome {
         verdict: "true".to_string(),
         witness: None,
@@ -5118,49 +6072,219 @@ fn try_overflow_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     })
 }
 
-/// Rank-3 `unreach-call` TRUE: STILL DISABLED, and the reason has changed.
+/// Rank-3 `unreach-call` TRUE — a SAF-native, fail-closed proof (plan 221 §3 B5).
 ///
-/// It was disabled in `e5265281` because its only confirmer was a bundled
-/// `CPAchecker`. Movement 1 (`plans/213`) re-enabled the sibling
-/// [`try_overflow_true`] as a SAF-native proof, but NOT this one, because
-/// `prove_unreachable` is still measurably unsound and the arm is worth nothing.
+/// History: disabled in `e5265281` (its only confirmer was a bundled `CPAchecker`),
+/// kept disabled because the interval sentinel `prove_unreachable` under-
+/// approximates a loop-head phi on some inputs (`loop-simple/deep-nested`) and
+/// proves ~0.2 % of the expected-TRUE pool anyway. This arm does NOT use that
+/// sentinel. It uses [`saf_svcomp::prove_unreach_exhaustive`]: bounded-exhaustive
+/// forward symbolic execution from `main` with EXACT machine semantics (declared
+/// bit widths, two's complement, exact casts, signed/unsigned compares), which
+/// abstains on everything it cannot model (pointer arithmetic, stores through
+/// unknown pointers, floats, indirect calls, recursion, unknown externs) and on
+/// any loop it cannot unwind to completion or any budget it exhausts. A proof
+/// means every path terminated without a feasible error call.
 ///
-/// **Why it is worth nothing.** All 3 `unreach-call` TRUEs this arm emitted across
-/// 22,631 tasks land in clusters that are already at the per-cluster dedup cap, so
-/// its marginal contribution is **0 weighted** — the whole -12 the tool removal
-/// cost was `no-overflow`. There is no score argument for taking any risk here.
+/// Gates before the engine, each fail-closed to `None` (the FALSE path then runs
+/// as before): OpenMP source text; a reachable thread spawn; an ingestion that
+/// dropped an instruction (a collapsed constant pointer expression is handled by
+/// the engine itself, which treats the affected globals as opaque).
 ///
-/// **Why it is still unsound.** A sweep over all 4,324 ground-truth-FALSE
-/// `unreach-call` tasks still finds a wrong PROVE (`loop-simple/deep-nested`). The
-/// mechanism is NOT the two bugs Movement 1 fixed, nor the SCCP cast folding it
-/// also fixed: the interval fixpoint UNDER-APPROXIMATES a loop-head phi, so a
-/// dispatch arm that is really reachable is refuted and the error block keeps the ⊥
-/// every block is pre-seeded with. `prove_unreachable` cannot tell that ⊥ from a
-/// genuinely refuted one. Minimal repro: a 3-state `while(1)` machine — with states
-/// `8466/8496/8512` it wrongly PROVEs, with states `0/1/2` it correctly abstains,
-/// so it is a widening-threshold artifact.
-///
-/// The no-overflow sibling is safe from the same bug because its sentinel now fails
-/// closed on an obligation whose program point was never visited
-/// (`ABSTAIN:unvisited-arith`). `prove_unreachable` has no equivalent, because a ⊥
-/// error block is exactly what its proof LOOKS like — it would need the fixpoint to
-/// record which blocks it actually visited.
-///
-/// Do not re-enable this until that under-approximation is fixed and the full
-/// expected-FALSE sweep returns 0 PROVEs. `verify_unreach_wrongprove_is_not_true`
-/// in `crates/saf-cli/tests/smoke.rs` is the regression that fires if anyone does.
-fn try_unreach_true(_ctx: &VerifyCtx) -> Option<VerdictOutcome> {
-    None
+/// Witness: the 2.0 `invariant_set` the rules want for the witness-required
+/// `C.unreach-call.*` cells is SAF's converged interval invariants, or an empty
+/// set — a validator then re-proves the program itself, which it can for the
+/// small, bounded programs this engine proves. Unconfirmed scores 0, never −32.
+/// `verify_unreach_wrongprove_is_not_true` (smoke) and the expected-FALSE sweep
+/// (plan 221, must stay at 0 PROVE) are the regressions for this arm.
+fn try_unreach_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    let source = std::fs::read_to_string(ctx.input).ok()?;
+    if saf_svcomp::source_has_openmp(&source) {
+        return None;
+    }
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        return None;
+    }
+    // A collapsed constant pointer expression is handled INSIDE the engine (the
+    // affected globals are opaque, `AirModule::collapsed_globals`); a dropped
+    // instruction is not, so it still gates the whole task.
+    if unreach_prover_blocked_by_dropped(ctx.module) {
+        return None;
+    }
+    let budget = unreach_prove_budget(ctx.budget);
+    let (proof, states) = saf_svcomp::prove_unreach_exhaustive_with_states(ctx.module, budget);
+    match proof {
+        saf_svcomp::ExhaustiveProof::Proven => {}
+        saf_svcomp::ExhaustiveProof::Abstain(reason) => {
+            eprintln!("saf verify: exhaustive unreach prover abstained ({reason})");
+            return None;
+        }
+    }
+    eprintln!("saf verify: exhaustive unreach prover PROVED every path error-free -> true");
+    // The exact header state sets of a fixpoint proof are the strongest loop
+    // invariants we have (plan 222 §2j); interval invariants fill in elsewhere.
+    let witness = saf_svcomp::build_correctness_witness(ctx.module, &source, ctx.meta, &states);
+    Some(VerdictOutcome {
+        verdict: "true".to_string(),
+        witness: None,
+        graphml: None,
+        correctness: Some(witness),
+    })
+}
+
+/// Does a dropped instruction invalidate the exhaustive unreachability proof?
+/// An unknown opcode does (nothing marks where it was). Of the lossy intrinsic
+/// skips, `llvm.stackrestore` only ends object lifetimes — a prover that never
+/// reasons about dangling accesses loses nothing — while `llvm.va_start`/
+/// `llvm.va_copy` and the `llvm.experimental.*` family may write memory.
+fn unreach_prover_blocked_by_dropped(module: &saf_core::air::AirModule) -> bool {
+    module.dropped_unknown_opcode
+        || module
+            .dropped_intrinsics
+            .iter()
+            .any(|n| !n.starts_with("llvm.stackrestore"))
+}
+
+/// Wall-clock budget of the exhaustive TRUE arm in `prove-unreachable`,
+/// seconds. `SAF_UNREACH_PROVE_BUDGET_S` overrides the default (an experiment
+/// knob; the verdict is budget-independent in soundness — a timeout only
+/// abstains).
+fn unreach_prove_budget_secs() -> u64 {
+    std::env::var("SAF_UNREACH_PROVE_BUDGET_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
+}
+
+/// Budget of the exhaustive TRUE arm under `verify`: it runs TRUE-first, so it
+/// takes a third of the task's wall budget, at most 300 s, leaving the FALSE
+/// portfolio the rest. That is 20 s under the measurement harness
+/// (`--timeout 60`, so the svcomp26 numbers stay comparable) and ~283 s in the
+/// competition (`--timeout 850`), where a 120 s budget already converted 21 % of
+/// the budget-bound expected-TRUE tasks (plan 223 §10). `SAF_UNREACH_PROVE_BUDGET_S`
+/// overrides.
+fn unreach_prove_budget(task_budget: std::time::Duration) -> std::time::Duration {
+    if let Some(secs) = std::env::var("SAF_UNREACH_PROVE_BUDGET_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return std::time::Duration::from_secs(secs);
+    }
+    (task_budget / 3).min(std::time::Duration::from_secs(300))
 }
 
 /// The `no-overflow` strategy: **TRUE-first** (rank 2 — a SAF-native sound
 /// interval proof, no external confirmer) then the R6 FALSE pipeline
 /// (confirmer-first, propose-free `UBSan` replay). Mirrors [`memsafety_strategy`] for
 /// the FALSE half; no sub-property, so a FALSE is always `false(no-overflow)`.
+/// Source locations `(line, column)` of the program's SIGNED left shifts, from
+/// clang's own `-fsanitize=shift-base` instrumentation: `UBSan` emits a
+/// `__ubsan_handle_shift_out_of_bounds` check only where the C left operand is
+/// signed (an unsigned shift is defined for every operand), and the check
+/// carries the shift expression's debug location — the same location the
+/// engine's `shl` instruction has. The LLVM IR alone cannot tell the two apart,
+/// so without this table every `shl` is a potential overflow and e.g. every
+/// Juliet `RAND32()` (`(unsigned)rand() << 30`) blocks a TRUE. `None` when the
+/// instrumented compile fails (the engine then checks every shift).
+fn signed_shift_locations(
+    clang: &str,
+    data_model: saf_svcomp::DataModel,
+    stub: &Path,
+    input: &Path,
+) -> Option<std::collections::BTreeSet<(u32, u32)>> {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().ok()?;
+    let out = dir.path().join("shift.ll");
+    let m = match data_model {
+        saf_svcomp::DataModel::ILP32 => "-m32",
+        saf_svcomp::DataModel::LP64 => "-m64",
+    };
+    let status = Command::new(clang)
+        .args([
+            "-S",
+            "-emit-llvm",
+            "-O0",
+            "-g",
+            "-Xclang",
+            "-disable-O0-optnone",
+            "-fsanitize=shift-base",
+            "-Wno-everything",
+            m,
+        ])
+        .arg("-include")
+        .arg(stub)
+        .arg(input)
+        .arg("-o")
+        .arg(&out)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&out).ok()?;
+    // `!dbg !N` of every shift check call.
+    let mut dbg_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        if !line.contains("__ubsan_handle_shift_out_of_bounds") || !line.contains("call") {
+            continue;
+        }
+        if let Some(rest) = line.rsplit("!dbg !").next() {
+            let id: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if !id.is_empty() {
+                dbg_ids.insert(id);
+            }
+        }
+    }
+    let mut locs = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let Some((lhs, rhs)) = line.split_once(" = !DILocation(") else {
+            continue;
+        };
+        let id = lhs.trim().trim_start_matches('!');
+        if !dbg_ids.contains(id) {
+            continue;
+        }
+        let field = |name: &str| -> Option<u32> {
+            rhs.split(&format!("{name}: "))
+                .nth(1)?
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .ok()
+        };
+        if let (Some(l), Some(c)) = (field("line"), field("column")) {
+            locs.insert((l, c));
+        }
+    }
+    Some(locs)
+}
+
+/// Externs that wait on a peer; see [`overflow_strategy`].
+const BLOCKING_EXTERNS: &[&str] = &["accept", "connect", "recv", "recvfrom"];
+
 fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     // Sound no-overflow TRUE (fail-closed to the FALSE path on any doubt).
     if let Some(outcome) = try_overflow_true(ctx) {
         return outcome;
+    }
+    // A program that waits on a peer (`accept`, `recv`, …) blocks the native
+    // UBSan sweeps below until each run's timeout, burning the task's budget
+    // without ever reaching the arithmetic; the engine's counterexample stage
+    // models those calls (plan 222 §2n), so it takes over directly.
+    if ctx
+        .module
+        .functions
+        .iter()
+        .any(|f| f.is_declaration && BLOCKING_EXTERNS.contains(&f.name.as_str()))
+    {
+        eprintln!(
+            "saf verify: program waits on a peer (socket input) -> engine counterexample stage"
+        );
+        return overflow_engine_counterexample(ctx);
     }
     match ubsan_confirm(
         ctx.input,
@@ -5196,14 +6320,89 @@ fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             }
         }
         Ok(None) => {
-            eprintln!("saf verify: UBSan replay reproduced no signed-integer overflow -> unknown");
-            unknown_outcome()
+            eprintln!("saf verify: UBSan replay reproduced no signed-integer overflow");
+            overflow_engine_counterexample(ctx)
         }
         Err(e) => {
-            eprintln!("saf verify: UBSan replay errored: {e:#} -> unknown");
-            unknown_outcome()
+            eprintln!("saf verify: UBSan replay errored: {e:#}");
+            overflow_engine_counterexample(ctx)
         }
     }
+}
+
+/// The second `no-overflow` FALSE stage (plan 222 §2n): the exhaustive engine's
+/// overflow counterexample, replayed natively with its nondet reads pinned; the
+/// `UBSan` report is the confirmation, the witness is target-only.
+fn overflow_engine_counterexample(ctx: &VerifyCtx) -> VerdictOutcome {
+    // Search order: breadth-first without shifts; if that finds nothing,
+    // depth-first; if that finds nothing either, breadth-first WITH shift
+    // overflows (confirmed by `-fsanitize=shift-base`). A candidate that does
+    // not replay is excluded and the same search runs again.
+    let mut opts = saf_svcomp::CexOptions {
+        signed_shl_locs: signed_shift_locations(ctx.clang, ctx.data_model, ctx.stub, ctx.input),
+        ..saf_svcomp::CexOptions::default()
+    };
+    for attempt in 0..=cex_retries() {
+        let Some(candidate) = engine_false_candidate(ctx, true, &opts) else {
+            if !opts.skip.is_empty() {
+                break;
+            }
+            if !opts.depth_first {
+                opts.depth_first = true;
+                continue;
+            }
+            if !opts.check_shl {
+                opts.depth_first = false;
+                opts.check_shl = true;
+                continue;
+            }
+            eprintln!("saf verify: no engine overflow counterexample -> unknown");
+            return unknown_outcome();
+        };
+        match ubsan_replay_sequence(
+            ctx.input,
+            ctx.data_model,
+            ctx.module,
+            ctx.stub,
+            ctx.tempdir,
+            ctx.clang,
+            &candidate,
+        ) {
+            Ok(Some(hit)) => {
+                let witness = build_witness(
+                    ctx,
+                    Some(saf_svcomp::lower_overflow_candidate(
+                        ctx.module,
+                        &candidate,
+                        &hit,
+                        verify_source(ctx).as_deref(),
+                    )),
+                );
+                if witness.is_none() {
+                    eprintln!(
+                        "saf verify: FALSE (engine counterexample, UBSan-confirmed) but witness unconstructible -> emitting false without a witness"
+                    );
+                }
+                return VerdictOutcome {
+                    verdict: saf_svcomp::overflow_verdict(),
+                    witness,
+                    graphml: None,
+                    correctness: None,
+                };
+            }
+            Ok(None) => eprintln!(
+                "saf verify: engine overflow counterexample did not replay (attempt {})",
+                attempt + 1
+            ),
+            Err(e) => {
+                eprintln!("saf verify: engine counterexample replay errored: {e:#} -> unknown");
+                return unknown_outcome();
+            }
+        }
+        opts.skip.insert(candidate.reach_error_inst);
+    }
+    eprintln!("saf verify: engine overflow counterexample did not replay -> unknown");
+    unknown_outcome()
 }
 
 /// The `termination` TRUE strategy (plan 201, R7 — SAF's first sound-TRUE arm).
@@ -5873,6 +7072,8 @@ fn tsan_confirm(
             // Determinism: redirect rand()/srand() to the driver's __wrap_* stubs.
             "-Wl,--wrap=rand",
             "-Wl,--wrap=srand",
+            "-Wl,--wrap=fscanf",
+            "-Wl,--wrap=__isoc99_fscanf",
         ]);
         cmd.args(instrument);
         cmd.args(extra)
@@ -6007,6 +7208,8 @@ fn ubsan_confirm(
             // Determinism: redirect rand()/srand() to the driver's __wrap_* stubs.
             "-Wl,--wrap=rand",
             "-Wl,--wrap=srand",
+            "-Wl,--wrap=fscanf",
+            "-Wl,--wrap=__isoc99_fscanf",
         ])
         .args(data_model.clang_flags())
         .arg("-include")
@@ -6948,6 +8151,164 @@ pub fn specs(args: &SpecsArgs) -> anyhow::Result<()> {
 mod verify_tests {
     use super::*;
 
+    /// The engine's `valid-memsafety` goal (plan 222 §2s) on small C programs:
+    /// the safe ones are proven, every unsafe one abstains — out-of-bounds
+    /// (concrete and symbolic size), use after free, double free, a leak in a
+    /// callee before `abort`, a dangling stack pointer, and a pointer kept from
+    /// an earlier activation of the same function. Needs clang (Docker).
+    #[test]
+    #[ignore = "needs clang"]
+    fn memsafety_goal_proves_safe_programs_and_abstains_on_violations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("stub.h");
+        std::fs::write(
+            &stub,
+            "#include <stdlib.h>\n#include <string.h>\nextern int __VERIFIER_nondet_int(void);\n",
+        )
+        .expect("stub");
+        let cases: &[(&str, bool, &str)] = &[
+            (
+                "safe_free",
+                true,
+                "int main(void){ int *a = malloc(4*sizeof(int)); for (int i=0;i<4;i++) a[i]=i; int s=a[3]; free(a); return s; }",
+            ),
+            (
+                "safe_list",
+                true,
+                "struct n { struct n *next; int v; }; struct n *head; int main(void){ for (int i=0;i<3;i++){ struct n *x = malloc(sizeof *x); x->v=i; x->next=head; head=x; } return 0; }",
+            ),
+            (
+                "safe_alloca_loop",
+                true,
+                "int main(void){ int *x = alloca(sizeof(int)); *x = __VERIFIER_nondet_int(); while (*x > 0) { *x = *x - 1; } return 0; }",
+            ),
+            (
+                "oob",
+                false,
+                "int main(void){ int *a = malloc(4*sizeof(int)); a[4]=1; free(a); return 0; }",
+            ),
+            (
+                "oob_sym",
+                false,
+                "int main(void){ int n = __VERIFIER_nondet_int(); if (n<1||n>8) return 0; char *a = malloc(n); a[7]=1; free(a); return 0; }",
+            ),
+            (
+                "uaf",
+                false,
+                "int main(void){ int *a = malloc(4); free(a); return *a; }",
+            ),
+            (
+                "double_free",
+                false,
+                "int main(void){ int *a = malloc(4); free(a); free(a); return 0; }",
+            ),
+            (
+                "leak_then_abort",
+                false,
+                "static void f(void){ int *p = malloc(4); *p=1; } int main(void){ f(); abort(); }",
+            ),
+            (
+                "dangling",
+                false,
+                "static int *f(void){ int x = 1; int *p = &x; return p; } int main(void){ int *q = f(); return *q; }",
+            ),
+            (
+                "reactivation",
+                false,
+                "int *g; static int f(int first){ int x = 5; if (first) { g = &x; return 0; } return *g; } int main(void){ f(1); return f(0); }",
+            ),
+            (
+                "block_scope",
+                false,
+                "int main(void){ int *p = 0; { int a = 7; p = &a; } int b = 3; return *p + b; }",
+            ),
+            (
+                "loop_scope",
+                false,
+                "int main(void){ int *p; for (int i = 0; i < 10; i++) { int a[10]; p = a; p[0] = 1; } p[0] = 2; return 0; }",
+            ),
+            (
+                "loop_scope_safe",
+                true,
+                "int main(void){ int s = 0; for (int i = 0; i < 3; i++) { int a[4]; a[0] = i; s += a[0]; } return s; }",
+            ),
+        ];
+        for (name, safe, body) in cases {
+            let src = dir.path().join(format!("{name}.c"));
+            std::fs::write(&src, body).expect("source");
+            let module =
+                compile_to_ir_memsafety(&src, saf_svcomp::DataModel::LP64, &stub, dir.path())
+                    .expect("compile")
+                    .expect("every stack object has lifetime markers");
+            let proof =
+                saf_svcomp::prove_memsafety_exhaustive(&module, std::time::Duration::from_secs(30));
+            assert_eq!(
+                matches!(proof, saf_svcomp::ExhaustiveProof::Proven),
+                *safe,
+                "{name}: {proof:?}"
+            );
+        }
+    }
+
+    /// `unsigned m = 1 << 31;` is a constant signed-shift overflow clang folds
+    /// away (no `shl` reaches the engine): the source gate must catch it, and
+    /// must stay quiet for the unsigned `1u << 31`. Needs clang (Docker).
+    #[test]
+    #[ignore = "needs clang"]
+    fn constant_shift_overflow_is_gated_at_the_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("stub.h");
+        std::fs::write(&stub, "").expect("stub");
+        let bad = dir.path().join("bad.c");
+        std::fs::write(
+            &bad,
+            "int main(void) { unsigned m = 1 << 31; return m != 0; }\n",
+        )
+        .expect("bad");
+        let good = dir.path().join("good.c");
+        std::fs::write(
+            &good,
+            "int main(void) { unsigned m = 1u << 31; return m != 0; }\n",
+        )
+        .expect("good");
+        let clang = std::env::var("SAF_CLANG").unwrap_or_else(|_| DEFAULT_CLANG.to_string());
+        assert!(overflow_source_constant_folds_in(
+            &clang,
+            saf_svcomp::DataModel::LP64,
+            &stub,
+            &bad
+        ));
+        assert!(!overflow_source_constant_folds_in(
+            &clang,
+            saf_svcomp::DataModel::LP64,
+            &stub,
+            &good
+        ));
+    }
+
+    /// The memory-safety recipe renames lifetime markers and refuses a stack
+    /// object that may die early without them (a compound literal).
+    #[test]
+    fn memsafety_rewrite_renames_markers_and_rejects_unmarked_objects() {
+        let ok = "define i32 @main() {\n  %retval = alloca i32\n  %x.addr = alloca i32\n  %buf = alloca [8 x i8]\n  call void @llvm.lifetime.start.p0(i64 8, ptr %buf)\n  call void @llvm.lifetime.end.p0(i64 8, ptr %buf)\n  ret i32 0\n}\ndeclare void @llvm.lifetime.start.p0(i64 immarg, ptr nocapture)\n";
+        let out = memsafety_rewrite_ir(ok).expect("all objects accounted for");
+        assert!(
+            out.contains("call void @__saf_lifetime_start(i64 8, ptr %buf)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("call void @__saf_lifetime_end(i64 8, ptr %buf)"),
+            "{out}"
+        );
+        assert!(!out.contains("declare void @llvm.lifetime."), "{out}");
+        assert!(
+            out.contains("declare void @__saf_lifetime_start(i64, ptr)"),
+            "{out}"
+        );
+        let lit = "define i32 @main() {\n  %.compoundliteral = alloca [2 x i32]\n  ret i32 0\n}\n";
+        assert!(memsafety_rewrite_ir(lit).is_none());
+    }
+
     #[test]
     fn assert_neutralizer_undefs_the_macro() {
         // The fallback header must `#undef __VERIFIER_assert` (guarded so it is a
@@ -7464,6 +8825,7 @@ mod verify_tests {
             stub: Path::new("/dev/null"),
             tempdir: dir.path(),
             clang: "clang",
+            budget: std::time::Duration::from_secs(60),
         };
         let hit = saf_svcomp::OverflowHit {
             file: "t.c".to_string(),
@@ -7554,6 +8916,7 @@ mod verify_tests {
             stub: Path::new("/dev/null"),
             tempdir: dir.path(),
             clang: "clang",
+            budget: std::time::Duration::from_secs(60),
         };
         // Fault at line 7 (`base + base`, after the loop). Only the line-2
         // unconditional read may bind; the line-4 in-loop read (never executed under
@@ -7611,6 +8974,7 @@ mod verify_tests {
             stub: Path::new("/dev/null"),
             tempdir: dir.path(),
             clang: "clang",
+            budget: std::time::Duration::from_secs(60),
         };
         let hit = saf_svcomp::OverflowHit {
             file: "m.c".to_string(),

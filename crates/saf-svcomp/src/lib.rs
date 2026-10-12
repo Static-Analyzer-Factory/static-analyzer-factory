@@ -41,6 +41,7 @@ pub mod summaries;
 pub mod termination;
 pub mod termination_witness;
 pub mod universe;
+pub mod unreach_prove;
 pub mod witness_lower;
 pub mod witness_yaml;
 
@@ -56,7 +57,9 @@ pub use conc_shim::{
     SHIM_CBOUND, SHIM_MAX_STEP, ShimPlan, conc_shim_schedulable, shim_preemption_plans,
     synthesize_conc_shim_driver,
 };
-pub use correctness_driver::{build_interval_invariant_witness, source_has_openmp};
+pub use correctness_driver::{
+    build_correctness_witness, build_interval_invariant_witness, source_has_openmp,
+};
 pub use correctness_witness::{
     InvariantKind, InvariantSetWitness, SourceInvariant, interval_to_c_expr,
 };
@@ -88,8 +91,17 @@ pub use termination::{
     is_known_returning_external, program_structurally_terminates, termination_verdict,
 };
 pub use termination_witness::build_ranking_witness;
+pub use unreach_prove::{
+    CexOptions, Counterexample, ExhaustiveProof, HeaderStates, KEEP_ALIVE, LIFETIME_END,
+    LIFETIME_START, PINNED_EXTERNS, StateVar, find_counterexample, find_counterexample_excluding,
+    is_pinned_extern, prove_memsafety_exhaustive, prove_no_overflow_exhaustive,
+    prove_no_overflow_exhaustive_shl, prove_no_overflow_exhaustive_with_states,
+    prove_no_overflow_exhaustive_with_states_shl, prove_unreach_exhaustive,
+    prove_unreach_exhaustive_with_states,
+};
 pub use witness_lower::{
-    lower_candidate, lower_must_reach, lower_reach_error_target, span_to_location,
+    find_inst_span, lower_candidate, lower_must_reach, lower_overflow_candidate,
+    lower_reach_error_target, span_to_location,
 };
 pub use witness_yaml::{
     Action, Constraint, SourceWaypoint, ViolationWitness, WaypointKind, WitnessMeta,

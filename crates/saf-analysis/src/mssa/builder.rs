@@ -610,6 +610,9 @@ mod tests {
             constants: std::collections::BTreeMap::new(),
             types: std::collections::BTreeMap::new(),
             target_pointer_width: 8,
+            collapsed_globals: None,
+            dropped_intrinsics: std::collections::BTreeSet::new(),
+            dropped_unknown_opcode: false,
             function_index: BTreeMap::new(),
             name_index: BTreeMap::new(),
         };
@@ -689,6 +692,9 @@ mod tests {
             constants: std::collections::BTreeMap::new(),
             types: std::collections::BTreeMap::new(),
             target_pointer_width: 8,
+            collapsed_globals: None,
+            dropped_intrinsics: std::collections::BTreeSet::new(),
+            dropped_unknown_opcode: false,
             function_index: BTreeMap::new(),
             name_index: BTreeMap::new(),
         };
@@ -774,6 +780,9 @@ mod tests {
             constants: std::collections::BTreeMap::new(),
             types: std::collections::BTreeMap::new(),
             target_pointer_width: 8,
+            collapsed_globals: None,
+            dropped_intrinsics: std::collections::BTreeSet::new(),
+            dropped_unknown_opcode: false,
             function_index: BTreeMap::new(),
             name_index: BTreeMap::new(),
         };

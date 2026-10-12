@@ -129,6 +129,18 @@ impl TypeInterner {
             return self.intern_float(64);
         }
 
+        // The other LLVM floating-point types, by their bit width (`half` 16,
+        // x87 `long double` 80, the 128-bit quad and PowerPC double-double).
+        if trimmed == "half" || trimmed == "bfloat" {
+            return self.intern_float(16);
+        }
+        if trimmed == "x86_fp80" {
+            return self.intern_float(80);
+        }
+        if trimmed == "fp128" || trimmed == "ppc_fp128" {
+            return self.intern_float(128);
+        }
+
         // Void
         if trimmed == "void" {
             return self.intern_void();
@@ -438,6 +450,16 @@ mod tests {
                 "expected Integer {{ bits: {bits} }} for \"{s}\""
             );
         }
+    }
+
+    #[test]
+    fn parse_long_double_type() {
+        let mut interner = TypeInterner::new();
+        let f80_id = interner.parse_llvm_type_string("x86_fp80");
+        assert!(matches!(
+            interner.forward.get(&f80_id),
+            Some(AirType::Float { bits: 80 })
+        ));
     }
 
     #[test]

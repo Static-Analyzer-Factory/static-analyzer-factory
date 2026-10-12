@@ -2247,6 +2247,9 @@ mod tests {
             constants: BTreeMap::new(),
             types: BTreeMap::new(),
             target_pointer_width: 8,
+            collapsed_globals: None,
+            dropped_intrinsics: std::collections::BTreeSet::new(),
+            dropped_unknown_opcode: false,
             function_index: BTreeMap::new(),
             name_index: BTreeMap::new(),
         }
@@ -2663,6 +2666,7 @@ mod tests {
             is_constant: true,
             span: None,
             value_type: None,
+            layout: None,
         });
         let defs: DefMap = BTreeMap::new();
         assert_eq!(
@@ -2692,6 +2696,7 @@ mod tests {
             is_constant: true,
             span: None,
             value_type: None,
+            layout: None,
         });
         m.globals.push(AirGlobal {
             id: bad,
@@ -2703,6 +2708,7 @@ mod tests {
             is_constant: true,
             span: None,
             value_type: None,
+            layout: None,
         });
         let defs: DefMap = BTreeMap::new();
 

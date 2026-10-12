@@ -2222,10 +2222,12 @@ dependencies = [
  "saf-analysis",
  "saf-core",
  "serde",
+ "serde_json",
  "serde_yaml",
  "sha2",
  "tracing",
  "z3",
+ "z3-sys",
 ]
 
 [[package]]

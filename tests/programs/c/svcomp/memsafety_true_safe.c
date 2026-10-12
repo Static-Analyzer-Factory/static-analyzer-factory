@@ -1,6 +1,6 @@
 // valid-memsafety TRUE (safe): in-bounds access, freed once. ASan never traps,
-// so the R5 confirmer never confirms a violation -> unknown (SAF never emits
-// `true`, and never a false alarm on a safe program).
+// so the R5 confirmer never confirms a violation; the engine's memory-safety
+// goal (plan 222 §2s) then proves it -> true (and never a false alarm).
 #include <stdlib.h>
 
 int main(void) {

@@ -5,7 +5,7 @@
 
 #![cfg(any(feature = "llvm-18", feature = "llvm-22"))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
@@ -19,7 +19,8 @@ use rustc_hash::FxHashMap;
 
 use saf_core::air::{
     AirBlock, AirBundle, AirFunction, AirGlobal, AirModule, AirParam, BinaryOp, CastKind, Constant,
-    FieldPath, FieldStep, HeapAllocKind, Instruction, Operation,
+    FieldPath, FieldStep, GEP_BYTES_KEY, HeapAllocKind, Instruction, Layout, LayoutField,
+    Operation,
 };
 use saf_core::id::make_id;
 use saf_core::ids::{BlockId, FunctionId, InstId, ModuleId, ObjId, ValueId};
@@ -53,6 +54,9 @@ pub(crate) struct MappingContext<'ctx> {
     pub module_id: ModuleId,
     /// Map from LLVM function names to AIR function IDs.
     pub function_ids: BTreeMap<String, FunctionId>,
+    /// Functions the module DEFINES (has a body for), by name: a call to one is
+    /// a call, never a model of the same-named library function.
+    pub defined_functions: BTreeSet<String>,
     /// Map from `LLVMValueRef` pointer (as `usize`) to AIR value IDs.
     /// Using pointer identity avoids `print_to_string()` FFI calls on cache hits.
     pub ptr_cache: FxHashMap<usize, ValueId>,
@@ -72,6 +76,14 @@ pub(crate) struct MappingContext<'ctx> {
     /// Map from global name to initializer constant.
     /// Used to resolve constant-expression GEPs into globals (Plan 084 Phase B).
     pub global_inits: BTreeMap<String, Constant>,
+    /// Declared (value) type of every global, by name, spelled as a GEP
+    /// expression spells it (`%struct.T`, `[2 x [3 x i32]]`) — what a constant
+    /// GEP's byte offset is laid out against. Filled in a pre-pass so
+    /// initializers may reference globals defined later.
+    pub global_llvm_types: BTreeMap<String, inkwell::llvm_sys::prelude::LLVMTypeRef>,
+    /// The module's data layout (`target datalayout`), for exact field offsets
+    /// and sizes; `None` when the module carries none.
+    pub target_data: Option<inkwell::targets::TargetData>,
     /// Current block ID (set during block conversion).
     /// Used by `decompose_constant_gep` to create synthetic instruction IDs.
     pub current_block_id: Option<BlockId>,
@@ -106,6 +118,14 @@ pub(crate) struct MappingContext<'ctx> {
     /// What this conversion could not faithfully represent. Accumulated as the
     /// module is walked and handed to [`saf_core::air::AirBundle::with_fidelity`].
     pub fidelity: saf_core::air::IngestFidelity,
+    /// Names of the globals a collapsed constant pointer expression resolved to
+    /// (see `collapsed_const_ptr_expr`), and whether some collapse could not be
+    /// attributed to a named global at all.
+    pub collapsed_global_names: BTreeSet<String>,
+    pub collapsed_unattributed: bool,
+    /// Lossy intrinsic skips, by name, and whether an unknown opcode was dropped.
+    pub dropped_intrinsic_names: BTreeSet<String>,
+    pub dropped_unknown_opcode: bool,
     /// Phantom data for the context lifetime.
     _phantom: std::marker::PhantomData<&'ctx ()>,
 }
@@ -116,6 +136,7 @@ impl MappingContext<'_> {
         Self {
             module_id,
             function_ids: BTreeMap::new(),
+            defined_functions: BTreeSet::new(),
             ptr_cache: FxHashMap::default(),
             block_counter: 0,
             inst_counter: 0,
@@ -124,6 +145,8 @@ impl MappingContext<'_> {
             source_files: SourceFileTracker::new(),
             constants: BTreeMap::new(),
             global_inits: BTreeMap::new(),
+            global_llvm_types: BTreeMap::new(),
+            target_data: None,
             current_block_id: None,
             pending_instructions: Vec::new(),
             type_interner: super::type_intern::TypeInterner::new(),
@@ -133,6 +156,10 @@ impl MappingContext<'_> {
             const_cache: FxHashMap::default(),
             decompose_pointer_arrays: std::env::var("SAF_DECOMPOSE_POINTER_ARRAYS").is_ok(),
             fidelity: saf_core::air::IngestFidelity::default(),
+            collapsed_global_names: BTreeSet::new(),
+            collapsed_unattributed: false,
+            dropped_intrinsic_names: BTreeSet::new(),
+            dropped_unknown_opcode: false,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -337,6 +364,33 @@ impl MappingContext<'_> {
         // named-global and scalar-int cases were already handled above.
         let repr = value.print_to_string().to_string();
 
+        // Decompose constant-expression GEPs into globals with aggregate initializers.
+        // A constant GEP like `ptr getelementptr inbounds ([2 x i32], ptr @a, i64 0, i64 1)`
+        // computes a field-indexed address into `@a`. Without decomposition,
+        // `extract_global_name_from_repr` would match "@a" and return the base
+        // global's ValueId, making `a[0]` and `a[1]` indistinguishable to PTA.
+        //
+        // Only decompose GEPs into globals that have aggregate initializers —
+        // for non-aggregate globals, the simple base-address resolution is correct
+        // and produces better results for alias analysis.
+        // An EXACT decomposition — the pointer-level index is 0, every other
+        // index is a constant field step — loses nothing, so the global is not
+        // marked collapsed (an address-level prover keeps it as exact cells:
+        // `hardness_wrappers_*` stores through `&arr[k]` constant expressions).
+        if repr.contains("getelementptr") {
+            // Deliberately NOT cached: the result is an INSTRUCTION appended in
+            // front of the current user, so every use (another block, another
+            // function) gets its own copy that executes right before it. A
+            // cached id would name an instruction the executing path never ran,
+            // and a consumer would then read the element constant registered
+            // under that id as if it were the address.
+            if let Some(gep_result_id) = self.exact_constant_gep(value.as_value_ref(), &repr) {
+                return gep_result_id;
+            }
+            // Not exactly decomposable — fall through: the collapse below
+            // records the loss.
+        }
+
         // FIDELITY. Everything reaching here is an UNNAMED constant — a bare
         // `@g` reference has a name and already returned via TYPED FAST PATH 1.
         // So if this text still mentions a global, it is a constant EXPRESSION
@@ -354,33 +408,16 @@ impl MappingContext<'_> {
         // it. Deliberately coarse: one flag for the whole module, set on any such
         // expression whether or not it was decomposed.
         if repr.contains('@') {
+            tracing::debug!("collapsed constant pointer expression: {repr}");
             self.fidelity.collapsed_const_ptr_expr = true;
-        }
-
-        // Decompose constant-expression GEPs into globals with aggregate initializers.
-        // A constant GEP like `ptr getelementptr inbounds ([2 x i32], ptr @a, i64 0, i64 1)`
-        // computes a field-indexed address into `@a`. Without decomposition,
-        // `extract_global_name_from_repr` would match "@a" and return the base
-        // global's ValueId, making `a[0]` and `a[1]` indistinguishable to PTA.
-        //
-        // Only decompose GEPs into globals that have aggregate initializers —
-        // for non-aggregate globals, the simple base-address resolution is correct
-        // and produces better results for alias analysis.
-        if repr.contains("getelementptr") {
-            if let Some((global_name, _)) = parse_constant_gep(&repr) {
-                if matches!(
-                    self.global_inits.get(global_name),
-                    Some(Constant::Aggregate { .. })
-                ) {
-                    if let Some(gep_result_id) = self.decompose_constant_gep(&repr) {
-                        self.ptr_cache.insert(ptr_key, gep_result_id);
-                        self.const_cache.insert(ptr_key, gep_result_id);
-                        return gep_result_id;
-                    }
+            // Attribute the collapse to its global so an address-level prover can
+            // treat exactly that global as opaque instead of refusing the module.
+            match extract_global_name_from_repr(&repr) {
+                Some(name) => {
+                    self.collapsed_global_names.insert(name.to_string());
                 }
+                None => self.collapsed_unattributed = true,
             }
-            // Non-aggregate global or decomposition failed — fall through to
-            // global ref check (simple base-address resolution is appropriate).
         }
 
         // Check if this is a global or function reference (format: "ptr @name" or "@name")
@@ -438,46 +475,62 @@ impl MappingContext<'_> {
     ///
     /// Returns the `ValueId` of the synthetic GEP's result, or `None` if the
     /// expression cannot be decomposed (non-global base, no block context, etc.).
-    fn decompose_constant_gep(&mut self, repr: &str) -> Option<ValueId> {
-        let (global_name, indices) = parse_constant_gep(repr)?;
-
-        // Look up the global's ValueId as the base pointer
-        let base_vid = *self.global_value_ids.get(global_name)?;
-
-        // Need a current block to create instruction IDs
-        let block_id = self.current_block_id?;
-
-        // Drop the first index: LLVM GEP's first index is a pointer-level step
-        // (advance by `sizeof(pointee)` * idx, almost always 0 for globals),
-        // not a type-descent index. SAF's `FieldPath` only carries descent
-        // steps — matching `resolve_constant_gep_element`'s behavior below.
-        //
-        // A single-index constant GEP (like `getelementptr [N x T], ptr @g,
-        // i64 K`) has no type descent — the index is purely pointer-level.
-        // Bail out so the caller falls through to simple base-address
-        // resolution; emitting a one-step `FieldPath{K}` would be wrong
-        // (it would descend into field K of the pointee, not offset past
-        // the aggregate by K * sizeof(pointee)).
-        if indices.len() < 2 {
+    /// An EXACT decomposition of a constant GEP expression (possibly a chain)
+    /// over a global with an aggregate, zero or string initializer, as a
+    /// synthetic `Gep` whose `FieldPath` is the structural path of the addressed
+    /// element in the global's declared type — so an address-level consumer
+    /// keeps the global as exact cells. The expression's byte offset comes from
+    /// LLVM's own source element types and the module's data layout (struct
+    /// field offsets with padding, array strides), then is laid out in the
+    /// declared type. `None` when it cannot be (no data layout, an index that
+    /// is not a constant, an offset in padding or inside a scalar, a vector):
+    /// the caller then records the collapse and the prover treats the global
+    /// as opaque.
+    fn exact_constant_gep(
+        &mut self,
+        value: inkwell::llvm_sys::prelude::LLVMValueRef,
+        repr: &str,
+    ) -> Option<ValueId> {
+        let td = self.target_data.as_ref()?;
+        let (global_name, offset) = const_pointer_global_offset(value, td)?;
+        // Aggregate, zero, or a `char` array recorded as text (a byte path).
+        if !matches!(
+            self.global_inits.get(&global_name),
+            Some(Constant::Aggregate { .. } | Constant::ZeroInit | Constant::String { .. })
+        ) {
+            tracing::debug!("constant gep: no aggregate/zero initializer for @{global_name}");
             return None;
         }
-        let field_indices: &[i64] = &indices[1..];
+        let base_vid = *self.global_value_ids.get(&global_name)?;
+        let ty_ref = *self.global_llvm_types.get(&global_name)?;
+        // SAFETY: the type ref was taken from this module's live global.
+        let ty = unsafe { inkwell::types::AnyTypeEnum::new(ty_ref) };
+        let Some(path) = offset_to_path(td, ty, offset) else {
+            tracing::debug!("constant gep: offset {offset} has no path in @{global_name}: {repr}");
+            return None;
+        };
+        let bytes = path_step_bytes(td, ty, &path);
+        self.synthesize_global_gep(base_vid, &path, Some(repr), bytes)
+    }
 
-        // Build FieldPath from parsed indices (all constant → Field steps)
-        let steps: Vec<FieldStep> = field_indices
-            .iter()
-            .filter_map(|&idx| {
-                u32::try_from(idx)
-                    .ok()
-                    .map(|i| FieldStep::Field { index: i })
-            })
-            .collect();
-
-        if steps.len() != field_indices.len() {
-            return None; // Some indices were negative or too large
-        }
-
-        let field_path = FieldPath { steps };
+    /// A synthetic `Gep` instruction (no span) from `base` along `path`,
+    /// appended to the current block; `repr` lets the addressed constant be
+    /// recorded for absint when it can be resolved.
+    fn synthesize_global_gep(
+        &mut self,
+        base_vid: ValueId,
+        path: &[u32],
+        repr: Option<&str>,
+        bytes: Option<Vec<(bool, u64)>>,
+    ) -> Option<ValueId> {
+        let block_id = self.current_block_id?;
+        let field_indices: Vec<i64> = path.iter().map(|&i| i64::from(i)).collect();
+        let field_path = FieldPath {
+            steps: path
+                .iter()
+                .map(|&index| FieldStep::Field { index })
+                .collect(),
+        };
 
         // Create synthetic GEP instruction
         let inst_id = self.create_inst_id(block_id);
@@ -493,7 +546,7 @@ impl MappingContext<'_> {
         // integers, so get_or_create_value_id will produce matching IDs when it
         // encounters the same constant as an operand elsewhere.
         let mut operands = vec![base_vid];
-        for &idx in field_indices {
+        for &idx in &field_indices {
             let idx_repr = format!("i64 {idx}");
             let idx_vid = ValueId::derive(idx_repr.as_bytes());
             self.constants
@@ -506,12 +559,19 @@ impl MappingContext<'_> {
         air_inst.operands = operands;
         air_inst.dst = Some(dst_id);
         air_inst.result_type = Some(self.type_interner.intern_pointer());
+        if let Some(bytes) = bytes.filter(|b| b.len() == path.len()) {
+            air_inst
+                .extensions
+                .insert(GEP_BYTES_KEY.to_string(), gep_bytes_json(&bytes));
+        }
 
         // Pointer cache insertion is handled by the caller (get_or_create_value_id).
 
         // Also store the resolved constant value (if available) so absint can
         // use it directly without going through PTA → loc_memory → load.
-        if let Some(constant) = resolve_constant_gep_element(repr, &self.global_inits) {
+        if let Some(constant) =
+            repr.and_then(|r| resolve_constant_gep_element(r, &self.global_inits))
+        {
             self.constants.entry(dst_id).or_insert(constant);
         }
 
@@ -584,6 +644,29 @@ pub fn convert_module(
         let name = func.get_name().to_str().unwrap_or("");
         if !name.starts_with("llvm.") {
             ctx.get_or_create_function_id(func);
+            if func.count_basic_blocks() > 0 {
+                ctx.defined_functions.insert(name.to_string());
+            }
+        }
+    }
+
+    // The data layout and every global's declared type, before any
+    // initializer or instruction operand needs them (a constant GEP's byte
+    // offset is laid out in the addressed global's type).
+    ctx.target_data = module
+        .get_data_layout()
+        .as_str()
+        .to_str()
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(inkwell::targets::TargetData::create);
+    for global in module.get_globals() {
+        if let Ok(name) = global.get_name().to_str() {
+            let ty = global.get_value_type();
+            ctx.global_llvm_types.insert(
+                name.to_string(),
+                inkwell::types::AsTypeRef::as_type_ref(&ty),
+            );
         }
     }
 
@@ -628,14 +711,43 @@ pub fn convert_module(
     let mut air_module = AirModule::new(module_id);
     air_module.name = module.get_name().to_str().ok().map(String::from);
     air_module.functions = air_functions;
+    // An external callee that is no function of the module — a compiler
+    // intrinsic mapped as an external call (`llvm.abs.i32`, `llvm.fabs.f64`,
+    // `llvm.fmuladd.f64`) — gets a declaration too, so a consumer can resolve
+    // the callee's NAME (the exhaustive engine models the pure ones) instead of
+    // finding a dangling `FunctionId`.
+    let known: std::collections::BTreeSet<FunctionId> =
+        air_module.functions.iter().map(|f| f.id).collect();
+    for (name, id) in &ctx.function_ids {
+        if !known.contains(id) {
+            let mut decl = AirFunction::new(*id, name.clone());
+            decl.is_declaration = true;
+            air_module.functions.push(decl);
+        }
+    }
     air_module.globals = air_globals;
     air_module.source_files = ctx.source_files.into_files();
     air_module.type_hierarchy = type_hierarchy;
     air_module.constants = ctx.constants;
     air_module.types = ctx.type_interner.into_table();
-    // TODO: Parse pointer size from LLVM module's data layout string.
-    // For now, default to 8 (64-bit targets).
-    air_module.target_pointer_width = 8;
+    // The pointer size of the module's own data layout (4 on an `ILP32` task);
+    // 8 when the module carries no data layout.
+    air_module.target_pointer_width = ctx
+        .target_data
+        .as_ref()
+        .map_or(8, |td| td.get_pointer_byte_size(None));
+    air_module.collapsed_globals = if ctx.collapsed_unattributed {
+        None
+    } else {
+        Some(
+            ctx.collapsed_global_names
+                .iter()
+                .filter_map(|n| ctx.global_value_ids.get(n).copied())
+                .collect(),
+        )
+    };
+    air_module.dropped_intrinsics = ctx.dropped_intrinsic_names;
+    air_module.dropped_unknown_opcode = ctx.dropped_unknown_opcode;
     air_module.rebuild_function_index();
 
     Ok(AirBundle::with_fidelity("llvm", air_module, ctx.fidelity))
@@ -670,6 +782,12 @@ fn convert_global(global: GlobalValue<'_>, ctx: &mut MappingContext<'_>) -> Opti
     // direction.
     let ty_str = global.get_value_type().print_to_string().to_string();
     air_global.value_type = Some(ctx.type_interner.parse_llvm_type_string(&ty_str));
+    // The object's byte layout, for consumers that address memory by byte
+    // offset (a prover's cells): where each initializer element starts.
+    air_global.layout = ctx
+        .target_data
+        .as_ref()
+        .and_then(|td| layout_of(td, global.get_value_type()));
 
     // Try to convert initializer.
     // Decompose array initializers whenever the element type is or contains a
@@ -760,6 +878,22 @@ fn pointer_elem_to_ref(
 /// Extract the name of a global that a pointer constant references.
 ///
 /// For pointers like `@global_name`, returns `Some("global_name")`.
+/// Is this constant array a C string — NUL-terminated with no interior NUL?
+fn array_is_c_string(av: inkwell::values::ArrayValue<'_>) -> bool {
+    let mut len: usize = 0;
+    // SAFETY: `av` is a live constant array; LLVM returns a pointer to `len`
+    // bytes that stays valid for the module's lifetime.
+    let bytes: &[u8] = unsafe {
+        let p = inkwell::llvm_sys::core::LLVMGetAsString(av.as_value_ref(), &raw mut len);
+        if p.is_null() {
+            &[]
+        } else {
+            std::slice::from_raw_parts(p.cast::<u8>(), len)
+        }
+    };
+    matches!(bytes.split_last(), Some((0, body)) if !body.contains(&0))
+}
+
 fn extract_global_ref_name(ptr: inkwell::values::PointerValue<'_>) -> Option<String> {
     // Typed: read the symbol-table name directly. `ptr.get_name()` returns the
     // empty CStr for unnamed values (e.g. constant-GEP expressions). For named
@@ -820,6 +954,22 @@ fn convert_constant_with_context(
                     return Some(Constant::GlobalRef(ValueId::new(func_id.raw())));
                 }
             }
+            // `&g.f` / `&a[1][2]`: a constant GEP over a global, resolved to the
+            // element's structural path by the data layout.
+            if let Some(td) = ctx.target_data.as_ref() {
+                if let Some((name, offset)) = const_pointer_global_offset(ptr.as_value_ref(), td) {
+                    if let (Some(&base), Some(&ty_ref)) = (
+                        ctx.global_value_ids.get(&name),
+                        ctx.global_llvm_types.get(&name),
+                    ) {
+                        // SAFETY: the type ref was taken from this module's live global.
+                        let ty = unsafe { inkwell::types::AnyTypeEnum::new(ty_ref) };
+                        if let Some(path) = offset_to_path(td, ty, offset) {
+                            return Some(Constant::GlobalElem { base, path });
+                        }
+                    }
+                }
+            }
             None
         }
         BasicValueEnum::ArrayValue(av) => {
@@ -828,7 +978,11 @@ fn convert_constant_with_context(
             if av.is_null() {
                 return Some(Constant::ZeroInit);
             }
-            if av.is_const_string() {
+            // A C string: NUL-terminated text with no interior NUL. A byte
+            // array like `{1, 0, 1, 0, 1}` also satisfies `is_const_string`, but
+            // `get_string_constant` would stop at its first NUL, so it goes
+            // through the element-wise path below instead.
+            if av.is_const_string() && array_is_c_string(av) {
                 #[allow(deprecated)]
                 if let Some(s) = av.get_string_constant().and_then(|s| s.to_str().ok()) {
                     return Some(Constant::string(s));
@@ -929,6 +1083,41 @@ fn convert_constant_with_context(
                 }
             }
 
+            // Arrays of floats and nested arrays of scalars (a 2-D or 3-D array
+            // initializer): element by element, so a prover can read `a[1][2]`
+            // from the initializer exactly.
+            if matches!(
+                av.get_type().get_element_type(),
+                inkwell::types::BasicTypeEnum::FloatType(_)
+                    | inkwell::types::BasicTypeEnum::ArrayType(_)
+            ) {
+                let mut elements = Vec::with_capacity(arr_len as usize);
+                let mut all_ok = true;
+                for i in 0..arr_len {
+                    let elem_ref =
+                        unsafe { inkwell::llvm_sys::core::LLVMGetAggregateElement(val_ref, i) };
+                    if elem_ref.is_null() {
+                        all_ok = false;
+                        break;
+                    }
+                    let elem: BasicValueEnum<'_> = unsafe { BasicValueEnum::new(elem_ref) };
+                    let c = match elem {
+                        BasicValueEnum::ArrayValue(_) => {
+                            convert_constant_with_context(elem, ctx, decompose_arrays)
+                        }
+                        _ => convert_constant_value(elem),
+                    };
+                    let Some(c) = c else {
+                        all_ok = false;
+                        break;
+                    };
+                    elements.push(c);
+                }
+                if all_ok {
+                    return Some(Constant::Aggregate { elements });
+                }
+            }
+
             // Unrecognized array shape: defer to scalar conversion (returns None
             // for non-string non-null arrays — matches prior behavior).
             convert_constant_value(value)
@@ -992,12 +1181,9 @@ fn convert_function(
                 ctx.type_interner.intern_integer(bits)
             }
             BasicValueEnum::FloatValue(v) => {
+                // `float`, `double`, `x86_fp80`, `half`, `fp128` by name.
                 let type_str = v.get_type().print_to_string().to_string();
-                if type_str == "float" {
-                    ctx.type_interner.intern_float(32)
-                } else {
-                    ctx.type_interner.intern_float(64)
-                }
+                ctx.type_interner.parse_llvm_type_string(&type_str)
             }
             _ => ctx.type_interner.intern_opaque(),
         });
@@ -1172,6 +1358,7 @@ fn convert_instruction(
         InstructionOpcode::FAdd => binary_op(BinaryOp::FAdd, inst, ctx),
         InstructionOpcode::FSub => binary_op(BinaryOp::FSub, inst, ctx),
         InstructionOpcode::FMul => binary_op(BinaryOp::FMul, inst, ctx),
+        InstructionOpcode::FNeg => fneg_op(inst, ctx),
         InstructionOpcode::FDiv => binary_op(BinaryOp::FDiv, inst, ctx),
         InstructionOpcode::FRem => binary_op(BinaryOp::FRem, inst, ctx),
         InstructionOpcode::And => binary_op(BinaryOp::And, inst, ctx),
@@ -1263,6 +1450,7 @@ fn convert_instruction(
             // control flow — an analysis that enumerates AIR instructions has no
             // way to know anything was here. See `IngestFidelity`.
             ctx.fidelity.dropped_instruction = true;
+            ctx.dropped_unknown_opcode = true;
             return Ok(None);
         }
     };
@@ -1318,6 +1506,23 @@ fn convert_instruction(
             .insert("llvm.nsw".to_string(), serde_json::Value::Bool(true));
     }
 
+    // A GEP's byte arithmetic per step (see `GEP_BYTES_KEY`): the structural
+    // `FieldPath` is relative to the GEP's own source element type, which need
+    // not be the shape of the object addressed (`float (*row)[14]` over a
+    // `[32 x [14 x float]]` global, a union member, a cast). Only the byte
+    // offset is shape-independent.
+    if matches!(air_inst.op, Operation::Gep { .. }) {
+        if let Some(steps) = ctx
+            .target_data
+            .as_ref()
+            .and_then(|td| gep_step_bytes(inst, td))
+        {
+            air_inst
+                .extensions
+                .insert(GEP_BYTES_KEY.to_string(), gep_bytes_json(&steps));
+        }
+    }
+
     // An alloca's object size, recorded ONLY when it is exact.
     //
     // `Operation::Alloca { size_bytes }` is not usable by anything that must fail
@@ -1330,6 +1535,16 @@ fn convert_instruction(
     // best-effort hint — this records a second, stricter value under its own key.
     // Absent means "no exact size available", which a prover must read as abstain.
     if matches!(air_inst.op, Operation::Alloca { .. }) {
+        if let Some(n) = ctx
+            .target_data
+            .as_ref()
+            .and_then(|td| layout_alloca_size_bytes(inst, td))
+        {
+            air_inst.extensions.insert(
+                saf_core::air::ALLOCA_LAYOUT_SIZE_KEY.to_string(),
+                serde_json::Value::from(n),
+            );
+        }
         if let Some(n) = exact_alloca_size_bytes(inst) {
             air_inst.extensions.insert(
                 saf_core::air::ALLOCA_EXACT_SIZE_KEY.to_string(),
@@ -1412,6 +1627,8 @@ fn convert_intrinsic_call(
             // write through a caller-supplied pointer. See `skip_is_lossy`.
             if super::intrinsics::skip_is_lossy(intrinsic_name) {
                 ctx.fidelity.dropped_instruction = true;
+                ctx.dropped_intrinsic_names
+                    .insert(intrinsic_name.to_string());
             }
             Ok(None)
         }
@@ -1461,6 +1678,23 @@ fn convert_intrinsic_call(
 /// Known heap allocation functions.
 /// These are recognized by name and converted to `HeapAlloc` operations.
 const HEAP_ALLOC_FUNCTIONS: &[(&str, &str)] = &[
+    // Linux kernel (the LDV driver tasks call these as externs); the `z`
+    // variants return zeroed memory, like `calloc`.
+    ("kmalloc", "kmalloc"),
+    ("__kmalloc", "kmalloc"),
+    ("kmalloc_array", "kmalloc"),
+    ("kzalloc", "kzalloc"),
+    ("kcalloc", "kzalloc"),
+    ("vmalloc", "vmalloc"),
+    ("vzalloc", "vzalloc"),
+    ("kmem_cache_alloc", "kmem_cache_alloc"),
+    ("kmem_cache_zalloc", "kmem_cache_zalloc"),
+    ("devm_kmalloc", "kmalloc"),
+    ("devm_kzalloc", "kzalloc"),
+    ("ldv_malloc", "malloc"),
+    ("ldv_zalloc", "kzalloc"),
+    ("ldv_kzalloc", "kzalloc"),
+    ("ldv_kmalloc", "kmalloc"),
     // C standard library
     ("malloc", "malloc"),
     ("calloc", "calloc"),
@@ -1512,8 +1746,12 @@ fn convert_call_instruction(
 ) -> Result<(Operation, Vec<ValueId>, bool), LlvmError> {
     // Try to get the called function name for direct calls
     if let Some(callee_name) = get_called_function_name(inst, &ctx.function_ids) {
-        // Check if this is a heap allocation function
-        if let Some(kind) = is_heap_alloc_function(&callee_name) {
+        // Check if this is a heap allocation function — of the library's: a
+        // task that defines `malloc`/`kzalloc`/`ldv_malloc` itself (the
+        // `ldv-consumption` models count allocations in such bodies) is called.
+        if let Some(kind) = is_heap_alloc_function(&callee_name)
+            .filter(|_| !ctx.defined_functions.contains(&callee_name))
+        {
             let operands = collect_call_args(inst, ctx);
             return Ok((
                 Operation::HeapAlloc {
@@ -1919,6 +2157,34 @@ fn binary_op(
     (Operation::BinaryOp { kind }, operands, true)
 }
 
+/// `fneg x` as `-0.0 - x`: IEEE subtraction from negative zero flips exactly
+/// the sign bit for every non-NaN operand (`-0.0 - (+0.0) = -0.0`,
+/// `-0.0 - (-0.0) = +0.0`), so the AIR needs no unary float operation. The
+/// synthetic constant is interned per module and width.
+fn fneg_op(
+    inst: InstructionValue<'_>,
+    ctx: &mut MappingContext<'_>,
+) -> (Operation, Vec<ValueId>, bool) {
+    let mut operands = collect_operands(inst, ctx);
+    let bits: u8 = match inst.get_type().print_to_string().to_str() {
+        Ok("float") => 32,
+        _ => 64,
+    };
+    let data = format!("{:032x}fneg-negzero{}", ctx.module_id.raw(), bits);
+    let neg_zero = ValueId::derive(data.as_bytes());
+    ctx.constants
+        .entry(neg_zero)
+        .or_insert(Constant::float(-0.0, bits));
+    operands.insert(0, neg_zero);
+    (
+        Operation::BinaryOp {
+            kind: BinaryOp::FSub,
+        },
+        operands,
+        true,
+    )
+}
+
 /// Does the instruction carry the LLVM `nsw` (no-signed-wrap) poison flag?
 ///
 /// The flag appears as a bare `nsw` token in the textual form, e.g.
@@ -2096,6 +2362,29 @@ fn exact_alloca_size_bytes(inst: InstructionValue<'_>) -> Option<u64> {
     elem_size.checked_mul(count)
 }
 
+/// An alloca's byte size by the data layout (`ALLOCA_LAYOUT_SIZE_KEY`): the
+/// allocation size of the allocated type times a constant element count;
+/// `None` for a variable-length alloca.
+fn layout_alloca_size_bytes(
+    inst: InstructionValue<'_>,
+    td: &inkwell::targets::TargetData,
+) -> Option<u64> {
+    let elem_ty = inst.get_allocated_type().ok()?;
+    let elem_size = td.get_abi_size(&elem_ty);
+    let count: u64 = if inst.get_num_operands() > 0 {
+        match inst.get_operand(0).and_then(operand_as_value) {
+            Some(BasicValueEnum::IntValue(iv)) if iv.is_const() => {
+                iv.get_zero_extended_constant()?
+            }
+            Some(BasicValueEnum::IntValue(_)) => return None,
+            _ => 1,
+        }
+    } else {
+        1
+    };
+    elem_size.checked_mul(count)
+}
+
 /// The byte size of an inkwell type when it is exact, else `None`.
 ///
 /// Deliberately narrow. Excluded, each for a stated reason:
@@ -2172,6 +2461,21 @@ fn convert_icmp_predicate(inst: InstructionValue<'_>) -> BinaryOp {
 /// Convert LLVM fcmp predicate to AIR `BinaryOp`.
 fn convert_fcmp_predicate(inst: InstructionValue<'_>) -> BinaryOp {
     let predicate = inst.get_fcmp_predicate().unwrap_or(FloatPredicate::OEQ);
+    // Exact: an unordered predicate is TRUE on NaN where its ordered twin is
+    // false (`x != x` is how C spells `isnan`), and a prover must see which.
+    match predicate {
+        FloatPredicate::UEQ => return BinaryOp::FCmpUeq,
+        FloatPredicate::UNE => return BinaryOp::FCmpUne,
+        FloatPredicate::UGT => return BinaryOp::FCmpUgt,
+        FloatPredicate::UGE => return BinaryOp::FCmpUge,
+        FloatPredicate::ULT => return BinaryOp::FCmpUlt,
+        FloatPredicate::ULE => return BinaryOp::FCmpUle,
+        FloatPredicate::ORD => return BinaryOp::FCmpOrd,
+        FloatPredicate::UNO => return BinaryOp::FCmpUno,
+        FloatPredicate::PredicateTrue => return BinaryOp::FCmpTrue,
+        FloatPredicate::PredicateFalse => return BinaryOp::FCmpFalse,
+        _ => {}
+    }
     match predicate {
         FloatPredicate::ONE | FloatPredicate::UNE => BinaryOp::FCmpOne,
         FloatPredicate::OGT | FloatPredicate::UGT => BinaryOp::FCmpOgt,
@@ -2212,8 +2516,25 @@ fn convert_constant_value(value: BasicValueEnum<'_>) -> Option<Constant> {
             }
             let bit_width = match v.get_type().print_to_string().to_str() {
                 Ok("float") => 32,
-                // "double" and all other types default to 64
-                _ => 64,
+                Ok("double") => 64,
+                // x87 `long double`: `LLVMConstRealGetDouble` would round it, so
+                // the exact 80-bit pattern is taken from the textual form
+                // (`x86_fp80 0xK403DFFFFFFFFFFFFFFFE`) and carried as a wide
+                // integer — the engine treats a float as its encoding anyway.
+                Ok("x86_fp80") => {
+                    let text = v.print_to_string().to_string();
+                    let hex = text
+                        .split("0xK")
+                        .nth(1)?
+                        .chars()
+                        .take(20)
+                        .collect::<String>();
+                    let bits = u128::from_str_radix(&hex, 16).ok()?;
+                    return Some(Constant::big_int(i128::try_from(bits).ok()?, 80));
+                }
+                // `half`, `fp128`: no exact representation here — no constant
+                // (a consumer then treats the operand as unconstrained).
+                _ => return None,
             };
             v.get_constant()
                 .map(|(val, _)| Constant::float(val, bit_width))
@@ -2259,6 +2580,260 @@ fn convert_constant_value(value: BasicValueEnum<'_>) -> Option<Constant> {
 ///
 /// Given a string like `ptr getelementptr inbounds ([2 x i32], ptr @a, i64 0, i64 1)`,
 /// returns `("a", [0, 1])`.
+/// `(global name, byte offset)` addressed by a constant pointer expression:
+/// a global itself, or a chain of constant GEPs over one. Every step's offset
+/// comes from the data layout: whole source elements for the pointer-level
+/// index, `offset_of_element` for a struct field, the element's store size
+/// for an array index. `None` for anything else (a non-constant index, an
+/// `inttoptr`, a vector, a function).
+fn const_pointer_global_offset(
+    val: inkwell::llvm_sys::prelude::LLVMValueRef,
+    td: &inkwell::targets::TargetData,
+) -> Option<(String, u64)> {
+    use inkwell::llvm_sys::LLVMOpcode;
+    use inkwell::llvm_sys::core::{
+        LLVMConstIntGetSExtValue, LLVMGetConstOpcode, LLVMGetGEPSourceElementType,
+        LLVMGetNumOperands, LLVMGetOperand, LLVMGetValueName2, LLVMIsAConstantExpr,
+        LLVMIsAConstantInt, LLVMIsAGlobalVariable,
+    };
+    use inkwell::types::{AnyType, AnyTypeEnum};
+    // SAFETY: `val` is a live constant of the module being converted; every
+    // operand and type ref read below belongs to the same module.
+    unsafe {
+        if !LLVMIsAGlobalVariable(val).is_null() {
+            let mut len: usize = 0;
+            let p = LLVMGetValueName2(val, &raw mut len);
+            if p.is_null() {
+                return None;
+            }
+            let name = std::str::from_utf8(std::slice::from_raw_parts(p.cast::<u8>(), len)).ok()?;
+            return Some((name.to_string(), 0));
+        }
+        if LLVMIsAConstantExpr(val).is_null()
+            || LLVMGetConstOpcode(val) != LLVMOpcode::LLVMGetElementPtr
+        {
+            return None;
+        }
+        let n = LLVMGetNumOperands(val);
+        if n < 2 {
+            return None;
+        }
+        let (name, base) = const_pointer_global_offset(LLVMGetOperand(val, 0), td)?;
+        let mut offset = i128::from(base);
+        let mut ty = AnyTypeEnum::new(LLVMGetGEPSourceElementType(val));
+        for i in 1..n {
+            let idx_val = LLVMGetOperand(val, u32::try_from(i).ok()?);
+            if LLVMIsAConstantInt(idx_val).is_null() {
+                return None;
+            }
+            let idx = i128::from(LLVMConstIntGetSExtValue(idx_val));
+            if i == 1 {
+                offset =
+                    offset.checked_add(idx.checked_mul(i128::from(td.get_store_size(&ty)))?)?;
+                continue;
+            }
+            match ty {
+                AnyTypeEnum::StructType(st) => {
+                    let field = u32::try_from(idx).ok()?;
+                    offset = offset.checked_add(i128::from(td.offset_of_element(&st, field)?))?;
+                    ty = st.get_field_type_at_index(field)?.as_any_type_enum();
+                }
+                AnyTypeEnum::ArrayType(at) => {
+                    if idx < 0 || idx >= i128::from(at.len()) {
+                        return None;
+                    }
+                    let elem = at.get_element_type();
+                    offset = offset
+                        .checked_add(idx.checked_mul(i128::from(td.get_store_size(&elem)))?)?;
+                    ty = elem.as_any_type_enum();
+                }
+                _ => return None,
+            }
+        }
+        Some((name, u64::try_from(offset).ok()?))
+    }
+}
+
+/// The structural path (field/element indices) of the scalar that starts
+/// exactly at byte `off` of a value of type `ty`, by the data layout. `None`
+/// when `off` falls into padding, inside a scalar, past the end, or into a
+/// type with no modelled layout (a vector).
+fn offset_to_path(
+    td: &inkwell::targets::TargetData,
+    ty: inkwell::types::AnyTypeEnum<'_>,
+    mut off: u64,
+) -> Option<Vec<u32>> {
+    use inkwell::types::{AnyType, AnyTypeEnum};
+    let mut path = Vec::new();
+    let mut ty = ty;
+    loop {
+        match ty {
+            AnyTypeEnum::StructType(st) => {
+                let mut hit = None;
+                for i in 0..st.count_fields() {
+                    let fo = td.offset_of_element(&st, i)?;
+                    let ft = st.get_field_type_at_index(i)?;
+                    let sz = td.get_store_size(&ft).max(1);
+                    if off >= fo && off < fo + sz {
+                        hit = Some((i, fo, ft));
+                        break;
+                    }
+                }
+                let (i, fo, ft) = hit?;
+                path.push(i);
+                off -= fo;
+                ty = ft.as_any_type_enum();
+            }
+            AnyTypeEnum::ArrayType(at) => {
+                let elem = at.get_element_type();
+                let esz = td.get_store_size(&elem);
+                if esz == 0 {
+                    return None;
+                }
+                let idx = off / esz;
+                if idx >= u64::from(at.len()) {
+                    return None;
+                }
+                path.push(u32::try_from(idx).ok()?);
+                off %= esz;
+                ty = elem.as_any_type_enum();
+            }
+            AnyTypeEnum::IntType(_) | AnyTypeEnum::FloatType(_) | AnyTypeEnum::PointerType(_) => {
+                return (off == 0).then_some(path);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The byte layout of a value of type `ty` by the data layout (allocation
+/// sizes, as `getelementptr` scales), or `None` for a type with a part the
+/// layout does not model (a vector, a function, an opaque struct).
+fn layout_of(
+    td: &inkwell::targets::TargetData,
+    ty: inkwell::types::AnyTypeEnum<'_>,
+) -> Option<Layout> {
+    use inkwell::types::{AnyType, AnyTypeEnum};
+    match ty {
+        AnyTypeEnum::IntType(_) | AnyTypeEnum::FloatType(_) | AnyTypeEnum::PointerType(_) => {
+            Some(Layout::Scalar {
+                size: td.get_abi_size(&ty),
+            })
+        }
+        AnyTypeEnum::ArrayType(at) => {
+            let elem = at.get_element_type();
+            Some(Layout::Array {
+                count: u64::from(at.len()),
+                stride: td.get_abi_size(&elem),
+                element: Box::new(layout_of(td, elem.as_any_type_enum())?),
+            })
+        }
+        AnyTypeEnum::StructType(st) => {
+            if st.is_opaque() {
+                return None;
+            }
+            let mut fields = Vec::new();
+            for i in 0..st.count_fields() {
+                fields.push(LayoutField {
+                    offset: td.offset_of_element(&st, i)?,
+                    layout: layout_of(td, st.get_field_type_at_index(i)?.as_any_type_enum())?,
+                });
+            }
+            Some(Layout::Struct {
+                size: td.get_abi_size(&st),
+                fields,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The byte arithmetic of each index step of a `getelementptr` instruction
+/// (see `GEP_BYTES_KEY`): `(false, stride)` for an array or pointer-level
+/// step, `(true, offset)` for a struct field. `None` when a step indexes a
+/// type the layout does not model.
+fn gep_step_bytes(
+    inst: InstructionValue<'_>,
+    td: &inkwell::targets::TargetData,
+) -> Option<Vec<(bool, u64)>> {
+    use inkwell::types::{AnyType, AnyTypeEnum};
+    // SAFETY: `inst` is a live GEP of the module being converted.
+    let mut ty = unsafe {
+        AnyTypeEnum::new(inkwell::llvm_sys::core::LLVMGetGEPSourceElementType(
+            inst.as_value_ref(),
+        ))
+    };
+    let mut out = Vec::new();
+    for i in 1..inst.get_num_operands() {
+        let value = inst.get_operand(i).and_then(operand_as_value)?;
+        if !value.is_int_value() {
+            return None;
+        }
+        if i == 1 {
+            out.push((false, td.get_abi_size(&ty)));
+            continue;
+        }
+        match ty {
+            AnyTypeEnum::StructType(st) => {
+                let idx = value.into_int_value().get_sign_extended_constant()?;
+                let field = u32::try_from(idx).ok()?;
+                out.push((true, td.offset_of_element(&st, field)?));
+                ty = st.get_field_type_at_index(field)?.as_any_type_enum();
+            }
+            AnyTypeEnum::ArrayType(at) => {
+                let elem = at.get_element_type();
+                out.push((false, td.get_abi_size(&elem)));
+                ty = elem.as_any_type_enum();
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The byte arithmetic of a synthetic GEP that descends `path` (each step a
+/// constant field/element index) from a value of type `ty`: every step is
+/// recorded as a fixed offset.
+fn path_step_bytes(
+    td: &inkwell::targets::TargetData,
+    ty: inkwell::types::AnyTypeEnum<'_>,
+    path: &[u32],
+) -> Option<Vec<(bool, u64)>> {
+    use inkwell::types::{AnyType, AnyTypeEnum};
+    let mut ty = ty;
+    let mut out = Vec::new();
+    for &i in path {
+        match ty {
+            AnyTypeEnum::StructType(st) => {
+                out.push((true, td.offset_of_element(&st, i)?));
+                ty = st.get_field_type_at_index(i)?.as_any_type_enum();
+            }
+            AnyTypeEnum::ArrayType(at) => {
+                let elem = at.get_element_type();
+                out.push((true, u64::from(i).checked_mul(td.get_abi_size(&elem))?));
+                ty = elem.as_any_type_enum();
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The `GEP_BYTES_KEY` encoding of per-step byte arithmetic.
+fn gep_bytes_json(steps: &[(bool, u64)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        steps
+            .iter()
+            .map(|(is_field, n)| {
+                serde_json::Value::Array(vec![
+                    serde_json::Value::from(u8::from(*is_field)),
+                    serde_json::Value::from(*n),
+                ])
+            })
+            .collect(),
+    )
+}
+
 fn parse_constant_gep(repr: &str) -> Option<(&str, Vec<i64>)> {
     if !repr.contains("getelementptr") {
         return None;

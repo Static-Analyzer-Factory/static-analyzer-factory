@@ -542,6 +542,16 @@ fn parse_binary_op(s: &str) -> Result<BinaryOp, FrontendError> {
         "f_cmp_oge" => Ok(BinaryOp::FCmpOge),
         "f_cmp_olt" => Ok(BinaryOp::FCmpOlt),
         "f_cmp_ole" => Ok(BinaryOp::FCmpOle),
+        "f_cmp_ueq" => Ok(BinaryOp::FCmpUeq),
+        "f_cmp_une" => Ok(BinaryOp::FCmpUne),
+        "f_cmp_ugt" => Ok(BinaryOp::FCmpUgt),
+        "f_cmp_uge" => Ok(BinaryOp::FCmpUge),
+        "f_cmp_ult" => Ok(BinaryOp::FCmpUlt),
+        "f_cmp_ule" => Ok(BinaryOp::FCmpUle),
+        "f_cmp_ord" => Ok(BinaryOp::FCmpOrd),
+        "f_cmp_uno" => Ok(BinaryOp::FCmpUno),
+        "f_cmp_true" => Ok(BinaryOp::FCmpTrue),
+        "f_cmp_false" => Ok(BinaryOp::FCmpFalse),
         other => Err(FrontendError::Parse(format!("unknown binary op: {other}"))),
     }
 }

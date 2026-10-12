@@ -104,7 +104,17 @@ impl From<BinaryOp> for OpKind {
             | BinaryOp::FCmpOgt
             | BinaryOp::FCmpOge
             | BinaryOp::FCmpOlt
-            | BinaryOp::FCmpOle => OpKind::Cmp,
+            | BinaryOp::FCmpOle
+            | BinaryOp::FCmpUeq
+            | BinaryOp::FCmpUne
+            | BinaryOp::FCmpUgt
+            | BinaryOp::FCmpUge
+            | BinaryOp::FCmpUlt
+            | BinaryOp::FCmpUle
+            | BinaryOp::FCmpOrd
+            | BinaryOp::FCmpUno
+            | BinaryOp::FCmpTrue
+            | BinaryOp::FCmpFalse => OpKind::Cmp,
         }
     }
 }

@@ -98,10 +98,11 @@ fn schema_checkers_lists_checker_names() {
 #[test]
 #[ignore]
 fn run_on_fixture_succeeds() {
-    cargo_bin_cmd!("saf")
-        .args(["run", "tests/fixtures/llvm/e2e/simple.ll"])
-        .assert()
-        .success();
+    let fx = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/llvm/e2e/absint_loop_bounds.ll"
+    );
+    cargo_bin_cmd!("saf").args(["run", fx]).assert().success();
 }
 
 // ---------------------------------------------------------------------------
@@ -256,33 +257,28 @@ fn verify_false_interproc_nondet() {
 
 /// R4 soundness negative: the interprocedural path exists but the steering-nondet
 /// guard is unsatisfiable (`x > 5 && x < 3`), so the callee error is genuinely
-/// unreachable → `unknown` (never a false alarm).
+/// unreachable. Never a false alarm; since plan 221 B5 the exhaustive prover
+/// discharges the contradictory guard and SAF answers `true`.
 #[test]
 #[ignore]
-fn verify_false_interproc_unsat_is_unknown() {
-    verify_unreach("unreach_false_interproc_unsat.c").stdout("unknown\n");
+fn verify_false_interproc_unsat_is_true() {
+    verify_unreach("unreach_false_interproc_unsat.c").stdout("true\n");
 }
 
-/// `reach_error()` present but provably unreachable → we never emit `true`, so
-/// the verdict is `unknown`.
+/// `reach_error()` present but provably unreachable: the bounded-exhaustive
+/// prover (plan 221 B5) explores every path and answers `true`.
 #[test]
 #[ignore]
-fn verify_true_simple_is_unknown() {
-    verify_unreach("unreach_true_simple.c").stdout("unknown\n");
+fn verify_true_simple_is_true() {
+    verify_unreach("unreach_true_simple.c").stdout("true\n");
 }
 
-/// Rank-3 TRUE is DISABLED, so even a cleanly provable contradiction abstains.
-///
-/// `x > 0 && x < 0` is a contradiction over a nondet value and the interval sentinel
-/// still proves the `reach_error` block ⊥ — but the sentinel alone is not
-/// wrong-TRUE-safe, its only confirmer was a bundled CPAchecker, and SAF ships no
-/// SV-COMP participant. So `saf verify` abstains. This is the DELIBERATE price of
-/// that decision; see `try_unreach_true`. Movement 1 (`plans/213`) makes the proof
-/// SAF-native, and this assertion flips back to `true` then.
+/// An infeasible error guard is proven by SAF's OWN exact-semantics prover (no
+/// bundled participant): `true`, with an `invariant_set` correctness witness.
 #[test]
 #[ignore]
-fn verify_unreach_true_infeasible_abstains_without_a_native_prover() {
-    verify_unreach("unreach_true_infeasible.c").stdout("unknown\n");
+fn verify_unreach_true_infeasible_is_proven_natively() {
+    verify_unreach("unreach_true_infeasible.c").stdout("true\n");
 }
 
 /// Rank-3 wrong-TRUE guard (soundness), and now the load-bearing regression for the
@@ -312,11 +308,12 @@ fn verify_unreach_wrongprove_is_not_true() {
 }
 
 /// `__VERIFIER_assume(x == 0)` makes the `x != 0` error path infeasible — must
-/// NOT be a false alarm. The verdict is `unknown` (never `false`).
+/// NOT be a false alarm. The exhaustive prover honours the assumption as a path
+/// constraint and SAF answers `true`.
 #[test]
 #[ignore]
-fn verify_assume_guarded_error_is_not_false() {
-    verify_unreach("assume_guards_error.c").stdout("unknown\n");
+fn verify_assume_guarded_error_is_true() {
+    verify_unreach("assume_guards_error.c").stdout("true\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -332,20 +329,20 @@ fn verify_assume_guarded_error_is_not_false() {
 /// `0 & 0xFF == 0 != 256` → `unknown`.
 #[test]
 #[ignore]
-fn verify_bitarith_false_alarm_is_unknown() {
-    verify_unreach("false_alarm_bitarith.c")
-        .stdout("unknown\n")
-        .stderr(predicate::str::contains("candidate(s) enumerated"));
+fn verify_bitarith_false_alarm_is_true() {
+    // The over-approximate candidate is refuted by replay (never `false`), and the
+    // exact-semantics prover (plan 222) then proves the program: `true`.
+    verify_unreach("false_alarm_bitarith.c").stdout("true\n");
 }
 
 /// Pointer-identity false alarm (test01 shape): Z3 models `p == q` as equal
 /// fresh integers, but distinct objects never alias at runtime → `unknown`.
 #[test]
 #[ignore]
-fn verify_ptrid_false_alarm_is_unknown() {
-    verify_unreach("false_alarm_ptrid.c")
-        .stdout("unknown\n")
-        .stderr(predicate::str::contains("candidate(s) enumerated"));
+fn verify_ptrid_false_alarm_is_true() {
+    // The over-approximate candidate is refuted by replay (never `false`), and the
+    // exact-semantics prover (plan 222) then proves the program: `true`.
+    verify_unreach("false_alarm_ptrid.c").stdout("true\n");
 }
 
 /// Uncomposed-recursion false alarm (afterrec-2 shape): intraprocedural Z3 sees
@@ -353,10 +350,10 @@ fn verify_ptrid_false_alarm_is_unknown() {
 /// negative at runtime → `unknown`.
 #[test]
 #[ignore]
-fn verify_recursion_false_alarm_is_unknown() {
-    verify_unreach("false_alarm_recursion.c")
-        .stdout("unknown\n")
-        .stderr(predicate::str::contains("candidate(s) enumerated"));
+fn verify_recursion_false_alarm_is_true() {
+    // The over-approximate candidate is refuted by replay (never `false`), and the
+    // exact-semantics prover (plan 222) then proves the program: `true`.
+    verify_unreach("false_alarm_recursion.c").stdout("true\n");
 }
 
 /// A loop-free fixture on which an over-approximating oracle would propose an
@@ -505,17 +502,46 @@ fn verify_false_direct_writes_witness() {
     );
 }
 
-/// An `unknown` verdict (reach_error present but unreachable) writes NO witness.
+/// An `unknown` verdict writes NO witness (`unreach_unknown_float.c`: floating
+/// point is outside the exact-semantics prover and no replay satisfies the
+/// contradictory guard).
 #[test]
 #[ignore]
 fn verify_unknown_writes_no_witness() {
     let dir = tempfile::tempdir().unwrap();
     let w = dir.path().join("w.yml");
-    verify_unreach_witness("unreach_true_simple.c", "LP64", &w).stdout("unknown\n");
+    verify_unreach_witness("unreach_unknown_float.c", "LP64", &w).stdout("unknown\n");
     assert!(
         !w.exists(),
         "no witness may be written for an unknown verdict"
     );
+}
+
+/// Same guard for the other unmodelled feature: a store through an indexed
+/// pointer (`unreach_unknown_array.c`) keeps the prover out — `unknown`, no witness.
+#[test]
+#[ignore]
+fn verify_unknown_array_store_writes_no_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().join("w.yml");
+    verify_unreach_witness("unreach_unknown_array.c", "LP64", &w).stdout("unknown\n");
+    assert!(
+        !w.exists(),
+        "no witness may be written for an unknown verdict"
+    );
+}
+
+/// A proven `true` (plan 222) writes a CORRECTNESS witness (`invariant_set`) to
+/// the `--witness` path — never a violation witness.
+#[test]
+#[ignore]
+fn verify_true_writes_correctness_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().join("w.yml");
+    verify_unreach_witness("unreach_true_simple.c", "LP64", &w).stdout("true\n");
+    let yaml = std::fs::read_to_string(&w).expect("correctness witness written");
+    assert!(yaml.contains("entry_type: invariant_set"), "{yaml}");
+    assert!(!yaml.contains("violation_sequence"), "{yaml}");
 }
 
 /// The emitted witness is byte-identical across re-runs (NFR-DET determinism).
@@ -686,11 +712,13 @@ fn verify_memsafety_null_deref_is_false_deref() {
     verify_memsafety("memsafety_false_null_deref.c", "LP64").stdout("false(valid-deref)\n");
 }
 
-/// A safe program: ASan never traps -> `unknown` (never `true`, never a false alarm).
+/// A safe program: ASan never traps, and the exact-semantics engine's
+/// memory-safety goal (plan 222 §2s) proves every access in bounds, the one
+/// `free` valid and nothing leaked -> `true` (never a false alarm).
 #[test]
 #[ignore]
-fn verify_memsafety_safe_is_unknown() {
-    verify_memsafety("memsafety_true_safe.c", "LP64").stdout("unknown\n");
+fn verify_memsafety_safe_is_true() {
+    verify_memsafety("memsafety_true_safe.c", "LP64").stdout("true\n");
 }
 
 /// A sequential program that calls __VERIFIER_atomic_* (NOT thread creation) around
@@ -754,10 +782,10 @@ fn verify_memsafety_false_writes_witness() {
 fn verify_memsafety_safe_writes_no_witness() {
     let dir = tempfile::tempdir().unwrap();
     let w = dir.path().join("w.yml");
-    verify_memsafety_witness("memsafety_true_safe.c", "LP64", &w).stdout("unknown\n");
+    verify_memsafety_witness("memsafety_true_safe.c", "LP64", &w).stdout("true\n");
     assert!(
         !w.exists(),
-        "no witness may be written for an unknown verdict"
+        "valid-memsafety TRUE is verdict-only: no witness may be written"
     );
 }
 
@@ -1029,16 +1057,20 @@ fn verify_termination_loop_in_unreachable_is_true() {
 /// `unknown` (never `true`).
 #[test]
 #[ignore]
-fn verify_termination_loop_is_unknown() {
-    verify_termination("termination_unknown_loop.c", "LP64").stdout("unknown\n");
+fn verify_termination_loop_is_true() {
+    // `while (i < n) i++;` has the linear ranking function `n - i` (plans/213
+    // Movement 1 onwards): proven, with a 2.1 correctness witness.
+    verify_termination("termination_unknown_loop.c", "LP64").stdout("true\n");
 }
 
 /// Recursion (a loop-free but self-recursive `fact`) => the acyclic-callgraph
 /// gate abstains => `unknown`.
 #[test]
 #[ignore]
-fn verify_termination_recursion_is_unknown() {
-    verify_termination("termination_unknown_recursion.c", "LP64").stdout("unknown\n");
+fn verify_termination_recursion_is_true() {
+    // `fact(5)`: the recursion route ranks the call on its decreasing argument
+    // (Movement 2 onwards): proven.
+    verify_termination("termination_unknown_recursion.c", "LP64").stdout("true\n");
 }
 
 /// A reachable indirect call (through a nondet-chosen function pointer) could
@@ -1057,11 +1089,11 @@ fn verify_termination_bad_external_is_unknown() {
     verify_termination("termination_unknown_bad_extern.c", "LP64").stdout("unknown\n");
 }
 
-/// A `true` verdict writes NO witness (the write-gate keys on a `false`-prefix;
-/// termination TRUE is witness-not-required).
+/// A termination `true` writes a 2.1 CORRECTNESS witness (`invariant_set`): every
+/// `C.termination.*` cell requires one under the 2027 rules (plan 212 Movement 0B).
 #[test]
 #[ignore]
-fn verify_termination_true_writes_no_witness() {
+fn verify_termination_true_writes_correctness_witness() {
     let dir = tempfile::tempdir().unwrap();
     let w = dir.path().join("w.yml");
     let prp = termination_prp();
@@ -1080,10 +1112,9 @@ fn verify_termination_true_writes_no_witness() {
         .assert()
         .success()
         .stdout("true\n");
-    assert!(
-        !w.exists(),
-        "no witness may be written for a `true` verdict"
-    );
+    let yaml =
+        std::fs::read_to_string(&w).expect("a termination TRUE writes its correctness witness");
+    assert!(yaml.contains("entry_type: invariant_set"), "{yaml}");
 }
 
 /// The `true` verdict is byte-stable across re-runs (a constant, no timestamps).

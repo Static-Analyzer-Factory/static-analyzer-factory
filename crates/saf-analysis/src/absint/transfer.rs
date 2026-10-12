@@ -114,8 +114,11 @@ pub fn build_constant_map(module: &AirModule) -> BTreeMap<ValueId, Interval> {
                 // Null/undef/zero treated as 0 (pointer value)
                 Interval::singleton(0, DEFAULT_BITS)
             }
-            Constant::String { .. } | Constant::Aggregate { .. } | Constant::GlobalRef(_) => {
-                // Strings, aggregates, and global refs are not scalar values
+            Constant::String { .. }
+            | Constant::Aggregate { .. }
+            | Constant::GlobalRef(_)
+            | Constant::GlobalElem { .. } => {
+                // Strings, aggregates, and global (element) refs are not scalar values
                 continue;
             }
         };
@@ -806,7 +809,17 @@ pub fn transfer_instruction_with_context(
                     | BinaryOp::FCmpOgt
                     | BinaryOp::FCmpOge
                     | BinaryOp::FCmpOlt
-                    | BinaryOp::FCmpOle => Interval::make_top(DEFAULT_BITS),
+                    | BinaryOp::FCmpOle
+                    | BinaryOp::FCmpUeq
+                    | BinaryOp::FCmpUne
+                    | BinaryOp::FCmpUgt
+                    | BinaryOp::FCmpUge
+                    | BinaryOp::FCmpUlt
+                    | BinaryOp::FCmpUle
+                    | BinaryOp::FCmpOrd
+                    | BinaryOp::FCmpUno
+                    | BinaryOp::FCmpTrue
+                    | BinaryOp::FCmpFalse => Interval::make_top(DEFAULT_BITS),
                 };
                 state.set(dst, result);
             }

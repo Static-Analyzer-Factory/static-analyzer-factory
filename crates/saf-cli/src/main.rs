@@ -19,7 +19,10 @@ fn main() -> anyhow::Result<()> {
                 tracing_subscriber::fmt::layer()
                     .json()
                     .with_writer(std::io::stderr)
-                    .with_filter(tracing_subscriber::EnvFilter::new("info")),
+                    .with_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    ),
             )
             .with(saf_layer)
             .init();
@@ -28,7 +31,10 @@ fn main() -> anyhow::Result<()> {
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_writer(std::io::stderr)
-                    .with_filter(tracing_subscriber::EnvFilter::new("info")),
+                    .with_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    ),
             )
             .with(saf_layer)
             .init();

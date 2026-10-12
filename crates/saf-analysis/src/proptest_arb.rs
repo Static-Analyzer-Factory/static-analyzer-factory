@@ -116,6 +116,9 @@ pub fn arb_air_module() -> impl Strategy<Value = AirModule> {
         constants: std::collections::BTreeMap::new(),
         types: std::collections::BTreeMap::new(),
         target_pointer_width: 8,
+        collapsed_globals: None,
+        dropped_intrinsics: std::collections::BTreeSet::new(),
+        dropped_unknown_opcode: false,
         function_index: BTreeMap::new(),
         name_index: BTreeMap::new(),
     })
@@ -135,6 +138,9 @@ pub fn arb_pta_module() -> impl Strategy<Value = AirModule> {
         constants: std::collections::BTreeMap::new(),
         types: std::collections::BTreeMap::new(),
         target_pointer_width: 8,
+        collapsed_globals: None,
+        dropped_intrinsics: std::collections::BTreeSet::new(),
+        dropped_unknown_opcode: false,
         function_index: BTreeMap::new(),
         name_index: BTreeMap::new(),
     })
@@ -255,6 +261,9 @@ pub fn arb_tracked_pta_module() -> impl Strategy<Value = (AirModule, usize, usiz
             constants: std::collections::BTreeMap::new(),
             types: std::collections::BTreeMap::new(),
             target_pointer_width: 8,
+            collapsed_globals: None,
+            dropped_intrinsics: std::collections::BTreeSet::new(),
+            dropped_unknown_opcode: false,
             function_index: BTreeMap::new(),
             name_index: BTreeMap::new(),
         };

@@ -6,7 +6,7 @@
 //!
 //! See FR-AIR-001 through FR-AIR-007 for full requirements.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,17 @@ pub enum Constant {
         value: String,
         /// Bit width.
         bits: u8,
+    },
+
+    /// The address of an ELEMENT of a global: `&g.f`, `&a[1][2]` — `base` is the
+    /// global's value id and `path` the structural index path to the element
+    /// in the global's declared type (a constant GEP expression the frontend
+    /// resolved exactly; see `GlobalRef` for the global itself).
+    GlobalElem {
+        /// The global.
+        base: ValueId,
+        /// Field/element indices from the global's type down to the element.
+        path: Vec<u32>,
     },
 
     /// Floating point constant.
@@ -384,6 +395,28 @@ pub enum BinaryOp {
     FCmpOlt,
     /// Ordered less or equal.
     FCmpOle,
+
+    // Float comparisons (unordered: also true when either operand is NaN)
+    /// Unordered or equal.
+    FCmpUeq,
+    /// Unordered or not equal (the C `!=` on floats).
+    FCmpUne,
+    /// Unordered or greater than.
+    FCmpUgt,
+    /// Unordered or greater or equal.
+    FCmpUge,
+    /// Unordered or less than.
+    FCmpUlt,
+    /// Unordered or less or equal.
+    FCmpUle,
+    /// Ordered: neither operand is NaN.
+    FCmpOrd,
+    /// Unordered: at least one operand is NaN.
+    FCmpUno,
+    /// Always true.
+    FCmpTrue,
+    /// Always false.
+    FCmpFalse,
 }
 
 // =============================================================================
@@ -1030,6 +1063,12 @@ pub struct AirGlobal {
     /// Type of the global's value (the global itself is always a pointer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_type: Option<TypeId>,
+
+    /// The byte layout of the object (by the target data layout), when the
+    /// frontend could size every part of it. Lets a consumer that addresses
+    /// memory by byte offset find the initializer element at an offset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<Layout>,
 }
 
 impl AirGlobal {
@@ -1044,7 +1083,129 @@ impl AirGlobal {
             is_constant: false,
             span: None,
             value_type: None,
+            layout: None,
         }
+    }
+}
+
+/// The byte layout of an object, by the target data layout.
+///
+/// Mirrors the shape of the object's initializer (`Constant::Aggregate`
+/// nesting): an array element or struct field at `path` in the initializer is
+/// the same `path` here. Sizes and strides are allocation (ABI) sizes, the
+/// unit `getelementptr` arithmetic uses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Layout {
+    /// An integer, float or pointer of `size` bytes.
+    Scalar {
+        /// Allocation size in bytes.
+        size: u64,
+    },
+    /// `count` elements, each `stride` bytes apart.
+    Array {
+        /// Element count.
+        count: u64,
+        /// Bytes from one element to the next.
+        stride: u64,
+        /// The element's layout.
+        element: Box<Layout>,
+    },
+    /// A struct of `size` bytes with fields at their byte offsets.
+    Struct {
+        /// Allocation size in bytes (with tail padding).
+        size: u64,
+        /// Fields in declaration order, each with its byte offset.
+        fields: Vec<LayoutField>,
+    },
+}
+
+/// A struct field in a [`Layout`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LayoutField {
+    /// Byte offset from the struct start.
+    pub offset: u64,
+    /// The field's layout.
+    pub layout: Layout,
+}
+
+impl Layout {
+    /// Allocation size of the whole object in bytes.
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        match self {
+            Self::Scalar { size } | Self::Struct { size, .. } => *size,
+            Self::Array { count, stride, .. } => count.saturating_mul(*stride),
+        }
+    }
+
+    /// The structural path and size of the scalar that starts exactly at byte
+    /// `off`. `None` when `off` is in padding, strictly inside a scalar, or
+    /// past the end.
+    #[must_use]
+    pub fn scalar_at(&self, mut off: u64) -> Option<(Vec<u32>, u64)> {
+        let mut path = Vec::new();
+        let mut cur = self;
+        loop {
+            match cur {
+                Self::Scalar { size } => return (off == 0).then_some((path, *size)),
+                Self::Array {
+                    count,
+                    stride,
+                    element,
+                } => {
+                    if *stride == 0 {
+                        return None;
+                    }
+                    let idx = off / stride;
+                    if idx >= *count {
+                        return None;
+                    }
+                    path.push(u32::try_from(idx).ok()?);
+                    off %= stride;
+                    cur = element;
+                }
+                Self::Struct { fields, .. } => {
+                    let (i, f) = fields.iter().enumerate().find(|(_, f)| {
+                        off >= f.offset && off < f.offset + f.layout.size().max(1)
+                    })?;
+                    path.push(u32::try_from(i).ok()?);
+                    off -= f.offset;
+                    cur = &f.layout;
+                }
+            }
+        }
+    }
+
+    /// The byte offset of the element or field at the structural `path`
+    /// (the offset of its first byte; a path ending at an aggregate names
+    /// the aggregate's start). `None` when the path leaves the object.
+    #[must_use]
+    pub fn offset_of_path(&self, path: &[u32]) -> Option<u64> {
+        let mut off: u64 = 0;
+        let mut cur = self;
+        for &i in path {
+            match cur {
+                Self::Scalar { .. } => return None,
+                Self::Array {
+                    count,
+                    stride,
+                    element,
+                } => {
+                    if u64::from(i) >= *count {
+                        return None;
+                    }
+                    off = off.checked_add(u64::from(i).checked_mul(*stride)?)?;
+                    cur = element;
+                }
+                Self::Struct { fields, .. } => {
+                    let f = fields.get(usize::try_from(i).ok()?)?;
+                    off = off.checked_add(f.offset)?;
+                    cur = &f.layout;
+                }
+            }
+        }
+        Some(off)
     }
 }
 
@@ -1133,6 +1294,29 @@ pub struct AirModule {
     #[serde(default = "default_pointer_width")]
     pub target_pointer_width: u32,
 
+    /// Globals whose address was the base of a constant pointer EXPRESSION the
+    /// frontend could not represent and therefore collapsed to the base
+    /// `ValueId` (`&g[500]` → `@g`; see [`IngestFidelity::collapsed_const_ptr_expr`]).
+    /// An address-level analysis must treat these globals as opaque. `None`
+    /// means the frontend could not attribute every collapse to a global, so
+    /// every global must be treated as opaque; `Some(empty)` means no collapse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collapsed_globals: Option<BTreeSet<ValueId>>,
+
+    /// Names of the LLVM intrinsics the frontend skipped although skipping may
+    /// lose a memory effect (`IngestFidelity::dropped_instruction` is the
+    /// summary flag). Lets a consumer decide per intrinsic whether the loss
+    /// matters to IT (`llvm.stackrestore` ends object lifetimes, which an
+    /// unreachability prover that never reasons about dangling accesses can
+    /// ignore, but a memory-safety prover cannot).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub dropped_intrinsics: BTreeSet<String>,
+
+    /// An instruction of an opcode the frontend does not model was dropped
+    /// (`va_arg`, `landingpad`, …); nothing in the AIR marks where.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dropped_unknown_opcode: bool,
+
     /// Pre-computed index: `FunctionId` -> position in `functions` vec.
     /// Skipped during serialization; rebuilt on deserialization.
     #[serde(skip)]
@@ -1182,6 +1366,12 @@ impl<'de> Deserialize<'de> for AirModule {
             types: BTreeMap<TypeId, AirType>,
             #[serde(default = "default_pointer_width")]
             target_pointer_width: u32,
+            #[serde(default)]
+            collapsed_globals: Option<BTreeSet<ValueId>>,
+            #[serde(default)]
+            dropped_intrinsics: BTreeSet<String>,
+            #[serde(default)]
+            dropped_unknown_opcode: bool,
         }
 
         let data = AirModuleData::deserialize(deserializer)?;
@@ -1207,6 +1397,9 @@ impl<'de> Deserialize<'de> for AirModule {
             constants: data.constants,
             types: data.types,
             target_pointer_width: data.target_pointer_width,
+            collapsed_globals: data.collapsed_globals,
+            dropped_intrinsics: data.dropped_intrinsics,
+            dropped_unknown_opcode: data.dropped_unknown_opcode,
             function_index,
             name_index,
         })
@@ -1226,6 +1419,9 @@ impl AirModule {
             type_hierarchy: Vec::new(),
             constants: BTreeMap::new(),
             types: BTreeMap::new(),
+            collapsed_globals: None,
+            dropped_intrinsics: BTreeSet::new(),
+            dropped_unknown_opcode: false,
             target_pointer_width: 8,
             function_index: BTreeMap::new(),
             name_index: BTreeMap::new(),
@@ -1323,6 +1519,12 @@ impl AirModule {
             self.types.get(&id),
             Some(AirType::Pointer | AirType::Reference { .. })
         )
+    }
+
+    /// Is `id` a floating-point type?
+    #[must_use]
+    pub fn is_float_type(&self, id: TypeId) -> bool {
+        matches!(self.types.get(&id), Some(AirType::Float { .. }))
     }
 
     /// Get the type of an instruction's result, if available.
@@ -1423,6 +1625,22 @@ impl IngestFidelity {
 /// fits inside an object can fail closed on its absence. An over-stated object
 /// size makes a bounds check pass when it should fail.
 pub const ALLOCA_EXACT_SIZE_KEY: &str = "llvm.alloca_exact_size";
+
+/// Extension key on a `Gep` instruction: the byte arithmetic of each index
+/// step, as a JSON array with one `[kind, n]` pair per step (in step order).
+/// `kind` 0 is an array or pointer-level step whose index operand is scaled by
+/// `n` bytes; `kind` 1 is a struct field step `n` bytes into the struct. The
+/// pointer the instruction produces is the base pointer plus the sum of the
+/// steps, which is exact wherever every scaled index is known. Absent when
+/// the frontend could not size a step (a vector element, no data layout).
+pub const GEP_BYTES_KEY: &str = "llvm.gep_bytes";
+
+/// Extension key on an `Alloca`: the object's byte size by the target data
+/// layout (allocation size of the allocated type × a constant count), for
+/// every alloca with a static size — pointers, floats and structs included,
+/// which [`ALLOCA_EXACT_SIZE_KEY`] leaves out because it is computed without
+/// a data layout. Absent for a variable-length alloca or without a layout.
+pub const ALLOCA_LAYOUT_SIZE_KEY: &str = "llvm.alloca_layout_size";
 
 /// The bundle produced by a frontend's `ingest()` call.
 ///

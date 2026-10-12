@@ -43,10 +43,17 @@ pub struct OverflowHit {
 /// - `+ - *`      → `runtime error: signed integer overflow: <a> <op> <b> cannot be represented in type '<T>'`
 /// - unary `-`    → `runtime error: negation of <x> cannot be represented in type '<T>'`
 /// - `INT_MIN/-1` → `runtime error: division of <x> by -1 cannot be represented in type '<T>'`
-const OVERFLOW_MARKERS: [&str; 3] = [
+/// - `<<` (with `-fsanitize=shift-base`, the engine-counterexample replay) →
+///   `runtime error: left shift of <x> by <n> places cannot be represented in type '<T>'`
+///   — a signed left shift whose result does not fit IS a signed overflow
+///   (sv-benchmarks `bitvector/byte_add*` expect FALSE for exactly this); the
+///   other `shift-base` form, `left shift of negative value <x>`, is undefined
+///   behaviour but not an overflow and is NOT accepted.
+const OVERFLOW_MARKERS: [&str; 4] = [
     "runtime error: signed integer overflow:",
     "runtime error: negation of ",
     "runtime error: division of ",
+    "runtime error: left shift of ",
 ];
 
 /// Parse a UBSan stderr report into a confirmed overflow hit, applying R1
@@ -188,6 +195,7 @@ pub fn lower_overflow_hit_enriched(
 /// True iff `line` is a UBSan located diagnostic for one of the signed-overflow forms.
 fn is_overflow_line(line: &str) -> bool {
     OVERFLOW_MARKERS.iter().any(|m| line.contains(m))
+        && !line.contains("left shift of negative value")
 }
 
 /// The function name of stack frame `#0` (from `print_stacktrace=1`), i.e. the text

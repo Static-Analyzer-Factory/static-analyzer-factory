@@ -75,10 +75,18 @@ fi
 # go to a throwaway dir so the sweep leaves no clutter.
 spec_arg=()
 [ -n "$PROPERTY" ] && spec_arg=(--spec "$PROPERTY")
+# The task's data model MUST reach CPAchecker: its default machine model is
+# 32-bit, under which e.g. an LP64 `long` constant overflow silently vanishes
+# (the validator then answers TRUE for a genuine violation).
+case "$DATA_MODEL" in
+    ILP32) cpa_bit=--32 ;;
+    *) cpa_bit=--64 ;;
+esac
 out_dir="$(mktemp -d)"
 out="$(timeout -k 15 130 "$CPA_HOME/bin/cpachecker" \
         --config "$CPA_HOME/config/violation-witness-validation.properties" \
         --witness "$WITNESS" \
+        "$cpa_bit" \
         "${spec_arg[@]}" \
         --timelimit 90s \
         --output-path "$out_dir" \
@@ -152,7 +160,7 @@ cbmc_confirms_memsafety() {
     # target line(s) the witness points at (the location SAF flagged the violation)
     lines="$(grep -oE 'line:[[:space:]]*[0-9]+' "$WITNESS" 2>/dev/null | grep -oE '[0-9]+' | sort -u)"
     [ -n "$lines" ] || return 1
-    o="$(timeout -k 15 120 "$cbmc_bin" --bounds-check --pointer-check --unwind 500 "$PROGRAM" 2>&1)" || true
+    o="$(timeout -k 15 120 "$cbmc_bin" "$cpa_bit" --bounds-check --pointer-check --unwind 500 "$PROGRAM" 2>&1)" || true
     # genuine, FAILED memory-safety properties (status at end of line), minus artifacts
     fails="$(printf '%s\n' "$o" \
       | grep -E ': FAILURE$' \
@@ -182,7 +190,7 @@ cbmc_confirms_unreach() {
     else
         return 1
     fi
-    o="$(timeout -k 15 120 "$cbmc_bin" --unwind 200 "$PROGRAM" 2>&1)" || true
+    o="$(timeout -k 15 120 "$cbmc_bin" "$cpa_bit" --unwind 200 "$PROGRAM" 2>&1)" || true
     printf '%s\n' "$o" \
       | grep -E ': FAILURE$' \
       | grep -viE 'unwinding assertion|no body for callee' \
