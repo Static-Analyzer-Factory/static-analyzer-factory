@@ -837,6 +837,10 @@ struct Engine<'a> {
     /// Counterexample mode: eager, no parking or merging, every path keeps its
     /// nondet reads and block trail; the first feasible violation is recorded.
     cex_mode: bool,
+    /// Termination mode ([`prove_termination_exhaustive`]): an unknown extern
+    /// (which may not return) and a NULL dereference abstain instead of being
+    /// modelled as havoc / the end of the path.
+    termination: bool,
     cex: Option<Counterexample>,
     /// Counterexample mode: violations at these instructions are passed over
     /// (a candidate there did not replay), so the search goes on to the next
@@ -879,6 +883,13 @@ struct Engine<'a> {
     /// Time spent in Z3 `simplify`, `check` and in state merging (probe stats).
     t_simplify: Duration,
     t_check: Duration,
+    /// Satisfying assignments of recent feasible branch queries (KLEE's
+    /// counterexample cache): a later query one of them satisfies is feasible
+    /// without calling Z3. Never consulted for violation queries or in
+    /// counterexample mode, which need Z3's own model.
+    model_cache: Vec<z3::Model>,
+    /// Queries the model cache answered.
+    model_hits: u64,
     t_merge: Duration,
     t_m_pc: Duration,
     n_merges: u64,
@@ -982,6 +993,59 @@ pub const LIFETIME_END: &str = "__saf_lifetime_end";
 /// local whose address escapes, so `mem2reg` leaves it a stack object. Inert.
 pub const KEEP_ALIVE: &str = "__saf_keep";
 
+/// `termination` TRUE from the same engine: every path of the program ends
+/// within the engine's bounds. Only the plain lazy and eager passes run — no
+/// loop-header fixpoint and no k-induction, which cut paths short — so a
+/// completed exploration means every execution reached `return` from `main`,
+/// `exit`/`abort`, or a false assumption; a loop that runs past the unwinding
+/// cap abstains. Signed overflow is checked on the way (its undefined
+/// behaviour is never modelled as wraparound for a termination argument), and
+/// an unknown extern (it might not return) or a NULL dereference abstains.
+#[must_use]
+pub fn prove_termination_exhaustive(module: &AirModule, budget: Duration) -> ExhaustiveProof {
+    if has_global_ctors_dtors(module) {
+        return ExhaustiveProof::Abstain("global-ctors-dtors".to_string());
+    }
+    let Some(main) = module
+        .functions
+        .iter()
+        .find(|f| f.name == "main" && !f.is_declaration)
+    else {
+        return ExhaustiveProof::Abstain("no-main".to_string());
+    };
+    let Some(entry) = main
+        .entry_block
+        .or_else(|| main.blocks.first().map(|b| b.id))
+    else {
+        return ExhaustiveProof::Abstain("no-entry".to_string());
+    };
+    let mut engine = Engine::new(module, budget);
+    engine.goal = Goal::SignedOverflow;
+    engine.termination = true;
+    let start = Instant::now();
+    engine.fixpoint = false;
+    engine.lazy_exhaustive = true;
+    engine.deadline = start + budget / 2;
+    let init = engine.initial_state(main, entry);
+    let lazy_note = match engine.run(init) {
+        Ok(()) => return ExhaustiveProof::Proven,
+        Err(reason) if reason == "error-feasible" => {
+            return ExhaustiveProof::Abstain("term-overflow-feasible".to_string());
+        }
+        Err(reason) => reason,
+    };
+    engine.lazy_exhaustive = false;
+    engine.steps = 0;
+    engine.solver_calls = 0;
+    engine.states = 0;
+    engine.deadline = start + budget;
+    let init = engine.initial_state(main, entry);
+    match engine.run(init) {
+        Ok(()) => ExhaustiveProof::Proven,
+        Err(reason) => ExhaustiveProof::Abstain(format!("{reason}; lazy: {lazy_note}")),
+    }
+}
+
 /// Externs the frontend maps to a `malloc`-kind allocation whose model may
 /// return NULL (the LDV harness allocators): the never-fails rule is
 /// `malloc`'s, not theirs.
@@ -1053,6 +1117,10 @@ pub struct CexOptions {
     /// other location is unsigned and never an overflow. `None`: unknown, every
     /// `shl` is checked.
     pub signed_shl_locs: Option<BTreeSet<(u32, u32)>>,
+    /// Search for a memory-safety violation ([`Goal::MemSafety`]) instead of
+    /// the `overflow` flag's goal. Run it on the memory-safety ingestion
+    /// recipe's module (lifetime markers).
+    pub memsafety: bool,
 }
 
 #[must_use]
@@ -1089,7 +1157,9 @@ pub fn find_counterexample_excluding(
         .entry_block
         .or_else(|| main.blocks.first().map(|b| b.id))?;
     let mut engine = Engine::new(module, budget);
-    engine.goal = if overflow {
+    engine.goal = if opts.memsafety {
+        Goal::MemSafety
+    } else if overflow {
         Goal::SignedOverflow
     } else {
         Goal::ReachError
@@ -1122,12 +1192,29 @@ fn prove_exhaustive(
     prove_exhaustive_opts(module, budget, goal, None)
 }
 
+/// Does code run outside `main`'s call graph? A global constructor runs before
+/// `main` and a destructor after it; every engine proof explores from `main`
+/// only, so such a module abstains (`global-ctors-dtors`, as in the shared
+/// reachable-universe gate).
+fn has_global_ctors_dtors(module: &AirModule) -> bool {
+    module
+        .globals
+        .iter()
+        .any(|g| g.name == "llvm.global_ctors" || g.name == "llvm.global_dtors")
+}
+
 fn prove_exhaustive_opts(
     module: &AirModule,
     budget: Duration,
     goal: Goal,
     signed_shl_locs: Option<&BTreeSet<(u32, u32)>>,
 ) -> (ExhaustiveProof, Vec<HeaderStates>) {
+    if has_global_ctors_dtors(module) {
+        return (
+            ExhaustiveProof::Abstain("global-ctors-dtors".to_string()),
+            Vec::new(),
+        );
+    }
     let Some(main) = module
         .functions
         .iter()
@@ -1446,6 +1533,7 @@ impl<'a> Engine<'a> {
             lazy_exhaustive: false,
             fixpoint: false,
             cex_mode: false,
+            termination: false,
             cex: None,
             cex_skip: BTreeSet::new(),
             cex_depth_first: false,
@@ -1466,6 +1554,8 @@ impl<'a> Engine<'a> {
             states: 0,
             t_simplify: Duration::ZERO,
             t_check: Duration::ZERO,
+            model_cache: Vec::new(),
+            model_hits: 0,
             t_merge: Duration::ZERO,
             t_m_pc: Duration::ZERO,
             n_merges: 0,
@@ -2407,7 +2497,7 @@ impl<'a> Engine<'a> {
     /// Counters appended to a budget abstain, for the probes.
     fn stats(&self) -> String {
         format!(
-            "({}:steps={},solver={},states={},restarts={},simplify={}ms,check={}ms,merge={}ms/{}n/pc{}ms)",
+            "({}:steps={},solver={},states={},restarts={},simplify={}ms,check={}ms,merge={}ms/{}n/pc{}ms,mc={})",
             match self.mode {
                 Mode::Exhaustive if self.lazy_exhaustive => "lexh".to_string(),
                 Mode::Exhaustive => "exh".to_string(),
@@ -2422,7 +2512,8 @@ impl<'a> Engine<'a> {
             self.t_check.as_millis(),
             self.t_merge.as_millis(),
             self.n_merges,
-            self.t_m_pc.as_millis()
+            self.t_m_pc.as_millis(),
+            self.model_hits
         )
     }
 
@@ -3131,11 +3222,17 @@ impl<'a> Engine<'a> {
                     _ => false,
                 };
                 if self.goal == Goal::MemSafety {
-                    let size = self.ms_alloc_size(st, inst, kind)?;
+                    let size = match self.ms_alloc_size(st, inst, kind) {
+                        Ok(size) => Some(size),
+                        // Counterexample search: an allocator the goal does not
+                        // model is a block of unknown size (never judged).
+                        Err(_) if self.cex_mode => None,
+                        Err(e) => return Err(e),
+                    };
                     st.heap.insert(
                         base,
                         HeapObj {
-                            size: Some(size),
+                            size,
                             status: HeapStatus::Live,
                         },
                     );
@@ -3226,6 +3323,9 @@ impl<'a> Engine<'a> {
                     self.ms_check_access(st, cell.as_ref(), bytes, inst.id, "load")?;
                 }
                 if cell.as_ref().is_some_and(|c| c.0 == NULL_BASE) {
+                    if self.termination {
+                        return Err("term-null-deref".to_string());
+                    }
                     trace(|| "load through NULL ends the path".to_string());
                     return Ok(Flow::Halt);
                 }
@@ -3263,6 +3363,9 @@ impl<'a> Engine<'a> {
                 if cell.0 == NULL_BASE {
                     // Undefined behaviour: the program has no further behaviour
                     // on this path (the field's reading of a null dereference).
+                    if self.termination {
+                        return Err("term-null-deref".to_string());
+                    }
                     trace(|| "store through NULL ends the path".to_string());
                     return Ok(Flow::Halt);
                 }
@@ -3525,39 +3628,42 @@ impl<'a> Engine<'a> {
         what: &str,
     ) -> Res<()> {
         let Some(cell) = cell else {
-            return Err(format!("ms-{what}-opaque-pointer"));
+            return self.ms_undecided(format!("ms-{what}-opaque-pointer"));
         };
         if cell.0 == NULL_BASE {
-            return Err(format!("ms-{what}-null"));
+            return self.ms_violation(st, at, format!("ms-{what}-null"));
         }
         let Some(off) = cell_offset(cell) else {
-            return Err(format!("ms-{what}-unknown-offset"));
+            return self.ms_undecided(format!("ms-{what}-unknown-offset"));
         };
         if st.dead.contains(&cell.0) {
-            return Err(format!("ms-{what}-dangling-stack"));
+            return self.ms_violation(st, at, format!("ms-{what}-dangling-stack"));
         }
         let end = u64::from(off) + bytes;
         if let Some(h) = st.heap.get(&cell.0) {
+            if h.status == HeapStatus::Freed {
+                return self.ms_violation(st, at, format!("ms-{what}-not-live"));
+            }
             if h.status != HeapStatus::Live {
-                return Err(format!("ms-{what}-not-live"));
+                return self.ms_undecided(format!("ms-{what}-not-live"));
             }
             let Some((size, vars)) = h.size.clone() else {
-                return Err(format!("ms-{what}-unknown-size"));
+                return self.ms_undecided(format!("ms-{what}-unknown-size"));
             };
             if let Some(n) = size.simplify().as_u64() {
                 return if end <= n {
                     Ok(())
                 } else {
-                    Err(format!("ms-{what}-out-of-bounds"))
+                    self.ms_violation(st, at, format!("ms-{what}-out-of-bounds"))
                 };
             }
             let end_bv = BV::from_u64(end, size.get_size());
             let oob = size.bvult(&end_bv);
             return self.check_violation(st, Some((&oob, &vars)), at);
         }
-        let size = self
-            .ms_static_size(st, cell.0)
-            .ok_or_else(|| format!("ms-{what}-unknown-object"))?;
+        let Some(size) = self.ms_static_size(st, cell.0) else {
+            return self.ms_undecided(format!("ms-{what}-unknown-object"));
+        };
         if end <= size {
             Ok(())
         } else {
@@ -3568,8 +3674,27 @@ impl<'a> Engine<'a> {
                     self.describe(cell.0)
                 )
             });
-            Err(format!("ms-{what}-out-of-bounds"))
+            self.ms_violation(st, at, format!("ms-{what}-out-of-bounds"))
         }
+    }
+
+    /// A definite memory-safety violation on this path: the prover abstains;
+    /// the counterexample search reports it (when the path is feasible) as a
+    /// candidate — only an AddressSanitizer replay ever confirms it.
+    fn ms_violation(&mut self, st: &mut State, at: InstId, reason: String) -> Res<()> {
+        if self.cex_mode {
+            return self.check_violation(st, None, at);
+        }
+        Err(reason)
+    }
+
+    /// An access the engine cannot judge: the prover abstains; the
+    /// counterexample search goes on without claiming anything (replay-gated).
+    fn ms_undecided(&self, reason: String) -> Res<()> {
+        if self.cex_mode {
+            return Ok(());
+        }
+        Err(reason)
     }
 
     /// Bytes a stored value occupies.
@@ -3673,18 +3798,37 @@ impl<'a> Engine<'a> {
 
     /// `free(p)`: NULL is a no-op; the start of a live heap block frees it;
     /// anything else abstains.
-    fn ms_free(&mut self, st: &mut State, args: &[ValueId]) -> Res<Flow> {
+    fn ms_free(&mut self, st: &mut State, at: InstId, args: &[ValueId]) -> Res<Flow> {
         let p = args.first().copied().ok_or("free-arity")?;
         match self.ptr(st, p)? {
             Some((b, _)) if b == NULL_BASE => Ok(Flow::Next),
-            Some((b, path)) if path.is_empty() => match st.heap.get_mut(&b) {
-                Some(h) if h.status == HeapStatus::Live => {
-                    h.status = HeapStatus::Freed;
-                    Ok(Flow::Next)
+            Some((b, path)) => {
+                let status = st.heap.get(&b).map(|h| h.status);
+                match status {
+                    Some(HeapStatus::Live) if path.is_empty() => {
+                        if let Some(h) = st.heap.get_mut(&b) {
+                            h.status = HeapStatus::Freed;
+                        }
+                        Ok(Flow::Next)
+                    }
+                    // Double free, a pointer into the middle of a block, or a
+                    // stack / global object: a definite invalid free.
+                    Some(HeapStatus::Freed | HeapStatus::Live) | None
+                        if !is_imprecise(&(b, path.clone())) =>
+                    {
+                        self.ms_violation(st, at, "ms-invalid-free".to_string())?;
+                        Ok(Flow::Next)
+                    }
+                    _ => {
+                        self.ms_undecided("ms-invalid-free".to_string())?;
+                        Ok(Flow::Next)
+                    }
                 }
-                _ => Err("ms-invalid-free".to_string()),
-            },
-            _ => Err("ms-invalid-free".to_string()),
+            }
+            None => {
+                self.ms_undecided("ms-invalid-free".to_string())?;
+                Ok(Flow::Next)
+            }
         }
     }
 
@@ -3741,6 +3885,11 @@ impl<'a> Engine<'a> {
     /// again, so this also catches a leak anywhere on the (finite) path; the
     /// call stack is not a root here, which is stricter than the definition.
     fn ms_memtrack(&self, st: &State) -> Res<()> {
+        // A leak is not confirmed by the replay (`valid-memtrack` violation
+        // witnesses are demo-mode only): the counterexample search ignores it.
+        if self.cex_mode {
+            return Ok(());
+        }
         let live: Vec<ValueId> = st
             .heap
             .iter()
@@ -3997,7 +4146,7 @@ impl<'a> Engine<'a> {
             return Ok(Flow::Halt);
         }
         if !defined && self.goal == Goal::MemSafety && name == "free" {
-            return self.ms_free(st, args);
+            return self.ms_free(st, inst.id, args);
         }
         if !defined && name == KEEP_ALIVE {
             return Ok(Flow::Next);
@@ -4055,7 +4204,7 @@ impl<'a> Engine<'a> {
             }
         }
         if !defined && PURE_EXTERNS.contains(&name) {
-            if self.goal == Goal::MemSafety {
+            if self.goal == Goal::MemSafety && !self.cex_mode {
                 self.ms_pure_extern_args(st, name, args)?;
             }
             if let Some(d) = inst.dst {
@@ -4301,7 +4450,10 @@ impl<'a> Engine<'a> {
         name: &str,
         args: &[ValueId],
     ) -> Res<Flow> {
-        if self.goal == Goal::MemSafety {
+        if self.termination {
+            return Err(format!("term-extern-{name}"));
+        }
+        if self.goal == Goal::MemSafety && !self.cex_mode {
             let stream = STREAM_ARG.iter().find(|(n, _)| *n == name).map(|(_, i)| *i);
             for (i, &arg) in args.iter().enumerate() {
                 if stream == Some(i)
@@ -4753,6 +4905,26 @@ impl<'a> Engine<'a> {
                 break;
             }
         }
+        // A recent satisfying assignment that also satisfies this query proves
+        // it feasible (sound: a genuine model; UNSAT still needs Z3).
+        let use_cache = !self.violation_query && !self.cex_mode && !debug_flag("nomodelcache");
+        if use_cache {
+            let t0 = Instant::now();
+            let holds = |m: &z3::Model, b: &Bool| {
+                m.eval(b, true).and_then(|v| v.as_bool()).unwrap_or(false)
+            };
+            let hit = self.model_cache.iter().position(|m| {
+                holds(m, extra) && chosen.iter().all(|&i| holds(m, &st.constraints[i].0))
+            });
+            self.t_check += t0.elapsed();
+            if let Some(i) = hit {
+                // Most recently useful first.
+                let m = self.model_cache.remove(i);
+                self.model_cache.insert(0, m);
+                self.model_hits += 1;
+                return Ok(Feas::Sat);
+            }
+        }
         self.solver_calls += 1;
         if self.solver_calls > MAX_SOLVER_CALLS {
             return Err(format!("budget-solver{}", self.stats()));
@@ -4795,6 +4967,12 @@ impl<'a> Engine<'a> {
                 )
             });
         }
+        if use_cache && res == SatResult::Sat {
+            if let Some(m) = self.solver.get_model() {
+                self.model_cache.insert(0, m);
+                self.model_cache.truncate(MODEL_CACHE_SIZE);
+            }
+        }
         Ok(match res {
             SatResult::Sat => Feas::Sat,
             SatResult::Unsat => Feas::Unsat,
@@ -4802,6 +4980,9 @@ impl<'a> Engine<'a> {
         })
     }
 }
+
+/// How many recent satisfying assignments the model cache keeps.
+const MODEL_CACHE_SIZE: usize = 8;
 
 /// The program point a state is parked at, for merging: function, block,
 /// instruction index, the call stack, and how often this block was entered.
@@ -7571,6 +7752,40 @@ mod tests {
             ],
         );
         assert_eq!(prove(&b.m), ExhaustiveProof::Proven);
+    }
+
+    /// A global constructor or destructor runs outside `main`'s call graph:
+    /// every engine proof (which explores from `main`) abstains.
+    #[test]
+    fn global_ctors_dtors_abstain_every_engine_proof() {
+        for name in ["llvm.global_ctors", "llvm.global_dtors"] {
+            let mut b = B::new();
+            let (e,) = (b.bid(),);
+            let (i_r, _) = b.inst(Operation::Ret, vec![], None);
+            b.func("main", vec![], vec![blk(e, vec![i_r])]);
+            let gid = ValueId::new(b.id());
+            let obj = saf_core::ids::ObjId::new(b.id());
+            b.m.globals
+                .push(saf_core::air::AirGlobal::new(gid, obj, name));
+            let why = |p: ExhaustiveProof| match p {
+                ExhaustiveProof::Abstain(r) => r,
+                ExhaustiveProof::Proven => "PROVEN".to_string(),
+            };
+            let d = Duration::from_secs(5);
+            assert_eq!(why(prove_unreach_exhaustive(&b.m, d)), "global-ctors-dtors");
+            assert_eq!(
+                why(prove_no_overflow_exhaustive(&b.m, d)),
+                "global-ctors-dtors"
+            );
+            assert_eq!(
+                why(prove_termination_exhaustive(&b.m, d)),
+                "global-ctors-dtors"
+            );
+            assert_eq!(
+                why(prove_memsafety_exhaustive(&b.m, d)),
+                "global-ctors-dtors"
+            );
+        }
     }
 
     /// `%n` writes through its argument; every other conversion only reads.

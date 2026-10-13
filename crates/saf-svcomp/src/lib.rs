@@ -65,6 +65,7 @@ pub use correctness_witness::{
 };
 pub use memsafety::{
     AsanHit, asan_class_to_subproperty, lower_memsafety_hit, memsafety_verdict, parse_asan_report,
+    parse_lsan_report,
 };
 pub use nondet::{NondetSite, nondet_line_map};
 pub use overflow::{
@@ -96,12 +97,12 @@ pub use unreach_prove::{
     LIFETIME_START, PINNED_EXTERNS, StateVar, find_counterexample, find_counterexample_excluding,
     is_pinned_extern, prove_memsafety_exhaustive, prove_no_overflow_exhaustive,
     prove_no_overflow_exhaustive_shl, prove_no_overflow_exhaustive_with_states,
-    prove_no_overflow_exhaustive_with_states_shl, prove_unreach_exhaustive,
-    prove_unreach_exhaustive_with_states,
+    prove_no_overflow_exhaustive_with_states_shl, prove_termination_exhaustive,
+    prove_unreach_exhaustive, prove_unreach_exhaustive_with_states,
 };
 pub use witness_lower::{
-    find_inst_span, lower_candidate, lower_must_reach, lower_overflow_candidate,
-    lower_reach_error_target, span_to_location,
+    find_inst_span, lower_candidate, lower_memsafety_candidate, lower_must_reach,
+    lower_overflow_candidate, lower_reach_error_target, span_to_location,
 };
 pub use witness_yaml::{
     Action, Constraint, SourceWaypoint, ViolationWitness, WaypointKind, WitnessMeta,

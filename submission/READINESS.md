@@ -169,3 +169,16 @@ layout; overlap-aware stores) instead of GEP-shaped structural paths. Release `6
 - fm-tools MR !1166: all CI jobs `stuck_pending_no_matching_runners` (fork has no runners); `data/saf.yml` passes
   every format/schema check locally; see the registration memory / message of 2026-10-11.
 
+## 12. 2026-10-12 — new upload candidate: `dist/saf-verify.zip` sha256 `781aeb7d…`
+
+Built from release `d883436d` (code = commit `dc44817` on `svcomp`): byte-offset memory cells (plan 222 §2q), replay stubs
+that abort when an undefined function is called (§2r), the `valid-memsafety` TRUE goal (§2s), 32-bit pointer width from
+the data layout, `sprintf` havocking its buffer. `chain_v14a` gates, counted on competition tasks only
+(`competition_proves.py`: a task counts when the svcomp26 run gave it a 2027 base category):
+unreach-call 0 / 4,324; no-overflow 0 / 3,733 (the one PROVE is the non-competition `ldv-consumption/todo/` task);
+valid-memsafety 0 / 10,087 (432 PROVE, all in `Unused_Juliet.set`: CWE690 allocator-returns-NULL and CWE122
+`sizeof(pointer)` families, whose labels contradict SV-COMP's never-failing allocation and are excluded from the
+competition for that reason); 540 expected-TRUE tasks 0 wrong FALSE; FALSE sweep 3,041 / 3,426; archive smoketest
+passed. Supersedes `5984ba6c…` (§9). Provisional score with the v13 unreach sweep and the memsafety sweep:
+~18,870 upper / ~9,930 lower Overall-eq; `chain_v14b` re-measures on this binary.
+

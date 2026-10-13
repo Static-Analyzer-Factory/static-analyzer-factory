@@ -1096,6 +1096,20 @@ pub fn prove_unreachable_cmd(args: &ProveUnreachableArgs) -> anyhow::Result<()> 
     // `SAF_PROVE_GOAL=valid-memsafety`: the engine's memory-safety goal (plan
     // 222 §2s); every dropped intrinsic gates it (`llvm.stackrestore` ends
     // object lifetimes, which this goal does reason about).
+    // `SAF_PROVE_GOAL=termination`: every path ends inside the engine's bounds
+    // (plan 222 §2t), without loop subsumption.
+    if std::env::var("SAF_PROVE_GOAL").is_ok_and(|g| g == "termination") {
+        let exhaustive = match saf_svcomp::prove_termination_exhaustive(&bundle.module, budget) {
+            saf_svcomp::ExhaustiveProof::Proven => "PROVE".to_string(),
+            saf_svcomp::ExhaustiveProof::Abstain(reason) => reason,
+        };
+        if exhaustive == "PROVE" {
+            println!("PROVE:exhaustive|interval=skipped");
+        } else {
+            println!("ABSTAIN:interval=skipped|exhaustive={exhaustive}");
+        }
+        return Ok(());
+    }
     if std::env::var("SAF_PROVE_GOAL").is_ok_and(|g| g == "valid-memsafety") {
         let Some(module) = compile_to_ir_memsafety(&args.input, data_model, &stub, dir.path())?
         else {
@@ -3583,6 +3597,13 @@ const MAX_CONCOLIC_RUNS: usize = 4;
 /// Call immediately before `.spawn()`. Linux-only (SV-COMP runs on Linux).
 fn harden_replay_spawn(cmd: &mut std::process::Command) -> &mut std::process::Command {
     use std::os::unix::process::CommandExt;
+    // Run the harness in its own (temporary) directory: a task that writes files
+    // by relative path (Juliet opens files named after its input) must not litter
+    // the caller's working directory.
+    let program = std::path::PathBuf::from(cmd.get_program());
+    if let Some(dir) = program.parent().filter(|d| !d.as_os_str().is_empty()) {
+        cmd.current_dir(dir);
+    }
     // SAFETY: the closure runs in the forked child before exec and only calls async-signal-safe
     // libc functions (prctl / getppid / _exit).
     unsafe {
@@ -3728,6 +3749,10 @@ const MEMSAFETY_SPLIT_WALL_SECS: u64 = 8;
 // `unknown`, never a false alarm), while the other mini-fuzz constants still probe the
 // task. Keep per-task jobs so jobs × 3 GB stays well under host RAM (≤16 on the 62 GB VM).
 const ASAN_OPTS: &str = "exitcode=1:abort_on_error=0:detect_leaks=0:check_printf=0:\
+max_allocation_size_mb=1024:hard_rss_limit_mb=3072";
+
+/// `ASAN_OPTIONS` for the `valid-memtrack` pass: `LeakSanitizer` on, at exit.
+const ASAN_OPTS_LEAKS: &str = "exitcode=1:abort_on_error=0:detect_leaks=1:check_printf=0:\
 max_allocation_size_mb=1024:hard_rss_limit_mb=3072";
 
 /// A second `ASAN_OPTIONS` variant that DISABLES the heap quarantine
@@ -4254,8 +4279,18 @@ fn engine_false_candidate(
     overflow: bool,
     opts: &saf_svcomp::CexOptions,
 ) -> Option<saf_svcomp::FalseCandidate> {
-    let found =
-        saf_svcomp::find_counterexample_excluding(ctx.module, cex_budget(), overflow, opts)?;
+    engine_false_candidate_in(ctx, ctx.module, overflow, opts)
+}
+
+/// [`engine_false_candidate`] on another ingestion of the task (the
+/// memory-safety recipe's module).
+fn engine_false_candidate_in(
+    _ctx: &VerifyCtx,
+    module: &saf_core::air::AirModule,
+    overflow: bool,
+    opts: &saf_svcomp::CexOptions,
+) -> Option<saf_svcomp::FalseCandidate> {
+    let found = saf_svcomp::find_counterexample_excluding(module, cex_budget(), overflow, opts)?;
     if opts.depth_first || opts.check_shl {
         eprintln!(
             "saf verify: (counterexample search: depth_first={} check_shl={})",
@@ -4268,10 +4303,10 @@ fn engine_false_candidate(
     );
     if std::env::var_os("SAF_CEX_DEBUG").is_some() {
         for (name, value, inst) in &found.nondets {
-            let span = saf_svcomp::find_inst_span(ctx.module, *inst);
+            let span = saf_svcomp::find_inst_span(module, *inst);
             eprintln!("saf verify:   pinned {name} = {value} at {span:?}");
         }
-        let span = saf_svcomp::find_inst_span(ctx.module, found.error_inst);
+        let span = saf_svcomp::find_inst_span(module, found.error_inst);
         eprintln!("saf verify:   violation at {span:?}");
     }
     Some(saf_svcomp::FalseCandidate {
@@ -4853,8 +4888,14 @@ fn memsafety_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         ctx.clang,
     ) {
         Ok(Some(hit)) => {
-            let witness = build_witness(ctx, Some(saf_svcomp::lower_memsafety_hit(&hit)));
-            if witness.is_none() {
+            // A `valid-memtrack` violation witness needs format 2.3, demo mode
+            // only in 2027 (not required): none is written.
+            let witness = if hit.subproperty == "valid-memtrack" {
+                None
+            } else {
+                build_witness(ctx, Some(saf_svcomp::lower_memsafety_hit(&hit)))
+            };
+            if witness.is_none() && hit.subproperty != "valid-memtrack" {
                 eprintln!(
                     "saf verify: FALSE (ASan {}) but witness unconstructible -> emitting false without a witness",
                     hit.subproperty
@@ -4875,12 +4916,12 @@ fn memsafety_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         // anchor), but that is an argument, not a mechanism. Running the
         // confirmer first means a reproduced violation always wins, so the
         // argument being wrong costs recall rather than a -32 wrong TRUE.
-        Ok(None) => memsafety_true_or_unknown(
+        Ok(None) => memsafety_true_or_engine_false(
             ctx,
             "saf verify: ASan replay reproduced no memsafety violation",
         ),
         Err(e) => {
-            memsafety_true_or_unknown(ctx, &format!("saf verify: ASan replay errored: {e:#}"))
+            memsafety_true_or_engine_false(ctx, &format!("saf verify: ASan replay errored: {e:#}"))
         }
     }
 }
@@ -4918,6 +4959,174 @@ fn memsafety_true_or_unknown(ctx: &VerifyCtx, why_no_false: &str) -> VerdictOutc
             }
         }
     }
+}
+
+/// The TRUE arms, then — when they do not prove the program — the engine's
+/// memory-safety counterexample with an `AddressSanitizer` replay of its inputs.
+fn memsafety_true_or_engine_false(ctx: &VerifyCtx, why_no_false: &str) -> VerdictOutcome {
+    let out = memsafety_true_or_unknown(ctx, why_no_false);
+    if out.verdict != "unknown" {
+        return out;
+    }
+    memsafety_engine_counterexample(ctx).unwrap_or(out)
+}
+
+/// `valid-memsafety` FALSE from the engine (plan 222 §2w): the memory-safety
+/// goal's counterexample search finds a feasible invalid access or free with
+/// concrete inputs; the program is replayed natively with those inputs under
+/// `AddressSanitizer`, and only an `ASan` trap in the program's own code confirms
+/// it (the sub-property is the `ASan` report's, as in [`asan_confirm`]). A candidate that
+/// does not reproduce is excluded and the search runs again.
+fn memsafety_engine_counterexample(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    let source = std::fs::read_to_string(ctx.input).ok()?;
+    if saf_svcomp::source_has_openmp(&source) {
+        return None;
+    }
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        return None;
+    }
+    // The memory-safety recipe's module (block-scope lifetimes); the shared
+    // module when the recipe refuses (the candidate is replay-gated either way).
+    let recipe = compile_to_ir_memsafety(ctx.input, ctx.data_model, ctx.stub, ctx.tempdir)
+        .ok()
+        .flatten();
+    let module = recipe.as_ref().unwrap_or(ctx.module);
+    let mut opts = saf_svcomp::CexOptions {
+        memsafety: true,
+        ..saf_svcomp::CexOptions::default()
+    };
+    for attempt in 0..=cex_retries() {
+        let Some(candidate) = engine_false_candidate_in(ctx, module, false, &opts) else {
+            if opts.skip.is_empty() && !opts.depth_first {
+                opts.depth_first = true;
+                continue;
+            }
+            eprintln!("saf verify: no engine memsafety counterexample -> unknown");
+            return None;
+        };
+        match asan_replay_sequence(ctx, module, &candidate) {
+            Ok(Some(hit)) => {
+                let witness = build_witness(
+                    ctx,
+                    Some(saf_svcomp::lower_memsafety_candidate(
+                        module,
+                        &candidate,
+                        &hit,
+                        Some(&source),
+                    )),
+                );
+                eprintln!(
+                    "saf verify: engine memsafety counterexample confirmed by ASan ({}) -> false",
+                    hit.subproperty
+                );
+                return Some(VerdictOutcome {
+                    verdict: saf_svcomp::memsafety_verdict(hit.subproperty),
+                    witness,
+                    graphml: None,
+                    correctness: None,
+                });
+            }
+            Ok(None) => eprintln!(
+                "saf verify: engine memsafety counterexample did not replay (attempt {})",
+                attempt + 1
+            ),
+            Err(e) => {
+                eprintln!("saf verify: memsafety counterexample replay errored: {e:#} -> unknown");
+                return None;
+            }
+        }
+        opts.skip.insert(candidate.reach_error_inst);
+    }
+    None
+}
+
+/// Replay an engine counterexample's inputs under `AddressSanitizer` (the driver
+/// of [`ubsan_replay_sequence`], compiled with `-fsanitize=address`); the trap
+/// is parsed by [`saf_svcomp::parse_asan_report`] (own-code faults with a
+/// mapped class only).
+fn asan_replay_sequence(
+    ctx: &VerifyCtx,
+    _module: &saf_core::air::AirModule,
+    candidate: &saf_svcomp::FalseCandidate,
+) -> anyhow::Result<Option<saf_svcomp::AsanHit>> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+    let dir = ctx.tempdir;
+    let sentinel = dir.join("saf_mcex.sentinel");
+    let driver_src = dir.join("saf_mcex_driver.c");
+    let harness = dir.join("saf_mcex_harness");
+    let errpath = dir.join("saf_mcex_stderr.txt");
+    let mut driver = synthesize_driver(candidate, &sentinel);
+    driver.push_str(&rand_wrapper(candidate));
+    std::fs::write(&driver_src, driver)
+        .with_context(|| "writing memsafety counterexample driver")?;
+    let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
+    let build = |neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(ctx.clang);
+        cmd.args([
+            "-O0",
+            "-g",
+            "-fsanitize=address",
+            "-fno-sanitize-recover=address",
+            "-Wno-everything",
+        ])
+        .args(replay_wrap_flags())
+        .args(ctx.data_model.clang_flags())
+        .arg("-include")
+        .arg(ctx.stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include").arg(n);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(ctx.input)
+            .arg(&driver_src)
+            .arg("-lm")
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    if !link_replay_harness(&build, &driver_src, dir, "memsafety counterexample replay")? {
+        return Ok(None);
+    }
+    for opts in [ASAN_OPTS, ASAN_OPTS_NO_QUARANTINE] {
+        let errfile =
+            std::fs::File::create(&errpath).with_context(|| "creating ASan stderr file")?;
+        let mut cmd = Command::new(&harness);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(errfile))
+            .env("ASAN_OPTIONS", opts);
+        let mut child = harden_replay_spawn(&mut cmd)
+            .spawn()
+            .with_context(|| "spawning memsafety counterexample harness")?;
+        let timeout = memsafety_replay_timeout();
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        kill_replay_group(&mut child);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => return Err(e).context("waiting on memsafety counterexample harness"),
+            }
+        }
+        let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+        if std::env::var_os("SAF_CEX_DEBUG").is_some() {
+            eprintln!("saf verify: memsafety cex harness stderr:\n{report}");
+        }
+        if let Some(hit) = saf_svcomp::parse_asan_report(&report) {
+            return Ok(Some(hit));
+        }
+    }
+    Ok(None)
 }
 
 /// The exact-semantics engine's `valid-memsafety` goal (plan 222 §2s), behind
@@ -5319,7 +5528,52 @@ fn asan_confirm(
     // the byte-stream runs the ORIGINAL program, and the hit is re-triggered on the same
     // input before emitting (R6). It costs one extra compile + a wall-capped set of native
     // runs, borne only by tasks the cheaper passes already left `unknown`.
-    asan_fuzz_pass(input, data_model, module, stub, dir, clang)
+    if let Some(hit) = asan_fuzz_pass(input, data_model, module, stub, dir, clang)? {
+        return Ok(Some(hit));
+    }
+
+    // Pass 4 (`valid-memtrack`, plan 222 §2x): no invalid dereference or free
+    // reproduced, so run the same harness once more with LeakSanitizer on. A
+    // block it reports at normal exit was unreachable from every global, stack
+    // and register — untracked, a `valid-memtrack` violation. Only a leak whose
+    // allocation stack reaches the task's own source counts; a run that ends in
+    // `abort` never reports (LeakSanitizer runs at exit only).
+    if harness.exists() {
+        let task_file = input
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let errfile =
+            std::fs::File::create(&errpath).with_context(|| "creating LSan stderr file")?;
+        let mut cmd = Command::new(&harness);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(errfile))
+            .env("ASAN_OPTIONS", ASAN_OPTS_LEAKS)
+            .env("SAF_NONDET_CONST", "0");
+        let mut child = harden_replay_spawn(&mut cmd)
+            .spawn()
+            .with_context(|| "spawning LSan harness")?;
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        kill_replay_group(&mut child);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => return Err(e).context("waiting on LSan harness"),
+            }
+        }
+        let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+        if let Some(hit) = saf_svcomp::parse_lsan_report(&report, &task_file) {
+            return Ok(Some(hit));
+        }
+    }
+    Ok(None)
 }
 
 /// Byte-stream depth-guided greybox `ASan` mini-fuzz (memsafety pass 3, lever
@@ -6433,6 +6687,19 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         }
     }
 
+    // Path 3 (plan 222 §2t): the exact-semantics engine explores every path to
+    // its end (bounded loops), behind the same gates as its other TRUE arms.
+    // The witness is the empty 2.1 `invariant_set` (the validator re-proves
+    // termination; there is no ranking function to state).
+    if !proven && termination_engine_proves(ctx) {
+        return VerdictOutcome {
+            verdict: saf_svcomp::termination_verdict().to_string(),
+            witness: None,
+            graphml: None,
+            correctness: Some(saf_svcomp::InvariantSetWitness::empty_2_1(ctx.meta)),
+        };
+    }
+
     if proven {
         // SV-COMP 2027 requires a 2.1-or-higher correctness witness for every
         // `C.termination.*` base category (it was "2.1 (demo mode)" = free in 2026).
@@ -6463,6 +6730,35 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         }
     } else {
         unknown_outcome()
+    }
+}
+
+/// The engine's termination arm ([`saf_svcomp::prove_termination_exhaustive`]):
+/// OpenMP, a reachable thread spawn or a dropped instruction abstain first.
+fn termination_engine_proves(ctx: &VerifyCtx) -> bool {
+    let Ok(source) = std::fs::read_to_string(ctx.input) else {
+        return false;
+    };
+    if saf_svcomp::source_has_openmp(&source) {
+        return false;
+    }
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        return false;
+    }
+    if unreach_prover_blocked_by_dropped(ctx.module) {
+        return false;
+    }
+    let budget = unreach_prove_budget(ctx.budget);
+    match saf_svcomp::prove_termination_exhaustive(ctx.module, budget) {
+        saf_svcomp::ExhaustiveProof::Proven => {
+            eprintln!("saf verify: exhaustive engine explored every path to its end -> true");
+            true
+        }
+        saf_svcomp::ExhaustiveProof::Abstain(reason) => {
+            eprintln!("saf verify: exhaustive termination prover abstained ({reason})");
+            false
+        }
     }
 }
 

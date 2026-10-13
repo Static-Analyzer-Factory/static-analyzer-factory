@@ -106,3 +106,5 @@ tests/benchmarks/incremental/*/.compiled/
 # SV-COMP sweep outputs and side build directories (local only)
 /results/
 /target-s*/
+# written by the saf-cli smoke tests
+/crates/saf-cli/witness.yml

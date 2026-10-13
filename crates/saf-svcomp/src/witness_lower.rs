@@ -192,6 +192,38 @@ pub fn lower_overflow_candidate(
     waypoints
 }
 
+/// The violation witness of an engine counterexample for `valid-memsafety`,
+/// confirmed by an AddressSanitizer replay: the pinned nondeterministic reads
+/// as `function_return` assumptions (as for `no-overflow`), then the target at
+/// the access ASan trapped on.
+#[must_use]
+pub fn lower_memsafety_candidate(
+    module: &AirModule,
+    cand: &FalseCandidate,
+    hit: &crate::memsafety::AsanHit,
+    source: Option<&str>,
+) -> Vec<SourceWaypoint> {
+    let src_lines: Option<Vec<&str>> = source.map(|s| s.lines().collect());
+    let src_lines = src_lines.as_deref();
+    let mut waypoints = Vec::new();
+    for nc in &cand.nondet_sequence {
+        if !(is_scalar_integer_nondet(&nc.func_name)
+            || nc.func_name == "rand"
+            || crate::unreach_prove::is_pinned_extern(&nc.func_name))
+        {
+            continue;
+        }
+        let Some(id) = nc.call_inst else {
+            continue;
+        };
+        if let Some(wp) = function_return_waypoint(module, id, nc.value, src_lines) {
+            waypoints.push(wp);
+        }
+    }
+    waypoints.extend(crate::memsafety::lower_memsafety_hit(hit));
+    waypoints
+}
+
 /// Developer aid: the `(file, line, column)` of an instruction, if it has a span.
 #[must_use]
 pub fn find_inst_span(module: &AirModule, inst_id: InstId) -> Option<(String, u32, u32)> {

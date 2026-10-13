@@ -123,6 +123,47 @@ pub fn parse_asan_report(stderr: &str) -> Option<AsanHit> {
     None // no locatable program frame -> abstain
 }
 
+/// Parse a LeakSanitizer report (ASan with `detect_leaks=1`, at normal program
+/// exit) into a `valid-memtrack` hit: the first leaked block whose allocation
+/// stack reaches a frame in the task's own source file (`task_file`, a
+/// basename). A block LeakSanitizer reports was unreachable from every global,
+/// stack and register at exit — it became untracked, which is a `valid-memtrack`
+/// violation. Leaks allocated only from other files (the replay driver, libc
+/// internals) are ignored; `None` when no leak qualifies.
+#[must_use]
+pub fn parse_lsan_report(stderr: &str, task_file: &str) -> Option<AsanHit> {
+    const MARKER: &str = "ERROR: LeakSanitizer: detected memory leaks";
+    let start = stderr.find(MARKER)?;
+    let mut in_block = false;
+    for line in stderr[start + MARKER.len()..].lines() {
+        let t = line.trim_start();
+        if t.starts_with("Direct leak of") || t.starts_with("Indirect leak of") {
+            in_block = true;
+            continue;
+        }
+        if !in_block || !t.starts_with('#') {
+            if t.is_empty() {
+                in_block = false;
+            }
+            continue;
+        }
+        let Some(descr) = t.split_once(" in ").map(|(_, d)| d) else {
+            continue;
+        };
+        if let Some((path, line_no, col)) = parse_frame_location(descr) {
+            if basename(&path) == task_file {
+                return Some(AsanHit {
+                    subproperty: "valid-memtrack",
+                    file: basename(&path),
+                    line: line_no,
+                    column: col,
+                });
+            }
+        }
+    }
+    None
+}
+
 /// The SV-COMP verdict string for a confirmed memsafety sub-property, e.g.
 /// `false(valid-deref)`. Decoupled from `Property::name()` (which is the combined
 /// `valid-memsafety`) because SV-COMP scores the specific sub-property.
@@ -247,6 +288,19 @@ fn basename(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lsan_report_yields_memtrack_at_the_programs_allocation() {
+        let report = "\n=================================================================\n==1==ERROR: LeakSanitizer: detected memory leaks\n\nDirect leak of 800 byte(s) in 1 object(s) allocated from:\n    #0 0x4a1b2c in malloc (/tmp/h+0x4a1b2c)\n    #1 0x4c2d3e in leak_bad /w/c/Juliet_Test/x_bad.i:850:30\n    #2 0x4c2e00 in main /w/c/Juliet_Test/x_bad.i:880:5\n\nSUMMARY: AddressSanitizer: 800 byte(s) leaked in 1 allocation(s).\n";
+        let hit = parse_lsan_report(report, "x_bad.i").expect("hit");
+        assert_eq!(hit.subproperty, "valid-memtrack");
+        assert_eq!(hit.line, 850);
+        assert_eq!(memsafety_verdict(hit.subproperty), "false(valid-memtrack)");
+        // A leak allocated only from the replay driver is not the program's.
+        let driver_only = report.replace("/w/c/Juliet_Test/x_bad.i", "/tmp/saf_asan_driver.c");
+        assert!(parse_lsan_report(&driver_only, "x_bad.i").is_none());
+        assert!(parse_lsan_report("no report", "x_bad.i").is_none());
+    }
+
     use super::*;
     use crate::property_kind::{DataModel, Language};
     use crate::witness_yaml::{ViolationWitness, WitnessMeta};
