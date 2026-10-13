@@ -211,6 +211,8 @@ pub fn run_sccp_function_with_widths(
         values.insert(*vid, sccp_val);
     }
 
+    seed_external_operands(func, &mut values);
+
     // Mark entry block executable.
     let entry_id = match func.entry_block {
         Some(id) => id,
@@ -319,6 +321,39 @@ fn constant_to_sccp(constant: &Constant) -> SccpValue {
         Constant::Null | Constant::ZeroInit => SccpValue::Constant(0),
         // Float, String, Undef, Aggregate, GlobalRef — not integer-foldable.
         _ => SccpValue::Bottom,
+    }
+}
+
+/// Everything the function reads but does not define — its parameters, a
+/// global's address, a function's address — is overdetermined (`Bottom`),
+/// as in Wegman-Zadeck. Left at `Top` ("not yet analysed"), such a value is
+/// the identity of `meet`: a phi joining `carry` (constant 0) with
+/// `carry + a0` (`a0` from a parameter) published the constant 0, the
+/// interval solver adopted it through `constant_map`, and the witness
+/// claimed `carry == 0` at a loop head (UAutomizer refuted it, 2026-10-12).
+fn seed_external_operands(func: &AirFunction, values: &mut BTreeMap<ValueId, SccpValue>) {
+    let defined: BTreeSet<ValueId> = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|i| i.dst)
+        .collect();
+    for p in &func.params {
+        values.insert(p.id, SccpValue::Bottom);
+    }
+    for inst in func.blocks.iter().flat_map(|b| b.instructions.iter()) {
+        let phi_inputs = match &inst.op {
+            Operation::Phi { incoming } => incoming.iter().map(|(_, v)| *v).collect(),
+            _ => Vec::new(),
+        };
+        for v in inst.operands.iter().chain(phi_inputs.iter()) {
+            if !defined.contains(v) && !values.contains_key(v) {
+                // (A read-only global's INITIAL value is keyed by its address in
+                // `read_only_globals`; the `Load` arm reads it there. The address
+                // itself is no constant.)
+                values.insert(*v, SccpValue::Bottom);
+            }
+        }
     }
 }
 
@@ -879,6 +914,78 @@ mod tests {
             "then block should be alive"
         );
         assert_eq!(result.constants.get(&cond_id), Some(&1));
+    }
+
+    /// A parameter is overdetermined, never "not yet analysed": a phi joining
+    /// the constant 0 with `p + 0` is no constant (it was published as 0).
+    #[test]
+    fn sccp_parameter_is_not_a_constant() {
+        use saf_core::air::*;
+        use saf_core::ids::*;
+
+        let p = ValueId::new(1);
+        let zero = ValueId::new(100);
+        let t = ValueId::new(102);
+        let phi = ValueId::new(103);
+        let (entry_id, then_id, else_id, join_id) = (
+            BlockId::new(1),
+            BlockId::new(2),
+            BlockId::new(3),
+            BlockId::new(4),
+        );
+
+        let mut entry = AirBlock::with_label(entry_id, "entry");
+        entry.instructions = vec![
+            Instruction::new(
+                InstId::new(10),
+                Operation::CondBr {
+                    then_target: then_id,
+                    else_target: else_id,
+                },
+            )
+            .with_operands(vec![p]),
+        ];
+        let mut then_block = AirBlock::with_label(then_id, "then");
+        then_block.instructions = vec![
+            Instruction::new(InstId::new(11), Operation::BinaryOp { kind: BinaryOp::Or })
+                .with_operands(vec![p, zero])
+                .with_dst(t),
+            Instruction::new(InstId::new(12), Operation::Br { target: join_id }),
+        ];
+        let mut else_block = AirBlock::with_label(else_id, "else");
+        else_block.instructions = vec![Instruction::new(
+            InstId::new(13),
+            Operation::Br { target: join_id },
+        )];
+        let mut join = AirBlock::with_label(join_id, "join");
+        join.instructions = vec![
+            Instruction::new(
+                InstId::new(14),
+                Operation::Phi {
+                    incoming: vec![(then_id, t), (else_id, zero)],
+                },
+            )
+            .with_dst(phi),
+            Instruction::new(InstId::new(15), Operation::Ret),
+        ];
+
+        let mut func = AirFunction::new(FunctionId::new(1), "test_param");
+        func.params = vec![AirParam::new(p, 0)];
+        func.blocks = vec![entry, then_block, else_block, join];
+        func.entry_block = Some(entry_id);
+        func.rebuild_block_index();
+
+        let mut module_constants = BTreeMap::new();
+        module_constants.insert(zero, Constant::Int { value: 0, bits: 32 });
+
+        let result = run_sccp_function(&func, &module_constants, &BTreeMap::new());
+        assert_eq!(result.constants.get(&t), None, "p | 0 is not a constant");
+        assert_eq!(
+            result.constants.get(&phi),
+            None,
+            "the join is not a constant"
+        );
+        assert!(!result.dead_blocks.contains(&then_id));
     }
 
     // ---- Cast evaluation tests ----

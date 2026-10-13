@@ -228,6 +228,13 @@ pub fn extract_local_variable_names(module_ir: &str) -> LocalVarNameMap {
     // Track current function by detecting `define` lines.
     let mut result: LocalVarNameMap = BTreeMap::new();
     let mut current_func: Option<String> = None;
+    // Registers some record names as two DIFFERENT variables (per function).
+    // After mem2reg a copy `partial_sum = carry;` is the record
+    // `dbg.value(%carry.0, "partial_sum")`: the register is `carry`'s loop-head
+    // phi, and whichever name came last would stick. Such a register stands for
+    // no single C variable, so it gets no name (a loop-head invariant written
+    // over the wrong variable was refuted by UAutomizer, 2026-10-12).
+    let mut ambiguous: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
 
     for line in module_ir.lines() {
         let trimmed = line.trim();
@@ -253,14 +260,29 @@ pub fn extract_local_variable_names(module_ir: &str) -> LocalVarNameMap {
             parse_dbg_declare(trimmed).or_else(|| parse_dbg_value(trimmed))
         {
             if let Some(var_name) = metadata_names.get(&meta_id) {
-                result
-                    .entry(func_name.clone())
-                    .or_default()
-                    .insert(reg_name, var_name.clone());
+                let names = result.entry(func_name.clone()).or_default();
+                match names.get(&reg_name) {
+                    Some(prev) if prev != var_name => {
+                        ambiguous
+                            .entry(func_name.clone())
+                            .or_default()
+                            .insert(reg_name);
+                    }
+                    _ => {
+                        names.insert(reg_name, var_name.clone());
+                    }
+                }
             }
         }
     }
 
+    for (func_name, regs) in &ambiguous {
+        if let Some(names) = result.get_mut(func_name) {
+            for reg in regs {
+                names.remove(reg);
+            }
+        }
+    }
     result
 }
 
@@ -625,5 +647,28 @@ define dso_local i32 @main() #0 !dbg !13 {
             map.get("main").and_then(|m| m.get("%.0")),
             Some(&"s".to_string())
         );
+    }
+
+    #[test]
+    fn register_named_as_two_variables_gets_no_name() {
+        // `partial_sum = carry;` after mem2reg: `carry`'s phi is also described
+        // as `partial_sum`. It stands for neither alone; `i` stays named.
+        let module_ir = r#"
+define dso_local i32 @mp_add() #0 !dbg !13 {
+  tail call void @llvm.dbg.value(metadata i16 %carry.0, metadata !140, metadata !DIExpression()), !dbg !62
+  tail call void @llvm.dbg.value(metadata i8 %i.0, metadata !141, metadata !DIExpression()), !dbg !62
+  tail call void @llvm.dbg.value(metadata i16 %carry.0, metadata !157, metadata !DIExpression()), !dbg !62
+  tail call void @llvm.dbg.value(metadata i8 %i.0, metadata !141, metadata !DIExpression()), !dbg !62
+  ret i32 0
+}
+
+!140 = !DILocalVariable(name: "carry", scope: !58, file: !2, line: 45, type: !22)
+!141 = !DILocalVariable(name: "i", scope: !58, file: !2, line: 47, type: !21)
+!157 = !DILocalVariable(name: "partial_sum", scope: !58, file: !2, line: 46, type: !22)
+"#;
+        let map = extract_local_variable_names(module_ir);
+        let names = map.get("mp_add").expect("function entry");
+        assert_eq!(names.get("%carry.0"), None);
+        assert_eq!(names.get("%i.0"), Some(&"i".to_string()));
     }
 }

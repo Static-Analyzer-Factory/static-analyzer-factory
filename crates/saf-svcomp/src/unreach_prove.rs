@@ -56,7 +56,7 @@ use saf_core::air::{
 };
 use saf_core::ids::{BlockId, FunctionId, InstId, ValueId};
 use z3::SatResult;
-use z3::ast::{Ast, BV, Bool};
+use z3::ast::{Ast, BV, Bool, Dynamic};
 
 use crate::property::{REACH_ERROR_NAMES, is_scalar_integer_nondet};
 
@@ -600,6 +600,33 @@ enum Mode {
     Step { k: u32 },
 }
 
+/// A candidate loop invariant for Houdini inference (plan 222 §2y): a
+/// comparison between a header phi and another loop variable, a value the
+/// loop only reads, or a constant.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct KCand {
+    op: KOp,
+    a: KTerm,
+    b: KTerm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum KOp {
+    Sle,
+    Slt,
+    Ule,
+    Ult,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum KTerm {
+    Val(ValueId),
+    Const(i64, u32),
+}
+
+/// Houdini's candidate cap per loop (each costs queries per captured state).
+const KCAND_CAP: usize = 600;
+
 /// The single natural loop that k-induction reasons about: in `main`, or in a
 /// loop-free `main`'s single looping callee (plan 223 slice 2).
 struct LoopInfo {
@@ -806,6 +833,13 @@ struct Engine<'a> {
     goal: Goal,
     mode: Mode,
     kloop: Option<LoopInfo>,
+    /// Invariants of the k-induction loop, assumed in every arbitrary header
+    /// state (proven inductive by Houdini before they are used).
+    kinv: Vec<KCand>,
+    /// Houdini capture: the header iteration at which a path stops and its
+    /// state is recorded in `kcaptured`.
+    kcapture_at: Option<u32>,
+    kcaptured: Vec<State>,
     module: &'a AirModule,
     /// Integer width of every SSA value with a known integer type.
     width: BTreeMap<ValueId, u32>,
@@ -890,6 +924,11 @@ struct Engine<'a> {
     model_cache: Vec<z3::Model>,
     /// Queries the model cache answered.
     model_hits: u64,
+    /// The module computes with floats: queries may hold floating-point terms,
+    /// and [`fp_abstract`] is tried before the exact (bit-blasted) query.
+    uses_fp: bool,
+    /// Queries the float abstraction refuted.
+    fp_abs_hits: u64,
     t_merge: Duration,
     t_m_pc: Duration,
     n_merges: u64,
@@ -1265,7 +1304,15 @@ fn prove_exhaustive_opts(
         Ok(lp) => {
             engine.kloop = Some(lp);
             engine.deadline = start + budget / 2;
+            // Houdini first (on the same half budget): its invariants strengthen
+            // every arbitrary header state of the step case.
+            let inv = engine.houdini(main, entry).unwrap_or_default();
+            engine.kinv = inv;
+            engine.steps = 0;
+            engine.solver_calls = 0;
+            engine.states = 0;
             let outcome = engine.k_induction(main, entry);
+            engine.kinv.clear();
             engine.kloop = None;
             engine.mode = Mode::Exhaustive;
             engine.steps = 0;
@@ -1519,6 +1566,9 @@ impl<'a> Engine<'a> {
             goal: Goal::ReachError,
             mode: Mode::Exhaustive,
             kloop: None,
+            kinv: Vec::new(),
+            kcapture_at: None,
+            kcaptured: Vec::new(),
             module,
             width,
             is_ptr,
@@ -1556,6 +1606,11 @@ impl<'a> Engine<'a> {
             t_check: Duration::ZERO,
             model_cache: Vec::new(),
             model_hits: 0,
+            uses_fp: module
+                .types
+                .values()
+                .any(|t| matches!(t, AirType::Float { .. })),
+            fp_abs_hits: 0,
             t_merge: Duration::ZERO,
             t_m_pc: Duration::ZERO,
             n_merges: 0,
@@ -2049,7 +2104,264 @@ impl<'a> Engine<'a> {
             .map(|(g, _)| *g)
             .collect();
         st.escaped.extend(mutable_globals);
+        // The proven (or, during Houdini, candidate) invariants of the header.
+        let kinv = self.kinv.clone();
+        for c in &kinv {
+            if let Ok(Some((b, vars))) = self.kcand_bool(&mut st, c) {
+                st.constraints.push((b, vars));
+            }
+        }
         st
+    }
+
+    /// The value of a candidate's term in `st` (an integer bit-vector), or
+    /// `None` when it is not one.
+    fn kterm_bv(&mut self, st: &mut State, t: &KTerm) -> Res<Option<(BV, Vars)>> {
+        Ok(match t {
+            KTerm::Const(k, w) => Some((int_bv(*k, *w), no_vars())),
+            KTerm::Val(v) => match self.val(st, *v, self.width.get(v).copied())? {
+                Val::Bv(b, vars) => Some((b, vars)),
+                Val::Ptr(_) => None,
+            },
+        })
+    }
+
+    /// The candidate as a formula over `st`'s values.
+    fn kcand_bool(&mut self, st: &mut State, c: &KCand) -> Res<Option<(Bool, Vars)>> {
+        let (Some((a, va)), Some((b, vb))) = (self.kterm_bv(st, &c.a)?, self.kterm_bv(st, &c.b)?)
+        else {
+            return Ok(None);
+        };
+        if a.get_size() != b.get_size() {
+            return Ok(None);
+        }
+        let f = match c.op {
+            KOp::Sle => a.bvsle(&b),
+            KOp::Slt => a.bvslt(&b),
+            KOp::Ule => a.bvule(&b),
+            KOp::Ult => a.bvult(&b),
+        };
+        Ok(Some((f, union(&va, &vb))))
+    }
+
+    /// Houdini candidates for the k-induction loop: every header phi against
+    /// the constants of the loop and against every other loop variable or value
+    /// the loop only reads (same width), in each direction, signed and unsigned.
+    // NOTE: one pass collecting the loop's phis, reads and the function's
+    // constants, then the two candidate families; splitting would only move
+    // the shared tables into parameters.
+    #[allow(clippy::too_many_lines)]
+    fn kcandidates(&self) -> Vec<KCand> {
+        let Some(lp) = self.kloop.as_ref() else {
+            return Vec::new();
+        };
+        let Some(f) = self.module.function(lp.func) else {
+            return Vec::new();
+        };
+        let int_width = |v: &ValueId| -> Option<u32> {
+            (!self.is_ptr.contains(v))
+                .then(|| self.width.get(v).copied())
+                .flatten()
+                .filter(|w| *w > 1)
+        };
+        let mut phis: Vec<(ValueId, u32)> = Vec::new();
+        let mut defined: BTreeSet<ValueId> = BTreeSet::new();
+        for b in f.blocks.iter().filter(|b| lp.body.contains(&b.id)) {
+            for i in &b.instructions {
+                if let Some(d) = i.dst {
+                    defined.insert(d);
+                    if b.id == lp.header && matches!(i.op, Operation::Phi { .. }) {
+                        if let Some(w) = int_width(&d) {
+                            phis.push((d, w));
+                        }
+                    }
+                }
+            }
+        }
+        let mut reads: BTreeSet<(ValueId, u32)> = BTreeSet::new();
+        for b in f.blocks.iter().filter(|b| lp.body.contains(&b.id)) {
+            for i in &b.instructions {
+                for op in &i.operands {
+                    if defined.contains(op) || self.module.constants.contains_key(op) {
+                        continue;
+                    }
+                    if let Some(w) = int_width(op) {
+                        reads.insert((*op, w));
+                    }
+                }
+            }
+        }
+        // Constants of the whole function (a bound established before the loop,
+        // `assume(n < 1000000)`, is what the step case needs to know about `n`).
+        let mut consts: BTreeSet<(i64, u32)> = BTreeSet::new();
+        for b in &f.blocks {
+            for i in &b.instructions {
+                for op in &i.operands {
+                    if let Some(Constant::Int { value, bits }) = self.module.constants.get(op) {
+                        consts.insert((*value, u32::from(*bits)));
+                    }
+                }
+            }
+        }
+        // Relations first (the cap must never cut them), then constant bounds
+        // for every loop variable and every value the loop reads.
+        let mut out = Vec::new();
+        let mut seen: BTreeSet<KCand> = BTreeSet::new();
+        let mut push = |c: KCand, out: &mut Vec<KCand>| {
+            if seen.insert(c.clone()) {
+                out.push(c);
+            }
+        };
+        let ops = [KOp::Sle, KOp::Slt, KOp::Ule, KOp::Ult];
+        for &(x, w) in &phis {
+            let terms = phis
+                .iter()
+                .chain(reads.iter())
+                .filter(|(y, wy)| *y != x && *wy == w)
+                .map(|(y, _)| KTerm::Val(*y));
+            for y in terms {
+                for op in ops {
+                    push(
+                        KCand {
+                            op,
+                            a: KTerm::Val(x),
+                            b: y.clone(),
+                        },
+                        &mut out,
+                    );
+                    push(
+                        KCand {
+                            op,
+                            a: y.clone(),
+                            b: KTerm::Val(x),
+                        },
+                        &mut out,
+                    );
+                }
+            }
+        }
+        for &(x, w) in phis.iter().chain(reads.iter()) {
+            let cs: BTreeSet<i64> = consts
+                .iter()
+                .filter(|(_, wc)| *wc == w)
+                .map(|(k, _)| *k)
+                .chain([0, 1])
+                .collect();
+            for k in cs {
+                for op in ops {
+                    push(
+                        KCand {
+                            op,
+                            a: KTerm::Val(x),
+                            b: KTerm::Const(k, w),
+                        },
+                        &mut out,
+                    );
+                    push(
+                        KCand {
+                            op,
+                            a: KTerm::Const(k, w),
+                            b: KTerm::Val(x),
+                        },
+                        &mut out,
+                    );
+                }
+            }
+        }
+        out.truncate(KCAND_CAP);
+        out
+    }
+
+    /// Drop every candidate that some captured state can violate.
+    fn kprune(&mut self, cands: &mut Vec<KCand>) -> Res<()> {
+        let states = std::mem::take(&mut self.kcaptured);
+        for mut st in states {
+            // All at once first: usually every candidate holds.
+            let mut fs = Vec::new();
+            let mut keep_idx = Vec::new();
+            for (i, c) in cands.iter().enumerate() {
+                if let Some((b, _)) = self.kcand_bool(&mut st, c)? {
+                    fs.push(b);
+                    keep_idx.push(i);
+                }
+            }
+            let all: Vars = Rc::new(VarSet::All);
+            let refs: Vec<&Bool> = fs.iter().collect();
+            let conj = Bool::and(&refs);
+            if matches!(self.feasible(&st, &conj.not(), &all)?, Feas::Unsat)
+                && keep_idx.len() == cands.len()
+            {
+                continue;
+            }
+            let mut kept = Vec::new();
+            for (j, i) in keep_idx.iter().enumerate() {
+                if matches!(self.feasible(&st, &fs[j].not(), &all)?, Feas::Unsat) {
+                    kept.push(cands[*i].clone());
+                }
+            }
+            *cands = kept;
+            if cands.is_empty() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Houdini (plan 222 §2y): the largest subset of the candidates that holds
+    /// at every first arrival at the loop header (initiation, from `main`'s
+    /// entry) and is preserved by one iteration from any header state that
+    /// satisfies it (consecution). The result is an inductive invariant: every
+    /// reachable header state satisfies it, so the step case may assume it.
+    fn houdini(&mut self, main: &saf_core::air::AirFunction, entry: BlockId) -> Res<Vec<KCand>> {
+        let mut cands = self.kcandidates();
+        if cands.is_empty() || debug_flag("nohoudini") {
+            return Ok(Vec::new());
+        }
+        let n0 = cands.len();
+        // Initiation: every path from the entry to the header's first arrival.
+        self.mode = Mode::Base { k: 1 };
+        self.kcapture_at = Some(1);
+        self.kcaptured.clear();
+        let init = self.initial_state(main, entry);
+        let r = self.run(init);
+        self.kcapture_at = None;
+        r?;
+        self.kprune(&mut cands)?;
+        // Consecution, to a fixpoint.
+        for _ in 0..16 {
+            if cands.is_empty() {
+                break;
+            }
+            let before = cands.len();
+            self.mode = Mode::Step { k: 1 };
+            self.kinv = cands.clone();
+            self.kcapture_at = Some(2);
+            self.kcaptured.clear();
+            let s0 = self.arbitrary_header_state(main);
+            let r = self.run(s0);
+            self.kcapture_at = None;
+            self.kinv.clear();
+            match r {
+                Ok(()) => {}
+                // Iteration 1 of the step case checks nothing; anything else
+                // (a budget) ends the inference with no invariant.
+                Err(e) => {
+                    trace(|| format!("houdini consecution run: {e}"));
+                    return Ok(Vec::new());
+                }
+            }
+            self.kprune(&mut cands)?;
+            if cands.len() == before {
+                break;
+            }
+        }
+        trace(|| {
+            format!(
+                "houdini: {} of {n0} candidates inductive: {cands:?}",
+                cands.len()
+            )
+        });
+        Ok(cands)
     }
 
     /// Exhaustively explore from `init`. `Ok(())` ⇒ no feasible error call.
@@ -2497,7 +2809,7 @@ impl<'a> Engine<'a> {
     /// Counters appended to a budget abstain, for the probes.
     fn stats(&self) -> String {
         format!(
-            "({}:steps={},solver={},states={},restarts={},simplify={}ms,check={}ms,merge={}ms/{}n/pc{}ms,mc={})",
+            "({}:steps={},solver={},states={},restarts={},simplify={}ms,check={}ms,merge={}ms/{}n/pc{}ms,mc={},fa={})",
             match self.mode {
                 Mode::Exhaustive if self.lazy_exhaustive => "lexh".to_string(),
                 Mode::Exhaustive => "exh".to_string(),
@@ -2513,7 +2825,8 @@ impl<'a> Engine<'a> {
             self.t_merge.as_millis(),
             self.n_merges,
             self.t_m_pc.as_millis(),
-            self.model_hits
+            self.model_hits,
+            self.fp_abs_hits
         )
     }
 
@@ -2621,6 +2934,21 @@ impl<'a> Engine<'a> {
                 let key = self.order_key(&st);
                 worklist.push(key, st);
                 return Ok(());
+            }
+            // Houdini capture: the state at the k-induction header, after its
+            // phis, at the requested iteration; the path ends here.
+            if let (Some(target), Some(lp)) = (self.kcapture_at, self.kloop.as_ref()) {
+                let depth = usize::from(lp.call_site.is_some());
+                if st.func == lp.func
+                    && st.block == lp.header
+                    && st.idx == lp.first_non_phi
+                    && st.frames.len() == depth
+                    && st.visits.get(&lp.header).copied().unwrap_or(0) == target
+                {
+                    st.parked = false;
+                    self.kcaptured.push(st);
+                    return Ok(());
+                }
             }
             st.parked = false;
             let flow = self.exec(&mut st, inst).map_err(|e| {
@@ -4854,6 +5182,43 @@ impl<'a> Engine<'a> {
         self.feasible_or_unknown(st, cond, vars)
     }
 
+    /// Floats: the abstraction of [`fp_abstract`] before the exact query:
+    /// `Unsat` when it refutes the query, `Unknown` for a branch it cannot
+    /// refute (see below), `None` to go on with the exact query.
+    fn fp_precheck(&mut self, st: &State, chosen: &[usize], extra: &Bool) -> Option<Feas> {
+        // Floats: the abstraction first (cheap — no float is bit-blasted). An
+        // UNSAT abstraction refutes the query; a satisfiable one decides nothing.
+        if self.uses_fp && !debug_flag("nofpabs") {
+            let mut q: Vec<&Bool> = chosen.iter().map(|&i| &st.constraints[i].0).collect();
+            q.push(extra);
+            let heavy = !debug_flag("fpabsall");
+            if let Some(abs) = fp_abstract(&q, heavy) {
+                self.solver.reset();
+                for a in &abs {
+                    self.solver.assert(a);
+                }
+                self.solver.set_params(&self.params);
+                let t0 = Instant::now();
+                let res = self.solver.check();
+                self.t_check += t0.elapsed();
+                if res == SatResult::Unsat {
+                    self.fp_abs_hits += 1;
+                    return Some(Feas::Unsat);
+                }
+                // A branch the abstraction cannot refute is taken as
+                // feasible-unknown without the exact (bit-blasted) query. Sound
+                // for a proof (one more path explored); a violation query on
+                // that path then abstains. Measured 2026-10-13 on 130
+                // Hardness/Floats tasks at 280 s: 42 PROVE vs 41, no loss
+                // (`SAF_UNREACH_DEBUG=nofpfork` restores the exact query).
+                if !debug_flag("nofpfork") && !self.violation_query && !self.cex_mode {
+                    return Some(Feas::Unknown);
+                }
+            }
+        }
+        None
+    }
+
     /// `true` iff `extra` is not refuted together with the path condition
     /// (`UNKNOWN` counts as feasible and is remembered on the state).
     fn feasible_or_unknown(&mut self, st: &mut State, extra: &Bool, vars: &Vars) -> Res<bool> {
@@ -4929,6 +5294,9 @@ impl<'a> Engine<'a> {
         if self.solver_calls > MAX_SOLVER_CALLS {
             return Err(format!("budget-solver{}", self.stats()));
         }
+        if let Some(f) = self.fp_precheck(st, &chosen, extra) {
+            return Ok(f);
+        }
         self.solver.reset();
         for i in chosen {
             self.solver.assert(&st.constraints[i].0);
@@ -4983,6 +5351,64 @@ impl<'a> Engine<'a> {
 
 /// How many recent satisfying assignments the model cache keeps.
 const MODEL_CACHE_SIZE: usize = 8;
+
+/// An over-approximation of a query over floats, for a cheap refutation.
+/// Every Boolean or bitvector term computed directly from a floating-point
+/// term (a comparison, `fp.to_ieee_bv`, a conversion to an integer) becomes a
+/// fresh constant of its sort, one constant per distinct term (Z3 shares
+/// structurally equal terms, and `substitute` replaces every occurrence).
+/// Any model of the query extends to a model of the abstraction (each fresh
+/// constant takes the value of the term it replaced), so an unsatisfiable
+/// abstraction proves the query unsatisfiable; a satisfiable one proves
+/// nothing. With `heavy_only`, only the expensive float operations are
+/// replaced (by fresh floats), which keeps every float fact a cheap query can
+/// decide — `x == x` holding exactly when `x` is no NaN, for one. `None` when
+/// nothing was replaced.
+fn fp_abstract(terms: &[&Bool], heavy_only: bool) -> Option<Vec<Bool>> {
+    use z3::DeclKind as K;
+    let is_fp = |d: &Dynamic| {
+        matches!(
+            d.get_sort().kind(),
+            z3::SortKind::FloatingPoint | z3::SortKind::RoundingMode
+        )
+    };
+    let mut seen: std::collections::HashSet<Dynamic> = std::collections::HashSet::new();
+    let mut subst: Vec<(Dynamic, Dynamic)> = Vec::new();
+    let mut stack: Vec<Dynamic> = terms.iter().map(|t| Dynamic::from((*t).clone())).collect();
+    while let Some(n) = stack.pop() {
+        if !n.is_app() || !seen.insert(n.clone()) {
+            continue;
+        }
+        // `heavy_only`: only the operations whose bit-blasting dominates
+        // (multiplication, division, remainder, square root, fused
+        // multiply-add) become fresh floats; comparisons, addition, NaN
+        // tests and conversions stay exact.
+        if heavy_only {
+            if matches!(
+                n.decl().kind(),
+                K::FPA_MUL | K::FPA_DIV | K::FPA_REM | K::FPA_SQRT | K::FPA_FMA
+            ) {
+                let fresh = Dynamic::fresh_const("fpabs", &n.get_sort());
+                subst.push((n, fresh));
+            } else {
+                stack.extend(n.children());
+            }
+            continue;
+        }
+        let kids = n.children();
+        if !is_fp(&n) && kids.iter().any(is_fp) {
+            let fresh = Dynamic::fresh_const("fpabs", &n.get_sort());
+            subst.push((n, fresh));
+            continue;
+        }
+        stack.extend(kids);
+    }
+    if subst.is_empty() {
+        return None;
+    }
+    let pairs: Vec<(&Dynamic, &Dynamic)> = subst.iter().map(|(a, b)| (a, b)).collect();
+    Some(terms.iter().map(|t| t.substitute(&pairs)).collect())
+}
 
 /// The program point a state is parked at, for merging: function, block,
 /// instruction index, the call stack, and how often this block was entered.

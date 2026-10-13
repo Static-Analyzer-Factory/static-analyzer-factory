@@ -182,3 +182,16 @@ competition for that reason); 540 expected-TRUE tasks 0 wrong FALSE; FALSE sweep
 passed. Supersedes `5984ba6c…` (§9). Provisional score with the v13 unreach sweep and the memsafety sweep:
 ~18,870 upper / ~9,930 lower Overall-eq; `chain_v14b` re-measures on this binary.
 
+## 13. 2026-10-13 — upload candidate: `dist/saf-verify.zip` sha256 `0fe0efe2…` (release v15, `dff01674`)
+
+Adds to §12: termination TRUE from the engine, the global ctor/dtor gate on every engine prover, memsafety FALSE from
+engine counterexamples (ASan replay), `valid-memtrack` FALSE via LeakSanitizer (verdict-only in 2027), the model cache.
+`chain_v15a` on competition tasks: 0 wrong PROVE over 4,324 unreach / 3,733 no-overflow / 10,087 memsafety / 974
+termination expected-FALSE tasks; 0 wrong FALSE over the 540 sanity tasks; `saf verify` on all 2,826 expected-TRUE
+memsafety tasks: 2 FALSE, both on tasks whose labels are wrong in sv-benchmarks (`coreutils-v9.5-units/
+seq_incr_no_carry_{functional,cover_proof}`: heap overflow when `num_digits == 1`; ASan- and CPAchecker-confirmed
+witnesses in `results/svcomp26/debug/labelbug/`; reported upstream by the user on 2026-10-13). Memsafety FALSE on the
+2,422 expected-FALSE tasks: 1,618 with the labelled sub-property (338 new), 70 naming another sub-property (UNKNOWN in
+BenchExec, 0 points). Score: **21,493 upper / 11,054 lower Overall-eq** (≈18,700 at measured confirmation rates).
+Supersedes `781aeb7d…` (§12).
+
