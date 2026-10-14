@@ -1278,6 +1278,27 @@ fn convert_instruction(
                     let is_inline_asm =
                         unsafe { !inkwell::llvm_sys::core::LLVMIsAInlineAsm(val_ref).is_null() };
                     if is_inline_asm {
+                        // FIDELITY: the asm vanishes. A value it returns is
+                        // undefined downstream (consumers treat it as unknown),
+                        // but a write to memory would be lost silently: an
+                        // indirect memory operand (`"=m"`/`"+m"`, `*` in the
+                        // IR constraint string — Linux `set_bit`'s `bts`) or a
+                        // `"memory"` clobber with a pointer argument marks the
+                        // module. A bare barrier (`"" ::: "memory"`) writes
+                        // nothing.
+                        let constraints = inline_asm_constraints(val_ref);
+                        let has_ptr_arg = (0..num_operands - 1).any(|k| {
+                            inst.get_operand(k)
+                                .and_then(operand_as_value)
+                                .is_some_and(|v| matches!(v, BasicValueEnum::PointerValue(_)))
+                        });
+                        if constraints.contains('*')
+                            || (constraints.contains("~{memory}") && has_ptr_arg)
+                        {
+                            ctx.fidelity.dropped_instruction = true;
+                            ctx.dropped_intrinsic_names
+                                .insert("inline-asm-memory".to_string());
+                        }
                         return Ok(None);
                     }
                     let name = ptr.get_name().to_bytes();
@@ -2024,6 +2045,22 @@ fn convert_phi_instruction(
     }
 
     Ok((Operation::Phi { incoming }, vec![], true))
+}
+
+/// The constraint string of an inline-asm callee (`""` when unavailable).
+fn inline_asm_constraints(asm: inkwell::llvm_sys::prelude::LLVMValueRef) -> String {
+    let mut len: usize = 0;
+    // SAFETY: `asm` is an `InlineAsm` value (checked by the caller with
+    // `LLVMIsAInlineAsm`); LLVM returns a pointer into the value's own storage
+    // and its length, valid while the module lives.
+    unsafe {
+        let p = inkwell::llvm_sys::core::LLVMGetInlineAsmConstraintString(asm, &raw mut len);
+        if p.is_null() {
+            return String::new();
+        }
+        let bytes = std::slice::from_raw_parts(p.cast::<u8>(), len);
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 }
 
 /// Extension key on the `Load`/`Store` pair an `atomicrmw` or `cmpxchg`

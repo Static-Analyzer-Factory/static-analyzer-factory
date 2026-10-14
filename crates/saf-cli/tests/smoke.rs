@@ -281,6 +281,19 @@ fn verify_unreach_true_infeasible_is_proven_natively() {
     verify_unreach("unreach_true_infeasible.c").stdout("true\n");
 }
 
+/// Wrong-TRUE guard: inline asm that writes memory (`bts` with a `"+m"` output,
+/// Linux `set_bit`) is dropped by the frontend, so a TRUE prover would miss the
+/// write; the module is marked lossy and the program must not be `true`.
+#[test]
+#[ignore]
+fn verify_unreach_asm_memory_write_is_not_true() {
+    let out = verify_unreach("unreach_false_asm_bts.c")
+        .get_output()
+        .stdout
+        .clone();
+    assert_ne!(String::from_utf8_lossy(&out).trim(), "true");
+}
+
 /// Wrong-TRUE guard: `__sync_fetch_and_add(&x, 2)` on `x == 5` makes `x == 7`
 /// reachable, but the frontend models an `atomicrmw` as storing its operand (2).
 /// The TRUE provers must refuse a module with an atomic read-modify-write.
