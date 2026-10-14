@@ -281,6 +281,19 @@ fn verify_unreach_true_infeasible_is_proven_natively() {
     verify_unreach("unreach_true_infeasible.c").stdout("true\n");
 }
 
+/// Wrong-TRUE guard: `__sync_fetch_and_add(&x, 2)` on `x == 5` makes `x == 7`
+/// reachable, but the frontend models an `atomicrmw` as storing its operand (2).
+/// The TRUE provers must refuse a module with an atomic read-modify-write.
+#[test]
+#[ignore]
+fn verify_unreach_atomic_rmw_is_not_true() {
+    let out = verify_unreach("unreach_false_atomic_rmw.c")
+        .get_output()
+        .stdout
+        .clone();
+    assert_ne!(String::from_utf8_lossy(&out).trim(), "true");
+}
+
 /// Rank-3 wrong-TRUE guard (soundness), and now the load-bearing regression for the
 /// disabled TRUE arm: `signextension-1` is a genuine FALSE task the interval sentinel
 /// WRONGLY proves (it cannot model the sign/unsigned conversions that satisfy the

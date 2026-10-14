@@ -1032,6 +1032,10 @@ pub fn prove_no_overflow_cmd(args: &ProveNoOverflowArgs) -> anyhow::Result<()> {
         println!("ABSTAIN:threads");
         return Ok(());
     }
+    if unreach_prover_blocked_by_dropped(&bundle.module) {
+        println!("ABSTAIN:ingest-fidelity");
+        return Ok(());
+    }
 
     match saf_analysis::absint::prove_no_signed_overflow(&bundle.module) {
         saf_analysis::absint::NoOverflowProof::Proven => println!("PROVE"),
@@ -6287,15 +6291,18 @@ fn try_overflow_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     //     at every `nsw` operation instead of a `reach_error` call. Same dropped-
     //     instruction gate, same budget, same audit duty (0 PROVE over the
     //     expected-FALSE `no-overflow` tasks).
+    // An instruction the frontend dropped or modelled imprecisely (an atomic
+    // read-modify-write stores its operand, not its result) gates the interval
+    // sentinel as well as the engine.
+    if unreach_prover_blocked_by_dropped(ctx.module) {
+        return None;
+    }
     let interval_proven = matches!(
         saf_analysis::absint::prove_no_signed_overflow(ctx.module),
         saf_analysis::absint::NoOverflowProof::Proven
     );
     let mut states: Vec<saf_svcomp::HeaderStates> = Vec::new();
     if !interval_proven {
-        if unreach_prover_blocked_by_dropped(ctx.module) {
-            return None;
-        }
         let budget = unreach_prove_budget(ctx.budget);
         let (proof, found) = saf_svcomp::prove_no_overflow_exhaustive_with_states_shl(
             ctx.module,

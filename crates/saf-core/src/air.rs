@@ -771,6 +771,17 @@ impl Instruction {
         )
     }
 
+    /// Is this half of the `Load`/`Store` pair an `atomicrmw` or `cmpxchg`
+    /// became? The pair stores the operand, not the operation's result, so its
+    /// values are an over-approximation for pointer analysis only.
+    #[must_use]
+    pub fn is_atomic_pair(&self) -> bool {
+        matches!(
+            self.extensions.get("llvm.atomic"),
+            Some(serde_json::Value::Bool(true))
+        )
+    }
+
     /// Check if this is a terminator instruction.
     #[must_use]
     pub fn is_terminator(&self) -> bool {

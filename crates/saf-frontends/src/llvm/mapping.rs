@@ -2026,6 +2026,10 @@ fn convert_phi_instruction(
     Ok((Operation::Phi { incoming }, vec![], true))
 }
 
+/// Extension key on the `Load`/`Store` pair an `atomicrmw` or `cmpxchg`
+/// becomes (see [`saf_core::air::Instruction::is_atomic_pair`]).
+const ATOMIC_EXT: &str = "llvm.atomic";
+
 /// Convert an `AtomicCmpXchg` instruction to a `Load` + `Store` pair.
 ///
 /// LLVM operands: `cmpxchg ptr %addr, T %expected, T %new_val`
@@ -2055,16 +2059,26 @@ fn convert_atomic_cmpxchg(
     let ptr_id = operands[0];
     let new_val_id = operands[2];
 
+    // FIDELITY: "always succeeds" over-approximates for pointer analysis only
+    // (see `convert_atomic_rmw`).
+    ctx.dropped_intrinsic_names.insert("cmpxchg".to_string());
+
     // Emit synthetic Store(new_val → *ptr)
     let store_inst_id = ctx.create_inst_id(block_id);
     let mut store_inst = Instruction::new(store_inst_id, Operation::Store);
     store_inst.operands = vec![new_val_id, ptr_id];
+    store_inst
+        .extensions
+        .insert(ATOMIC_EXT.to_string(), serde_json::Value::Bool(true));
     store_inst.span = extract_span(inst, &mut ctx.source_files);
     ctx.pending_instructions.push(store_inst);
 
     // Return Load(dst ← *ptr) as the main instruction
     let mut load_inst = Instruction::new(inst_id, Operation::Load);
     load_inst.operands = vec![ptr_id];
+    load_inst
+        .extensions
+        .insert(ATOMIC_EXT.to_string(), serde_json::Value::Bool(true));
 
     // Register the result ValueId using pointer identity so that downstream
     // instructions (e.g., `extractvalue`) referencing this SSA value resolve
@@ -2117,16 +2131,29 @@ fn convert_atomic_rmw(
     let ptr_id = operands[0];
     let val_id = operands[1];
 
+    // FIDELITY: the pair below stores `%val` itself, not `old <op> %val` — an
+    // over-approximation for pointer analysis only. A value analysis must not
+    // read it (`x = 5; __sync_fetch_and_add(&x, 2); x == 7` would look
+    // unreachable): both halves carry `llvm.atomic`, and the module records the
+    // operation as imprecisely modelled.
+    ctx.dropped_intrinsic_names.insert("atomicrmw".to_string());
+
     // Emit synthetic Store(val → *ptr)
     let store_inst_id = ctx.create_inst_id(block_id);
     let mut store_inst = Instruction::new(store_inst_id, Operation::Store);
     store_inst.operands = vec![val_id, ptr_id];
+    store_inst
+        .extensions
+        .insert(ATOMIC_EXT.to_string(), serde_json::Value::Bool(true));
     store_inst.span = extract_span(inst, &mut ctx.source_files);
     ctx.pending_instructions.push(store_inst);
 
     // Return Load(dst ← *ptr) as the main instruction
     let mut load_inst = Instruction::new(inst_id, Operation::Load);
     load_inst.operands = vec![ptr_id];
+    load_inst
+        .extensions
+        .insert(ATOMIC_EXT.to_string(), serde_json::Value::Bool(true));
 
     // Register the result ValueId
     let ptr_key = inst.as_value_ref() as usize;
