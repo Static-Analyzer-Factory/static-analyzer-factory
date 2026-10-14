@@ -220,5 +220,8 @@ rounds to nearest), and `undef` read as one symbol per path. v18 (commit `ada3c2
 (`conc_overflow.rs`: execution bounds, flow-insensitive ranges of address-untaken globals, guard-narrowed SSA ranges;
 414 / 661 expected-TRUE `C.no-overflow.Concurrency` tasks, 0 / 8 expected-FALSE, 0 PROVE over the 3,733 expected-FALSE
 no-overflow tasks). Estimated score ≈ 23,550 upper Overall-eq (v16 sweeps + the concurrent proofs; that category takes
-no witness). The v18 archive passed its smoketest; the full gate chain (`chain_v18m`) is running — upload only after
-`dist/README-ARCHIVE-STATUS.txt` says the gates are clean.
+no witness). The v18 archive passed its smoketest, and `chain_v18m` (maxwell, competition tasks) is clean: 0 wrong PROVE over
+4,324 unreach / 3,733 no-overflow / 10,087 memsafety / 974 termination expected-FALSE tasks; `saf verify` TRUE on 0 of
+the 4,454 expected-FALSE unreach-call + no-overflow tasks; 0 wrong FALSE over the 540 sanity tasks and the 2,826
+expected-TRUE memsafety tasks (the two reported label bugs aside); FALSE sweep 3,041 / 3,426. **`50db8f61…` is the file
+to upload.**
