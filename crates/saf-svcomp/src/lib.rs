@@ -16,6 +16,7 @@
 pub mod assert_site;
 pub mod bmc;
 pub mod bmc_incremental;
+pub mod conc_overflow;
 pub mod conc_replay;
 pub mod conc_seq;
 pub mod conc_shim;
@@ -46,6 +47,7 @@ pub mod witness_lower;
 pub mod witness_yaml;
 
 pub use bmc::enumerate_bmc_candidates;
+pub use conc_overflow::{ConcOverflowProof, prove_no_overflow_concurrent};
 pub use conc_replay::{
     ReplayPlan, conc_replay_schedulable, replay_plans, synthesize_conc_replay_driver,
 };

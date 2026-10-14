@@ -870,6 +870,32 @@ fn verify_overflow_witness(
         .success()
 }
 
+/// Threads that each bump a shared counter once, outside any loop: the
+/// interleaving-independent prover bounds the counter by its increments ->
+/// `true`.
+#[test]
+#[ignore]
+fn verify_overflow_conc_bounded_counter_is_true() {
+    verify_overflow("overflow_true_conc_bounded_counter.c", "LP64").stdout("true\n");
+}
+
+/// Concurrent programs whose shared global CAN overflow (a stored `INT_MAX`, an
+/// atomic add, unboundedly many spawns, an address passed to the thread): the
+/// concurrent prover must not answer `true`.
+#[test]
+#[ignore]
+fn verify_overflow_conc_overflowing_is_not_true() {
+    for fx in [
+        "overflow_false_conc_stored_max.c",
+        "overflow_false_conc_atomic.c",
+        "overflow_false_conc_spawn_loop.c",
+        "overflow_false_conc_escaped_address.c",
+    ] {
+        let out = verify_overflow(fx, "LP64").get_output().stdout.clone();
+        assert_ne!(String::from_utf8_lossy(&out).trim(), "true", "{fx}");
+    }
+}
+
 /// Unconditional signed addition overflow (INT_MAX + 1) -> false(no-overflow) (LP64).
 #[test]
 #[ignore]

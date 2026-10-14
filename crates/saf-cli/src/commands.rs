@@ -1071,6 +1071,15 @@ pub fn prove_unreachable_cmd(args: &ProveUnreachableArgs) -> anyhow::Result<()> 
     }
     let callgraph = saf_analysis::callgraph::CallGraph::build(&bundle.module);
     if saf_svcomp::fast_paths::reachable_spawns_threads(&bundle.module, &callgraph) {
+        // `SAF_PROVE_GOAL=no-overflow`: the interleaving-independent prover
+        // `saf verify` uses for a threaded program (same gates).
+        if std::env::var("SAF_PROVE_GOAL").is_ok_and(|g| g == "no-overflow") {
+            println!(
+                "{}",
+                dev_prove_concurrent(&bundle.module, data_model, &stub, &args.input)
+            );
+            return Ok(());
+        }
         println!("ABSTAIN:threads");
         return Ok(());
     }
@@ -6274,15 +6283,16 @@ fn try_overflow_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     if saf_svcomp::source_has_openmp(&source) {
         return None;
     }
-    // (2) Reachable thread spawn: a sequential interval proof is unsound under
-    //     concurrency (the same gate the UBSan FALSE path uses).
-    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
-    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
-        return None;
-    }
     // (3) Compile-time constant overflow clang folds away (no IR arithmetic to see).
     if overflow_source_constant_folds(ctx) {
         return None;
+    }
+    // (2) Reachable thread spawn: a sequential interval proof is unsound under
+    //     concurrency (the same gate the UBSan FALSE path uses) — the
+    //     interleaving-independent prover decides instead.
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        return try_overflow_true_concurrent(ctx);
     }
     // (4) Sentinel: prove EVERY reachable signed add/sub/mul in-bounds over the
     //     converged interval solution (fail-closed on any TOP/absent/unmodelled op).
@@ -6331,6 +6341,67 @@ fn try_overflow_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
         graphml: None,
         correctness: Some(witness),
     })
+}
+
+/// The fidelity gate of the concurrent no-overflow prover: as
+/// [`unreach_prover_blocked_by_dropped`], except that an atomic
+/// read-modify-write is understood (the prover leaves its target untracked).
+fn conc_prover_blocked_by_dropped(m: &saf_core::air::AirModule) -> bool {
+    m.dropped_unknown_opcode
+        || m.dropped_intrinsics
+            .iter()
+            .any(|n| !n.starts_with("llvm.stackrestore") && n != "atomicrmw" && n != "cmpxchg")
+}
+
+/// `prove-unreachable` with `SAF_PROVE_GOAL=no-overflow` on a threaded program:
+/// the concurrent prover `saf verify` uses, as one result line.
+fn dev_prove_concurrent(
+    m: &saf_core::air::AirModule,
+    data_model: saf_svcomp::DataModel,
+    stub: &Path,
+    input: &Path,
+) -> String {
+    if conc_prover_blocked_by_dropped(m) {
+        return "ABSTAIN:threads|ingest-fidelity".to_string();
+    }
+    let clang = std::env::var("SAF_CLANG").unwrap_or_else(|_| DEFAULT_CLANG.to_string());
+    let locs = signed_shift_locations(&clang, data_model, stub, input);
+    match saf_svcomp::prove_no_overflow_concurrent(m, locs.as_ref()) {
+        saf_svcomp::ConcOverflowProof::Proven => "PROVE:concurrent".to_string(),
+        saf_svcomp::ConcOverflowProof::Abstain(r) => format!("ABSTAIN:threads|conc={r}"),
+    }
+}
+
+/// `no-overflow` TRUE for a program that spawns threads: the
+/// interleaving-independent prover [`saf_svcomp::prove_no_overflow_concurrent`]
+/// (execution bounds + flow-insensitive global ranges). A dropped or
+/// unmodelled instruction other than an atomic read-modify-write (which the
+/// prover handles: its target is untracked) gates it. The correctness witness
+/// is an empty `invariant_set`: `C.no-overflow.Concurrency` takes no witness,
+/// and SAF's interval invariants are sequential.
+fn try_overflow_true_concurrent(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    let m = ctx.module;
+    if conc_prover_blocked_by_dropped(m) {
+        return None;
+    }
+    let locs = signed_shift_locations(ctx.clang, ctx.data_model, ctx.stub, ctx.input);
+    match saf_svcomp::prove_no_overflow_concurrent(m, locs.as_ref()) {
+        saf_svcomp::ConcOverflowProof::Proven => {
+            eprintln!(
+                "saf verify: concurrent no-overflow prover PROVED every operation in range -> true"
+            );
+            Some(VerdictOutcome {
+                verdict: "true".to_string(),
+                witness: None,
+                graphml: None,
+                correctness: Some(saf_svcomp::InvariantSetWitness::empty(ctx.meta)),
+            })
+        }
+        saf_svcomp::ConcOverflowProof::Abstain(reason) => {
+            eprintln!("saf verify: concurrent no-overflow prover abstained ({reason})");
+            None
+        }
+    }
 }
 
 /// Rank-3 `unreach-call` TRUE — a SAF-native, fail-closed proof (plan 221 §3 B5).
