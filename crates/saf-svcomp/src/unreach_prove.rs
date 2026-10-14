@@ -843,6 +843,11 @@ struct Engine<'a> {
     module: &'a AirModule,
     /// Integer width of every SSA value with a known integer type.
     width: BTreeMap<ValueId, u32>,
+    /// Every value some instruction or parameter of the module defines. A
+    /// value outside it is an `undef`/`poison` operand (read fresh at each use);
+    /// a value inside it that this path never computed (one defined before the
+    /// loop, read in the k-induction step case) is ONE fresh symbol per path.
+    defined: BTreeSet<ValueId>,
     /// SSA values of pointer type.
     is_ptr: BTreeSet<ValueId>,
     /// Scalar global cells: address value → (initial content, is_constant).
@@ -1383,6 +1388,18 @@ impl<'a> Engine<'a> {
         let mut owned: BTreeMap<FunctionId, Vec<ValueId>> = BTreeMap::new();
         let mut has_alloca = BTreeSet::new();
         let mut def_block: BTreeMap<ValueId, BlockId> = BTreeMap::new();
+        let defined: BTreeSet<ValueId> = module
+            .functions
+            .iter()
+            .flat_map(|f| {
+                f.params.iter().map(|p| p.id).chain(
+                    f.blocks
+                        .iter()
+                        .flat_map(|b| b.instructions.iter())
+                        .filter_map(|i| i.dst),
+                )
+            })
+            .collect();
         let mut candidates: BTreeSet<ValueId> = BTreeSet::new();
         let mut cross_block: BTreeSet<ValueId> = BTreeSet::new();
         for f in &module.functions {
@@ -1595,6 +1612,7 @@ impl<'a> Engine<'a> {
             fixpoint_off: BTreeSet::new(),
             n_restarts: 0,
             owned,
+            defined,
             has_alloca,
             block_local,
             rpo,
@@ -3116,7 +3134,10 @@ impl<'a> Engine<'a> {
                     trace(|| format!("constant {vid:?} ({}) -> {e}", self.describe(vid)));
                     e
                 })?;
-            st.values.insert(vid, v.clone());
+            // `undef` is fresh at every use (see below): never cached.
+            if !matches!(c, Constant::Undef) {
+                st.values.insert(vid, v.clone());
+            }
             return Ok(v);
         }
         // No definition anywhere: an `undef`/`poison` operand (an uninitialised
@@ -3124,10 +3145,17 @@ impl<'a> Engine<'a> {
         // left opaque. Admitting EVERY value of its width only adds behaviours,
         // so a proof over it stays sound; without a width there is no safe
         // symbol to mint.
+        // An `undef` (no definition in the module) is fresh at EVERY read: the
+        // frontend gives all `undef`s of a type ONE module-wide id, and LLVM
+        // lets each use take its own value — caching it made two uninitialised
+        // locals read the same symbol (a wrong TRUE). A defined value this path
+        // never computed is one symbol for the path (see `defined`).
         if let Some(bits) = want_bits.or_else(|| self.width.get(&vid).copied()) {
             trace(|| format!("fresh: undefined operand {vid:?} ({bits} bits)"));
             let v = self.fresh_val(bits);
-            st.values.insert(vid, v.clone());
+            if self.defined.contains(&vid) {
+                st.values.insert(vid, v.clone());
+            }
             return Ok(v);
         }
         if self.is_ptr.contains(&vid) {
@@ -3438,7 +3466,24 @@ impl<'a> Engine<'a> {
             }
             Operation::Copy | Operation::Freeze => {
                 let src = inst.operands.first().copied().ok_or("copy-arity")?;
-                let v = self.val(st, src, self.width.get(&src).copied())?;
+                // `freeze <ty> undef` (an uninitialised local, see the CLI's
+                // `pin_uninit_locals`): the operand has no width of its own,
+                // the result does; an `undef` pointer is any pointer.
+                let want = self
+                    .width
+                    .get(&src)
+                    .or_else(|| inst.dst.as_ref().and_then(|d| self.width.get(d)))
+                    .copied();
+                let v = match self.val(st, src, want) {
+                    Ok(v) => v,
+                    Err(e)
+                        if e == "undefined-value"
+                            && inst.dst.is_some_and(|d| self.is_ptr.contains(&d)) =>
+                    {
+                        Val::Ptr(None)
+                    }
+                    Err(e) => return Err(e),
+                };
                 set(st, inst, v);
                 Ok(Flow::Next)
             }
@@ -4771,6 +4816,11 @@ impl<'a> Engine<'a> {
         if self.termination {
             return Err(format!("term-extern-{name}"));
         }
+        // The floating-point environment: every float operation here rounds to
+        // nearest, so a program that changes the rounding mode is not modelled.
+        if FENV_SETTERS.contains(&name) || name.starts_with("llvm.set.rounding") {
+            return Err(format!("fenv-{name}"));
+        }
         if self.goal == Goal::MemSafety && !self.cex_mode {
             let stream = STREAM_ARG.iter().find(|(n, _)| *n == name).map(|(_, i)| *i);
             for (i, &arg) in args.iter().enumerate() {
@@ -5371,6 +5421,17 @@ impl<'a> Engine<'a> {
         })
     }
 }
+
+/// Externs that change the floating-point environment (rounding mode,
+/// exception handling), which the engine does not model.
+const FENV_SETTERS: &[&str] = &[
+    "fesetround",
+    "fesetenv",
+    "feupdateenv",
+    "feholdexcept",
+    "fesetexceptflag",
+    "fesetmode",
+];
 
 /// How many recent satisfying assignments the model cache keeps.
 const MODEL_CACHE_SIZE: usize = 8;
@@ -6597,11 +6658,11 @@ mod tests {
         assert_eq!(prove(&b.m), ExhaustiveProof::Proven);
     }
 
-    /// `int s; if (s == 7 && s == 8) reach_error();` — `s` is read before any
-    /// assignment (an `undef` operand with no definition). Every value is
-    /// admitted, and the contradictory guard still proves the error dead.
+    /// `if (u == 7 && u == 8) reach_error();` with `u` an `undef` operand (no
+    /// definition anywhere): each use of `undef` may take its own value (LLVM),
+    /// so the guard is satisfiable and the error must NOT be proven dead.
     #[test]
-    fn undefined_operand_is_admitted_as_any_value() {
+    fn undefined_operand_is_fresh_at_every_use() {
         let mut b = B::new();
         let err = b.decl("reach_error");
         let (e, bb_then, bb_end) = (b.bid(), b.bid(), b.bid());
@@ -6648,7 +6709,10 @@ mod tests {
                 blk(bb_end, vec![i_r2]),
             ],
         );
-        assert_eq!(prove(&b.m), ExhaustiveProof::Proven);
+        assert_eq!(
+            prove(&b.m),
+            ExhaustiveProof::Abstain("error-feasible".into())
+        );
     }
 
     /// `int a, b; if (&a == &b) reach_error();` — distinct objects never alias.

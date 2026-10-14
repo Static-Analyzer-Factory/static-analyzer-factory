@@ -1052,6 +1052,9 @@ pub fn prove_no_overflow_cmd(args: &ProveNoOverflowArgs) -> anyhow::Result<()> {
 ///
 /// # Errors
 /// Returns `Err` if the stub header is missing, or compilation / ingestion fails.
+// NOTE: a dev command that runs the same gates as `saf verify` one after the
+// other and prints one result line; splitting it would scatter the gate order.
+#[allow(clippy::too_many_lines)]
 pub fn prove_unreachable_cmd(args: &ProveUnreachableArgs) -> anyhow::Result<()> {
     use anyhow::Context;
     let data_model: saf_svcomp::DataModel = args.data_model.into();
@@ -1085,7 +1088,10 @@ pub fn prove_unreachable_cmd(args: &ProveUnreachableArgs) -> anyhow::Result<()> 
     }
 
     if unreach_prover_blocked_by_dropped(&bundle.module) {
-        println!("ABSTAIN:ingest-fidelity");
+        println!(
+            "ABSTAIN:ingest-fidelity({})",
+            dropped_summary(&bundle.module)
+        );
         return Ok(());
     }
     // Two independent provers: the interval sentinel and the bounded-exhaustive
@@ -6470,6 +6476,15 @@ fn try_unreach_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
 /// skips, `llvm.stackrestore` only ends object lifetimes — a prover that never
 /// reasons about dangling accesses loses nothing — while `llvm.va_start`/
 /// `llvm.va_copy` and the `llvm.experimental.*` family may write memory.
+/// What the frontend dropped or modelled imprecisely, for sweep histograms.
+fn dropped_summary(module: &saf_core::air::AirModule) -> String {
+    let mut why: Vec<String> = module.dropped_intrinsics.iter().cloned().collect();
+    if module.dropped_unknown_opcode {
+        why.push("unknown-opcode".to_string());
+    }
+    why.join(",")
+}
+
 fn unreach_prover_blocked_by_dropped(module: &saf_core::air::AirModule) -> bool {
     module.dropped_unknown_opcode
         || module

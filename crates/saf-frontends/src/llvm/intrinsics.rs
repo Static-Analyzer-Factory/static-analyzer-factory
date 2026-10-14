@@ -55,8 +55,11 @@ impl IntrinsicOp {
 pub fn skip_is_lossy(name: &str) -> bool {
     // `va_start`/`va_copy` initialise a `va_list` by writing through the pointer
     // argument; `va_end` does not write and is genuinely inert.
+    // Exact names up to LLVM 18; overloaded (`llvm.va_start.p0`) from LLVM 19.
     name == "llvm.va_start"
         || name == "llvm.va_copy"
+        || name.starts_with("llvm.va_start.")
+        || name.starts_with("llvm.va_copy.")
         // An open-ended family: members are added upstream without review here,
         // and several (`llvm.experimental.gc.*`, the vector-predication set) do
         // touch memory.
@@ -138,7 +141,14 @@ pub fn classify_intrinsic(name: &str) -> IntrinsicMapping {
         return IntrinsicMapping::Skip;
     }
     // Vararg intrinsics — no pointer effect
-    if name == "llvm.va_start" || name == "llvm.va_end" || name == "llvm.va_copy" {
+    // `llvm.va_start.p0` etc. from LLVM 19 on (see `skip_is_lossy`).
+    if name == "llvm.va_start"
+        || name == "llvm.va_end"
+        || name == "llvm.va_copy"
+        || name.starts_with("llvm.va_start.")
+        || name.starts_with("llvm.va_end.")
+        || name.starts_with("llvm.va_copy.")
+    {
         return IntrinsicMapping::Skip;
     }
 

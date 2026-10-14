@@ -1287,13 +1287,18 @@ fn convert_instruction(
                         // module. A bare barrier (`"" ::: "memory"`) writes
                         // nothing.
                         let constraints = inline_asm_constraints(val_ref);
+                        let asm_text = inline_asm_text(val_ref);
                         let has_ptr_arg = (0..num_operands - 1).any(|k| {
                             inst.get_operand(k)
                                 .and_then(operand_as_value)
                                 .is_some_and(|v| matches!(v, BasicValueEnum::PointerValue(_)))
                         });
+                        // A non-empty asm with a "memory" clobber may write any
+                        // global by name (`movl $1, g(%rip)`); only the empty
+                        // barrier is known to write nothing.
                         if constraints.contains('*')
-                            || (constraints.contains("~{memory}") && has_ptr_arg)
+                            || (constraints.contains("~{memory}")
+                                && (has_ptr_arg || !asm_text.trim().is_empty()))
                         {
                             ctx.fidelity.dropped_instruction = true;
                             ctx.dropped_intrinsic_names
@@ -2045,6 +2050,20 @@ fn convert_phi_instruction(
     }
 
     Ok((Operation::Phi { incoming }, vec![], true))
+}
+
+/// The assembly text of an inline-asm callee (`""` when unavailable).
+fn inline_asm_text(asm: inkwell::llvm_sys::prelude::LLVMValueRef) -> String {
+    let mut len: usize = 0;
+    // SAFETY: as in `inline_asm_constraints`.
+    unsafe {
+        let p = inkwell::llvm_sys::core::LLVMGetInlineAsmAsmString(asm, &raw mut len);
+        if p.is_null() {
+            return String::new();
+        }
+        let bytes = std::slice::from_raw_parts(p.cast::<u8>(), len);
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 }
 
 /// The constraint string of an inline-asm callee (`""` when unavailable).

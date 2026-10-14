@@ -281,6 +281,20 @@ fn verify_unreach_true_infeasible_is_proven_natively() {
     verify_unreach("unreach_true_infeasible.c").stdout("true\n");
 }
 
+/// Wrong-TRUE guards from the frontend/engine review: a non-empty asm with a
+/// "memory" clobber writing a global by name, and a program that changes the
+/// rounding mode. None may be `true`. (Reading an uninitialised local whose
+/// address is never taken is undefined behaviour in C11 6.3.2.1p2, which
+/// sv-benchmarks excludes; `mem2reg` folds such reads, so it is not guarded.)
+#[test]
+#[ignore]
+fn verify_unreach_review_holes_are_not_true() {
+    for fx in ["unreach_false_asm_global.c", "unreach_false_fesetround.c"] {
+        let out = verify_unreach(fx).get_output().stdout.clone();
+        assert_ne!(String::from_utf8_lossy(&out).trim(), "true", "{fx}");
+    }
+}
+
 /// Wrong-TRUE guard: inline asm that writes memory (`bts` with a `"+m"` output,
 /// Linux `set_bit`) is dropped by the frontend, so a TRUE prover would miss the
 /// write; the module is marked lossy and the program must not be `true`.
