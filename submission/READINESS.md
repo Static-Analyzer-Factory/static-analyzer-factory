@@ -209,3 +209,16 @@ over the 540 sanity tasks; memsafety verify on 2,826 expected-TRUE: only the two
 3,055 / 3,426. Witness sample (CPAchecker, then UAutomizer): 73 / 78 TRUE witnesses confirmed, 0 refuted; 17 / 20 of the
 new Hardness proofs. Score (v16 sweeps; v17 costs 5 unreach-call proofs): **≈21,700 upper / ≈11,000 lower Overall-eq**.
 Supersedes `0fe0efe2…` (§13, never uploaded).
+
+## 15. 2026-10-14 — v17 withdrawn; candidate `dist/saf-verify.zip` sha256 `50db8f61…` (release v18, `71f36fc6`), gates pending
+
+The v17 archive of §14 (`a697ffa9…`) must NOT be uploaded: a frontend/engine review after its gates found wrong-TRUE
+holes no audited task exercises — an atomic read-modify-write modelled as storing its operand (`__sync_fetch_and_add`),
+inline asm that writes memory dropped silently (Linux `set_bit`'s `bts`, `movl $1, g(%rip)`), `fesetround` (the engine
+rounds to nearest), and `undef` read as one symbol per path. v18 (commit `ada3c21`) refuses or models each of them
+(regression tests in `crates/saf-cli/tests/smoke.rs`), and adds `no-overflow` TRUE for threaded programs
+(`conc_overflow.rs`: execution bounds, flow-insensitive ranges of address-untaken globals, guard-narrowed SSA ranges;
+414 / 661 expected-TRUE `C.no-overflow.Concurrency` tasks, 0 / 8 expected-FALSE, 0 PROVE over the 3,733 expected-FALSE
+no-overflow tasks). Estimated score ≈ 23,550 upper Overall-eq (v16 sweeps + the concurrent proofs; that category takes
+no witness). The v18 archive passed its smoketest; the full gate chain (`chain_v18m`) is running — upload only after
+`dist/README-ARCHIVE-STATUS.txt` says the gates are clean.
