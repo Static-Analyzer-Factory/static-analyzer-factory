@@ -3651,11 +3651,7 @@ impl<'a> Engine<'a> {
                     self.ms_check_access(st, cell.as_ref(), bytes, inst.id, "load")?;
                 }
                 if cell.as_ref().is_some_and(|c| c.0 == NULL_BASE) {
-                    if self.termination {
-                        return Err("term-null-deref".to_string());
-                    }
-                    trace(|| "load through NULL ends the path".to_string());
-                    return Ok(Flow::Halt);
+                    return self.null_deref(st, "load");
                 }
                 let d = inst.dst.ok_or("load-dst")?;
                 let v = if self.is_ptr.contains(&d) {
@@ -3689,13 +3685,7 @@ impl<'a> Engine<'a> {
                     return Err("store-const-global".to_string());
                 }
                 if cell.0 == NULL_BASE {
-                    // Undefined behaviour: the program has no further behaviour
-                    // on this path (the field's reading of a null dereference).
-                    if self.termination {
-                        return Err("term-null-deref".to_string());
-                    }
-                    trace(|| "store through NULL ends the path".to_string());
-                    return Ok(Flow::Halt);
+                    return self.null_deref(st, "store");
                 }
                 if is_imprecise(&cell) {
                     // Some cell of the object changed: forget them all (later
@@ -5217,6 +5207,39 @@ impl<'a> Engine<'a> {
             }
         }
         None
+    }
+
+    /// A load or store through NULL. Undefined behaviour, and verifiers do not
+    /// agree on what follows: natively the program crashes, while the tools that
+    /// label sv-benchmarks tasks often read an arbitrary value and go on (the
+    /// non-competition `ldv-consumption/todo/32_7a…flexcop-usb` overflows only
+    /// past such a read, UAutomizer: FALSE). Ending the path there would rest a
+    /// proof on one reading, so a FEASIBLE null dereference abstains in every
+    /// proof mode; a refuted path is dead. Counterexample mode ends the path
+    /// (its verdicts are confirmed natively). In the step case, iterations up
+    /// to `k` belong to the base case, as for a violation.
+    fn null_deref(&mut self, st: &mut State, what: &str) -> Res<Flow> {
+        if self.termination {
+            return Err("term-null-deref".to_string());
+        }
+        if self.cex_mode {
+            trace(|| format!("{what} through NULL ends the path (counterexample mode)"));
+            return Ok(Flow::Halt);
+        }
+        if let (Mode::Step { k }, Some(lp)) = (self.mode, self.kloop.as_ref()) {
+            if st.visits.get(&lp.header).copied().unwrap_or(0) <= k {
+                return Ok(Flow::Halt);
+            }
+        }
+        // An exact query: the float shortcut must not decide this.
+        self.violation_query = true;
+        let (pc, _) = path_condition(st);
+        let feas = self.feasible(st, &pc, &no_vars());
+        self.violation_query = false;
+        match feas? {
+            Feas::Unsat => Ok(Flow::Halt),
+            Feas::Sat | Feas::Unknown => Err(format!("null-deref-{what}")),
+        }
     }
 
     /// `true` iff `extra` is not refuted together with the path condition
@@ -9351,6 +9374,67 @@ mod tests {
             prove(&program(HeapAllocKind::Malloc)),
             ExhaustiveProof::Abstain("error-feasible".into())
         );
+    }
+    /// `int *p = NULL; if (*p == 5) reach_error();` — a feasible load through
+    /// NULL abstains (verifiers disagree on what follows it); behind a refuted
+    /// branch it is a dead path and the proof stands.
+    #[test]
+    fn feasible_null_dereference_abstains() {
+        fn program(guarded: bool) -> AirModule {
+            let mut b = B::new();
+            let err = b.decl("reach_error");
+            let (e, bb_ld, bb_then, bb_end) = (b.bid(), b.bid(), b.bid(), b.bid());
+            let null = ValueId::new(b.id());
+            b.m.constants.insert(null, Constant::Null);
+            let zero = b.konst(0);
+            let one = b.konst(1);
+            let five = b.konst(5);
+            // guard: `if (0 == 1)` when guarded, `if (0 == 0)` otherwise
+            let (i_g, g) = fbin(
+                &mut b,
+                BinaryOp::ICmpEq,
+                zero,
+                if guarded { one } else { zero },
+                I1,
+            );
+            let (i_gb, _) = b.inst(
+                Operation::CondBr {
+                    then_target: bb_ld,
+                    else_target: bb_end,
+                },
+                vec![g],
+                None,
+            );
+            let (i_ld, v) = b.inst(Operation::Load, vec![null], Some(I32));
+            let (i_eq, eq) = fbin(&mut b, BinaryOp::ICmpEq, v.unwrap(), five, I1);
+            let (i_br, _) = b.inst(
+                Operation::CondBr {
+                    then_target: bb_then,
+                    else_target: bb_end,
+                },
+                vec![eq],
+                None,
+            );
+            let (i_err, _) = b.inst(Operation::CallDirect { callee: err }, vec![], None);
+            let (i_r1, _) = b.inst(Operation::Ret, vec![], None);
+            let (i_r2, _) = b.inst(Operation::Ret, vec![], None);
+            b.func(
+                "main",
+                vec![],
+                vec![
+                    blk(e, vec![i_g, i_gb]),
+                    blk(bb_ld, vec![i_ld, i_eq, i_br]),
+                    blk(bb_then, vec![i_err, i_r1]),
+                    blk(bb_end, vec![i_r2]),
+                ],
+            );
+            b.m
+        }
+        assert_eq!(
+            prove(&program(false)),
+            ExhaustiveProof::Abstain("null-deref-load".into())
+        );
+        assert_eq!(prove(&program(true)), ExhaustiveProof::Proven);
     }
 
     /// `struct s *p = kzalloc(..); if (p->next != NULL) reach_error();` — the

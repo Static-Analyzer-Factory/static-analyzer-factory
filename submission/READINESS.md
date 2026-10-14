@@ -195,3 +195,17 @@ witnesses in `results/svcomp26/debug/labelbug/`; reported upstream by the user o
 BenchExec, 0 points). Score: **21,493 upper / 11,054 lower Overall-eq** (≈18,700 at measured confirmation rates).
 Supersedes `781aeb7d…` (§12).
 
+
+## 14. 2026-10-14 — upload candidate: `dist/saf-verify.zip` sha256 `a697ffa9…` (release v17, `4669557c`)
+
+v16 (commit `8ed9afa`: Houdini invariants for k-induction, float abstraction, SCCP parameter fix, ambiguous debug-name
+fix — the `byte_add_1-1` invalid-witness bug) plus v17 (a feasible NULL dereference abstains in every proof mode instead
+of ending the path: the non-competition `ldv-consumption/todo/32_7a…flexcop-usb` was PROVEd no-overflow although
+UAutomizer finds the overflow past a read through a NULL global pointer). Gates `chain_v16a/m`, `chain_v17m` on
+competition tasks: 0 wrong PROVE over 4,324 unreach / 3,733 no-overflow / 10,087 memsafety / 974 termination
+expected-FALSE tasks; `saf verify` TRUE on 0 of the 4,454 expected-FALSE unreach-call + no-overflow tasks (including the
+1,028 no-overflow tasks the FALSE sweep had not covered, which audits the interval no-overflow sentinel); 0 wrong FALSE
+over the 540 sanity tasks; memsafety verify on 2,826 expected-TRUE: only the two reported label bugs. FALSE sweep
+3,055 / 3,426. Witness sample (CPAchecker, then UAutomizer): 73 / 78 TRUE witnesses confirmed, 0 refuted; 17 / 20 of the
+new Hardness proofs. Score (v16 sweeps; v17 costs 5 unreach-call proofs): **≈21,700 upper / ≈11,000 lower Overall-eq**.
+Supersedes `0fe0efe2…` (§13, never uploaded).
