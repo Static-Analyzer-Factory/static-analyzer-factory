@@ -1175,6 +1175,36 @@ pub fn find_counterexample(
 ) -> Option<Counterexample> {
     find_counterexample_excluding(module, budget, overflow, &CexOptions::default())
 }
+/// `no-overflow` for ONE function on its own: every signed (`nsw`) operation
+/// of `func`, and of the functions it calls, stays in range for ANY argument
+/// values. The engine starts at `func` with fresh parameters and explores every
+/// path to its return. Sound for a call site only when `func` reads no memory
+/// that the caller or another thread could have written — the caller checks
+/// that (`conc_overflow`'s pure-leaf test); globals here hold their
+/// initialisers, not arbitrary values.
+#[must_use]
+pub fn prove_function_no_overflow(
+    module: &AirModule,
+    func: saf_core::ids::FunctionId,
+    budget: Duration,
+    signed_shl_locs: Option<&BTreeSet<(u32, u32)>>,
+) -> ExhaustiveProof {
+    let Some(f) = module.function(func).filter(|f| !f.is_declaration) else {
+        return ExhaustiveProof::Abstain("no-function".to_string());
+    };
+    let Some(entry) = f.entry_block.or_else(|| f.blocks.first().map(|b| b.id)) else {
+        return ExhaustiveProof::Abstain("no-entry".to_string());
+    };
+    let mut engine = Engine::new(module, budget);
+    engine.goal = Goal::SignedOverflow;
+    engine.signed_shl_locs = signed_shl_locs.cloned();
+    engine.deadline = Instant::now() + budget;
+    let init = engine.initial_state(f, entry);
+    match engine.run(init) {
+        Ok(()) => ExhaustiveProof::Proven,
+        Err(e) => ExhaustiveProof::Abstain(e),
+    }
+}
 
 /// [`find_counterexample`] that passes over violations at the `skip`
 /// instructions: a caller whose replay of an earlier candidate failed (an

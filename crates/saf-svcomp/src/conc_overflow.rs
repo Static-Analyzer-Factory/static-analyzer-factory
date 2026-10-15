@@ -58,6 +58,8 @@ const UNBOUNDED: u64 = u64::MAX;
 const COUNT_CAP: u64 = 1 << 20;
 /// Interval iterations per function before a still-changing value is widened.
 const WIDEN_AFTER: u32 = 3;
+/// Engine budget per pure-leaf function, seconds.
+const LEAF_BUDGET_S: u64 = 10;
 /// Outer iterations over the global ranges before widening them.
 const GLOBAL_ROUNDS: u32 = 12;
 
@@ -139,6 +141,10 @@ struct Prover<'a> {
     tracked: BTreeMap<ValueId, u32>,
     /// Current range of each tracked global.
     grange: BTreeMap<ValueId, Iv>,
+    /// Per function, the tracked globals only it stores to, when it runs at
+    /// most once: inside it, two reads with no store of its own between them
+    /// read the same value (nobody else writes), see [`load_aliases`].
+    single_writer: BTreeMap<FunctionId, BTreeSet<ValueId>>,
 }
 
 impl<'a> Prover<'a> {
@@ -161,6 +167,7 @@ impl<'a> Prover<'a> {
             mult,
             tracked: BTreeMap::new(),
             grange: BTreeMap::new(),
+            single_writer: BTreeMap::new(),
         }
     }
 
@@ -168,6 +175,7 @@ impl<'a> Prover<'a> {
         self.check_function_addresses()?;
         self.compute_counts()?;
         self.compute_tracked();
+        self.compute_single_writer();
         // Global ranges to a fixpoint (each round re-evaluates every function
         // against the current global ranges).
         for g in self.tracked.keys() {
@@ -394,6 +402,30 @@ impl<'a> Prover<'a> {
         self.tracked = cand.into_iter().filter(|(g, _)| !bad.contains(g)).collect();
     }
 
+    /// See [`Self::single_writer`]: every store to `g` is in one function
+    /// whose execution count is at most 1.
+    fn compute_single_writer(&mut self) {
+        let mut writers: BTreeMap<ValueId, BTreeSet<FunctionId>> = BTreeMap::new();
+        for f in self.funcs.values() {
+            for i in f.blocks.iter().flat_map(|b| b.instructions.iter()) {
+                if matches!(i.op, Operation::Store) {
+                    if let Some(g) = i.operands.get(1).filter(|g| self.tracked.contains_key(g)) {
+                        writers.entry(*g).or_default().insert(f.id);
+                    }
+                }
+            }
+        }
+        for (g, fs) in writers {
+            if fs.len() != 1 {
+                continue;
+            }
+            let f = *fs.iter().next().expect("one writer");
+            if self.count.get(&f).copied() == Some(1) {
+                self.single_writer.entry(f).or_default().insert(g);
+            }
+        }
+    }
+
     fn global_init(&self, g: ValueId) -> Iv {
         let bits = self.tracked[&g];
         let glob = self.module.globals.iter().find(|x| x.id == g);
@@ -439,10 +471,104 @@ impl<'a> Prover<'a> {
             if self.count.get(&f.id).copied().unwrap_or(0) == 0 {
                 continue;
             }
-            let r = self.function_ranges(f, check)?;
+            let r = match self.function_ranges(f, check) {
+                Ok(r) => r,
+                // A pure leaf the engine proves overflow-free for ANY arguments
+                // discharges its own obligations (`plus(a, b)` guarded by
+                // `assume(b <= 0 || a <= INT_MAX - b)`: relational, beyond
+                // intervals). Its ranges are not needed: a call result is `⊤`.
+                Err(e) if check && self.pure_leaf(f.id, 0) && self.engine_proves(f.id) => {
+                    let _ = e;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             out.extend(r);
         }
         Ok(out)
+    }
+
+    /// A function whose memory accesses all go to its own `alloca`s and whose
+    /// calls go only to other pure leaves or to the inert externs (`abort`,
+    /// nondet sources, the assertion helpers): nothing it reads can be written
+    /// by a caller or another thread, so its behaviour depends on its arguments
+    /// alone.
+    fn pure_leaf(&self, f: FunctionId, depth: u32) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        let Some(func) = self.funcs.get(&f) else {
+            return false;
+        };
+        let allocas: BTreeSet<ValueId> = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter(|i| matches!(i.op, Operation::Alloca { .. }))
+            .filter_map(|i| i.dst)
+            .collect();
+        for i in func.blocks.iter().flat_map(|b| b.instructions.iter()) {
+            match &i.op {
+                Operation::Load => {
+                    if !i.operands.first().is_some_and(|p| allocas.contains(p)) {
+                        return false;
+                    }
+                }
+                Operation::Store => {
+                    if !i.operands.get(1).is_some_and(|p| allocas.contains(p)) {
+                        return false;
+                    }
+                }
+                Operation::Memcpy
+                | Operation::Memset
+                | Operation::Gep { .. }
+                | Operation::HeapAlloc { .. }
+                | Operation::Global { .. }
+                | Operation::CallIndirect { .. } => return false,
+                Operation::CallDirect { callee } => {
+                    if self.funcs.contains_key(callee) {
+                        if *callee == f || !self.pure_leaf(*callee, depth + 1) {
+                            return false;
+                        }
+                    } else {
+                        let name = self
+                            .module
+                            .function(*callee)
+                            .map_or("", |c| c.name.as_str());
+                        let inert = name.starts_with("__VERIFIER_nondet_")
+                            || matches!(
+                                name,
+                                "abort"
+                                    | "exit"
+                                    | "__assert_fail"
+                                    | "reach_error"
+                                    | "__VERIFIER_error"
+                            )
+                            || name.starts_with("llvm.dbg.")
+                            || name.starts_with("llvm.lifetime.");
+                        if !inert {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// The exact-semantics engine proves `f` overflow-free from fresh
+    /// arguments ([`crate::unreach_prove::prove_function_no_overflow`]).
+    fn engine_proves(&self, f: FunctionId) -> bool {
+        matches!(
+            crate::unreach_prove::prove_function_no_overflow(
+                self.module,
+                f,
+                std::time::Duration::from_secs(LEAF_BUDGET_S),
+                self.signed_shl_locs,
+            ),
+            crate::unreach_prove::ExhaustiveProof::Proven
+        )
     }
 
     /// Next global ranges from the stores (see the module documentation).
@@ -555,7 +681,12 @@ impl<'a> Prover<'a> {
             .flat_map(|b| b.instructions.iter())
             .filter_map(|i| i.dst.map(|d| (d, i)))
             .collect();
-        let guards = edge_guards(f);
+        let guards = edge_guards(self.module, f);
+        let alias = self
+            .single_writer
+            .get(&f.id)
+            .map(|gs| load_aliases(f, gs))
+            .unwrap_or_default();
         let none: Vec<(ValueId, bool)> = Vec::new();
         for _ in 0..64 {
             let mut changed = false;
@@ -563,6 +694,7 @@ impl<'a> Prover<'a> {
                 let g = Ctx {
                     defs: &defs,
                     guards: guards.get(&b.id).unwrap_or(&none),
+                    alias: &alias,
                 };
                 for i in &b.instructions {
                     let Some(d) = i.dst else { continue };
@@ -593,6 +725,7 @@ impl<'a> Prover<'a> {
                         let g = Ctx {
                             defs: &defs,
                             guards: guards.get(&b.id).unwrap_or(&none),
+                            alias: &alias,
                         };
                         for i in &b.instructions {
                             if let Some(bits) = self.int_bits(i) {
@@ -623,7 +756,7 @@ impl<'a> Prover<'a> {
         // While checking, an operand with no range yet (only on code the
         // fixpoint never reached) counts as `⊤`.
         let opnd = |k: usize, w: u32| -> Option<Iv> {
-            let v = *i.operands.get(k)?;
+            let v = g.canon(*i.operands.get(k)?);
             let x = self.operand_range(f, r, v, w);
             let x = if check { Some(x.unwrap_or(top(w))) } else { x };
             x.map(|x| self.refine(f, r, g, v, x))
@@ -869,16 +1002,17 @@ impl<'a> Prover<'a> {
             let [p, q] = ci.operands[..] else { continue };
             let k = if pol { k } else { k.negate() };
             for (lhs, rhs, kk) in [(p, q, k), (q, p, k.swap())] {
-                let same = lhs == v
+                let src = |d: &Instruction| d.operands.first().map(|o| g.canon(*o));
+                let same = g.canon(lhs) == v
                     || g.defs.get(&lhs).is_some_and(|d| match d.op {
                         Operation::Cast {
                             kind: CastKind::SExt,
                             ..
-                        } => d.operands.first() == Some(&v),
+                        } => src(d) == Some(v),
                         Operation::Cast {
                             kind: CastKind::ZExt,
                             ..
-                        } => d.operands.first() == Some(&v) && x.lo >= 0,
+                        } => src(d) == Some(v) && x.lo >= 0,
                         _ => false,
                     });
                 if !same {
@@ -887,7 +1021,7 @@ impl<'a> Prover<'a> {
                 let Some(w) = self.value_bits(f, lhs) else {
                     continue;
                 };
-                let Some(o) = self.operand_range(f, r, rhs, w) else {
+                let Some(o) = self.operand_range(f, r, g.canon(rhs), w) else {
                     continue;
                 };
                 let y = kk.narrow(x, o);
@@ -922,6 +1056,15 @@ impl Iv {
 struct Ctx<'b> {
     defs: &'b BTreeMap<ValueId, &'b Instruction>,
     guards: &'b [(ValueId, bool)],
+    /// Loads that read the same value as an earlier value ([`load_aliases`]).
+    alias: &'b BTreeMap<ValueId, ValueId>,
+}
+
+impl Ctx<'_> {
+    /// The value `v` is known to equal (itself when none).
+    fn canon(&self, v: ValueId) -> ValueId {
+        self.alias.get(&v).copied().unwrap_or(v)
+    }
 }
 
 /// An integer comparison, as "left `Cmp` right".
@@ -1045,6 +1188,87 @@ impl Cmp {
             _ => x,
         }
     }
+}
+
+/// For the single-writer globals `gs` of `f` (see [`Prover::single_writer`]):
+/// every load of one that must read the value of an earlier load or store in
+/// `f`, mapped to that value. A forward dataflow carries, per global, the SSA
+/// value it is known to hold (a store sets it, a load with nothing known sets
+/// it to the load itself); a join keeps it only when every predecessor agrees.
+/// Sound because no other function stores to `g` and `f` runs at most once:
+/// between two of `f`'s own accesses nothing changes `g`. No fixpoint within
+/// the round limit: no aliases.
+fn load_aliases(f: &AirFunction, gs: &BTreeSet<ValueId>) -> BTreeMap<ValueId, ValueId> {
+    type St = BTreeMap<ValueId, Option<ValueId>>;
+    let Some(gr) = Graph::of(f) else {
+        return BTreeMap::new();
+    };
+    let mut out: BTreeMap<BlockId, St> = BTreeMap::new();
+    let pass = |out: &BTreeMap<BlockId, St>, alias: &mut BTreeMap<ValueId, ValueId>| {
+        let mut new_out: BTreeMap<BlockId, St> = BTreeMap::new();
+        for b in &f.blocks {
+            let mut cur: St = if b.id == gr.entry {
+                gs.iter().map(|g| (*g, None)).collect()
+            } else {
+                let mut acc: Option<St> = None;
+                for p in &gr.preds[&b.id] {
+                    let Some(po) = new_out.get(p).or_else(|| out.get(p)) else {
+                        continue;
+                    };
+                    acc = Some(match acc {
+                        None => po.clone(),
+                        Some(a) => a
+                            .iter()
+                            .map(|(g, x)| (*g, if po.get(g) == Some(x) { *x } else { None }))
+                            .collect(),
+                    });
+                }
+                let Some(acc) = acc else { continue };
+                acc
+            };
+            for i in &b.instructions {
+                match i.op {
+                    Operation::Store => {
+                        if let (Some(v), Some(g)) = (i.operands.first(), i.operands.get(1)) {
+                            if gs.contains(g) {
+                                let v = alias.get(v).copied().unwrap_or(*v);
+                                cur.insert(*g, Some(v));
+                            }
+                        }
+                    }
+                    Operation::Load => {
+                        if let (Some(g), Some(d)) = (i.operands.first(), i.dst) {
+                            if gs.contains(g) {
+                                match cur.get(g).copied().flatten() {
+                                    Some(x) => {
+                                        alias.insert(d, x);
+                                    }
+                                    None => {
+                                        cur.insert(*g, Some(d));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            new_out.insert(b.id, cur);
+        }
+        new_out
+    };
+    for _ in 0..64 {
+        let mut scratch = BTreeMap::new();
+        let next = pass(&out, &mut scratch);
+        if next == out {
+            // Stable: the aliases of one more pass over the fixpoint.
+            let mut alias = BTreeMap::new();
+            let _ = pass(&out, &mut alias);
+            return alias;
+        }
+        out = next;
+    }
+    BTreeMap::new()
 }
 
 /// Per block, the conditions the edges into it established: `(c, pol)` when a
@@ -1298,7 +1522,7 @@ fn trip_bound(
     u64::try_from(trips).ok()
 }
 
-fn edge_guards(f: &AirFunction) -> BTreeMap<BlockId, Vec<(ValueId, bool)>> {
+fn edge_guards(module: &AirModule, f: &AirFunction) -> BTreeMap<BlockId, Vec<(ValueId, bool)>> {
     let Some(g) = Graph::of(f) else {
         return BTreeMap::new();
     };
@@ -1332,6 +1556,49 @@ fn edge_guards(f: &AirFunction) -> BTreeMap<BlockId, Vec<(ValueId, bool)>> {
             }
         }
         out.insert(*b, gs);
+    }
+    // A branch on an `i1` phi (`while (a && b)`: `phi [false, %cond], [%cmp2,
+    // %rhs]`): the phi has the branch's polarity only along the incoming edges
+    // whose value is not the constant opposite, so when exactly one is left the
+    // path came from that block — its value held, and so did that block's own
+    // guards. Two rounds cover a `&&` of three.
+    let defs: BTreeMap<ValueId, &Instruction> = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|i| i.dst.map(|d| (d, i)))
+        .collect();
+    let konst = |v: ValueId| match module.constants.get(&v) {
+        Some(Constant::Int { value, .. }) => Some(*value != 0),
+        _ => None,
+    };
+    for _ in 0..2 {
+        let snapshot = out.clone();
+        for (b, gs) in &mut out {
+            let mut extra: Vec<(ValueId, bool)> = Vec::new();
+            for &(c, pol) in gs.iter() {
+                let Some(Operation::Phi { incoming }) = defs.get(&c).map(|i| &i.op) else {
+                    continue;
+                };
+                let live: Vec<&(BlockId, ValueId)> = incoming
+                    .iter()
+                    .filter(|(_, v)| konst(*v) != Some(!pol))
+                    .collect();
+                let [(p, v)] = live[..] else { continue };
+                if konst(*v).is_none() {
+                    extra.push((*v, pol));
+                }
+                if let Some(pg) = snapshot.get(p) {
+                    extra.extend(pg.iter().copied());
+                }
+            }
+            let _ = b;
+            for e in extra {
+                if !gs.contains(&e) {
+                    gs.push(e);
+                }
+            }
+        }
     }
     out
 }

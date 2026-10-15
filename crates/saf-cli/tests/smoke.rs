@@ -906,6 +906,16 @@ fn verify_overflow_conc_bounded_counter_is_true() {
     verify_overflow("overflow_true_conc_bounded_counter.c", "LP64").stdout("true\n");
 }
 
+/// A counter only its own thread writes, read twice per iteration (guard and
+/// increment): the single-writer rule ties the reads; and a helper guarded by
+/// relational assumptions, proven on its own by the engine -> `true`.
+#[test]
+#[ignore]
+fn verify_overflow_conc_single_writer_and_leaf_are_true() {
+    verify_overflow("overflow_true_conc_single_writer.c", "LP64").stdout("true\n");
+    verify_overflow("overflow_true_conc_guarded_leaf.c", "LP64").stdout("true\n");
+}
+
 /// Concurrent programs whose shared global CAN overflow (a stored `INT_MAX`, an
 /// atomic add, unboundedly many spawns, an address passed to the thread): the
 /// concurrent prover must not answer `true`.
@@ -917,6 +927,9 @@ fn verify_overflow_conc_overflowing_is_not_true() {
         "overflow_false_conc_atomic.c",
         "overflow_false_conc_spawn_loop.c",
         "overflow_false_conc_escaped_address.c",
+        "overflow_false_conc_unguarded_leaf.c",
+        "overflow_false_conc_reread_shared.c",
+        "overflow_false_conc_leaf_reads_global.c",
     ] {
         let out = verify_overflow(fx, "LP64").get_output().stdout.clone();
         assert_ne!(String::from_utf8_lossy(&out).trim(), "true", "{fx}");
