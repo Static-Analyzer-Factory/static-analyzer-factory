@@ -224,17 +224,56 @@ pub fn extract_local_variable_names(module_ir: &str) -> LocalVarNameMap {
         return BTreeMap::new();
     }
 
-    // Phase 2: Parse dbg.declare intrinsics within function contexts.
-    // Track current function by detecting `define` lines.
+    // Phase 2: Parse dbg.declare / dbg.value records within function contexts,
+    // noting the block each record and each register definition is in.
+    //
+    // A register two records name DIFFERENTLY: after mem2reg a copy
+    // `partial_sum = carry;` is `dbg.value(%carry.0, "partial_sum")` in the loop
+    // body, while `carry`'s loop-head phi got `dbg.value(%carry.0, "carry")` in
+    // the header, right after its definition. The record in the register's OWN
+    // block says what the register is where it is defined (the loop head, for a
+    // phi), so a unique name among those records wins; else a name every record
+    // agrees on; else none (a loop-head invariant over the wrong variable was
+    // refuted by UAutomizer, 2026-10-12, and a swap `x = y; y = tmp;` names each
+    // phi as both variables in the body).
     let mut result: LocalVarNameMap = BTreeMap::new();
     let mut current_func: Option<String> = None;
-    // Registers some record names as two DIFFERENT variables (per function).
-    // After mem2reg a copy `partial_sum = carry;` is the record
-    // `dbg.value(%carry.0, "partial_sum")`: the register is `carry`'s loop-head
-    // phi, and whichever name came last would stick. Such a register stands for
-    // no single C variable, so it gets no name (a loop-head invariant written
-    // over the wrong variable was refuted by UAutomizer, 2026-10-12).
-    let mut ambiguous: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+    let mut block = String::from("entry");
+    let mut def_block: BTreeMap<String, String> = BTreeMap::new();
+    let mut records: Vec<(String, String, String)> = Vec::new();
+
+    let resolve = |func_name: &str,
+                   def_block: &BTreeMap<String, String>,
+                   records: &[(String, String, String)],
+                   result: &mut LocalVarNameMap| {
+        let mut by_reg: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
+        for (reg, var, blk) in records {
+            by_reg
+                .entry(reg.as_str())
+                .or_default()
+                .push((var.as_str(), blk.as_str()));
+        }
+        let names = result.entry(func_name.to_string()).or_default();
+        for (reg, recs) in by_reg {
+            let home = def_block.get(reg).map(String::as_str);
+            let local: std::collections::BTreeSet<&str> = recs
+                .iter()
+                .filter(|(_, b)| Some(*b) == home)
+                .map(|(v, _)| *v)
+                .collect();
+            let all: std::collections::BTreeSet<&str> = recs.iter().map(|(v, _)| *v).collect();
+            let pick = if local.len() == 1 {
+                local.into_iter().next()
+            } else if local.is_empty() && all.len() == 1 {
+                all.into_iter().next()
+            } else {
+                None
+            };
+            if let Some(v) = pick {
+                names.insert(reg.to_string(), v.to_string());
+            }
+        }
+    };
 
     for line in module_ir.lines() {
         let trimmed = line.trim();
@@ -242,47 +281,48 @@ pub fn extract_local_variable_names(module_ir: &str) -> LocalVarNameMap {
         // Detect function boundaries
         if let Some(func_name) = parse_function_define(trimmed) {
             current_func = Some(func_name);
+            block = String::from("entry");
+            def_block.clear();
+            records.clear();
             continue;
         }
         if trimmed == "}" {
-            current_func = None;
+            if let Some(f) = current_func.take() {
+                resolve(&f, &def_block, &records, &mut result);
+            }
             continue;
         }
 
-        // Only parse dbg.declare inside functions
-        let Some(ref func_name) = current_func else {
+        let Some(ref _func_name) = current_func else {
             continue;
         };
 
-        // Try to parse dbg.declare (pre-mem2reg allocas) or dbg.value (promoted
-        // SSA values after mem2reg — the loop-header phis we need to name).
+        // A block label starts in column 0: `while.cond:   ; preds = ...`.
+        if !line.starts_with([' ', '\t']) {
+            let head = line.split(';').next().unwrap_or("").trim_end();
+            if let Some(label) = head.strip_suffix(':') {
+                block = label.to_string();
+                continue;
+            }
+        }
+        // A register definition: `%x.0 = phi ...`.
+        if let Some((lhs, _)) = trimmed.split_once(" = ") {
+            if lhs.starts_with('%') && !lhs.contains(' ') {
+                def_block.insert(lhs.to_string(), block.clone());
+            }
+        }
+
+        // dbg.declare (pre-mem2reg allocas) or dbg.value (promoted SSA values
+        // after mem2reg — the loop-header phis we need to name).
         if let Some((reg_name, meta_id)) =
             parse_dbg_declare(trimmed).or_else(|| parse_dbg_value(trimmed))
         {
             if let Some(var_name) = metadata_names.get(&meta_id) {
-                let names = result.entry(func_name.clone()).or_default();
-                match names.get(&reg_name) {
-                    Some(prev) if prev != var_name => {
-                        ambiguous
-                            .entry(func_name.clone())
-                            .or_default()
-                            .insert(reg_name);
-                    }
-                    _ => {
-                        names.insert(reg_name, var_name.clone());
-                    }
-                }
+                records.push((reg_name, var_name.clone(), block.clone()));
             }
         }
     }
 
-    for (func_name, regs) in &ambiguous {
-        if let Some(names) = result.get_mut(func_name) {
-            for reg in regs {
-                names.remove(reg);
-            }
-        }
-    }
     result
 }
 
@@ -647,6 +687,31 @@ define dso_local i32 @main() #0 !dbg !13 {
             map.get("main").and_then(|m| m.get("%.0")),
             Some(&"s".to_string())
         );
+    }
+
+    #[test]
+    fn a_phi_takes_the_name_recorded_in_its_own_block() {
+        // `partial_sum = carry;` names carry's loop-head phi `partial_sum` in the
+        // body; the record in the header (the phi's own block) says `carry`.
+        let module_ir = r#"
+define dso_local i32 @mp_add() #0 !dbg !13 {
+entry:
+  br label %while.cond
+while.cond:                                       ; preds = %while.body, %entry
+  %carry.0 = phi i16 [ 0, %entry ], [ 1, %while.body ]
+  tail call void @llvm.dbg.value(metadata i16 %carry.0, metadata !140, metadata !DIExpression()), !dbg !62
+  br label %while.body
+while.body:                                       ; preds = %while.cond
+  tail call void @llvm.dbg.value(metadata i16 %carry.0, metadata !157, metadata !DIExpression()), !dbg !62
+  br label %while.cond
+}
+
+!140 = !DILocalVariable(name: "carry", scope: !58, file: !2, line: 45, type: !22)
+!157 = !DILocalVariable(name: "partial_sum", scope: !58, file: !2, line: 46, type: !22)
+"#;
+        let map = extract_local_variable_names(module_ir);
+        let names = map.get("mp_add").expect("function entry");
+        assert_eq!(names.get("%carry.0"), Some(&"carry".to_string()));
     }
 
     #[test]

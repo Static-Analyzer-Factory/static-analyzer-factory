@@ -212,6 +212,200 @@ pub fn build_ranking_witness(
     InvariantSetWitness::assemble(meta, &invariants).ok()
 }
 
+/// A 2.1 termination witness: the synthesised ranking function's transition
+/// invariant for every loop [`rank_loops`] ranked, and for every other loop a
+/// candidate read off its exit guard — a loop staying while `a > b` (or `>=`)
+/// is witnessed by `\at(a - b, AnyPrev) > a - b`, one staying while `a < b`
+/// by `b - a` decreasing. The guard candidate is a validator HINT, not part of
+/// any proof: the verdict never depends on it, and a candidate the validator
+/// rejects costs what the empty `invariant_set` costs (an unconfirmed TRUE).
+/// `None` when no loop yields an entry.
+#[must_use]
+pub fn build_termination_witness(
+    module: &AirModule,
+    source: &str,
+    meta: &WitnessMeta,
+) -> Option<InvariantSetWitness> {
+    if source_has_openmp(source) {
+        return None;
+    }
+    let names = build_value_names(module);
+    let globals: BTreeMap<ValueId, &str> = module
+        .globals
+        .iter()
+        .map(|g| (g.id, g.name.as_str()))
+        .collect();
+    let src_lines: Vec<&str> = source.lines().collect();
+    let mut invariants: Vec<SourceInvariant> = Vec::new();
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        let cfg = Cfg::build(func);
+        let mut ranked: BTreeMap<saf_core::ids::BlockId, String> = BTreeMap::new();
+        if let Some(rankings) = rank_loops(func, module, &cfg) {
+            for lr in rankings {
+                if let Some(v) = lr
+                    .ranked
+                    .components()
+                    .and(transition_invariant(&lr.ranked, &names))
+                {
+                    ranked.insert(lr.header, v);
+                }
+            }
+        }
+        let headers = saf_analysis::absint::detect_loop_headers(&cfg);
+        for block in &func.blocks {
+            if !headers.contains(block.id) || header_has_function_call(block) {
+                continue;
+            }
+            let value = match ranked.get(&block.id) {
+                Some(v) => Some(v.clone()),
+                None => guard_relation(module, func, &cfg, block, &names, &globals),
+            };
+            let Some(value) = value else { continue };
+            let Some((file_name, line, column)) = loop_head_location(module, block, &src_lines)
+            else {
+                continue;
+            };
+            invariants.push(SourceInvariant {
+                file_name,
+                line,
+                column,
+                function: Some(func.name.clone()),
+                value,
+                kind: InvariantKind::LoopTransition,
+            });
+        }
+    }
+    if invariants.is_empty() {
+        return None;
+    }
+    InvariantSetWitness::assemble(meta, &invariants).ok()
+}
+
+/// The guard candidate of [`build_termination_witness`] for the loop headed by
+/// `block`, when the header branches on an integer comparison with exactly one
+/// successor that leads back to the header and both operands render as C.
+fn guard_relation(
+    module: &AirModule,
+    func: &saf_core::air::AirFunction,
+    cfg: &Cfg,
+    block: &saf_core::air::AirBlock,
+    names: &BTreeMap<ValueId, String>,
+    globals: &BTreeMap<ValueId, &str>,
+) -> Option<String> {
+    use saf_core::air::{BinaryOp, Operation};
+    let t = block.instructions.last()?;
+    let Operation::CondBr {
+        then_target,
+        else_target,
+    } = t.op
+    else {
+        return None;
+    };
+    let reaches = |from: saf_core::ids::BlockId| {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut stack = vec![from];
+        while let Some(b) = stack.pop() {
+            if b == block.id {
+                return true;
+            }
+            if seen.insert(b) {
+                if let Some(ss) = cfg.successors.get(&b) {
+                    stack.extend(ss.iter().copied());
+                }
+            }
+        }
+        false
+    };
+    let stay_then = match (reaches(then_target), reaches(else_target)) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => return None,
+    };
+    let c = *t.operands.first()?;
+    let defs: BTreeMap<ValueId, &saf_core::air::Instruction> = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|i| i.dst.map(|d| (d, i)))
+        .collect();
+    let ci = defs.get(&c)?;
+    let Operation::BinaryOp { kind } = ci.op else {
+        return None;
+    };
+    let [a, b] = ci.operands[..] else { return None };
+    // The comparison that holds while the loop goes on.
+    let kind = if stay_then {
+        kind
+    } else {
+        match kind {
+            BinaryOp::ICmpSlt => BinaryOp::ICmpSge,
+            BinaryOp::ICmpSle => BinaryOp::ICmpSgt,
+            BinaryOp::ICmpSgt => BinaryOp::ICmpSle,
+            BinaryOp::ICmpSge => BinaryOp::ICmpSlt,
+            _ => return None,
+        }
+    };
+    let (hi, lo) = match kind {
+        BinaryOp::ICmpSgt | BinaryOp::ICmpSge => (a, b),
+        BinaryOp::ICmpSlt | BinaryOp::ICmpSle => (b, a),
+        _ => return None,
+    };
+    let (hc, hp) = render_operand(module, &defs, names, globals, hi, 0)?;
+    let (lc, lp) = render_operand(module, &defs, names, globals, lo, 0)?;
+    // Constants cancel; the relation must mention at least one variable.
+    if hc == hp && lc == lp {
+        return None;
+    }
+    Some(format!("({hp}) - ({lp}) > ({hc}) - ({lc})"))
+}
+
+/// `(current, previous)` C renderings of an integer operand: a constant, a
+/// named SSA value, a sign/zero extension of one, or a load of a named global.
+fn render_operand(
+    module: &AirModule,
+    defs: &BTreeMap<ValueId, &saf_core::air::Instruction>,
+    names: &BTreeMap<ValueId, String>,
+    globals: &BTreeMap<ValueId, &str>,
+    v: ValueId,
+    depth: u32,
+) -> Option<(String, String)> {
+    use saf_core::air::{CastKind, Constant, Operation};
+    if depth > 4 {
+        return None;
+    }
+    if let Some(Constant::Int { value, .. }) = module.constants.get(&v) {
+        let s = value.to_string();
+        return Some((s.clone(), s));
+    }
+    if let Some(n) = names.get(&v).filter(|n| is_c_identifier(n)) {
+        return Some((n.clone(), format!("\\at({n}, AnyPrev)")));
+    }
+    let d = defs.get(&v)?;
+    match &d.op {
+        Operation::Cast {
+            kind: CastKind::SExt | CastKind::ZExt,
+            ..
+        } => render_operand(
+            module,
+            defs,
+            names,
+            globals,
+            *d.operands.first()?,
+            depth + 1,
+        ),
+        Operation::Load => {
+            // A named global. (Not a cell through a pointer: CPAchecker 4.2.2's
+            // termination validator throws on `\at(*p, AnyPrev)`.)
+            let g = globals.get(d.operands.first()?)?;
+            is_c_identifier(g).then(|| ((*g).to_string(), format!("\\at({g}, AnyPrev)")))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

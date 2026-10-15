@@ -6782,14 +6782,20 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
 
     // Path 3 (plan 222 §2t): the exact-semantics engine explores every path to
     // its end (bounded loops), behind the same gates as its other TRUE arms.
-    // The witness is the empty 2.1 `invariant_set` (the validator re-proves
-    // termination; there is no ranking function to state).
+    // The witness carries one `loop_transition_invariant` per loop where one
+    // renders (a synthesised ranking function, else a decreasing measure read off
+    // the loop's guard — a validator hint, never part of the proof), else it is
+    // the empty 2.1 `invariant_set`.
     if !proven && termination_engine_proves(ctx) {
+        let correctness = std::fs::read_to_string(ctx.input)
+            .ok()
+            .and_then(|src| saf_svcomp::build_termination_witness(ctx.module, &src, ctx.meta))
+            .unwrap_or_else(|| saf_svcomp::InvariantSetWitness::empty_2_1(ctx.meta));
         return VerdictOutcome {
             verdict: saf_svcomp::termination_verdict().to_string(),
             witness: None,
             graphml: None,
-            correctness: Some(saf_svcomp::InvariantSetWitness::empty_2_1(ctx.meta)),
+            correctness: Some(correctness),
         };
     }
 
@@ -6813,7 +6819,7 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         // as one transition invariant), or a symbol with no C name.
         let correctness = std::fs::read_to_string(ctx.input)
             .ok()
-            .and_then(|src| saf_svcomp::build_ranking_witness(ctx.module, &src, ctx.meta))
+            .and_then(|src| saf_svcomp::build_termination_witness(ctx.module, &src, ctx.meta))
             .unwrap_or_else(|| saf_svcomp::InvariantSetWitness::empty_2_1(ctx.meta));
         VerdictOutcome {
             verdict: saf_svcomp::termination_verdict().to_string(),

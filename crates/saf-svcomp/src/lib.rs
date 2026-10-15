@@ -93,7 +93,7 @@ pub use se_interp::{enumerate_concolic_flip_seeds, enumerate_se_candidates};
 pub use termination::{
     is_known_returning_external, program_structurally_terminates, termination_verdict,
 };
-pub use termination_witness::build_ranking_witness;
+pub use termination_witness::{build_ranking_witness, build_termination_witness};
 pub use unreach_prove::{
     CexOptions, Counterexample, ExhaustiveProof, HeaderStates, KEEP_ALIVE, LIFETIME_END,
     LIFETIME_START, PINNED_EXTERNS, StateVar, find_counterexample, find_counterexample_excluding,
