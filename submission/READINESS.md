@@ -225,3 +225,16 @@ no witness). The v18 archive passed its smoketest, and `chain_v18m` (maxwell, co
 the 4,454 expected-FALSE unreach-call + no-overflow tasks; 0 wrong FALSE over the 540 sanity tasks and the 2,826
 expected-TRUE memsafety tasks (the two reported label bugs aside); FALSE sweep 3,041 / 3,426. **`50db8f61…` is the file
 to upload.**
+
+## 16. 2026-10-15 — upload candidate: `dist/saf-verify-v19.zip` sha256 `125d70e5…` (release v19, `229b3565`)
+
+v18 plus: termination correctness witnesses carry one `loop_transition_invariant` per loop (a synthesised ranking
+function, else a decreasing measure read off the loop guard — a validator hint, never part of the proof; CPAchecker
+4.2.2 confirms 20 / 65 sampled termination TRUE vs 18 / 65 with the empty witness, none lost); C names of loop-head values
+come from the debug record in the defining block (unreach/no-overflow witness sample 93 / 98 confirmed vs 90 / 98, 0
+refuted); the concurrent no-overflow prover handles single-writer globals, `&&` guards and pure helper functions
+(451 / 661 `C.no-overflow.Concurrency` expected-TRUE, was 414). `chain_v19m` (maxwell, competition tasks) is clean:
+0 wrong PROVE over 4,324 unreach / 3,733 no-overflow / 10,087 memsafety / 974 termination expected-FALSE tasks;
+`saf verify` TRUE on 0 of 4,454 expected-FALSE unreach-call + no-overflow tasks; 0 wrong FALSE over the 540 sanity tasks
+and the 2,826 expected-TRUE memsafety tasks (the two reported label bugs aside); FALSE sweep 3,042 / 3,426.
+Supersedes §15 (v18).
