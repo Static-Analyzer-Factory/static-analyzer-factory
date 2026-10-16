@@ -22,10 +22,21 @@
 //!    Interleavings only choose WHICH earlier value an increment read, so the
 //!    bound holds for all of them (lost updates only shrink it). Any other
 //!    global is `⊤` when loaded.
+//!    Copies generalise increments: a store of `load(h) + c` to `g` adds `c`
+//!    to some value `h` held, so `g` is bounded over the globals it copies
+//!    from. Past the type's range a wrapping (non-`nsw`) increment makes the
+//!    global `⊤`.
 //! 3. **Value ranges.** Per function, an interval fixpoint over the SSA values
 //!    (phis joined, values that keep changing widened to their type's range),
 //!    with tracked loads at their global's range and every other load, call
-//!    result and parameter at `⊤`.
+//!    result and parameter at `⊤`. Values are narrowed by the facts in force:
+//!    dominating branch conditions, `assume` calls, and disjunctions (several
+//!    predecessors or an `i1` phi, never a loop header's). Two loads read the
+//!    same value when nothing else can store between them: the global has a
+//!    single writer that runs once, or both lie in one atomic section
+//!    (`__VERIFIER_atomic_begin` … `_end`). A global `main` stores to only
+//!    before it can have spawned a thread is constant once threads run; loads
+//!    in thread-only code see its value at the spawn sites.
 //! 4. **Obligations.** Every signed (`nsw`) add/sub/mul, `sdiv`/`srem`, signed
 //!    `shl` and `abs` call in a function that may run must stay in range.
 //!
@@ -94,6 +105,23 @@ fn join(a: Option<Iv>, b: Iv) -> Iv {
         },
     }
 }
+/// The intersection of two ranges of one value (`a` when they are disjoint,
+/// which only unreachable code can make them).
+fn meet(a: Iv, b: Iv) -> Iv {
+    let m = Iv {
+        lo: a.lo.max(b.lo),
+        hi: a.hi.min(b.hi),
+    };
+    if m.lo <= m.hi { m } else { a }
+}
+/// Every SSA value of `f` and the instruction defining it.
+fn defs_of(f: &AirFunction) -> BTreeMap<ValueId, &Instruction> {
+    f.blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|i| i.dst.map(|d| (d, i)))
+        .collect()
+}
 /// `v` as the signed value of its low `bits` bits.
 fn wrap(v: i128, bits: u32) -> i128 {
     if bits >= 128 {
@@ -143,8 +171,20 @@ struct Prover<'a> {
     grange: BTreeMap<ValueId, Iv>,
     /// Per function, the tracked globals only it stores to, when it runs at
     /// most once: inside it, two reads with no store of its own between them
-    /// read the same value (nobody else writes), see [`load_aliases`].
+    /// read the same value (nobody else writes), see [`alias_dataflow`].
     single_writer: BTreeMap<FunctionId, BTreeSet<ValueId>>,
+    /// Functions that return only when their one argument is non-zero
+    /// (`assume_abort_if_not`, see [`is_assume_fn`]), and `__VERIFIER_assume`.
+    assume_fns: BTreeSet<FunctionId>,
+    /// Tracked globals stored to only by `main` before it can have started a
+    /// thread ([`Self::pre_spawn_stores`]): constant once any thread runs.
+    frozen_globals: BTreeSet<ValueId>,
+    /// Functions that run only inside threads (reached from `main` by no
+    /// chain of direct calls), so only after the first spawn.
+    post_only: BTreeSet<FunctionId>,
+    /// The range of each frozen global once threads run: its value at the
+    /// spawn sites ([`Self::frozen_ranges`]). Used by loads in `post_only`.
+    frozen: BTreeMap<ValueId, Iv>,
 }
 
 impl<'a> Prover<'a> {
@@ -168,6 +208,21 @@ impl<'a> Prover<'a> {
             tracked: BTreeMap::new(),
             grange: BTreeMap::new(),
             single_writer: BTreeMap::new(),
+            assume_fns: module
+                .functions
+                .iter()
+                .filter(|f| {
+                    if f.is_declaration || f.blocks.is_empty() {
+                        f.name == "__VERIFIER_assume"
+                    } else {
+                        is_assume_fn(module, f)
+                    }
+                })
+                .map(|f| f.id)
+                .collect(),
+            frozen_globals: BTreeSet::new(),
+            post_only: BTreeSet::new(),
+            frozen: BTreeMap::new(),
         }
     }
 
@@ -176,8 +231,24 @@ impl<'a> Prover<'a> {
         self.compute_counts()?;
         self.compute_tracked();
         self.compute_single_writer();
-        // Global ranges to a fixpoint (each round re-evaluates every function
-        // against the current global ranges).
+        self.compute_post_only();
+        let ranges = self.global_fixpoint()?;
+        // Second round with the frozen globals' values at the spawn sites,
+        // read off the first round's (sound) ranges.
+        if !self.frozen_globals.is_empty() && !self.post_only.is_empty() {
+            self.frozen = self.frozen_ranges(&ranges);
+            if !self.frozen.is_empty() {
+                self.global_fixpoint()?;
+            }
+        }
+        // Final pass: the obligations.
+        self.all_function_ranges(true)?;
+        Ok(())
+    }
+
+    /// Global ranges to a fixpoint (each round re-evaluates every function
+    /// against the current global ranges); the value ranges of the last round.
+    fn global_fixpoint(&mut self) -> Res<BTreeMap<ValueId, Iv>> {
         for g in self.tracked.keys() {
             let init = self.global_init(*g);
             self.grange.insert(*g, init);
@@ -201,15 +272,206 @@ impl<'a> Prover<'a> {
                 }
             }
             if !changed {
-                break;
+                return Ok(ranges);
             }
             if rounds > GLOBAL_ROUNDS + 2 {
                 return Err("global-ranges-diverge".to_string());
             }
         }
-        // Final pass: the obligations.
-        self.all_function_ranges(true)?;
-        Ok(())
+    }
+
+    /// See [`Self::post_only`].
+    fn compute_post_only(&mut self) {
+        let Some(main) = self.funcs.values().find(|f| f.name == "main").map(|f| f.id) else {
+            return;
+        };
+        let mut seen: BTreeSet<FunctionId> = BTreeSet::from([main]);
+        let mut stack = vec![main];
+        while let Some(f) = stack.pop() {
+            for i in self.funcs[&f]
+                .blocks
+                .iter()
+                .flat_map(|b| b.instructions.iter())
+            {
+                if let Operation::CallDirect { callee } = i.op {
+                    if self.funcs.contains_key(&callee) && seen.insert(callee) {
+                        stack.push(callee);
+                    }
+                }
+            }
+        }
+        self.post_only = self
+            .funcs
+            .keys()
+            .filter(|f| !seen.contains(f))
+            .copied()
+            .collect();
+    }
+
+    /// Per frozen global, the join over every `pthread_create` site of its
+    /// value there: in `main`, the SSA value it is known to hold, narrowed by
+    /// the facts in force at the site; elsewhere its global range. After the
+    /// first spawn the global never changes, so every thread reads its value
+    /// at that first site.
+    fn frozen_ranges(&self, ranges: &BTreeMap<ValueId, Iv>) -> BTreeMap<ValueId, Iv> {
+        let Some(main) = self.funcs.values().find(|f| f.name == "main") else {
+            return BTreeMap::new();
+        };
+        let is_spawn = |i: &Instruction| self.callee_name(i) == Some("pthread_create");
+        let outside = self.funcs.values().any(|f| {
+            f.id != main.id
+                && f.blocks
+                    .iter()
+                    .flat_map(|b| b.instructions.iter())
+                    .any(&is_spawn)
+        });
+        let sites: Positions = main
+            .blocks
+            .iter()
+            .flat_map(|b| {
+                b.instructions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, i)| is_spawn(i))
+                    .map(move |(k, _)| (b.id, k))
+            })
+            .collect();
+        let (alias, states) = self.aliases(main, &sites);
+        let defs = defs_of(main);
+        let (guards, facts) = self.instruction_facts(main, &defs);
+        let alts = edge_alternatives(main, &guards);
+        let cfg = CfgFacts::of(main);
+        let mut out = BTreeMap::new();
+        for g in &self.frozen_globals {
+            let bits = self.tracked[g];
+            let mut acc: Option<Iv> = outside.then(|| self.grange[g]);
+            for (b, k) in &sites {
+                let at = states
+                    .get(&(*b, *k))
+                    .and_then(|st| st.get(g))
+                    .and_then(|v| {
+                        let x = self.operand_range(main, ranges, *v, bits)?;
+                        let ctx = Ctx {
+                            defs: &defs,
+                            guards: &facts[b][*k],
+                            alias: &alias,
+                            blocks: &guards,
+                            alts: alts.get(b).map_or(&[], Vec::as_slice),
+                            cfg: &cfg,
+                        };
+                        Some(self.refine(main, ranges, &ctx, *v, x))
+                    });
+                acc = Some(join(acc, at.unwrap_or(self.grange[g])));
+            }
+            if let Some(r) = acc {
+                out.insert(*g, r);
+            }
+        }
+        out
+    }
+
+    /// [`alias_dataflow`] for `f`: its single-writer globals always, the other
+    /// tracked globals inside atomic sections.
+    #[allow(clippy::type_complexity)]
+    fn aliases(
+        &self,
+        f: &AirFunction,
+        want: &Positions,
+    ) -> (
+        BTreeMap<ValueId, ValueId>,
+        BTreeMap<(BlockId, usize), BTreeMap<ValueId, ValueId>>,
+    ) {
+        let none = BTreeSet::new();
+        let sw = self.single_writer.get(&f.id).unwrap_or(&none);
+        let shared: BTreeSet<ValueId> = self
+            .tracked
+            .keys()
+            .filter(|g| !sw.contains(g))
+            .copied()
+            .collect();
+        let inert = |i: &Instruction| self.inert_call(i);
+        let module = self.module;
+        let callee = move |i: &Instruction| -> Option<(&'a str, bool)> {
+            let Operation::CallDirect { callee } = i.op else {
+                return None;
+            };
+            let c = module.function(callee)?;
+            Some((c.name.as_str(), c.is_declaration || c.blocks.is_empty()))
+        };
+        let scope = AliasScope {
+            sw,
+            shared: &shared,
+            inert: &inert,
+            callee: &callee,
+        };
+        alias_dataflow(f, &scope, want)
+    }
+
+    /// A call that stores to no global: a nondet source, `__VERIFIER_assume`,
+    /// a process exit, or an `assume` helper ([`Self::assume_fns`]) whose only
+    /// calls are such.
+    fn inert_call(&self, i: &Instruction) -> bool {
+        let Operation::CallDirect { callee } = i.op else {
+            return false;
+        };
+        let Some(c) = self.module.function(callee) else {
+            return false;
+        };
+        let inert_extern = |c: &AirFunction| {
+            (c.is_declaration || c.blocks.is_empty())
+                && (c.name.starts_with("__VERIFIER_nondet_")
+                    || matches!(
+                        c.name.as_str(),
+                        "__VERIFIER_assume"
+                            | "abort"
+                            | "exit"
+                            | "_exit"
+                            | "__assert_fail"
+                            | "reach_error"
+                    ))
+        };
+        if inert_extern(c) {
+            return true;
+        }
+        self.assume_fns.contains(&callee)
+            && c.blocks
+                .iter()
+                .flat_map(|b| b.instructions.iter())
+                .all(|j| match j.op {
+                    Operation::Store | Operation::CallIndirect { .. } => false,
+                    Operation::CallDirect { callee } => {
+                        self.module.function(callee).is_some_and(inert_extern)
+                    }
+                    _ => true,
+                })
+    }
+
+    /// The guards in force at each instruction: the block's edge guards, plus
+    /// the facts of the `assume` calls before it in the block (expanded through
+    /// `i1` phis like edge guards).
+    fn instruction_facts(
+        &self,
+        f: &AirFunction,
+        defs: &BTreeMap<ValueId, &Instruction>,
+    ) -> (Guards, InstrFacts) {
+        let guards = edge_guards(self.module, f, &self.assume_fns);
+        let facts_at = |b: &saf_core::air::AirBlock| -> Vec<Vec<(ValueId, bool)>> {
+            let mut local: Vec<(ValueId, bool)> = guards.get(&b.id).cloned().unwrap_or_default();
+            let mut per = Vec::with_capacity(b.instructions.len());
+            for i in &b.instructions {
+                per.push(local.clone());
+                if let Some(fct) = assume_fact(defs, &self.assume_fns, i) {
+                    for e in expand_fact(self.module, defs, &guards, fct) {
+                        if !local.contains(&e) {
+                            local.push(e);
+                        }
+                    }
+                }
+            }
+            per
+        };
+        let facts = f.blocks.iter().map(|b| (b.id, facts_at(b))).collect();
+        (guards, facts)
     }
 
     /// A function's address may only be the start routine of `pthread_create`;
@@ -404,14 +666,39 @@ impl<'a> Prover<'a> {
 
     /// See [`Self::single_writer`]: every store to `g` is in one function
     /// whose execution count is at most 1.
+    ///
+    /// A store in `main` before it can have started any thread
+    /// ([`Self::pre_spawn_stores`]) happens before every thread runs, so it
+    /// does not make `main` a second writer of a thread's global.
     fn compute_single_writer(&mut self) {
+        let pre = self.pre_spawn_stores();
+        let main = self.funcs.values().find(|f| f.name == "main").map(|f| f.id);
         let mut writers: BTreeMap<ValueId, BTreeSet<FunctionId>> = BTreeMap::new();
+        let mut pre_only: BTreeSet<ValueId> = BTreeSet::new();
         for f in self.funcs.values() {
-            for i in f.blocks.iter().flat_map(|b| b.instructions.iter()) {
-                if matches!(i.op, Operation::Store) {
-                    if let Some(g) = i.operands.get(1).filter(|g| self.tracked.contains_key(g)) {
+            for b in &f.blocks {
+                for (k, i) in b.instructions.iter().enumerate() {
+                    if !matches!(i.op, Operation::Store) {
+                        continue;
+                    }
+                    let Some(g) = i.operands.get(1).filter(|g| self.tracked.contains_key(g)) else {
+                        continue;
+                    };
+                    if Some(f.id) == main && pre.contains(&(b.id, k)) {
+                        pre_only.insert(*g);
+                    } else {
                         writers.entry(*g).or_default().insert(f.id);
                     }
+                }
+            }
+        }
+        // Written only before the first spawn: `main` is its single writer,
+        // and the global is frozen once threads run.
+        if let Some(m) = main {
+            for g in pre_only {
+                if let std::collections::btree_map::Entry::Vacant(e) = writers.entry(g) {
+                    e.insert(BTreeSet::from([m]));
+                    self.frozen_globals.insert(g);
                 }
             }
         }
@@ -424,6 +711,90 @@ impl<'a> Prover<'a> {
                 self.single_writer.entry(f).or_default().insert(g);
             }
         }
+    }
+
+    /// Stores in `main` (run once, called from nowhere) at positions no thread
+    /// creation can precede: not after a call that may start a thread in its
+    /// block, nor in a block reachable from one.
+    fn pre_spawn_stores(&self) -> BTreeSet<(BlockId, usize)> {
+        let Some(main) = self.funcs.values().find(|f| f.name == "main") else {
+            return BTreeSet::new();
+        };
+        if self.count.get(&main.id).copied() != Some(1) {
+            return BTreeSet::new();
+        }
+        let called = self.funcs.values().any(|f| {
+            f.blocks
+                .iter()
+                .flat_map(|b| b.instructions.iter())
+                .any(|i| matches!(i.op, Operation::CallDirect { callee } if callee == main.id))
+        });
+        if called {
+            return BTreeSet::new();
+        }
+        // Functions that may start a thread, transitively.
+        let direct_spawn = |i: &Instruction| {
+            matches!(self.callee_name(i), Some("pthread_create" | "thrd_create"))
+                || matches!(i.op, Operation::CallIndirect { .. })
+        };
+        let mut spawns: BTreeSet<FunctionId> = BTreeSet::new();
+        loop {
+            let before = spawns.len();
+            for f in self.funcs.values() {
+                let any = f.blocks.iter().flat_map(|b| b.instructions.iter()).any(|i| {
+                    direct_spawn(i)
+                        || matches!(i.op, Operation::CallDirect { callee } if spawns.contains(&callee))
+                });
+                if any {
+                    spawns.insert(f.id);
+                }
+            }
+            if spawns.len() == before {
+                break;
+            }
+        }
+        let may_spawn = |i: &Instruction| {
+            direct_spawn(i)
+                || matches!(i.op, Operation::CallDirect { callee } if spawns.contains(&callee))
+        };
+        // Blocks reachable from a spawning call.
+        let succ: BTreeMap<BlockId, Vec<BlockId>> = main
+            .blocks
+            .iter()
+            .map(|b| {
+                (
+                    b.id,
+                    b.instructions.last().map(successors).unwrap_or_default(),
+                )
+            })
+            .collect();
+        let mut after: BTreeSet<BlockId> = BTreeSet::new();
+        let mut stack: Vec<BlockId> = main
+            .blocks
+            .iter()
+            .filter(|b| b.instructions.iter().any(&may_spawn))
+            .flat_map(|b| succ[&b.id].iter().copied())
+            .collect();
+        while let Some(b) = stack.pop() {
+            if after.insert(b) {
+                stack.extend(succ.get(&b).into_iter().flatten().copied());
+            }
+        }
+        let mut out = BTreeSet::new();
+        for b in &main.blocks {
+            if after.contains(&b.id) {
+                continue;
+            }
+            for (k, i) in b.instructions.iter().enumerate() {
+                if may_spawn(i) {
+                    break;
+                }
+                if matches!(i.op, Operation::Store) {
+                    out.insert((b.id, k));
+                }
+            }
+        }
+        out
     }
 
     fn global_init(&self, g: ValueId) -> Iv {
@@ -572,14 +943,22 @@ impl<'a> Prover<'a> {
     }
 
     /// Next global ranges from the stores (see the module documentation).
+    ///
+    /// Increments generalise to copies between tracked globals of one width: a
+    /// store of `load(h) + c` to `g` (`c` may be 0: `tmp = n; n2 = tmp + 1`)
+    /// writes SOME value `h` held plus `c`. Tracing any value back through the
+    /// copies that produced it reaches an initial value or a non-copy store,
+    /// over distinct, strictly earlier store executions, and only through the
+    /// globals `g` copies from, directly or not (its "sources", `g` included).
+    /// So `g` lies in `[lo − Σ neg, hi + Σ pos]` with `[lo, hi]` over the inits
+    /// and non-copy stores of its sources and the sums over the copy
+    /// executions into them.
     fn next_global_ranges(&self, ranges: &BTreeMap<ValueId, Iv>) -> BTreeMap<ValueId, Iv> {
-        let mut base: BTreeMap<ValueId, Iv> = BTreeMap::new();
-        // Total increment amounts (`None`: unbounded). Amounts are not counts:
-        // they saturate only at "unbounded", never at `COUNT_CAP`.
-        let mut pos: BTreeMap<ValueId, Option<u128>> = BTreeMap::new();
-        let mut neg: BTreeMap<ValueId, Option<u128>> = BTreeMap::new();
+        let mut base: Vec<(ValueId, Iv)> = Vec::new();
+        // (target, source, executions × |c| (`None`: unbounded), c ≥ 0, wraps).
+        let mut copies: Vec<(ValueId, ValueId, Option<u128>, bool, bool)> = Vec::new();
         for g in self.tracked.keys() {
-            base.insert(*g, self.global_init(*g));
+            base.push((*g, self.global_init(*g)));
         }
         for f in self.funcs.values() {
             let fc = self.count.get(&f.id).copied().unwrap_or(0);
@@ -607,43 +986,73 @@ impl<'a> Prover<'a> {
                     let Some(&bits) = self.tracked.get(&g) else {
                         continue;
                     };
-                    if let Some(c) = increment_of(self.module, &defs, v, g) {
+                    let copy = copy_of(self.module, &defs, v)
+                        .filter(|(h, _)| self.tracked.get(h) == Some(&bits));
+                    if let Some((h, c)) = copy {
+                        let c = wrap(c, bits);
+                        // Amounts are not counts: they saturate only at
+                        // "unbounded", never at `COUNT_CAP`.
                         let amount = if k == UNBOUNDED {
                             None
                         } else {
                             u128::from(k).checked_mul(c.unsigned_abs())
                         };
-                        let slot = if c >= 0 { &mut pos } else { &mut neg };
-                        let e = slot.entry(g).or_insert(Some(0));
-                        *e = e.zip(amount).and_then(|(x, y)| x.checked_add(y));
+                        let wraps = c != 0 && !defs.get(&v).is_some_and(|d| d.has_no_signed_wrap());
+                        copies.push((g, h, amount, c >= 0, wraps));
                         continue;
                     }
                     let r = self.operand_range(f, ranges, v, bits).unwrap_or(top(bits));
-                    let e = base.get(&g).copied();
-                    base.insert(g, join(e, r));
+                    base.push((g, r));
                 }
             }
         }
+        let mut from: BTreeMap<ValueId, BTreeSet<ValueId>> = BTreeMap::new();
+        for (g, h, ..) in &copies {
+            from.entry(*g).or_default().insert(*h);
+        }
         let mut out = BTreeMap::new();
         for (g, bits) in &self.tracked {
-            let b = base[g];
-            let p = pos
-                .get(g)
-                .copied()
-                .unwrap_or(Some(0))
-                .and_then(|x| i128::try_from(x).ok());
-            let n = neg
-                .get(g)
-                .copied()
-                .unwrap_or(Some(0))
-                .and_then(|x| i128::try_from(x).ok());
-            let hi = p
-                .and_then(|p| b.hi.checked_add(p))
-                .map_or(smax(*bits), |x| x.min(smax(*bits)));
-            let lo = n
-                .and_then(|n| b.lo.checked_sub(n))
-                .map_or(smin(*bits), |x| x.max(smin(*bits)));
-            out.insert(*g, Iv { lo, hi });
+            let mut src: BTreeSet<ValueId> = BTreeSet::from([*g]);
+            let mut stack = vec![*g];
+            while let Some(x) = stack.pop() {
+                for h in from.get(&x).into_iter().flatten() {
+                    if src.insert(*h) {
+                        stack.push(*h);
+                    }
+                }
+            }
+            let mut b: Option<Iv> = None;
+            for (x, r) in &base {
+                if src.contains(x) {
+                    b = Some(join(b, *r));
+                }
+            }
+            let b = b.unwrap_or(top(*bits));
+            let (mut pos, mut neg): (Option<u128>, Option<u128>) = (Some(0), Some(0));
+            let mut wraps = false;
+            for (x, _, amount, up, w) in &copies {
+                if !src.contains(x) {
+                    continue;
+                }
+                let slot = if *up { &mut pos } else { &mut neg };
+                *slot = slot.zip(*amount).and_then(|(p, q)| p.checked_add(q));
+                wraps |= *w;
+            }
+            let total = |m: Option<u128>| m.and_then(|x| i128::try_from(x).ok());
+            let hi = total(pos).and_then(|p| b.hi.checked_add(p));
+            let lo = total(neg).and_then(|n| b.lo.checked_sub(n));
+            let iv = match (lo, hi) {
+                (Some(lo), Some(hi)) if fits(Iv { lo, hi }, *bits) => Iv { lo, hi },
+                // Out of range: a wrapping increment can reach any value; an
+                // `nsw` one cannot pass the bound without overflowing, which its
+                // own obligation reports.
+                _ if wraps => top(*bits),
+                _ => Iv {
+                    lo: lo.map_or(smin(*bits), |x| x.max(smin(*bits))),
+                    hi: hi.map_or(smax(*bits), |x| x.min(smax(*bits))),
+                },
+            };
+            out.insert(*g, iv);
         }
         out
     }
@@ -681,22 +1090,22 @@ impl<'a> Prover<'a> {
             .flat_map(|b| b.instructions.iter())
             .filter_map(|i| i.dst.map(|d| (d, i)))
             .collect();
-        let guards = edge_guards(self.module, f);
-        let alias = self
-            .single_writer
-            .get(&f.id)
-            .map(|gs| load_aliases(f, gs))
-            .unwrap_or_default();
-        let none: Vec<(ValueId, bool)> = Vec::new();
+        let alias = self.aliases(f, &BTreeSet::new()).0;
+        let (guards, facts) = self.instruction_facts(f, &defs);
+        let alts = edge_alternatives(f, &guards);
+        let cfg = CfgFacts::of(f);
         for _ in 0..64 {
             let mut changed = false;
             for b in &f.blocks {
-                let g = Ctx {
-                    defs: &defs,
-                    guards: guards.get(&b.id).unwrap_or(&none),
-                    alias: &alias,
-                };
-                for i in &b.instructions {
+                for (k, i) in b.instructions.iter().enumerate() {
+                    let g = Ctx {
+                        defs: &defs,
+                        guards: &facts[&b.id][k],
+                        alias: &alias,
+                        blocks: &guards,
+                        alts: alts.get(&b.id).map_or(&[], Vec::as_slice),
+                        cfg: &cfg,
+                    };
                     let Some(d) = i.dst else { continue };
                     let Some(bits) = self.int_bits(i) else {
                         continue;
@@ -722,12 +1131,15 @@ impl<'a> Prover<'a> {
             if !changed {
                 if check {
                     for b in &f.blocks {
-                        let g = Ctx {
-                            defs: &defs,
-                            guards: guards.get(&b.id).unwrap_or(&none),
-                            alias: &alias,
-                        };
-                        for i in &b.instructions {
+                        for (k, i) in b.instructions.iter().enumerate() {
+                            let g = Ctx {
+                                defs: &defs,
+                                guards: &facts[&b.id][k],
+                                alias: &alias,
+                                blocks: &guards,
+                                alts: alts.get(&b.id).map_or(&[], Vec::as_slice),
+                                cfg: &cfg,
+                            };
                             if let Some(bits) = self.int_bits(i) {
                                 self.transfer(f, &r, &g, i, bits, true)?;
                             }
@@ -761,7 +1173,14 @@ impl<'a> Prover<'a> {
             let x = if check { Some(x.unwrap_or(top(w))) } else { x };
             x.map(|x| self.refine(f, r, g, v, x))
         };
-        let fail = |what: &str| -> Res<Option<Iv>> { Err(format!("{what}-in-{}", f.name)) };
+        let fail = |what: &str| -> Res<Option<Iv>> {
+            let line = i
+                .span
+                .as_ref()
+                .and_then(|sp| crate::witness_lower::span_to_location(self.module, sp))
+                .map_or(String::new(), |(_, l, _)| format!("@L{l}"));
+            Err(format!("{what}-in-{}{line}", f.name))
+        };
         Ok(match &i.op {
             Operation::BinaryOp { kind } => {
                 // Comparisons: a boolean.
@@ -951,7 +1370,12 @@ impl<'a> Prover<'a> {
             Operation::Load => {
                 let g = i.operands.first().copied();
                 match g.and_then(|g| self.grange.get(&g).copied()) {
-                    Some(gr) if !i.is_atomic_pair() => Some(gr),
+                    Some(gr) if !i.is_atomic_pair() => {
+                        let fz = g
+                            .filter(|_| self.post_only.contains(&f.id))
+                            .and_then(|g| self.frozen.get(&g));
+                        Some(fz.map_or(gr, |z| meet(gr, *z)))
+                    }
                     _ => Some(top(bits)),
                 }
             }
@@ -992,9 +1416,70 @@ impl<'a> Prover<'a> {
         v: ValueId,
         x: Iv,
     ) -> Iv {
+        let mut x = self.refine_in(f, r, g, g.guards, v, x, 0);
+        for alts in g.alts {
+            let mut acc: Option<Iv> = None;
+            for alt in alts {
+                acc = Some(join(acc, self.refine_in(f, r, g, alt, v, x, 1)));
+            }
+            if let Some(a) = acc {
+                x = meet(x, a);
+            }
+        }
+        x
+    }
+
+    /// [`Self::refine`] under the facts `facts`. A fact that an `i1` phi has
+    /// some value with several incoming edges still possible (`a || b` true)
+    /// is a disjunction: the path came from one of them, so `v` lies in the
+    /// join of its refinements under each edge's own facts (that block's
+    /// guards and the incoming value, as in [`expand_fact`]).
+    #[allow(clippy::too_many_arguments)]
+    fn refine_in(
+        &self,
+        f: &AirFunction,
+        r: &BTreeMap<ValueId, Iv>,
+        g: &Ctx<'_>,
+        facts: &[(ValueId, bool)],
+        v: ValueId,
+        x: Iv,
+        depth: u32,
+    ) -> Iv {
+        let konst = |w: ValueId| match self.module.constants.get(&w) {
+            Some(Constant::Int { value, .. }) => Some(*value != 0),
+            _ => None,
+        };
         let mut x = x;
-        for &(c, pol) in g.guards {
+        for &(c, pol) in facts {
             let Some(ci) = g.defs.get(&c) else { continue };
+            if let Operation::Phi { incoming } = &ci.op {
+                if depth >= 3 || g.cfg.header_phis.contains(&c) {
+                    continue;
+                }
+                let Some(dst_block) = g.cfg.phis.get(&c).copied() else {
+                    continue;
+                };
+                let live: Vec<&(BlockId, ValueId)> = incoming
+                    .iter()
+                    .filter(|(_, w)| konst(*w) != Some(!pol))
+                    .collect();
+                let mut acc: Option<Iv> = None;
+                for (p, w) in live {
+                    let mut alt: Vec<(ValueId, bool)> =
+                        g.blocks.get(p).cloned().unwrap_or_default();
+                    if konst(*w).is_none() {
+                        alt.push((*w, pol));
+                    }
+                    if let Some(e) = g.cfg.edges.get(&(*p, dst_block)) {
+                        alt.push(*e);
+                    }
+                    acc = Some(join(acc, self.refine_in(f, r, g, &alt, v, x, depth + 1)));
+                }
+                if let Some(a) = acc {
+                    x = meet(x, a);
+                }
+                continue;
+            }
             let Operation::BinaryOp { kind } = ci.op else {
                 continue;
             };
@@ -1056,7 +1541,13 @@ impl Iv {
 struct Ctx<'b> {
     defs: &'b BTreeMap<ValueId, &'b Instruction>,
     guards: &'b [(ValueId, bool)],
-    /// Loads that read the same value as an earlier value ([`load_aliases`]).
+    /// Every block's edge guards (for the disjunctive refinement in
+    /// [`Prover::refine`]).
+    blocks: &'b Guards,
+    /// The disjunctions in force in this block ([`edge_alternatives`]).
+    alts: &'b [Alternatives],
+    cfg: &'b CfgFacts,
+    /// Loads that read the same value as an earlier value ([`alias_dataflow`]).
     alias: &'b BTreeMap<ValueId, ValueId>,
 }
 
@@ -1190,25 +1681,76 @@ impl Cmp {
     }
 }
 
-/// For the single-writer globals `gs` of `f` (see [`Prover::single_writer`]):
-/// every load of one that must read the value of an earlier load or store in
-/// `f`, mapped to that value. A forward dataflow carries, per global, the SSA
-/// value it is known to hold (a store sets it, a load with nothing known sets
-/// it to the load itself); a join keeps it only when every predecessor agrees.
-/// Sound because no other function stores to `g` and `f` runs at most once:
-/// between two of `f`'s own accesses nothing changes `g`. No fixpoint within
-/// the round limit: no aliases.
-fn load_aliases(f: &AirFunction, gs: &BTreeSet<ValueId>) -> BTreeMap<ValueId, ValueId> {
-    type St = BTreeMap<ValueId, Option<ValueId>>;
+/// Per block, the conditions in force on entry ([`edge_guards`]).
+type Guards = BTreeMap<BlockId, Vec<(ValueId, bool)>>;
+
+/// A disjunction of conjunctions of conditions ([`edge_alternatives`]).
+type Alternatives = Vec<Vec<(ValueId, bool)>>;
+
+/// Per block, per instruction, the facts in force just before it
+/// ([`Prover::instruction_facts`]).
+type InstrFacts = BTreeMap<BlockId, Vec<Vec<(ValueId, bool)>>>;
+
+/// Positions in a function: block and instruction index.
+type Positions = BTreeSet<(BlockId, usize)>;
+
+/// Which globals [`alias_dataflow`] follows in a function, and how.
+struct AliasScope<'b, 'm> {
+    /// Single-writer globals of the function (see [`Prover::single_writer`]):
+    /// no other function stores to them and the function runs at most once,
+    /// so between two of its own accesses nothing changes them.
+    sw: &'b BTreeSet<ValueId>,
+    /// Other tracked globals: followed only inside an atomic section, where no
+    /// other thread runs (`__VERIFIER_atomic_begin()` … `_end()`, or a whole
+    /// `__VERIFIER_atomic_*` function); forgotten at the section's ends and at
+    /// any call that might store (`inert` says which keep them).
+    shared: &'b BTreeSet<ValueId>,
+    inert: &'b dyn Fn(&Instruction) -> bool,
+    /// A direct call's callee name, and whether it is only declared.
+    callee: &'b dyn Fn(&Instruction) -> Option<(&'m str, bool)>,
+}
+
+/// Every load of a followed global (see [`AliasScope`]) that must read the
+/// value of an earlier load or store in `f`, mapped to that value; and the
+/// value each followed global is known to hold just before each instruction of
+/// `want`. A forward dataflow carries, per global, the SSA value it is known
+/// to hold (a store sets it, a load with nothing known sets it to the load
+/// itself), and whether every path is inside an atomic section; a join keeps
+/// a value only when every predecessor agrees. No fixpoint within the round
+/// limit: no aliases.
+// NOTE: one dataflow — the transfer, the join and the fixpoint read best
+// together.
+#[allow(clippy::type_complexity, clippy::too_many_lines)]
+fn alias_dataflow(
+    f: &AirFunction,
+    scope: &AliasScope<'_, '_>,
+    want: &Positions,
+) -> (
+    BTreeMap<ValueId, ValueId>,
+    BTreeMap<(BlockId, usize), BTreeMap<ValueId, ValueId>>,
+) {
+    type St = (BTreeMap<ValueId, Option<ValueId>>, bool);
     let Some(gr) = Graph::of(f) else {
-        return BTreeMap::new();
+        return (BTreeMap::new(), BTreeMap::new());
     };
+    let (sw, shared) = (scope.sw, scope.shared);
+    let kill_shared = |st: &mut St| {
+        for g in shared {
+            st.0.insert(*g, None);
+        }
+    };
+    let entry: St = (
+        sw.iter().chain(shared.iter()).map(|g| (*g, None)).collect(),
+        f.name.starts_with("__VERIFIER_atomic_"),
+    );
     let mut out: BTreeMap<BlockId, St> = BTreeMap::new();
-    let pass = |out: &BTreeMap<BlockId, St>, alias: &mut BTreeMap<ValueId, ValueId>| {
+    let pass = |out: &BTreeMap<BlockId, St>,
+                alias: &mut BTreeMap<ValueId, ValueId>,
+                at: &mut BTreeMap<(BlockId, usize), BTreeMap<ValueId, ValueId>>| {
         let mut new_out: BTreeMap<BlockId, St> = BTreeMap::new();
         for b in &f.blocks {
             let mut cur: St = if b.id == gr.entry {
-                gs.iter().map(|g| (*g, None)).collect()
+                entry.clone()
             } else {
                 let mut acc: Option<St> = None;
                 for p in &gr.preds[&b.id] {
@@ -1217,37 +1759,69 @@ fn load_aliases(f: &AirFunction, gs: &BTreeSet<ValueId>) -> BTreeMap<ValueId, Va
                     };
                     acc = Some(match acc {
                         None => po.clone(),
-                        Some(a) => a
-                            .iter()
-                            .map(|(g, x)| (*g, if po.get(g) == Some(x) { *x } else { None }))
-                            .collect(),
+                        Some(a) => (
+                            a.0.iter()
+                                .map(|(g, x)| (*g, if po.0.get(g) == Some(x) { *x } else { None }))
+                                .collect(),
+                            a.1 && po.1,
+                        ),
                     });
                 }
-                let Some(acc) = acc else { continue };
+                let Some(mut acc) = acc else { continue };
+                if !acc.1 {
+                    kill_shared(&mut acc);
+                }
                 acc
             };
-            for i in &b.instructions {
+            for (k, i) in b.instructions.iter().enumerate() {
+                if want.contains(&(b.id, k)) {
+                    at.insert(
+                        (b.id, k),
+                        cur.0
+                            .iter()
+                            .filter_map(|(g, x)| x.map(|x| (*g, x)))
+                            .collect(),
+                    );
+                }
+                let followed =
+                    |g: &ValueId, cur: &St| sw.contains(g) || (cur.1 && shared.contains(g));
                 match i.op {
                     Operation::Store => {
                         if let (Some(v), Some(g)) = (i.operands.first(), i.operands.get(1)) {
-                            if gs.contains(g) {
+                            if followed(g, &cur) {
                                 let v = alias.get(v).copied().unwrap_or(*v);
-                                cur.insert(*g, Some(v));
+                                cur.0.insert(*g, Some(v));
+                            } else if shared.contains(g) {
+                                cur.0.insert(*g, None);
                             }
                         }
                     }
                     Operation::Load => {
                         if let (Some(g), Some(d)) = (i.operands.first(), i.dst) {
-                            if gs.contains(g) {
-                                match cur.get(g).copied().flatten() {
+                            if followed(g, &cur) {
+                                match cur.0.get(g).copied().flatten() {
                                     Some(x) => {
                                         alias.insert(d, x);
                                     }
                                     None => {
-                                        cur.insert(*g, Some(d));
+                                        cur.0.insert(*g, Some(d));
                                     }
                                 }
                             }
+                        }
+                    }
+                    Operation::CallDirect { .. } | Operation::CallIndirect { .. } => {
+                        match (scope.callee)(i) {
+                            Some(("__VERIFIER_atomic_begin", true)) => {
+                                kill_shared(&mut cur);
+                                cur.1 = true;
+                            }
+                            Some(("__VERIFIER_atomic_end", true)) => {
+                                kill_shared(&mut cur);
+                                cur.1 = false;
+                            }
+                            _ if (scope.inert)(i) => {}
+                            _ => kill_shared(&mut cur),
                         }
                     }
                     _ => {}
@@ -1259,16 +1833,194 @@ fn load_aliases(f: &AirFunction, gs: &BTreeSet<ValueId>) -> BTreeMap<ValueId, Va
     };
     for _ in 0..64 {
         let mut scratch = BTreeMap::new();
-        let next = pass(&out, &mut scratch);
+        let next = pass(&out, &mut scratch, &mut BTreeMap::new());
         if next == out {
             // Stable: the aliases of one more pass over the fixpoint.
-            let mut alias = BTreeMap::new();
-            let _ = pass(&out, &mut alias);
-            return alias;
+            let (mut alias, mut at) = (BTreeMap::new(), BTreeMap::new());
+            let _ = pass(&out, &mut alias, &mut at);
+            return (alias, at);
         }
         out = next;
     }
-    BTreeMap::new()
+    (BTreeMap::new(), BTreeMap::new())
+}
+
+/// The fact an `assume(c)` call establishes once it returns: the `i1`
+/// comparison its argument extends (`assume_abort_if_not(x < n)` passes
+/// `zext (icmp slt x, n)`).
+fn assume_fact(
+    defs: &BTreeMap<ValueId, &Instruction>,
+    assume_fns: &BTreeSet<FunctionId>,
+    i: &Instruction,
+) -> Option<(ValueId, bool)> {
+    let Operation::CallDirect { callee } = i.op else {
+        return None;
+    };
+    if !assume_fns.contains(&callee) {
+        return None;
+    }
+    let a = *i.operands.first()?;
+    match defs.get(&a).map(|d| (&d.op, d)) {
+        Some((
+            Operation::Cast {
+                kind: CastKind::ZExt | CastKind::SExt,
+                ..
+            },
+            d,
+        )) => d.operands.first().map(|c| (*c, true)),
+        Some((Operation::BinaryOp { kind }, _)) if int_compare(*kind).is_some() => Some((a, true)),
+        _ => None,
+    }
+}
+
+/// A fact plus what it implies through `i1` phis (`while (a && b)`: `phi
+/// [false, %cond], [%cmp2, %rhs]`): the phi has the fact's polarity only along
+/// the incoming edges whose value is not the constant opposite, so when exactly
+/// one is left the path came from that block — its value held, and so did that
+/// block's own guards.
+fn expand_fact(
+    module: &AirModule,
+    defs: &BTreeMap<ValueId, &Instruction>,
+    guards: &BTreeMap<BlockId, Vec<(ValueId, bool)>>,
+    fact: (ValueId, bool),
+) -> Vec<(ValueId, bool)> {
+    let konst = |v: ValueId| match module.constants.get(&v) {
+        Some(Constant::Int { value, .. }) => Some(*value != 0),
+        _ => None,
+    };
+    let mut out = vec![fact];
+    let mut k = 0;
+    while k < out.len() && out.len() < 64 {
+        let (c, pol) = out[k];
+        k += 1;
+        let Some(Operation::Phi { incoming }) = defs.get(&c).map(|i| &i.op) else {
+            continue;
+        };
+        let live: Vec<&(BlockId, ValueId)> = incoming
+            .iter()
+            .filter(|(_, v)| konst(*v) != Some(!pol))
+            .collect();
+        let [(p, v)] = live[..] else { continue };
+        let mut add = Vec::new();
+        if konst(*v).is_none() {
+            add.push((*v, pol));
+        }
+        if let Some(pg) = guards.get(p) {
+            add.extend(pg.iter().copied());
+        }
+        for e in add {
+            if !out.contains(&e) {
+                out.push(e);
+            }
+        }
+    }
+    out
+}
+
+/// A function that returns only when its single argument is non-zero:
+/// exactly one conditional branch, on `arg != 0` / `arg == 0` (possibly through
+/// a cast), whose zero-side successor reaches no `ret` (`if (!c) abort();`).
+fn is_assume_fn(module: &AirModule, f: &AirFunction) -> bool {
+    let [p] = &f.params[..] else { return false };
+    // No other way out before the check: no `switch`, no second branch.
+    let plain = f.blocks.iter().all(|b| {
+        b.instructions.last().is_some_and(|t| {
+            matches!(
+                t.op,
+                Operation::Br { .. }
+                    | Operation::CondBr { .. }
+                    | Operation::Ret
+                    | Operation::Unreachable
+            )
+        })
+    });
+    if !plain {
+        return false;
+    }
+    let branches: Vec<&Instruction> = f
+        .blocks
+        .iter()
+        .filter_map(|b| b.instructions.last())
+        .filter(|t| matches!(t.op, Operation::CondBr { .. }))
+        .collect();
+    let [t] = branches[..] else { return false };
+    let Operation::CondBr {
+        then_target,
+        else_target,
+    } = t.op
+    else {
+        return false;
+    };
+    let defs: BTreeMap<ValueId, &Instruction> = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|i| i.dst.map(|d| (d, i)))
+        .collect();
+    let Some(c) = t.operands.first().and_then(|c| defs.get(c)) else {
+        return false;
+    };
+    let Operation::BinaryOp { kind } = c.op else {
+        return false;
+    };
+    let [x, y] = c.operands[..] else { return false };
+    let is_zero = |v: ValueId| {
+        matches!(
+            module.constants.get(&v),
+            Some(Constant::Int { value: 0, .. })
+        )
+    };
+    let is_param = |v: ValueId| {
+        v == p.id
+            || defs.get(&v).is_some_and(|d| {
+                matches!(
+                    d.op,
+                    Operation::Cast {
+                        kind: CastKind::ZExt | CastKind::SExt | CastKind::Trunc,
+                        ..
+                    }
+                ) && d.operands.first() == Some(&p.id)
+            })
+    };
+    let ok_operands = (is_param(x) && is_zero(y)) || (is_param(y) && is_zero(x));
+    if !ok_operands {
+        return false;
+    }
+    let zero_side = match kind {
+        BinaryOp::ICmpNe => else_target,
+        BinaryOp::ICmpEq => then_target,
+        _ => return false,
+    };
+    // No `ret` reachable from the zero side.
+    let succ: BTreeMap<BlockId, Vec<BlockId>> = f
+        .blocks
+        .iter()
+        .map(|b| {
+            (
+                b.id,
+                b.instructions.last().map(successors).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![zero_side];
+    while let Some(b) = stack.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        let Some(blk) = f.blocks.iter().find(|x| x.id == b) else {
+            continue;
+        };
+        if blk
+            .instructions
+            .iter()
+            .any(|i| matches!(i.op, Operation::Ret))
+        {
+            return false;
+        }
+        stack.extend(succ.get(&b).into_iter().flatten().copied());
+    }
+    true
 }
 
 /// Per block, the conditions the edges into it established: `(c, pol)` when a
@@ -1522,7 +2274,11 @@ fn trip_bound(
     u64::try_from(trips).ok()
 }
 
-fn edge_guards(module: &AirModule, f: &AirFunction) -> BTreeMap<BlockId, Vec<(ValueId, bool)>> {
+fn edge_guards(
+    module: &AirModule,
+    f: &AirFunction,
+    assume_fns: &BTreeSet<FunctionId>,
+) -> BTreeMap<BlockId, Vec<(ValueId, bool)>> {
     let Some(g) = Graph::of(f) else {
         return BTreeMap::new();
     };
@@ -1557,42 +2313,45 @@ fn edge_guards(module: &AirModule, f: &AirFunction) -> BTreeMap<BlockId, Vec<(Va
         }
         out.insert(*b, gs);
     }
-    // A branch on an `i1` phi (`while (a && b)`: `phi [false, %cond], [%cmp2,
-    // %rhs]`): the phi has the branch's polarity only along the incoming edges
-    // whose value is not the constant opposite, so when exactly one is left the
-    // path came from that block — its value held, and so did that block's own
-    // guards. Two rounds cover a `&&` of three.
-    let defs: BTreeMap<ValueId, &Instruction> = f
+    // An `assume(c)` call in a strict dominator: every path into the block
+    // passed it, and it returned only with `c` true.
+    let fdefs: BTreeMap<ValueId, &Instruction> = f
         .blocks
         .iter()
         .flat_map(|b| b.instructions.iter())
         .filter_map(|i| i.dst.map(|d| (d, i)))
         .collect();
-    let konst = |v: ValueId| match module.constants.get(&v) {
-        Some(Constant::Int { value, .. }) => Some(*value != 0),
-        _ => None,
-    };
-    for _ in 0..2 {
-        let snapshot = out.clone();
-        for (b, gs) in &mut out {
-            let mut extra: Vec<(ValueId, bool)> = Vec::new();
-            for &(c, pol) in gs.iter() {
-                let Some(Operation::Phi { incoming }) = defs.get(&c).map(|i| &i.op) else {
-                    continue;
-                };
-                let live: Vec<&(BlockId, ValueId)> = incoming
-                    .iter()
-                    .filter(|(_, v)| konst(*v) != Some(!pol))
-                    .collect();
-                let [(p, v)] = live[..] else { continue };
-                if konst(*v).is_none() {
-                    extra.push((*v, pol));
-                }
-                if let Some(pg) = snapshot.get(p) {
-                    extra.extend(pg.iter().copied());
+    for b in ids {
+        let mut facts = Vec::new();
+        for d in &dom[b] {
+            if d == b {
+                continue;
+            }
+            if let Some(blk) = f.blocks.iter().find(|x| x.id == *d) {
+                facts.extend(
+                    blk.instructions
+                        .iter()
+                        .filter_map(|i| assume_fact(&fdefs, assume_fns, i)),
+                );
+            }
+        }
+        if let Some(gs) = out.get_mut(b) {
+            for e in facts {
+                if !gs.contains(&e) {
+                    gs.push(e);
                 }
             }
-            let _ = b;
+        }
+    }
+    // A branch on an `i1` phi (`while (a && b)`): see [`expand_fact`]. Two
+    // rounds cover a `&&` of three.
+    for _ in 0..2 {
+        let snapshot = out.clone();
+        for gs in out.values_mut() {
+            let extra: Vec<(ValueId, bool)> = gs
+                .iter()
+                .flat_map(|&fct| expand_fact(module, &fdefs, &snapshot, fct))
+                .collect();
             for e in extra {
                 if !gs.contains(&e) {
                     gs.push(e);
@@ -1601,6 +2360,102 @@ fn edge_guards(module: &AirModule, f: &AirFunction) -> BTreeMap<BlockId, Vec<(Va
         }
     }
     out
+}
+
+/// Per block, the disjunctions in force on entry: for every dominator `d`
+/// (itself included) that several forward edges enter, one alternative per
+/// predecessor `p`: `p`'s guards and the condition of the edge `p → d`. The
+/// path entered `d` along one of them. Not for loop headers (a back edge's
+/// facts may be about an earlier iteration's values), and not when some
+/// alternative knows nothing (the disjunction would bound nothing).
+fn edge_alternatives(f: &AirFunction, guards: &Guards) -> BTreeMap<BlockId, Vec<Alternatives>> {
+    let Some(g) = Graph::of(f) else {
+        return BTreeMap::new();
+    };
+    let mut at: BTreeMap<BlockId, Alternatives> = BTreeMap::new();
+    for d in &g.ids {
+        let ps = &g.preds[d];
+        if ps.len() < 2 || ps.iter().any(|p| g.dom[p].contains(d)) {
+            continue;
+        }
+        let mut alts: Alternatives = Vec::new();
+        for p in ps {
+            let mut alt = guards.get(p).cloned().unwrap_or_default();
+            if let Some(t) = g.term.get(p) {
+                if let (
+                    Operation::CondBr {
+                        then_target,
+                        else_target,
+                    },
+                    Some(&c),
+                ) = (&t.op, t.operands.first())
+                {
+                    if then_target != else_target {
+                        alt.push((c, then_target == d));
+                    }
+                }
+            }
+            alts.push(alt);
+        }
+        if alts.iter().all(|a| !a.is_empty()) {
+            at.insert(*d, alts);
+        }
+    }
+    g.ids
+        .iter()
+        .map(|b| {
+            let v: Vec<Alternatives> = g.dom[b].iter().filter_map(|d| at.get(d).cloned()).collect();
+            (*b, v)
+        })
+        .collect()
+}
+
+/// Per-function CFG facts for [`Prover::refine_in`].
+#[derive(Default)]
+struct CfgFacts {
+    /// The condition a conditional edge `p → s` establishes.
+    edges: BTreeMap<(BlockId, BlockId), (ValueId, bool)>,
+    /// Phis of loop headers: an incoming back edge's facts may be about an
+    /// earlier iteration's values, so they are never split into alternatives.
+    header_phis: BTreeSet<ValueId>,
+    /// The block of each phi.
+    phis: BTreeMap<ValueId, BlockId>,
+}
+
+impl CfgFacts {
+    fn of(f: &AirFunction) -> Self {
+        let Some(g) = Graph::of(f) else {
+            return Self::default();
+        };
+        let mut out = Self::default();
+        for (p, t) in &g.term {
+            if let (
+                Operation::CondBr {
+                    then_target,
+                    else_target,
+                },
+                Some(&c),
+            ) = (&t.op, t.operands.first())
+            {
+                if then_target != else_target {
+                    out.edges.insert((*p, *then_target), (c, true));
+                    out.edges.insert((*p, *else_target), (c, false));
+                }
+            }
+        }
+        for b in &f.blocks {
+            let header = g.preds[&b.id].iter().any(|p| g.dom[p].contains(&b.id));
+            for i in &b.instructions {
+                if let (Operation::Phi { .. }, Some(d)) = (&i.op, i.dst) {
+                    out.phis.insert(d, b.id);
+                    if header {
+                        out.header_phis.insert(d);
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 fn successors(t: &Instruction) -> Vec<BlockId> {
@@ -1680,31 +2535,40 @@ fn sat_mul(a: u64, b: u128) -> u64 {
     }
 }
 
-/// `v` is `load(g) + c` or `load(g) − c` (`c` a constant): the increment `c`.
-fn increment_of(
+/// A stored value that is a copy of a global plus a constant: `load(h)`
+/// (`c` = 0), `load(h) + c`, `c + load(h)` or `load(h) - c` (the caller checks
+/// that `h` is tracked).
+fn copy_of(
     module: &AirModule,
     defs: &BTreeMap<ValueId, &Instruction>,
     v: ValueId,
-    g: ValueId,
-) -> Option<i128> {
+) -> Option<(ValueId, i128)> {
+    let load_of = |w: ValueId| {
+        defs.get(&w).and_then(|d| {
+            (matches!(d.op, Operation::Load) && !d.is_atomic_pair())
+                .then(|| d.operands.first().copied())
+                .flatten()
+        })
+    };
+    if let Some(h) = load_of(v) {
+        return Some((h, 0));
+    }
     let i = defs.get(&v)?;
     let Operation::BinaryOp { kind } = i.op else {
         return None;
     };
     let [x, y] = i.operands[..] else { return None };
-    let is_load_of_g = |w: ValueId| {
-        defs.get(&w).is_some_and(|d| {
-            matches!(d.op, Operation::Load) && !d.is_atomic_pair() && d.operands.first() == Some(&g)
-        })
-    };
     let konst = |w: ValueId| match module.constants.get(&w) {
         Some(Constant::Int { value, .. }) => Some(i128::from(*value)),
         _ => None,
     };
     match kind {
-        BinaryOp::Add if is_load_of_g(x) => konst(y),
-        BinaryOp::Add if is_load_of_g(y) => konst(x),
-        BinaryOp::Sub if is_load_of_g(x) => konst(y).map(|c| -c),
+        BinaryOp::Add => match (load_of(x), load_of(y)) {
+            (Some(h), _) if konst(y).is_some() => Some((h, konst(y)?)),
+            (_, Some(h)) if konst(x).is_some() => Some((h, konst(x)?)),
+            _ => None,
+        },
+        BinaryOp::Sub => Some((load_of(x)?, -konst(y)?)),
         _ => None,
     }
 }

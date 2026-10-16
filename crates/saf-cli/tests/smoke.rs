@@ -916,6 +916,23 @@ fn verify_overflow_conc_single_writer_and_leaf_are_true() {
     verify_overflow("overflow_true_conc_guarded_leaf.c", "LP64").stdout("true\n");
 }
 
+/// Thread facts the concurrent prover uses: an `assume_abort_if_not` inside
+/// the thread, stores in `main` before the first spawn, increments through
+/// copies between globals, and a bound `main` assumes before spawning the
+/// reader -> `true`.
+#[test]
+#[ignore]
+fn verify_overflow_conc_thread_facts_are_true() {
+    for fx in [
+        "overflow_true_conc_assume_in_thread.c",
+        "overflow_true_conc_pre_spawn_store.c",
+        "overflow_true_conc_copy_chain.c",
+        "overflow_true_conc_frozen_bound.c",
+    ] {
+        verify_overflow(fx, "LP64").stdout("true\n");
+    }
+}
+
 /// Concurrent programs whose shared global CAN overflow (a stored `INT_MAX`, an
 /// atomic add, unboundedly many spawns, an address passed to the thread): the
 /// concurrent prover must not answer `true`.
@@ -930,6 +947,19 @@ fn verify_overflow_conc_overflowing_is_not_true() {
         "overflow_false_conc_unguarded_leaf.c",
         "overflow_false_conc_reread_shared.c",
         "overflow_false_conc_leaf_reads_global.c",
+        // Unsigned increments wrap past `INT_MAX` (once unboundedly, once by
+        // two large steps; once through a copy): the global is `⊤`, not
+        // clamped at the bound.
+        "overflow_false_conc_unsigned_wrap.c",
+        "overflow_false_conc_unsigned_wrap_bounded.c",
+        "overflow_false_conc_copy_wrap.c",
+        // An `assume` helper that can return early; a store after a spawn in
+        // a loop; a bound re-stored after its assume, or assumed only after
+        // the spawn.
+        "overflow_false_conc_assume_early_return.c",
+        "overflow_false_conc_store_after_spawn_loop.c",
+        "overflow_false_conc_frozen_restored.c",
+        "overflow_false_conc_frozen_assume_after_spawn.c",
     ] {
         let out = verify_overflow(fx, "LP64").get_output().stdout.clone();
         assert_ne!(String::from_utf8_lossy(&out).trim(), "true", "{fx}");
