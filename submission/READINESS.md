@@ -238,3 +238,19 @@ refuted); the concurrent no-overflow prover handles single-writer globals, `&&` 
 `saf verify` TRUE on 0 of 4,454 expected-FALSE unreach-call + no-overflow tasks; 0 wrong FALSE over the 540 sanity tasks
 and the 2,826 expected-TRUE memsafety tasks (the two reported label bugs aside); FALSE sweep 3,042 / 3,426.
 Supersedes §15 (v18).
+
+## 17. 2026-10-16 — v19 and v18 withdrawn; upload candidate: `dist/saf-verify-v20.zip` sha256 `ef857d84…` (release v20, `cf031711`)
+
+The v18 and v19 concurrent no-overflow prover clamped a global's summed increments at the type's bound even for
+wrapping (unsigned) adds, so `unsigned u; thread: while (1) u = u + 1; main: (int)u - 1` got `saf verify` → `true`.
+No sv-benchmarks task triggers it (both gate chains were clean), but it is a wrong TRUE; neither archive was uploaded.
+v20 (commit `4879646`) makes such a global ⊤ past the range (regression fixtures `overflow_false_conc_unsigned_wrap*.c`,
+`overflow_false_conc_copy_wrap.c`) and extends the concurrent prover: `assume` calls inside threads, stores in `main`
+before the first spawn, constant-after-spawn globals read at the spawn sites, increments through copies between globals,
+reads inside `__VERIFIER_atomic_begin`/`_end` sections, and disjunctive guards (494 / 661 `C.no-overflow.Concurrency`
+expected-TRUE, was 451; 0 / 8 expected-FALSE). `chain_v20m` (maxwell, competition tasks) is clean: 0 wrong PROVE over
+4,324 unreach / 3,733 no-overflow / 10,087 memsafety / 974 termination expected-FALSE tasks; `saf verify` TRUE on 0 of
+4,454 expected-FALSE unreach-call + no-overflow tasks; 0 wrong FALSE over the 540 sanity tasks and the 2,826
+expected-TRUE memsafety tasks (the two reported label bugs aside); FALSE sweep 3,043 / 3,426. Measured upper
+Overall-eq 23,802 (v19 23,581; about +190 of it from no-overflow, the rest unreach-call time-limit noise on the shared
+host). The archive passed its smoketest. Supersedes §16.
