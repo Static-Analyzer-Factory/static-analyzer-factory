@@ -4371,6 +4371,9 @@ impl<'a> Engine<'a> {
         if let Some(v) = st.memory.get(&cell) {
             return match v {
                 Val::Bv(x, vs) if x.get_size() == bits => Ok(Val::Bv(x.clone(), vs.clone())),
+                Val::Bv(x, vs) if bits < x.get_size() && bits % 8 == 0 && x.get_size() % 8 == 0 => {
+                    Ok(Val::Bv(x.extract(bits - 1, 0), vs.clone()))
+                }
                 Val::Bv(..) => Err("load-width-mismatch".to_string()),
                 Val::Ptr(_) => Err("load-int-from-pointer-cell".to_string()),
             };
@@ -4380,11 +4383,22 @@ impl<'a> Engine<'a> {
             return Ok(self.fresh_val(bits));
         }
         // Part of the loaded bytes was written through another cell (a
-        // narrower or misaligned store): the value is partly unknown.
-        if !self
-            .overlapping_cells(st, &cell, bits.div_ceil(8))
-            .is_empty()
-        {
+        // narrower or misaligned store): the value is partly unknown — unless
+        // one written integer cell holds every loaded byte (a byte read of an
+        // `int`). A written cell is current over all its bytes (`write_cell`
+        // drops the cells a store overlaps), and the targets are little-endian
+        // (x86), so the bytes are bits `[8·d, 8·d + bits)` of its value.
+        let over = self.overlapping_cells(st, &cell, bits.div_ceil(8));
+        if let ([k], Some(off)) = (over.as_slice(), cell_offset(&cell)) {
+            if let (Some(Val::Bv(x, vs)), Some(o)) = (st.memory.get(k), cell_offset(k)) {
+                let w = x.get_size();
+                let lo = (off - o.min(off)) * 8;
+                if o <= off && bits % 8 == 0 && w % 8 == 0 && lo + bits <= w {
+                    return Ok(Val::Bv(x.extract(lo + bits - 1, lo), vs.clone()));
+                }
+            }
+        }
+        if !over.is_empty() {
             trace(|| format!("fresh: load overlaps a written cell of {:?}", cell.0));
             return Ok(self.fresh_val(bits));
         }
@@ -8432,9 +8446,10 @@ mod tests {
         }
     }
 
-    /// `short s[4] = {1,2,3,4}; ((int *)s)[0] = 7; if (s[1] == 2) reach_error();`
+    /// `short s[4] = {1,2,3,4}; ((int *)s)[0] = 7; if (s[1] == 0) reach_error();`
     /// — a 4-byte store through another view overlaps the 2-byte cell `s[1]`:
-    /// it no longer holds its initialiser, and the error is feasible.
+    /// it no longer holds its initialiser 2 but the upper half of 7
+    /// (little-endian), 0, so the error is feasible.
     #[test]
     fn overlapping_store_forgets_the_narrower_cell() {
         use saf_core::air::{AirGlobal, FieldPath, FieldStep, Layout};
@@ -8470,14 +8485,14 @@ mod tests {
         const I16: TypeId = TypeId::new(16);
         b.m.types.insert(I16, AirType::Integer { bits: 16 });
         let (i_ld, v) = b.inst(Operation::Load, vec![p.unwrap()], Some(I16));
-        let two16 = ValueId::new(b.id());
+        let zero16 = ValueId::new(b.id());
         b.m.constants
-            .insert(two16, Constant::Int { value: 2, bits: 16 });
+            .insert(zero16, Constant::Int { value: 0, bits: 16 });
         let (i_eq, eq) = b.inst(
             Operation::BinaryOp {
                 kind: BinaryOp::ICmpEq,
             },
-            vec![v.unwrap(), two16],
+            vec![v.unwrap(), zero16],
             Some(I1),
         );
         let (i_br, _) = b.inst(

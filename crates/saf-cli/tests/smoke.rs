@@ -966,6 +966,25 @@ fn verify_overflow_conc_overflowing_is_not_true() {
     }
 }
 
+/// A local written through another pointer before the overflowing add (a
+/// pointer kept in a global, a struct field or an array; a byte or union
+/// store into the `int`): the PTA-free interval sentinel must not read the
+/// local back as its earlier value, so the answer is never `true`.
+#[test]
+#[ignore]
+fn verify_overflow_aliased_local_is_not_true() {
+    for fx in [
+        "overflow_false_alias_through_global_ptr.c",
+        "overflow_false_alias_ptr_in_struct.c",
+        "overflow_false_alias_ptr_in_array.c",
+        "overflow_false_byte_store_into_int.c",
+        "overflow_false_union_byte_store.c",
+    ] {
+        let out = verify_overflow(fx, "LP64").get_output().stdout.clone();
+        assert_ne!(String::from_utf8_lossy(&out).trim(), "true", "{fx}");
+    }
+}
+
 /// Unconditional signed addition overflow (INT_MAX + 1) -> false(no-overflow) (LP64).
 #[test]
 #[ignore]

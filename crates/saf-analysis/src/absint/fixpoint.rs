@@ -54,6 +54,8 @@ pub struct FixpointContext<'a> {
     pub obj_type_map: Option<&'a BTreeMap<ObjId, TypeId>>,
     /// Optional set of blocks proven unreachable by SCCP.
     pub dead_blocks: Option<&'a BTreeSet<BlockId>>,
+    /// The allocas a PTA-free load may read back ([`super::transfer::private_allocas`]).
+    pub private_allocas: Option<&'a BTreeSet<ValueId>>,
 }
 
 impl<'a> FixpointContext<'a> {
@@ -72,6 +74,7 @@ impl<'a> FixpointContext<'a> {
             global_summaries: None,
             obj_type_map: None,
             dead_blocks: None,
+            private_allocas: None,
         }
     }
 }
@@ -238,7 +241,14 @@ pub fn solve_abstract_interp_with_context(
     } else {
         BTreeMap::new()
     };
+    let private: BTreeSet<ValueId> = module
+        .functions
+        .iter()
+        .filter(|f| !f.is_declaration)
+        .flat_map(|f| super::transfer::private_allocas(f, module))
+        .collect();
     let enriched_ctx = FixpointContext {
+        private_allocas: Some(&private),
         pta: ctx.pta,
         specs: ctx.specs,
         return_intervals: ctx.return_intervals,
@@ -909,6 +919,7 @@ fn apply_transfer(
         global_summaries: ctx.global_summaries,
         specs: ctx.specs,
         obj_type_map: ctx.obj_type_map,
+        private_allocas: ctx.private_allocas,
     };
     transfer_instruction_with_context(inst, state, constant_map, module, &transfer_ctx);
 }
@@ -935,6 +946,7 @@ pub fn solve_function_with_params(
     };
 
     let cfg = Cfg::build(func);
+    let private = super::transfer::private_allocas(func, module);
 
     // Create a modified constant map with parameter bindings
     let mut extended_constant_map = constant_map.clone();
@@ -998,6 +1010,7 @@ pub fn solve_function_with_params(
         }
         let phi_ctx = TransferContext {
             reached_blocks: Some(&reached),
+            private_allocas: Some(&private),
             ..TransferContext::default()
         };
 
@@ -1080,6 +1093,7 @@ pub fn solve_function_with_params(
     }
     let phi_ctx_final = TransferContext {
         reached_blocks: Some(&reached_final),
+        private_allocas: Some(&private),
         ..TransferContext::default()
     };
     for block in &func.blocks {

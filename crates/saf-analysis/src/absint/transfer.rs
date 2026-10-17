@@ -61,6 +61,11 @@ pub struct TransferContext<'a> {
     /// Optional map from allocation `ObjId` to struct `TypeId`.
     /// Used to compute field byte offsets for field-sensitive GEP tracking.
     pub obj_type_map: Option<&'a BTreeMap<ObjId, TypeId>>,
+    /// Without PTA, a load reads what was last stored through the SAME pointer
+    /// value, so it is only sound for an object no other pointer can reach:
+    /// the [`private_allocas`]. Loads through any other pointer are `⊤`.
+    /// `None` keeps the old pointer-keyed behaviour (unit tests only).
+    pub private_allocas: Option<&'a BTreeSet<ValueId>>,
 }
 
 impl<'a> TransferContext<'a> {
@@ -78,6 +83,7 @@ impl<'a> TransferContext<'a> {
             global_summaries: None,
             specs: None,
             obj_type_map: None,
+            private_allocas: None,
         }
     }
 }
@@ -157,6 +163,75 @@ pub fn resolve_operand(
     }
     // Default to top (unknown)
     Interval::make_top(DEFAULT_BITS)
+}
+
+/// The allocas of `func` that no pointer but their own can reach: every use is
+/// the pointer operand of a plain load or store, all of one width. Anything
+/// else (a GEP into it, a cast, passing or storing its address, a byte view of
+/// an `int`) lets another pointer value write it behind the pointer-keyed
+/// memory of the PTA-free analysis.
+#[must_use]
+pub fn private_allocas(func: &saf_core::air::AirFunction, module: &AirModule) -> BTreeSet<ValueId> {
+    #[derive(PartialEq, Eq, Clone, Copy)]
+    enum Width {
+        Int(u16),
+        Ty(TypeId),
+    }
+    let defs: BTreeMap<ValueId, &Instruction> = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|i| i.dst.map(|d| (d, i)))
+        .collect();
+    let ty_width = |t: TypeId| match module.get_type(t) {
+        Some(AirType::Integer { bits }) => Some(Width::Int(*bits)),
+        Some(_) => Some(Width::Ty(t)),
+        None => None,
+    };
+    let value_width = |v: ValueId| -> Option<Width> {
+        if let Some(c) = module.constants.get(&v) {
+            return match c {
+                saf_core::air::Constant::Int { bits, .. } => Some(Width::Int(u16::from(*bits))),
+                _ => None,
+            };
+        }
+        if let Some(p) = func.params.iter().find(|p| p.id == v) {
+            return p.param_type.and_then(ty_width);
+        }
+        defs.get(&v).and_then(|d| d.result_type).and_then(ty_width)
+    };
+    let mut width: BTreeMap<ValueId, Option<Width>> = BTreeMap::new();
+    let mut bad: BTreeSet<ValueId> = BTreeSet::new();
+    for i in func.blocks.iter().flat_map(|b| b.instructions.iter()) {
+        if let (Operation::Alloca { .. }, Some(d)) = (&i.op, i.dst) {
+            width.entry(d).or_insert(None);
+        }
+    }
+    for i in func.blocks.iter().flat_map(|b| b.instructions.iter()) {
+        for (k, v) in i.operands.iter().enumerate() {
+            if !width.contains_key(v) {
+                continue;
+            }
+            let w = match i.op {
+                Operation::Load if k == 0 => i.result_type.and_then(ty_width),
+                Operation::Store if k == 1 => i.operands.first().and_then(|x| value_width(*x)),
+                _ => None,
+            };
+            match (w, width.get(v).copied().flatten()) {
+                (None, _) => {
+                    bad.insert(*v);
+                }
+                (Some(w), None) => {
+                    width.insert(*v, Some(w));
+                }
+                (Some(w), Some(o)) if w != o => {
+                    bad.insert(*v);
+                }
+                _ => {}
+            }
+        }
+    }
+    width.into_keys().filter(|v| !bad.contains(v)).collect()
 }
 
 /// Apply the transfer function for a single instruction with optional context.
@@ -347,11 +422,14 @@ pub fn transfer_instruction_with_context(
                     };
                     state.set(dst, result);
                 } else {
-                    // No PTA: basic ValueId-based load
-                    if let Some(stored_interval) = state.load(ptr) {
-                        state.set(dst, stored_interval.clone());
-                    } else {
-                        state.set(dst, Interval::make_top(DEFAULT_BITS));
+                    // No PTA: basic ValueId-based load — only for a private alloca
+                    // (another pointer may have written any other object).
+                    let trusted = ctx.private_allocas.is_none_or(|p| p.contains(&ptr));
+                    match state.load(ptr) {
+                        Some(stored_interval) if trusted => {
+                            state.set(dst, stored_interval.clone());
+                        }
+                        _ => state.set(dst, Interval::make_top(DEFAULT_BITS)),
                     }
                 }
             } else {

@@ -1828,6 +1828,7 @@ fn solve_single_function_with_pta_and_summaries(
         }
         let transfer_ctx = TransferContext {
             pta: Some(pta),
+            private_allocas: None,
             return_intervals: Some(return_intervals),
             reached_blocks: Some(&reached),
             memory_summaries,
@@ -2027,6 +2028,7 @@ fn solve_single_function_with_pta_and_summaries(
             }
             let narrow_ctx = TransferContext {
                 pta: Some(pta),
+                private_allocas: None,
                 return_intervals: Some(return_intervals),
                 reached_blocks: Some(&narrow_reached),
                 memory_summaries,
@@ -2121,6 +2123,7 @@ fn solve_single_function_with_pta_and_summaries(
     }
     let final_ctx = TransferContext {
         pta: Some(pta),
+        private_allocas: None,
         return_intervals: Some(return_intervals),
         reached_blocks: Some(&final_reached),
         memory_summaries,
