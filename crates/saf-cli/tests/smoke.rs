@@ -281,6 +281,20 @@ fn verify_unreach_true_infeasible_is_proven_natively() {
     verify_unreach("unreach_true_infeasible.c").stdout("true\n");
 }
 
+/// A counter that passes one more constant bound per Houdini consecution
+/// round: the candidate set is still shrinking when the rounds run out, so it
+/// is no invariant, and the error after 25 iterations must not be proven
+/// unreachable (btor2c DAIO wrong TRUE at the competition budget, 2026-10-18).
+#[test]
+#[ignore]
+fn verify_unreach_unconverged_houdini_is_not_true() {
+    let out = verify_unreach("unreach_false_houdini_slow_counter.c")
+        .get_output()
+        .stdout
+        .clone();
+    assert_ne!(String::from_utf8_lossy(&out).trim(), "true");
+}
+
 /// Wrong-TRUE guards from the frontend/engine review: a non-empty asm with a
 /// "memory" clobber writing a global by name, and a program that changes the
 /// rounding mode. None may be `true`. (Reading an uninitialised local whose

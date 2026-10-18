@@ -626,6 +626,9 @@ enum KTerm {
 
 /// Houdini's candidate cap per loop (each costs queries per captured state).
 const KCAND_CAP: usize = 600;
+/// Houdini consecution rounds; a candidate set still shrinking after them
+/// yields no invariant.
+const HOUDINI_ROUNDS: u32 = 16;
 
 /// The single natural loop that k-induction reasons about: in `main`, or in a
 /// loop-free `main`'s single looping callee (plan 223 slice 2).
@@ -2375,9 +2378,14 @@ impl<'a> Engine<'a> {
         self.kcapture_at = None;
         r?;
         self.kprune(&mut cands)?;
-        // Consecution, to a fixpoint.
-        for _ in 0..16 {
+        // Consecution, to a fixpoint. Only a round that drops nothing proves
+        // the set inductive: a set still shrinking when the rounds run out is
+        // NOT an invariant (a counter that passes one more bound per round),
+        // so it yields none (DAIO wrong TRUE, 2026-10-18).
+        let mut stable = false;
+        for _ in 0..HOUDINI_ROUNDS {
             if cands.is_empty() {
+                stable = true;
                 break;
             }
             let before = cands.len();
@@ -2400,8 +2408,13 @@ impl<'a> Engine<'a> {
             }
             self.kprune(&mut cands)?;
             if cands.len() == before {
+                stable = true;
                 break;
             }
+        }
+        if !stable {
+            trace(|| "houdini: consecution did not converge, no invariant".to_string());
+            return Ok(Vec::new());
         }
         trace(|| {
             format!(
@@ -2409,7 +2422,76 @@ impl<'a> Engine<'a> {
                 cands.len()
             )
         });
+        if debug_flag("houdiniaudit") {
+            self.houdini_audit(main, entry, &cands)?;
+        }
         Ok(cands)
+    }
+
+    /// Debug (`SAF_UNREACH_DEBUG=houdiniaudit`): an invariant must hold at every
+    /// REACHABLE header state, so pruning against the exact states of
+    /// iterations 2..=`SAF_HOUDINI_AUDIT_MAX` (8) from the entry drops nothing;
+    /// anything dropped is a false "invariant". Also lists the candidates by
+    /// header-phi position.
+    fn houdini_audit(
+        &mut self,
+        main: &saf_core::air::AirFunction,
+        entry: BlockId,
+        cands: &[KCand],
+    ) -> Res<()> {
+        // The kept candidates over header-phi positions (match them against
+        // the header's phis in the `mem2reg` IR) and other operands.
+        if let Some(lp) = self.kloop.as_ref() {
+            let hdr: Vec<ValueId> = self
+                .module
+                .function(lp.func)
+                .and_then(|f| f.blocks.iter().find(|b| b.id == lp.header))
+                .map(|b| {
+                    b.instructions
+                        .iter()
+                        .filter_map(|i| i.dst.filter(|_| matches!(i.op, Operation::Phi { .. })))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let term = |t: &KTerm| match t {
+                KTerm::Const(k, w) => format!("{k}:i{w}"),
+                KTerm::Val(v) => hdr.iter().position(|x| x == v).map_or_else(
+                    || format!("read[{}]", self.describe(*v)),
+                    |i| format!("phi{i}"),
+                ),
+            };
+            for c in cands {
+                eprintln!("[houdinicand] {} {:?} {}", term(&c.a), c.op, term(&c.b));
+            }
+        }
+        let max: u32 = std::env::var("SAF_HOUDINI_AUDIT_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        for t in 2..=max {
+            let mut probe = cands.to_vec();
+            self.mode = Mode::Base { k: t };
+            self.kcapture_at = Some(t);
+            self.kcaptured.clear();
+            let init = self.initial_state(main, entry);
+            let r = self.run(init);
+            self.kcapture_at = None;
+            if let Err(e) = r {
+                eprintln!("[houdiniaudit] iteration {t}: run stopped ({e})");
+                break;
+            }
+            let n = self.kcaptured.len();
+            self.kprune(&mut probe)?;
+            let lost: Vec<&KCand> = cands.iter().filter(|c| !probe.contains(c)).collect();
+            eprintln!(
+                "[houdiniaudit] iteration {t}: {n} states, {} false: {lost:?}",
+                lost.len()
+            );
+            if !lost.is_empty() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Exhaustively explore from `init`. `Ok(())` ⇒ no feasible error call.
