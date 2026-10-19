@@ -254,3 +254,18 @@ expected-TRUE, was 451; 0 / 8 expected-FALSE). `chain_v20m` (maxwell, competitio
 expected-TRUE memsafety tasks (the two reported label bugs aside); FALSE sweep 3,043 / 3,426. Measured upper
 Overall-eq 23,802 (v19 23,581; about +190 of it from no-overflow, the rest unreach-call time-limit noise on the shared
 host). The archive passed its smoketest. Supersedes §16.
+
+## 18. 2026-10-19 — v20 and v21 withdrawn; upload candidate: `dist/saf-verify-v22.zip` sha256 `999e36cd…` (release v22, `af587071`)
+
+Two more wrong-TRUE holes, both in every release before v22, neither triggered at the 20 s budget the earlier gates used:
+the no-overflow interval sentinel read an address-taken local back as the value last stored through the same pointer,
+missing stores through other pointers (`int *gp = &x; *gp = INT_MAX; x + 1`: 5 crafted `true`s; fixed in v21, commit
+`25ea80c`: PTA-free loads trust memory only for private allocas); and Houdini returned a candidate set that was still
+shrinking when its 16 consecution rounds ran out, so 1-induction PROVEd the competition task
+`hardware-verification-bv/btor2c-lazyMod.v_DAIO.c` (expected FALSE) after ~67 s — reached only at the competition TRUE
+budget (283 s = min(850/3, 300)); fixed in v22, commit `2b739b3`. Gate chains now include a re-audit at that budget of
+every expected-FALSE task the 20 s audit left budget-bound. `chain_v22m` (maxwell) is clean: 0 wrong PROVE over 4,324
+unreach / 3,733 no-overflow / 10,087 memsafety / 974 termination expected-FALSE tasks, and 0 over the 3,005 budget-bound
+ones at 283 s; `saf verify` TRUE on 0 of 4,454 expected-FALSE unreach-call + no-overflow tasks; 0 wrong FALSE over the
+540 sanity tasks and the 2,826 expected-TRUE memsafety tasks (label bugs aside). The archive passed its smoketest.
+SV-COMP 2027 runs on Ubuntu 26.04; `clang-18`, `libclang-rt-18-dev` and `libffi8` exist there. Supersedes §17.
