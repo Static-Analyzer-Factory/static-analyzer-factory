@@ -81,6 +81,10 @@ competition_participations:
         name: Gelei Deng
       - orcid: 0000-0001-7983-2544
         name: Hongxu Chen
+    categories:
+      - C.Overall
+      - C.TrueOverall
+      - C.FalseOverall
 
 techniques:
   - Abstract Interpretation
