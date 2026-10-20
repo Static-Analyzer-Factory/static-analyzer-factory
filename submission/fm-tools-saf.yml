@@ -54,7 +54,7 @@ versions:
       - llvm-18
       - zlib1g
     base_container_images:
-      - docker.io/ubuntu:24.04
+      - docker.io/ubuntu:26.04
 
 competition_participations:
   - competition: "SV-COMP 2027"
