@@ -269,3 +269,19 @@ unreach / 3,733 no-overflow / 10,087 memsafety / 974 termination expected-FALSE 
 ones at 283 s; `saf verify` TRUE on 0 of 4,454 expected-FALSE unreach-call + no-overflow tasks; 0 wrong FALSE over the
 540 sanity tasks and the 2,826 expected-TRUE memsafety tasks (label bugs aside). The archive passed its smoketest.
 SV-COMP 2027 runs on Ubuntu 26.04; `clang-18`, `libclang-rt-18-dev` and `libffi8` exist there. Supersedes §17.
+
+## 19. 2026-10-20 — submitted: Zenodo published, BenchExec PR open, fm-tools MR updated
+
+- **Zenodo:** record `10.5281/zenodo.23251564` (version DOI) published, version `svcomp27`, MIT, one file
+  `saf-verify.zip` = `dist/saf-verify-v22.zip` (sha256 `999e36cd…`, md5 `05b744ac…`); re-downloaded and byte-identical,
+  and its `smoketest.sh` passes both in the dev image and in `competition-scripts/user:2027` (Ubuntu 26.04.1) with the
+  ten `required_ubuntu_packages` installed (all ten exist there).
+- **BenchExec:** <https://github.com/sosy-lab/benchexec/pull/1340> adds `benchexec/tools/saf.py` (this repo's file);
+  all 15 GitHub checks pass; `test_tool_info` against the Zenodo archive is clean. Awaiting review — fm-tools'
+  `check-archives-2027` needs it merged.
+- **fm-tools MR !1166:** `categories: [C.Overall, C.TrueOverall, C.FalseOverall]` added; branch rebased onto current
+  `main` (`7a1697a`) so the pipeline includes the 2027 jobs. Locally: format, consistency, sort, file conventions,
+  schema `--year 2027 --check-handles` all pass. The fork has no runners (instance runners cannot be enabled), so
+  every MR pipeline ends `stuck_pending_no_matching_runners`; the maintainers have to run it in the parent project.
+- **Open (human):** MR comment / e-mail to the organizers (dirk.beyer@lmu.de, strejcek@fi.muni.cz) announcing the jury
+  member's address and asking for the parent-project pipeline run.
