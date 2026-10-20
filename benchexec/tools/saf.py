@@ -2,7 +2,6 @@
 # https://github.com/sosy-lab/benchexec
 #
 # SPDX-FileCopyrightText: 2007-2020 Dirk Beyer <https://www.sosy-lab.org>
-# SPDX-FileCopyrightText: 2026 PLACEHOLDER-SAF-COPYRIGHT-HOLDER
 #
 # SPDX-License-Identifier: Apache-2.0
 
@@ -20,17 +19,11 @@ class Tool(benchexec.tools.template.BaseTool2):
     point. That subcommand writes exactly one verdict line to stdout, always one
     of the BenchExec RESULT_* strings, and every diagnostic message to stderr.
 
-    Properties that SAF has a strategy for, with the verdicts it reports for
-    each of them in the current version:
-      unreach-call     "false(unreach-call)"
-      valid-memsafety  "false(valid-deref)", "false(valid-free)"
-      no-overflow      "false(no-overflow)"
-      termination      "true"
-      no-data-race     "true", "false(no-data-race)"
-    Every other property, valid-memcleanup and the coverage properties for
-    example, yields "unknown", and so does every task that a strategy cannot
-    decide. This module does not depend on the table above: it accepts any
-    RESULT_* verdict that SAF prints, including subproperties not listed here.
+    SAF reports "true", "false(<subproperty>)" (for example
+    "false(unreach-call)" or "false(valid-deref)") or "unknown"; properties it
+    has no strategy for, and tasks it cannot decide, yield "unknown". This
+    module accepts any RESULT_* verdict that SAF prints, so it does not need to
+    change when SAF learns a new property or subproperty.
 
     A property file is required. SAF reads the CHECK(... LTL ...) directive out
     of the given .prp file and never looks at the file name, so it cannot run
