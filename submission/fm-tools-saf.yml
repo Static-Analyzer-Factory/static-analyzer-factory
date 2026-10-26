@@ -40,7 +40,7 @@ maintainers:
 
 versions:
   # REPLACE-ME: the version DOI of the Zenodo record's new version (saf-verify-l21.zip), once published.
-  - version: "svcomp27-llvm21"
+  - version: "svcomp27"
     doi: 10.5281/zenodo.0000000
     benchexec_toolinfo_options: []
     required_ubuntu_packages:
@@ -55,27 +55,11 @@ versions:
       - zlib1g
     base_container_images:
       - docker.io/ubuntu:26.04
-  - version: "svcomp27"
-    doi: 10.5281/zenodo.23251564
-    benchexec_toolinfo_options: []
-    required_ubuntu_packages:
-      - clang-18
-      - libc6-dev-i386
-      - libclang-rt-18-dev
-      - libffi8
-      - libgcc-s1
-      - libstdc++6
-      - libtinfo6
-      - libzstd1
-      - llvm-18
-      - zlib1g
-    base_container_images:
-      - docker.io/ubuntu:26.04
 
 competition_participations:
   - competition: "SV-COMP 2027"
     track: "Verification"
-    tool_version: "svcomp27-llvm21"
+    tool_version: "svcomp27"
     jury_member:
       orcid: 0000-0003-0576-6243
       name: Wei Li
