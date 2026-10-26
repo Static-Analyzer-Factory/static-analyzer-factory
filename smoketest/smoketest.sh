@@ -26,7 +26,8 @@
 #      the load-bearing end-to-end assertion for the archive layout.
 #   3. A nondet-guarded reachable error yields exactly `false(unreach-call)`
 #      and a non-empty YAML-2.0 violation witness. Reaching that verdict needs
-#      clang-18/opt-18 on PATH (or $SAF_CLANG/$SAF_OPT) plus the linked-in Z3;
+#      the clang-N/opt-N of the LLVM SAF links (N from `saf --version`) on PATH
+#      (or $SAF_CLANG/$SAF_OPT) plus the linked-in Z3;
 #      with any of them missing SAF degrades to `unknown` and this fails.
 #   4. An undecidable task yields exactly `unknown` and writes NO witness.
 #
@@ -103,7 +104,7 @@ esac
 #
 # It ALSO rejects a version that starts with the name the tool-info module
 # reports -- but that check reads the MODULE's version(), not this binary's raw
-# output. clap prints "saf 0.1.0 (LLVM 18.1)" and benchexec/tools/saf.py strips
+# output. clap prints e.g. "saf 0.1.0 (LLVM 21.1)" and benchexec/tools/saf.py strips
 # the leading tool-name token before handing it to fm-tools. So the digit-first
 # property is pinned in benchexec/tools/test_saf.py, parametrised over the exact
 # string this binary prints. Asserting it here would be stricter than SV-COMP

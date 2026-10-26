@@ -45,7 +45,7 @@
 #   SAF_ARCHIVE_MAX_GLIBC    highest tolerated GLIBC_     (default 2.39)
 #   SAF_ARCHIVE_TIMESTAMP    mtime stamped on every entry (default 2020-01-01T00:00:00Z)
 #   SAF_ARCHIVE_SKIP_SMOKETEST=1  skip running the smoke test on the unpacked
-#                            archive (only for hosts without clang-18; the
+#                            archive (only for hosts without clang-N; the
 #                            archive is then NOT fully verified)
 #
 # SPDX-License-Identifier: MIT
@@ -177,7 +177,7 @@ GLIBC_MAX="$(objdump -T "$SAF_BIN" 2>/dev/null | grep -o 'GLIBC_2\.[0-9]*' | sor
 GLIBC_HIGHEST="$(printf '%s\nGLIBC_%s\n' "$GLIBC_MAX" "$MAX_GLIBC" | sort -uV | tail -1)"
 [ "$GLIBC_HIGHEST" = "GLIBC_$MAX_GLIBC" ] ||
     die "binary requires $GLIBC_MAX but the competition image provides at most GLIBC_$MAX_GLIBC
-      Build against an older glibc (the LLVM-18 dev image) or raise SAF_ARCHIVE_MAX_GLIBC
+      Build against an older glibc (the Ubuntu 24.04 dev images) or raise SAF_ARCHIVE_MAX_GLIBC
       only after confirming the competition's Ubuntu release."
 info "max glibc symbol: $GLIBC_MAX (limit GLIBC_$MAX_GLIBC)"
 
@@ -260,6 +260,12 @@ done
 SAF_VERSION="$("$ROOT/bin/saf" --version 2>/dev/null || true)"
 [ -n "$SAF_VERSION" ] || die "'bin/saf --version' produced no output from the staged tree"
 info "version string: $SAF_VERSION"
+# The LLVM major the binary links ("saf 0.1.0 (LLVM 21.1)" -> 21): it spawns the
+# matching clang-N / opt-N, and the README names those and the runtime packages.
+LLVM_MAJOR="$(printf '%s' "$SAF_VERSION" | sed -n 's/.*(LLVM \([0-9][0-9]*\)\..*/\1/p')"
+[ -n "$LLVM_MAJOR" ] || die "cannot read the LLVM version from '$SAF_VERSION'"
+# Shared libraries beyond the loader / vdso, as the README lists them.
+SAF_LIBS="$(printf '%s\n' "$LDD_OUT" | awk '$2 == "=>" {print $1}' | grep -v '^linux-vdso' | paste -sd, - | sed 's/,/, /g')"
 
 cat >"$ROOT/README.md" <<EOF
 # SAF — Static Analyzer Factory (SV-COMP submission archive)
@@ -311,11 +317,10 @@ makes every task answer \`unknown\`.
 
 x86-64 Linux, glibc ≥ 2.39 (the highest \`GLIBC_\` symbol version the binary
 references; asserted at archive-build time). LLVM and Z3 are linked statically.
-At run time SAF spawns \`clang-18\` and \`opt-18\` (override with \`\$SAF_CLANG\` /
+At run time SAF spawns \`clang-${LLVM_MAJOR}\` and \`opt-${LLVM_MAJOR}\` (override with \`\$SAF_CLANG\` /
 \`\$SAF_OPT\`) to compile the task and its replay harnesses; the sanitizer runtimes
-(\`libclang-rt-18-dev\`) are needed for the memory-safety and overflow
-confirmers. Remaining shared-library dependencies: libffi.so.8, libm, libz,
-libzstd.so.1, libtinfo.so.6, libstdc++, libgcc_s, libc.
+(\`libclang-rt-${LLVM_MAJOR}-dev\`) and \`llvm-symbolizer-${LLVM_MAJOR}\` (\`llvm-${LLVM_MAJOR}\`) are needed for the
+memory-safety and overflow confirmers. Shared-library dependencies: ${SAF_LIBS}.
 
 SAF bundles **no** SV-COMP participant — no other verifier is shipped or
 invoked. clang/opt are compilers and the sanitizers are runtime libraries;
@@ -594,7 +599,7 @@ else
     step "run smoketest.sh on the unpacked archive"
     (cd "$UNPACKED" && ./smoketest.sh) ||
         die "smoketest.sh failed on the unpacked archive.
-      Run it inside the dev container (clang-18/opt-18 must be on PATH), or set
+      Run it inside the dev container (clang-${LLVM_MAJOR}/opt-${LLVM_MAJOR} must be on PATH), or set
       SAF_ARCHIVE_SKIP_SMOKETEST=1 to build an explicitly unverified archive."
 fi
 
