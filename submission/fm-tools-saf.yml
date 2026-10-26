@@ -39,9 +39,8 @@ maintainers:
     url:
 
 versions:
-  # REPLACE-ME: the version DOI of the Zenodo record's new version (saf-verify-l21.zip), once published.
   - version: "svcomp27"
-    doi: 10.5281/zenodo.0000000
+    doi: 10.5281/zenodo.23659307
     benchexec_toolinfo_options: []
     required_ubuntu_packages:
       - clang-21
