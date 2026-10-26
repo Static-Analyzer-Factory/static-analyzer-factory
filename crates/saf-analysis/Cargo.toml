@@ -32,6 +32,7 @@ analysis-cegar = []
 analysis-invariants = []
 # LLVM version selection for dev-dependencies (saf-frontends, saf-test-utils):
 llvm-18 = ["saf-frontends/llvm-18", "saf-test-utils/llvm-18"]
+llvm-21 = ["saf-frontends/llvm-21", "saf-test-utils/llvm-21"]
 llvm-22 = ["saf-frontends/llvm-22", "saf-test-utils/llvm-22"]
 
 [dev-dependencies]

@@ -16,8 +16,9 @@ path = "src/main.rs"
 
 [features]
 default = ["llvm-18"]
-llvm-18 = ["saf-frontends/llvm-18"]
-llvm-22 = ["saf-frontends/llvm-22"]
+llvm-18 = ["saf-frontends/llvm-18", "saf-test-utils/llvm-18"]
+llvm-21 = ["saf-frontends/llvm-21", "saf-test-utils/llvm-21"]
+llvm-22 = ["saf-frontends/llvm-22", "saf-test-utils/llvm-22"]
 
 [dependencies]
 saf-core = { workspace = true, features = ["logging-subscriber"] }
@@ -40,4 +41,4 @@ libc = "0.2"
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
-saf-test-utils = { path = "../saf-test-utils" }
+saf-test-utils = { path = "../saf-test-utils", default-features = false }

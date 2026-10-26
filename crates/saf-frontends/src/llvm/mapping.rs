@@ -3,7 +3,7 @@
 //! Converts LLVM instructions, values, and types to their AIR equivalents.
 //! This is the core conversion logic shared by all LLVM version adapters.
 
-#![cfg(any(feature = "llvm-18", feature = "llvm-22"))]
+#![cfg(any(feature = "llvm-18", feature = "llvm-21", feature = "llvm-22"))]
 
 use std::collections::{BTreeMap, BTreeSet};
 

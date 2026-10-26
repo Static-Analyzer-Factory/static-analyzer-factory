@@ -3290,6 +3290,24 @@ impl<'a> Engine<'a> {
     }
 
     /// Developer trace helper: the instruction defining `vid`, or what else it is.
+    /// The memory cells of `st` that hold a pointer, and what each points to
+    /// (for traces).
+    fn pointer_cells(&self, st: &State) -> String {
+        let cells: Vec<String> = st
+            .memory
+            .iter()
+            .filter(|(_, v)| matches!(v, Val::Ptr(_)))
+            .map(|(k, v)| {
+                let to = match v {
+                    Val::Ptr(Some((base, _))) => self.describe(*base),
+                    _ => "opaque".to_string(),
+                };
+                format!("{} -> {to}", self.describe(k.0))
+            })
+            .collect();
+        format!("pointers in memory: {cells:?}")
+    }
+
     fn describe(&self, vid: ValueId) -> String {
         if let Some(c) = self.module.constants.get(&vid) {
             return format!("constant {c:?}");
@@ -4995,6 +5013,7 @@ impl<'a> Engine<'a> {
             }
         }
         if !self.cex_mode && st.memory.values().any(|v| matches!(v, Val::Ptr(_))) {
+            trace(|| format!("extern {name}: {}", self.pointer_cells(st)));
             return Err(format!("extern-{name}-pointer-in-memory"));
         }
         trace(|| format!("fresh: unknown extern {name} havocs globals + pointee args"));

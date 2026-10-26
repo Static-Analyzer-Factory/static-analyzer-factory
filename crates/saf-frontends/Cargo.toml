@@ -9,6 +9,7 @@ description = "Frontend trait and implementations (LLVM, AIR JSON) for the Stati
 [features]
 default = ["llvm-18"]
 llvm-18 = ["dep:inkwell", "inkwell/llvm18-1"]
+llvm-21 = ["dep:inkwell", "inkwell/llvm21-1"]
 llvm-22 = ["dep:inkwell", "inkwell/llvm22-1"]
 
 [dependencies]

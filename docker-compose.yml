@@ -76,6 +76,35 @@ services:
         LLVM_VERSION: "18"
 
   # -------------------------------------------------------------------------
+  # LLVM 21 — the clang/llvm that the SV-COMP 2027 image (Ubuntu 26.04) ships.
+  # Shares the version-independent cargo caches with LLVM 18; only the build
+  # cache is separate.
+  # -------------------------------------------------------------------------
+  dev-llvm21:
+    build:
+      context: .
+      target: dev
+      args:
+        APT_MIRROR: ${APT_MIRROR-mirrors.aliyun.com}
+        LLVM_VERSION: "21"
+    image: saf-dev:llvm21
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - LLVM_VERSION=21
+      - SAF_CARGO_FEATURES=--no-default-features --features "saf-frontends/llvm-21,saf-analysis/z3-solver,saf-core/logging-subscriber,saf-cli/llvm-21,saf-bench/llvm-21,saf-trace/llvm-21,saf-datalog/llvm-21,saf-test-utils/llvm-21"
+    volumes:
+      - .:/workspace
+      - cargo-registry-llvm18:/opt/cargo/registry
+      - cargo-git-llvm18:/opt/cargo/git
+      - cargo-bin-llvm18:/opt/cargo/bin
+      - target-cache-llvm21:/workspace/target
+      - maturin-cache-llvm21:/workspace/target-maturin
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+
+  # -------------------------------------------------------------------------
   # LLVM 22 — opt-in; parallel image stream with isolated caches.
   # -------------------------------------------------------------------------
   dev-llvm22:
@@ -160,6 +189,8 @@ volumes:
   target-cache-llvm18:
   maturin-cache-llvm18:
   # LLVM-22 caches
+  target-cache-llvm21:
+  maturin-cache-llvm21:
   cargo-registry-llvm22:
   cargo-git-llvm22:
   cargo-bin-llvm22:

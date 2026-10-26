@@ -3,19 +3,19 @@
 //! This trait abstracts over LLVM version differences, allowing the frontend
 //! to work with LLVM 18, 22, or future versions through a common interface.
 
-#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-21", feature = "llvm-22"))]
 use inkwell::context::Context;
-#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-21", feature = "llvm-22"))]
 use inkwell::module::Module;
 
-#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-21", feature = "llvm-22"))]
 use super::error::LlvmError;
 
 /// Version-agnostic interface to LLVM operations.
 ///
 /// Each supported LLVM version implements this trait with version-specific
 /// handling where needed.
-#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-21", feature = "llvm-22"))]
 #[allow(dead_code)] // Trait contract: methods implemented by version-specific adapters via impl_llvm_adapter! macro
 pub trait LlvmAdapter: Send + Sync {
     /// Get the LLVM version string (e.g., "18.1", "22.1").
@@ -42,7 +42,7 @@ pub trait LlvmAdapter: Send + Sync {
 }
 
 /// Stub adapter trait when no LLVM feature is enabled.
-#[cfg(not(any(feature = "llvm-18", feature = "llvm-22")))]
+#[cfg(not(any(feature = "llvm-18", feature = "llvm-21", feature = "llvm-22")))]
 #[allow(dead_code)] // Stub trait for compilation when no LLVM feature is enabled
 pub trait LlvmAdapter: Send + Sync {
     /// Get the LLVM version string.
@@ -53,7 +53,7 @@ pub trait LlvmAdapter: Send + Sync {
 ///
 /// All LLVM versions share the same implementation — only the struct name
 /// and version string differ. This macro eliminates the duplication.
-#[cfg(any(feature = "llvm-18", feature = "llvm-22"))]
+#[cfg(any(feature = "llvm-18", feature = "llvm-21", feature = "llvm-22"))]
 macro_rules! impl_llvm_adapter {
     ($name:ident, $version:expr) => {
         /// Adapter for a specific LLVM version.
@@ -115,13 +115,21 @@ pub fn create_adapter() -> Box<dyn LlvmAdapter> {
     Box::new(super::llvm18::Llvm18Adapter)
 }
 
-#[cfg(all(feature = "llvm-22", not(feature = "llvm-18")))]
+#[cfg(all(feature = "llvm-21", not(feature = "llvm-18")))]
+pub fn create_adapter() -> Box<dyn LlvmAdapter> {
+    Box::new(super::llvm21::Llvm21Adapter)
+}
+
+#[cfg(all(
+    feature = "llvm-22",
+    not(any(feature = "llvm-18", feature = "llvm-21"))
+))]
 pub fn create_adapter() -> Box<dyn LlvmAdapter> {
     Box::new(super::llvm22::Llvm22Adapter)
 }
 
-#[cfg(not(any(feature = "llvm-18", feature = "llvm-22")))]
+#[cfg(not(any(feature = "llvm-18", feature = "llvm-21", feature = "llvm-22")))]
 #[allow(dead_code)] // Stub for compilation when no LLVM feature is enabled
 pub fn create_adapter() -> Box<dyn LlvmAdapter> {
-    panic!("LLVM frontend requires either llvm-18 or llvm-22 feature to be enabled")
+    panic!("LLVM frontend requires the llvm-18, llvm-21 or llvm-22 feature to be enabled")
 }

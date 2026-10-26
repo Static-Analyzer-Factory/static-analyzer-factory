@@ -13,6 +13,7 @@ path = "src/main.rs"
 [features]
 default = ["llvm-18"]
 llvm-18 = ["saf-frontends/llvm-18"]
+llvm-21 = ["saf-frontends/llvm-21"]
 llvm-22 = ["saf-frontends/llvm-22"]
 
 [dependencies]

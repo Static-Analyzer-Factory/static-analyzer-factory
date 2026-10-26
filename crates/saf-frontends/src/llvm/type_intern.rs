@@ -3,7 +3,7 @@
 //! Deduplicates `AirType` values into a centralized type table using
 //! content-addressed `TypeId` derivation for deterministic IDs.
 
-#![cfg(any(feature = "llvm-18", feature = "llvm-22"))]
+#![cfg(any(feature = "llvm-18", feature = "llvm-21", feature = "llvm-22"))]
 
 use std::collections::BTreeMap;
 

@@ -1105,6 +1105,7 @@ dependencies = [
  "inkwell_internals",
  "libc",
  "llvm-sys 181.3.0",
+ "llvm-sys 211.1.0",
  "llvm-sys 221.0.1",
  "thiserror",
 ]
@@ -1276,6 +1277,20 @@ name = "llvm-sys"
 version = "181.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e24aad69cbdb0c6ebe777262e9e6314dceba0d6e6a2a63e47563ccd293a2eda8"
+dependencies = [
+ "anyhow",
+ "cc",
+ "lazy_static",
+ "libc",
+ "regex-lite",
+ "semver",
+]
+
+[[package]]
+name = "llvm-sys"
+version = "211.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d46d5a98158d96b6bf216265dcd8200378c1e01ae9e40b2a3ad25d70a337aa1e"
 dependencies = [
  "anyhow",
  "cc",

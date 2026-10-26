@@ -327,11 +327,16 @@ impl From<CliDataModel> for saf_svcomp::DataModel {
 // Version string surfaced by `saf --version`. Includes the LLVM major.minor
 // this binary links against so users can tell LLVM 18 and LLVM 22 images
 // apart without running an analysis.
-#[cfg(all(feature = "llvm-18", not(feature = "llvm-22")))]
+#[cfg(feature = "llvm-18")]
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (LLVM 18.1)");
-#[cfg(all(feature = "llvm-22", not(feature = "llvm-18")))]
+#[cfg(all(feature = "llvm-21", not(feature = "llvm-18")))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (LLVM 21.1)");
+#[cfg(all(
+    feature = "llvm-22",
+    not(any(feature = "llvm-18", feature = "llvm-21"))
+))]
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (LLVM 22.1)");
-#[cfg(not(any(feature = "llvm-18", feature = "llvm-22")))]
+#[cfg(not(any(feature = "llvm-18", feature = "llvm-21", feature = "llvm-22")))]
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (no LLVM)");
 
 #[derive(Parser)]
@@ -1216,9 +1221,13 @@ pub fn memsafe_prove_cmd(args: &MemsafeProveArgs) -> anyhow::Result<()> {
 const DEFAULT_CLANG: &str = "clang-22";
 #[cfg(feature = "llvm-22")]
 const DEFAULT_OPT: &str = "opt-22";
-#[cfg(not(feature = "llvm-22"))]
+#[cfg(feature = "llvm-21")]
+const DEFAULT_CLANG: &str = "clang-21";
+#[cfg(feature = "llvm-21")]
+const DEFAULT_OPT: &str = "opt-21";
+#[cfg(not(any(feature = "llvm-21", feature = "llvm-22")))]
 const DEFAULT_CLANG: &str = "clang-18";
-#[cfg(not(feature = "llvm-22"))]
+#[cfg(not(any(feature = "llvm-21", feature = "llvm-22")))]
 const DEFAULT_OPT: &str = "opt-18";
 
 /// Locate the bundled SV-COMP stub header, independently of the CWD.
@@ -1585,9 +1594,13 @@ fn memsafety_pin_escaped(text: &str) -> String {
                         // type; a stored VALUE `store ptr %x, ptr %p` is an escape.
                         let is_store_value =
                             t.starts_with("store ") && t[end..].trim_start().starts_with(", ptr ");
-                        // Lifetime markers and debug-info intrinsics are not
-                        // uses of the address.
-                        let lifetime = t.contains("@llvm.lifetime.") || t.contains("@llvm.dbg.");
+                        // Lifetime markers and debug info — the `@llvm.dbg.*`
+                        // intrinsics up to LLVM 18, the `#dbg_declare(...)` /
+                        // `#dbg_value(...)` records from LLVM 19 — are not uses
+                        // of the address.
+                        let lifetime = t.contains("@llvm.lifetime.")
+                            || t.contains("@llvm.dbg.")
+                            || t.starts_with("#dbg_");
                         if lifetime || (address_of_access && !is_store_value) {
                             continue;
                         }
@@ -8702,6 +8715,26 @@ mod verify_tests {
         );
         let lit = "define i32 @main() {\n  %.compoundliteral = alloca [2 x i32]\n  ret i32 0\n}\n";
         assert!(memsafety_rewrite_ir(lit).is_none());
+    }
+
+    /// Debug info is no use of a local's address, in either spelling: the
+    /// `@llvm.dbg.declare` call up to LLVM 18 and the `#dbg_declare` record
+    /// from LLVM 19. A stored value is an escape and stays pinned.
+    #[test]
+    fn memsafety_pin_ignores_debug_records() {
+        let keep = format!("call void @{}(ptr %", saf_svcomp::KEEP_ALIVE);
+        for dbg in [
+            "  call void @llvm.dbg.declare(metadata ptr %argv.addr, metadata !18, metadata !DIExpression()), !dbg !19",
+            "    #dbg_declare(ptr %argv.addr, !18, !DIExpression(), !19)",
+        ] {
+            let ir = format!(
+                "define i32 @main(ptr %argv) {{\n  %argv.addr = alloca ptr\n  %p = alloca ptr\n  %x = alloca i32\n  store ptr %argv, ptr %argv.addr\n{dbg}\n  store ptr %x, ptr %p\n  ret i32 0\n}}\n"
+            );
+            let out = memsafety_pin_escaped(&ir);
+            assert!(!out.contains(&format!("{keep}argv.addr)")), "{out}");
+            assert!(!out.contains(&format!("{keep}p)")), "{out}");
+            assert!(out.contains(&format!("{keep}x)")), "{out}");
+        }
     }
 
     #[test]
