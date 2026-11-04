@@ -6729,8 +6729,10 @@ fn dev_prove_concurrent(
 /// (execution bounds + flow-insensitive global ranges). A dropped or
 /// unmodelled instruction other than an atomic read-modify-write (which the
 /// prover handles: its target is untracked) gates it. The correctness witness
-/// is an empty `invariant_set`: `C.no-overflow.Concurrency` takes no witness,
-/// and SAF's interval invariants are sequential.
+/// is an empty `invariant_set` declaring format 2.1 — SV-COMP 2027 requires
+/// 2.1 or higher for `C.no-overflow.Concurrency` (the training run's 2.0
+/// documents left 100 TRUE verdicts unconfirmed) — as SAF's interval
+/// invariants are sequential.
 fn try_overflow_true_concurrent(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     let m = ctx.module;
     if conc_prover_blocked_by_dropped(m) {
@@ -6746,7 +6748,7 @@ fn try_overflow_true_concurrent(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
                 verdict: "true".to_string(),
                 witness: None,
                 graphml: None,
-                correctness: Some(saf_svcomp::InvariantSetWitness::empty(ctx.meta)),
+                correctness: Some(saf_svcomp::InvariantSetWitness::empty_2_1(ctx.meta)),
             })
         }
         saf_svcomp::ConcOverflowProof::Abstain(reason) => {
