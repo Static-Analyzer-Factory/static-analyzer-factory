@@ -94,12 +94,15 @@ pub use se_interp::{enumerate_concolic_flip_seeds, enumerate_se_candidates};
 pub use termination::{
     is_known_returning_external, program_structurally_terminates, termination_verdict,
 };
-pub use termination_witness::{build_ranking_witness, build_termination_witness};
+pub use termination_witness::{
+    build_nontermination_witness, build_ranking_witness, build_termination_witness,
+};
 pub use unreach_prove::{
     CexOptions, Counterexample, ExhaustiveProof, HeaderStates, KEEP_ALIVE, LIFETIME_END,
-    LIFETIME_START, PINNED_EXTERNS, StateVar, find_counterexample, find_counterexample_excluding,
-    is_pinned_extern, module_has_failable_allocation, prove_memcleanup_exhaustive,
-    prove_memsafety_exhaustive, prove_no_overflow_exhaustive, prove_no_overflow_exhaustive_shl,
+    LIFETIME_START, Lasso, PINNED_EXTERNS, StateVar, find_counterexample,
+    find_counterexample_excluding, find_nontermination, is_pinned_extern,
+    module_has_failable_allocation, prove_memcleanup_exhaustive, prove_memsafety_exhaustive,
+    prove_no_overflow_exhaustive, prove_no_overflow_exhaustive_shl,
     prove_no_overflow_exhaustive_with_states, prove_no_overflow_exhaustive_with_states_shl,
     prove_termination_exhaustive, prove_unreach_exhaustive, prove_unreach_exhaustive_with_states,
 };

@@ -277,6 +277,43 @@ fn still_proves_unreachable_with_null_guarded_allocation() {
 }
 
 // ---------------------------------------------------------------------------
+// valid-memsafety leak check at a termination
+//
+// At `abort`/`exit` the call stack still exists: a block an active function can
+// still use is not lost, one whose last pointer was overwritten is.
+// ---------------------------------------------------------------------------
+
+/// `saf verify --property valid-memsafety.prp --data-model LP64 <fixture>`, asserting exit 0.
+fn verify_memsafety(name: &str) -> assert_cmd::assert::Assert {
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            fixture("valid-memsafety.prp").as_str(),
+            "--data-model",
+            "LP64",
+            fixture(name).as_str(),
+        ])
+        .assert()
+        .success()
+}
+
+/// `safe_malloc` aborts on NULL while `main` holds the earlier block: TRUE.
+#[test]
+#[ignore]
+fn memsafety_true_when_abort_happens_while_the_caller_holds_the_block() {
+    verify_memsafety("memsafety_true_abort_while_caller_holds.c").stdout(predicate::eq("true\n"));
+}
+
+/// The block's only pointer is overwritten before `abort()`: never TRUE.
+#[test]
+#[ignore]
+fn memsafety_not_true_when_the_block_is_lost_before_abort() {
+    verify_memsafety("memsafety_false_lost_before_abort.c")
+        .stdout(predicate::str::contains("true").not());
+}
+
+// ---------------------------------------------------------------------------
 // valid-memcleanup
 //
 // Every allocated block must be freed before the program terminates; both

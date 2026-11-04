@@ -45,12 +45,15 @@ use saf_core::air::AirModule;
 use saf_core::ids::ValueId;
 
 use crate::correctness_driver::{
-    build_value_names, header_has_function_call, is_c_identifier, loop_head_location,
-    source_has_openmp,
+    build_value_names, c_value_literal, header_has_function_call, is_c_identifier,
+    leftmost_non_ws_column, loop_head_location, source_has_openmp,
 };
 use crate::correctness_witness::{InvariantKind, InvariantSetWitness, SourceInvariant};
 use crate::ranking::{Ranked, RankingFunction, rank_loops};
-use crate::witness_yaml::WitnessMeta;
+use crate::unreach_prove::{Lasso, StateVar};
+use crate::witness_yaml::{
+    Action, Constraint, SourceWaypoint, ViolationWitness, WaypointKind, WitnessMeta,
+};
 
 /// Render one side of the transition relation: `Σ cᵥ·name(v)`, with `\at(v,
 /// AnyPrev)` substituted for each variable when `previous` is set.
@@ -551,4 +554,144 @@ mod tests {
         assert!(!cur.contains("\\at("));
         assert_eq!(prev.matches('*').count(), cur.matches('*').count());
     }
+}
+
+/// The format-2.1 `termination` violation witness of a [`Lasso`]: a `follow`
+/// assumption at the loop head that pins the recurring state (the header's own
+/// integer phis and parameters, and the scalar globals), then the same
+/// assumption as the `cycle` — the loop head is passed in that state forever.
+/// A variable without a C name is left out, which only weakens both
+/// assumptions. `None` (no witness; the verdict stands) when the loop head
+/// cannot be placed on its loop keyword (from the header's branch, or from a
+/// back edge's when the header performs a call), or the program uses OpenMP.
+#[must_use]
+pub fn build_nontermination_witness(
+    module: &AirModule,
+    source: &str,
+    meta: &WitnessMeta,
+    lasso: &Lasso,
+) -> Option<ViolationWitness> {
+    if source_has_openmp(source) {
+        return None;
+    }
+    let func = module.function(lasso.func)?;
+    let block = func.blocks.iter().find(|b| b.id == lasso.block)?;
+    let src_lines: Vec<&str> = source.lines().collect();
+    // The loop statement's location: the header's own branch (`while (c)`), or
+    // else a back edge's (`while (1)`: the header is the body's first block).
+    let header_loc = (!header_has_function_call(block))
+        .then(|| loop_head_location(module, block, &src_lines))
+        .flatten();
+    let (file_name, line, column) = header_loc
+        .or_else(|| {
+            lasso.latches.iter().find_map(|l| {
+                let b = func.blocks.iter().find(|b| b.id == *l)?;
+                loop_head_location(module, b, &src_lines)
+            })
+        })
+        .or_else(|| header_statement_location(module, block, &src_lines))?;
+    let value_names = build_value_names(module);
+    let header_phis: std::collections::BTreeSet<ValueId> = block
+        .instructions
+        .iter()
+        .filter(|i| matches!(i.op, saf_core::air::Operation::Phi { .. }))
+        .filter_map(|i| i.dst)
+        .collect();
+    let scalar = |t: Option<saf_core::ids::TypeId>| {
+        !t.is_some_and(|t| module.is_pointer_type(t) || module.is_float_type(t))
+    };
+    let params: std::collections::BTreeSet<ValueId> = func
+        .params
+        .iter()
+        .filter(|p| scalar(p.param_type))
+        .map(|p| p.id)
+        .collect();
+    let global_names: BTreeMap<ValueId, &str> = module
+        .globals
+        .iter()
+        .filter(|g| scalar(g.value_type))
+        .map(|g| (g.id, g.name.as_str()))
+        .collect();
+    let mut conj: Vec<String> = Vec::new();
+    for (var, v, bits) in &lasso.state {
+        let name = match var {
+            StateVar::Value(id) if header_phis.contains(id) || params.contains(id) => {
+                value_names.get(id).map(String::as_str)
+            }
+            StateVar::Value(_) => None,
+            StateVar::Global(g) => global_names.get(g).copied(),
+        };
+        let Some(name) = name.filter(|n| is_c_identifier(n)) else {
+            continue;
+        };
+        if *bits == 0 || *bits > 64 {
+            continue;
+        }
+        let lit = c_value_literal(name, *v, *bits);
+        if !conj.contains(&lit) {
+            conj.push(lit);
+        }
+    }
+    let value = if conj.is_empty() {
+        "1".to_string()
+    } else {
+        format!("({})", conj.join(" && "))
+    };
+    let at_head = |action: Action| SourceWaypoint {
+        kind: WaypointKind::Assumption,
+        action,
+        file_name: file_name.clone(),
+        line,
+        column: Some(column),
+        function: Some(func.name.clone()),
+        constraint: Some(Constraint {
+            format: Some("c_expression".to_string()),
+            value: value.clone(),
+        }),
+    };
+    ViolationWitness::assemble_lasso(meta, &[at_head(Action::Follow)], &[at_head(Action::Cycle)])
+        .ok()
+}
+
+/// A loop without a loop statement (`goto` loops of CIL-generated code): the
+/// start of the header's first statement, when that statement begins its own
+/// line — an identifier (assignment or call), not a brace, label or keyword.
+fn header_statement_location(
+    module: &AirModule,
+    block: &saf_core::air::AirBlock,
+    src_lines: &[&str],
+) -> Option<(String, u32, u32)> {
+    let span = block
+        .instructions
+        .iter()
+        .filter(|i| !matches!(i.op, saf_core::air::Operation::Phi { .. }))
+        .find_map(|i| i.span.as_ref().filter(|s| s.line_start > 0))?;
+    let (file_name, line, _) = crate::witness_lower::span_to_location(module, span)?;
+    let column = leftmost_non_ws_column(src_lines, line)?;
+    let text = src_lines.get(usize::try_from(line).ok()?.checked_sub(1)?)?;
+    let rest = text.get(usize::try_from(column).ok()?.checked_sub(1)?..)?;
+    let ident: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let after = rest[ident.len()..].trim_start();
+    let keyword = matches!(
+        ident.as_str(),
+        "if" | "else"
+            | "while"
+            | "for"
+            | "do"
+            | "switch"
+            | "case"
+            | "default"
+            | "goto"
+            | "return"
+            | "break"
+            | "continue"
+    );
+    let starts_statement = is_c_identifier(&ident)
+        && !keyword
+        && !after.starts_with(':')
+        && rest.trim_end().ends_with(';');
+    starts_statement.then_some((file_name, line, column))
 }

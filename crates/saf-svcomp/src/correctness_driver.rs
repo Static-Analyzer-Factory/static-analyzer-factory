@@ -178,7 +178,7 @@ fn interval_invariants(module: &AirModule, source: &str) -> Vec<SourceInvariant>
 /// signed rendering compares equal for both signednesses at 32 and 64 bits
 /// (`x == -1` holds for `unsigned x == UINT_MAX`); below 32 bits the operand is
 /// promoted to `int` first, so both readings are offered when they differ.
-fn c_value_literal(name: &str, v: u64, bits: u32) -> String {
+pub(crate) fn c_value_literal(name: &str, v: u64, bits: u32) -> String {
     let signed: i128 = if bits >= 64 {
         i128::from(i64::from_ne_bytes(v.to_ne_bytes()))
     } else if v & (1u64 << (bits - 1)) != 0 {
@@ -450,7 +450,7 @@ pub(crate) fn is_c_identifier(name: &str) -> bool {
 /// 1-based column of the first non-whitespace char on 1-based `line`, or `None`.
 /// This is the loop-keyword column SV-COMP witnesses want (never the guard's
 /// column — see plan 207 / 1a gotchas).
-fn leftmost_non_ws_column(src_lines: &[&str], line: u32) -> Option<u32> {
+pub(crate) fn leftmost_non_ws_column(src_lines: &[&str], line: u32) -> Option<u32> {
     let idx = usize::try_from(line).ok()?.checked_sub(1)?;
     let text = src_lines.get(idx)?;
     let byte_pos = text.find(|c: char| !c.is_whitespace())?;

@@ -74,6 +74,9 @@ pub enum Action {
     Follow,
     /// Executions represented by the witness must not pass through this waypoint.
     Avoid,
+    /// The waypoint is passed infinitely often (format 2.1 non-termination:
+    /// the segments after the follow segments form the cycle).
+    Cycle,
 }
 
 impl Action {
@@ -81,6 +84,7 @@ impl Action {
         match self {
             Action::Follow => "follow",
             Action::Avoid => "avoid",
+            Action::Cycle => "cycle",
         }
     }
 }
@@ -270,6 +274,52 @@ impl ViolationWitness {
             entry: Entry {
                 entry_type: "violation_sequence",
                 metadata: build_metadata_versioned(meta, b"data-race", FORMAT_VERSION_2_2),
+                content,
+            },
+        })
+    }
+
+    /// Assemble a format-2.1 `termination` violation witness (a lasso): one
+    /// segment per `stem` waypoint (each a `follow`), then one segment per
+    /// `cycle` waypoint (each a `cycle`), the cycle being repeated forever.
+    ///
+    /// # Errors
+    /// Returns `Err` if the cycle is empty, a stem waypoint is not a `follow`, a
+    /// cycle waypoint is not a `cycle`, or a constraint's presence does not
+    /// match its waypoint's kind.
+    pub fn assemble_lasso(
+        meta: &WitnessMeta,
+        stem: &[SourceWaypoint],
+        cycle: &[SourceWaypoint],
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!cycle.is_empty(), "a lasso needs a cycle");
+        let mut content = Vec::new();
+        for (wp, action) in stem
+            .iter()
+            .map(|w| (w, Action::Follow))
+            .chain(cycle.iter().map(|w| (w, Action::Cycle)))
+        {
+            anyhow::ensure!(
+                wp.action == action,
+                "lasso waypoint at line {} must be `{}`",
+                wp.line,
+                action.as_str()
+            );
+            anyhow::ensure!(
+                wp.kind.requires_constraint() == wp.constraint.is_some(),
+                "waypoint type `{}` constraint mismatch",
+                wp.kind.as_str()
+            );
+            content.push(SegmentWrap {
+                segment: vec![WaypointWrap {
+                    waypoint: waypoint_out(wp),
+                }],
+            });
+        }
+        Ok(Self {
+            entry: Entry {
+                entry_type: "violation_sequence",
+                metadata: build_metadata_versioned(meta, b"termination", FORMAT_VERSION_2_1),
                 content,
             },
         })

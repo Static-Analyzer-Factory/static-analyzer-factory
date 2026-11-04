@@ -1170,6 +1170,43 @@ fn verify_termination(fixture: &str, data_model: &str) -> assert_cmd::assert::As
         .success()
 }
 
+/// A loop-header state that recurs (`x == -2` forever) => `false(termination)`,
+/// with a format-2.1 lasso witness (a `follow` then a `cycle` assumption).
+#[test]
+#[ignore]
+fn verify_termination_recurrent_state_is_false_with_lasso_witness() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let w = dir.path().join("witness.yml");
+    let prp = termination_prp();
+    let fx = svcomp_fixture("termination_false_recurrent.c");
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            prp.as_str(),
+            "--data-model",
+            "LP64",
+            "--witness",
+            w.to_str().expect("utf-8 path"),
+            fx.as_str(),
+        ])
+        .assert()
+        .success()
+        .stdout("false(termination)\n");
+    let yaml = std::fs::read_to_string(&w).expect("lasso witness written");
+    assert!(yaml.contains("format_version: '2.1'") || yaml.contains("format_version: \"2.1\""));
+    assert!(yaml.contains("action: cycle"));
+    assert!(yaml.contains("x == -2"));
+}
+
+/// A countdown loop terminates on every input: never `false`.
+#[test]
+#[ignore]
+fn verify_termination_countdown_is_never_false() {
+    verify_termination("termination_true_countdown.c", "LP64")
+        .stdout(predicate::str::contains("false").not());
+}
+
 /// A loop-free, call-free `main` => provably terminates => `true` (LP64).
 #[test]
 #[ignore]

@@ -62,6 +62,10 @@ use crate::property::{REACH_ERROR_NAMES, is_scalar_integer_nondet};
 
 /// Max times one block may be (re-)entered on a single path (loop unwinding).
 const VISIT_CAP: u32 = 4_096;
+/// The non-termination search's stop signal ([`Engine::nonterm_check`]).
+const NT_FOUND: &str = "nt-found";
+/// Concrete header states one path remembers (non-termination search).
+const NT_SEEN_CAP: usize = 4_096;
 /// Max instructions executed across all states.
 const MAX_STEPS: u64 = 3_000_000;
 /// Max states dequeued.
@@ -511,6 +515,10 @@ struct State {
     /// [`Flow::AllocSplit`]: `Some(false)` returns NULL, `Some(true)` a fresh
     /// object. `None` everywhere else (it never survives the instruction).
     alloc_choice: Option<bool>,
+    /// Non-termination search only: the concrete loop-header states this path
+    /// has passed, each with the number of nondet reads before it (see
+    /// [`Engine::nonterm_check`]).
+    nt_seen: BTreeMap<ConcreteKey, usize>,
 }
 
 /// Concrete content of one footprint slot of a loop-header state.
@@ -682,6 +690,66 @@ fn successors(b: &saf_core::air::AirBlock) -> Vec<BlockId> {
         }
         _ => vec![],
     }
+}
+
+/// The SSA values live out of each block of a function.
+type LiveOut = BTreeMap<BlockId, BTreeSet<ValueId>>;
+
+/// The SSA values live out of every block of `f` (backward data flow to a
+/// fixpoint). A phi's incoming value is live out of its own predecessor only,
+/// and phi operands never count as ordinary uses of the phi's block.
+fn live_out_sets(f: &saf_core::air::AirFunction) -> LiveOut {
+    let mut gen_: BTreeMap<BlockId, BTreeSet<ValueId>> = BTreeMap::new();
+    let mut kill: BTreeMap<BlockId, BTreeSet<ValueId>> = BTreeMap::new();
+    // (predecessor, successor) → the values the successor's phis take from it.
+    let mut edge: BTreeMap<(BlockId, BlockId), BTreeSet<ValueId>> = BTreeMap::new();
+    for b in &f.blocks {
+        let g = gen_.entry(b.id).or_default();
+        let k = kill.entry(b.id).or_default();
+        for inst in &b.instructions {
+            if let Operation::Phi { incoming } = &inst.op {
+                for (pred, v) in incoming {
+                    edge.entry((*pred, b.id)).or_default().insert(*v);
+                }
+            } else {
+                for v in &inst.operands {
+                    if !k.contains(v) {
+                        g.insert(*v);
+                    }
+                }
+            }
+            if let Some(d) = inst.dst {
+                k.insert(d);
+            }
+        }
+    }
+    let succs: BTreeMap<BlockId, Vec<BlockId>> =
+        f.blocks.iter().map(|b| (b.id, successors(b))).collect();
+    let mut live_in: BTreeMap<BlockId, BTreeSet<ValueId>> = BTreeMap::new();
+    let mut live_out: BTreeMap<BlockId, BTreeSet<ValueId>> = BTreeMap::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in f.blocks.iter().rev() {
+            let mut out = BTreeSet::new();
+            for s in &succs[&b.id] {
+                if let Some(inn) = live_in.get(s) {
+                    out.extend(inn.iter().copied());
+                }
+                if let Some(e) = edge.get(&(b.id, *s)) {
+                    out.extend(e.iter().copied());
+                }
+            }
+            let mut inn: BTreeSet<ValueId> = out.difference(&kill[&b.id]).copied().collect();
+            inn.extend(gen_[&b.id].iter().copied());
+            if live_in.get(&b.id) != Some(&inn) {
+                live_in.insert(b.id, inn);
+                changed = true;
+            }
+            live_out.insert(b.id, out);
+        }
+    }
+    live_out
 }
 
 /// Reverse-postorder index of every block of `f` (unreachable blocks last).
@@ -890,6 +958,13 @@ struct Engine<'a> {
     /// [`Goal::MemSafety`] for `valid-memcleanup`: a termination with ANY heap
     /// block not freed is a violation, not only an unreachable one.
     memcleanup: bool,
+    /// Live-out SSA values per block, per function, computed on first use by
+    /// the leak check at a termination (see [`Engine::halt_stack_roots`]).
+    live_out: std::cell::RefCell<BTreeMap<FunctionId, Rc<LiveOut>>>,
+    /// Non-termination search ([`find_nontermination`]): counterexample-mode
+    /// exploration that looks for a loop-header state recurring on one path.
+    nonterm: bool,
+    lasso: Option<Lasso>,
     cex: Option<Counterexample>,
     /// Counterexample mode: violations at these instructions are passed over
     /// (a candidate there did not replay), so the search goes on to the next
@@ -1137,6 +1212,66 @@ pub fn module_has_failable_allocation(module: &AirModule) -> bool {
                 .any(|i| matches!(&i.op, Operation::HeapAlloc { kind } if alloc_may_fail(kind)))
         })
     })
+}
+
+/// A non-terminating execution found by [`find_nontermination`]: the loop
+/// header where a concrete state recurs and that state (integer SSA values and
+/// scalar globals, as for [`HeaderStates`]); the values the nondet reads return
+/// up to the second visit, in program order, of which those from `cycle_start`
+/// on belong to one round of the cycle (every round may return the same).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lasso {
+    /// Function of the loop header.
+    pub func: FunctionId,
+    /// The loop header block.
+    pub block: BlockId,
+    /// The recurring state at the header (after its phis).
+    pub state: HeaderState,
+    /// `(nondet function, value, call instruction)` of every read up to the
+    /// recurrence.
+    pub nondets: Vec<(String, i64, InstId)>,
+    /// Index into `nondets` of the first read of the cycle.
+    pub cycle_start: usize,
+    /// The loop's latches (blocks of its body that branch back to `block`):
+    /// for `while (1)` the header is the body's first block, and only the
+    /// back edge carries the loop statement's location.
+    pub latches: Vec<BlockId>,
+}
+
+/// Search for an execution of `module` that never terminates: an eager,
+/// counterexample-mode exploration from `main` (no merging, every branch
+/// checked) that stops at the first loop-header state, restricted to what the
+/// continuation can read, that is fully concrete and recurs on its own path.
+/// Operations with undefined behaviour are excluded from the execution (the
+/// path continues where they are defined, and dies where they cannot be), so
+/// the lasso is a defined, infinite execution. `None` when the budget runs out
+/// or no path has one. A CANDIDATE: the caller confirms it natively.
+#[must_use]
+pub fn find_nontermination(module: &AirModule, budget: Duration) -> Option<Lasso> {
+    if has_global_ctors_dtors(module) {
+        return None;
+    }
+    let main = module
+        .functions
+        .iter()
+        .find(|f| f.name == "main" && !f.is_declaration)?;
+    let entry = main
+        .entry_block
+        .or_else(|| main.blocks.first().map(|b| b.id))?;
+    let mut engine = Engine::new(module, budget);
+    engine.goal = Goal::SignedOverflow;
+    engine.termination = true;
+    engine.cex_mode = true;
+    engine.cex_depth_first = true;
+    engine.nonterm = true;
+    engine.deadline = Instant::now() + budget;
+    let init = engine.initial_state(main, entry);
+    let res = engine.run(init);
+    trace(|| format!("non-termination search ended: {res:?}"));
+    match res {
+        Err(e) if e == NT_FOUND => engine.lasso.take(),
+        _ => None,
+    }
 }
 
 /// Externs the frontend maps to a `malloc`-kind allocation whose model may
@@ -1695,6 +1830,9 @@ impl<'a> Engine<'a> {
             cex_mode: false,
             termination: false,
             memcleanup: false,
+            live_out: std::cell::RefCell::new(BTreeMap::new()),
+            nonterm: false,
+            lasso: None,
             cex: None,
             cex_skip: BTreeSet::new(),
             cex_depth_first: false,
@@ -2001,6 +2139,7 @@ impl<'a> Engine<'a> {
             versioned: BTreeMap::new(),
             dead_end: false,
             alloc_choice: None,
+            nt_seen: BTreeMap::new(),
         };
         for p in &main.params {
             let v = match self.width.get(&p.id) {
@@ -2169,6 +2308,7 @@ impl<'a> Engine<'a> {
             versioned: BTreeMap::new(),
             dead_end: false,
             alloc_choice: None,
+            nt_seen: BTreeMap::new(),
         };
         // Parameters of main and of the loop's function are unconstrained.
         let mut param_ids: Vec<ValueId> = main.params.iter().map(|p| p.id).collect();
@@ -2620,7 +2760,14 @@ impl<'a> Engine<'a> {
                     continue;
                 }
             }
-            self.step_state(state, &mut worklist)?;
+            match self.step_state(state, &mut worklist) {
+                Ok(()) => {}
+                // Non-termination search: a path the engine cannot follow (an
+                // opaque extern, undefined behaviour, the unwind cap …) is only
+                // dropped — the search needs ONE lasso, not every path.
+                Err(e) if self.nonterm && e != NT_FOUND && !e.starts_with("budget") => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -2825,67 +2972,7 @@ impl<'a> Engine<'a> {
             if self.fixpoint_off.contains(&(key.func, key.block)) {
                 continue;
             }
-            let mut slots = key.vals.iter();
-            let mut state: HeaderState = Vec::new();
-            for f in &key.frames {
-                for _ in &f.5 {
-                    slots.next();
-                }
-            }
-            for vid in &key.value_ids {
-                if let Some(CVal::Bv(v, bits)) = slots.next() {
-                    state.push((StateVar::Value(*vid), *v, *bits));
-                }
-            }
-            let mut written: BTreeSet<ValueId> = BTreeSet::new();
-            for cell in &key.cells {
-                let slot = slots.next();
-                if cell.1.is_empty() && self.globals.contains_key(&cell.0) {
-                    written.insert(cell.0);
-                    if let Some(CVal::Bv(v, bits)) = slot {
-                        state.push((StateVar::Global(cell.0), *v, *bits));
-                    }
-                }
-            }
-            // A scalar global never written on the path (and not escaped) still
-            // holds its initialiser there — part of the state all the same.
-            for (gid, (init, is_const)) in &self.globals {
-                if *is_const || written.contains(gid) || key.escaped.contains(gid) {
-                    continue;
-                }
-                let scalar = match init {
-                    Some(Constant::Int { value, bits }) => {
-                        let bits = u32::from(*bits);
-                        (bits > 0 && bits <= 64).then(|| {
-                            let mask = if bits == 64 {
-                                u64::MAX
-                            } else {
-                                (1u64 << bits) - 1
-                            };
-                            // INVARIANT: the bit pattern of a `bits`-wide value.
-                            #[allow(clippy::cast_sign_loss)]
-                            let v = (*value as u64) & mask;
-                            (v, bits)
-                        })
-                    }
-                    Some(Constant::ZeroInit) => self
-                        .module
-                        .globals
-                        .iter()
-                        .find(|g| g.id == *gid)
-                        .and_then(|g| g.value_type)
-                        .and_then(|t| match self.module.types.get(&t) {
-                            Some(saf_core::air::AirType::Integer { bits }) => {
-                                Some((0u64, u32::from(*bits)))
-                            }
-                            _ => None,
-                        }),
-                    _ => None,
-                };
-                if let Some((v, bits)) = scalar {
-                    state.push((StateVar::Global(*gid), v, bits));
-                }
-            }
+            let state = self.key_header_state(key);
             by_header
                 .entry((key.func, key.block))
                 .or_default()
@@ -2899,6 +2986,210 @@ impl<'a> Engine<'a> {
                 states,
             })
             .collect()
+    }
+
+    /// Non-termination search, at a loop-header entry: the state restricted to
+    /// what the continuation can read (each active frame's live values, all
+    /// memory and object bookkeeping) is fully concrete and was already seen on
+    /// this path ⇒ the path from that visit to this one repeats forever. The
+    /// path is feasible (every branch of the eager search was), every operation
+    /// on it is free of undefined behaviour (see
+    /// [`Engine::nonterm_exclude_ub`]), and the repeated part reads nothing
+    /// symbolic from before it, so its own nondet reads can return the same
+    /// values on every round. Records the lasso and stops the search.
+    fn nonterm_check(&mut self, st: &mut State) -> Res<()> {
+        let Some(live) = self.live_projection(st) else {
+            return Ok(());
+        };
+        let (key, syms) = footprint(&live);
+        if !syms.is_empty() {
+            return Ok(());
+        }
+        let Some(&cycle_start) = st.nt_seen.get(&key) else {
+            if st.nt_seen.len() < NT_SEEN_CAP {
+                st.nt_seen.insert(key, st.nondets.len());
+            }
+            return Ok(());
+        };
+        if st.has_unknown {
+            return Err("nt-unknown".to_string());
+        }
+        let (pc, _) = path_condition(st);
+        self.solver.reset();
+        self.solver.assert(&pc);
+        self.solver_calls += 1;
+        if self.solver.check() != SatResult::Sat {
+            return Err("nt-no-model".to_string());
+        }
+        let model = self.solver.get_model().ok_or("nt-no-model")?;
+        let nondets = self.nondet_values(st, &model);
+        let state = self.key_header_state(&key);
+        trace(|| {
+            format!(
+                "lasso at block={:?} after {} nondet reads",
+                st.block,
+                nondets.len()
+            )
+        });
+        let latches = self
+            .module
+            .function(st.func)
+            .map(|f| {
+                let body = natural_loops(f)
+                    .into_iter()
+                    .find(|(h, _)| *h == st.block)
+                    .map(|(_, body)| body)
+                    .unwrap_or_default();
+                f.blocks
+                    .iter()
+                    .filter(|b| body.contains(&b.id) && successors(b).contains(&st.block))
+                    .map(|b| b.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.lasso = Some(Lasso {
+            func: st.func,
+            block: st.block,
+            state,
+            nondets,
+            cycle_start,
+            latches,
+        });
+        Err(NT_FOUND.to_string())
+    }
+
+    /// `st` with only the SSA values some active frame can still read: the
+    /// current frame's live values here, each caller's after its call. `None`
+    /// for a recursive stack (an outer activation's values sit in its frame).
+    fn live_projection(&self, st: &State) -> Option<State> {
+        let mut active = BTreeSet::from([st.func]);
+        for f in &st.frames {
+            if !active.insert(f.func) || !f.saved.is_empty() {
+                return None;
+            }
+        }
+        let mut keep = self.live_at(st.func, st.block, st.idx)?;
+        for f in &st.frames {
+            keep.extend(self.live_at(f.func, f.ret_block, f.ret_idx + 1)?);
+        }
+        let mut out = st.clone();
+        out.values.retain(|v, _| keep.contains(v));
+        out.nt_seen = BTreeMap::new();
+        Some(out)
+    }
+
+    /// Non-termination search, at an operation with undefined behaviour on
+    /// some inputs (`cond`: the violation condition): the infinite execution
+    /// must avoid it, so the path continues under `¬cond`, and dies when that is
+    /// infeasible. An error call (`cond` = `None`) is a termination: the path
+    /// ends there by itself.
+    fn nonterm_exclude_ub(&mut self, st: &mut State, cond: Option<(&Bool, &Vars)>) -> Res<()> {
+        let Some((c, vars)) = cond else {
+            return Ok(());
+        };
+        let safe = c.not();
+        match self.feasible(st, &safe, vars)? {
+            Feas::Sat => {
+                st.constraints.push((safe, vars.clone()));
+                Ok(())
+            }
+            Feas::Unsat => Err("nt-ub".to_string()),
+            Feas::Unknown => Err("nt-ub-unknown".to_string()),
+        }
+    }
+
+    /// The values the path's nondet reads take in `model`, in program order.
+    fn nondet_values(&self, st: &State, model: &z3::Model) -> Vec<(String, i64, InstId)> {
+        let mut nondets = Vec::with_capacity(st.nondets.len());
+        for (name, bits, n, inst) in &st.nondets {
+            let Some(sym) = self.symbols.get(n) else {
+                continue;
+            };
+            let raw = st
+                .pinned
+                .get(n)
+                .copied()
+                .unwrap_or_else(|| model.eval(sym, true).and_then(|b| b.as_u64()).unwrap_or(0));
+            let unsigned = ["uint", "ulong", "ushort", "uchar", "ulonglong", "size_t"]
+                .iter()
+                .any(|u| name.ends_with(u));
+            let value: i64 = if *bits >= 64 || unsigned {
+                i64::from_ne_bytes(raw.to_ne_bytes())
+            } else if raw & (1u64 << (bits - 1)) != 0 {
+                i64::from_ne_bytes(raw.to_ne_bytes()) - (1i64 << bits)
+            } else {
+                i64::from_ne_bytes(raw.to_ne_bytes())
+            };
+            nondets.push((name.clone(), value, *inst));
+        }
+        nondets
+    }
+
+    /// A concrete header state projected to its integer SSA values and scalar
+    /// globals (a never-written, non-escaped scalar global holds its initialiser).
+    fn key_header_state(&self, key: &ConcreteKey) -> HeaderState {
+        let mut slots = key.vals.iter();
+        let mut state: HeaderState = Vec::new();
+        for f in &key.frames {
+            for _ in &f.5 {
+                slots.next();
+            }
+        }
+        for vid in &key.value_ids {
+            if let Some(CVal::Bv(v, bits)) = slots.next() {
+                state.push((StateVar::Value(*vid), *v, *bits));
+            }
+        }
+        let mut written: BTreeSet<ValueId> = BTreeSet::new();
+        for cell in &key.cells {
+            let slot = slots.next();
+            if cell.1.is_empty() && self.globals.contains_key(&cell.0) {
+                written.insert(cell.0);
+                if let Some(CVal::Bv(v, bits)) = slot {
+                    state.push((StateVar::Global(cell.0), *v, *bits));
+                }
+            }
+        }
+        // A scalar global never written on the path (and not escaped) still
+        // holds its initialiser there — part of the state all the same.
+        for (gid, (init, is_const)) in &self.globals {
+            if *is_const || written.contains(gid) || key.escaped.contains(gid) {
+                continue;
+            }
+            let scalar = match init {
+                Some(Constant::Int { value, bits }) => {
+                    let bits = u32::from(*bits);
+                    (bits > 0 && bits <= 64).then(|| {
+                        let mask = if bits == 64 {
+                            u64::MAX
+                        } else {
+                            (1u64 << bits) - 1
+                        };
+                        // INVARIANT: the bit pattern of a `bits`-wide value.
+                        #[allow(clippy::cast_sign_loss)]
+                        let v = (*value as u64) & mask;
+                        (v, bits)
+                    })
+                }
+                Some(Constant::ZeroInit) => self
+                    .module
+                    .globals
+                    .iter()
+                    .find(|g| g.id == *gid)
+                    .and_then(|g| g.value_type)
+                    .and_then(|t| match self.module.types.get(&t) {
+                        Some(saf_core::air::AirType::Integer { bits }) => {
+                            Some((0u64, u32::from(*bits)))
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            if let Some((v, bits)) = scalar {
+                state.push((StateVar::Global(*gid), v, bits));
+            }
+        }
+        state
     }
 
     fn header_fixpoint(&mut self, st: &mut State) -> Res<Option<Vec<State>>> {
@@ -3111,6 +3402,15 @@ impl<'a> Engine<'a> {
             let Some(inst) = block.instructions.get(st.idx) else {
                 return Err("block-without-terminator".to_string());
             };
+            // Non-termination search: once per loop-header entry, after its phis.
+            if self.nonterm
+                && self.loop_headers.contains(&(st.func, st.block))
+                && !matches!(inst.op, Operation::Phi { .. })
+                && (st.idx == 0
+                    || matches!(block.instructions[st.idx - 1].op, Operation::Phi { .. }))
+            {
+                self.nonterm_check(&mut st)?;
+            }
             // Park once per block entry at a join point, after its phis — except
             // a state with an EMPTY path condition (fully concrete after a
             // domain split or fixpoint restart) at an ordinary join: merging it
@@ -3224,7 +3524,7 @@ impl<'a> Engine<'a> {
                         st.dead.extend(dying.into_iter().map(|(_, b)| b));
                         st.stack = live;
                         if depth == 0 {
-                            self.ms_memtrack(&st)?;
+                            self.ms_memtrack(&st, false)?;
                         }
                     }
                     let Some(frame) = st.frames.pop() else {
@@ -3268,7 +3568,7 @@ impl<'a> Engine<'a> {
                 Flow::Halt => {
                     trace(|| format!("halt at block={:?}", st.block));
                     if self.goal == Goal::MemSafety && !st.dead_end {
-                        self.ms_memtrack(&st)?;
+                        self.ms_memtrack(&st, true)?;
                     }
                     return Ok(());
                 }
@@ -4472,9 +4772,17 @@ impl<'a> Engine<'a> {
 
     /// At a path end every unfreed heap block must be reachable from the
     /// globals. A block that became untracked earlier can never become tracked
-    /// again, so this also catches a leak anywhere on the (finite) path; the
-    /// call stack is not a root here, which is stricter than the definition.
-    fn ms_memtrack(&self, st: &State) -> Res<()> {
+    /// again, so this also catches a leak anywhere on the (finite) path.
+    ///
+    /// When `main` returns its frame is gone, so the globals are the only roots.
+    /// At a termination (`halted`: `abort`, `exit`, a failed assertion …) the
+    /// call stack still exists, and a block an active function still holds is
+    /// not lost: the 2027 tasks' `safe_malloc` aborts on a failed allocation
+    /// while the caller holds the earlier blocks, and those tasks are labelled
+    /// memory-safe. The stack roots are only the values each frame can still use
+    /// (see [`Engine::halt_stack_roots`]): a pointer the program overwrote or
+    /// will never read again does not hold its block.
+    fn ms_memtrack(&self, st: &State, halted: bool) -> Res<()> {
         // A leak is not confirmed by the replay (`valid-memtrack` violation
         // witnesses are demo-mode only): the counterexample search ignores it.
         if self.cex_mode {
@@ -4501,6 +4809,12 @@ impl<'a> Engine<'a> {
         let mut reached: BTreeSet<ValueId> = BTreeSet::new();
         let mut work: Vec<ValueId> = self.globals.keys().copied().collect();
         let mut unknown = false;
+        if halted {
+            if let Some((roots, opaque)) = self.halt_stack_roots(st) {
+                work.extend(roots);
+                unknown |= opaque;
+            }
+        }
         while let Some(b) = work.pop() {
             if !reached.insert(b) {
                 continue;
@@ -4526,6 +4840,66 @@ impl<'a> Engine<'a> {
         } else {
             Err("ms-leak".to_string())
         }
+    }
+
+    /// The objects the call stack holds at a termination: the pointer values
+    /// live in each active frame at its resume point (the current frame after
+    /// the terminating instruction, each caller after its call) and every live
+    /// stack object. The flag reports a live opaque pointer. `None` (globals
+    /// only) when a function is active more than once: an outer activation's
+    /// values sit in its frame's saved bindings, not in the state's values.
+    fn halt_stack_roots(&self, st: &State) -> Option<(Vec<ValueId>, bool)> {
+        let mut active = BTreeSet::from([st.func]);
+        for f in &st.frames {
+            if !active.insert(f.func) || !f.saved.is_empty() {
+                return None;
+            }
+        }
+        let mut points = vec![(st.func, st.block, st.idx + 1)];
+        points.extend(
+            st.frames
+                .iter()
+                .map(|f| (f.func, f.ret_block, f.ret_idx + 1)),
+        );
+        let mut roots: Vec<ValueId> = st.stack.iter().map(|(_, b)| *b).collect();
+        let mut opaque = false;
+        for (func, block, idx) in points {
+            for v in self.live_at(func, block, idx)? {
+                match st.values.get(&v) {
+                    Some(Val::Ptr(Some((t, _)))) => roots.push(*t),
+                    Some(Val::Ptr(None)) => opaque = true,
+                    _ => {}
+                }
+            }
+        }
+        Some((roots, opaque))
+    }
+
+    /// The SSA values of `func` live before instruction `idx` of `block`: used
+    /// on some path from there before the end of the function. `None` when the
+    /// function or block is unknown.
+    fn live_at(&self, func: FunctionId, block: BlockId, idx: usize) -> Option<BTreeSet<ValueId>> {
+        let f = self.module.functions.iter().find(|f| f.id == func)?;
+        let b = f.blocks.iter().find(|b| b.id == block)?;
+        let out = {
+            let mut cache = self.live_out.borrow_mut();
+            Rc::clone(
+                cache
+                    .entry(func)
+                    .or_insert_with(|| Rc::new(live_out_sets(f))),
+            )
+        };
+        let mut live = out.get(&block).cloned().unwrap_or_default();
+        // Backwards over the rest of the block: a definition kills, a use gens.
+        for inst in b.instructions.iter().skip(idx).rev() {
+            if let Some(d) = inst.dst {
+                live.remove(&d);
+            }
+            if !matches!(inst.op, Operation::Phi { .. }) {
+                live.extend(inst.operands.iter().copied());
+            }
+        }
+        Some(live)
     }
 
     fn load_pointer(&mut self, st: &State, cell: Option<&Cell>) -> Val {
@@ -5198,6 +5572,9 @@ impl<'a> Engine<'a> {
         if self.cex_mode && self.cex_skip.contains(&at) {
             return Ok(()); // a candidate here did not replay: look further
         }
+        if self.nonterm {
+            return self.nonterm_exclude_ub(st, cond);
+        }
         if let (Mode::Step { k }, Some(lp)) = (self.mode, self.kloop.as_ref()) {
             // Iteration count is kept per path, so a violation reached from a
             // nested call still belongs to the current iteration.
@@ -5353,28 +5730,7 @@ impl<'a> Engine<'a> {
             return Ok(()); // no model: no candidate (the verdict is unchanged)
         }
         let model = self.solver.get_model().ok_or("cex-no-model")?;
-        let mut nondets = Vec::with_capacity(st.nondets.len());
-        for (name, bits, n, inst) in &st.nondets {
-            let Some(sym) = self.symbols.get(n) else {
-                continue;
-            };
-            let raw = st
-                .pinned
-                .get(n)
-                .copied()
-                .unwrap_or_else(|| model.eval(sym, true).and_then(|b| b.as_u64()).unwrap_or(0));
-            let unsigned = ["uint", "ulong", "ushort", "uchar", "ulonglong", "size_t"]
-                .iter()
-                .any(|u| name.ends_with(u));
-            let value: i64 = if *bits >= 64 || unsigned {
-                i64::from_ne_bytes(raw.to_ne_bytes())
-            } else if raw & (1u64 << (bits - 1)) != 0 {
-                i64::from_ne_bytes(raw.to_ne_bytes()) - (1i64 << bits)
-            } else {
-                i64::from_ne_bytes(raw.to_ne_bytes())
-            };
-            nondets.push((name.clone(), value, *inst));
-        }
+        let nondets = self.nondet_values(st, &model);
         let block_path = st
             .path
             .iter()

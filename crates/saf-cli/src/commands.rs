@@ -7153,7 +7153,12 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         };
     }
 
-    if proven {
+    if !proven {
+        // Neither TRUE arm proved termination: look for a non-terminating
+        // execution (TRUE verdicts are untouched by this arm).
+        return nontermination_false(ctx).unwrap_or_else(unknown_outcome);
+    }
+    {
         // SV-COMP 2027 requires a 2.1-or-higher correctness witness for every
         // `C.termination.*` base category (it was "2.1 (demo mode)" = free in 2026).
         // Emitting none scored 0 on all 36 of SAF's dedup-weighted termination
@@ -7181,9 +7186,219 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             graphml: None,
             correctness: Some(correctness),
         }
-    } else {
-        unknown_outcome()
     }
+}
+
+/// `false(termination)`: the engine's non-termination search
+/// ([`saf_svcomp::find_nontermination`]) finds a loop-header state that recurs
+/// on one feasible, defined path, and a native run of the program on that
+/// path's inputs ([`nontermination_confirmed`]) is still busy computing when
+/// its time is up. Same gates as the engine's TRUE arm (OpenMP, threads,
+/// dropped instructions). The witness is the format-2.1 lasso; without one
+/// (no placeable loop head) the verdict still stands.
+fn nontermination_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    let source = std::fs::read_to_string(ctx.input).ok()?;
+    if saf_svcomp::source_has_openmp(&source) {
+        return None;
+    }
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph)
+        || unreach_prover_blocked_by_dropped(ctx.module)
+    {
+        return None;
+    }
+    let Some(lasso) = saf_svcomp::find_nontermination(ctx.module, unreach_prove_budget(ctx.budget))
+    else {
+        eprintln!("saf verify: non-termination search found no recurring state -> unknown");
+        return None;
+    };
+    match nontermination_confirmed(ctx, &lasso) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("saf verify: native run did not confirm the lasso -> unknown");
+            return None;
+        }
+        Err(e) => {
+            eprintln!("saf verify: native lasso confirmation failed: {e:#} -> unknown");
+            return None;
+        }
+    }
+    eprintln!(
+        "saf verify: loop-header state recurs ({} nondet reads) and the native run keeps computing -> false(termination)",
+        lasso.nondets.len()
+    );
+    Some(VerdictOutcome {
+        verdict: "false(termination)".to_string(),
+        witness: saf_svcomp::build_nontermination_witness(ctx.module, &source, ctx.meta, &lasso),
+        graphml: None,
+        correctness: None,
+    })
+}
+
+/// Wall time the native run of a lasso gets, and the CPU time it must have
+/// used by then: a program that sleeps or blocks is not computing forever.
+const NONTERM_RUN: std::time::Duration = std::time::Duration::from_secs(3);
+const NONTERM_MIN_CPU_TICKS_FRACTION: f64 = 0.5;
+
+/// Run the ORIGINAL program natively on the lasso's inputs: the stem's nondet
+/// values in order, then the cycle's values over and over (each round of the
+/// cycle may return the same values, since it starts from the same state).
+/// Confirmed iff the run neither exits nor crashes within [`NONTERM_RUN`] and
+/// spent at least half of it on the CPU. Only scalar integer nondet reads are
+/// replayed; a lasso reading anything else is not confirmed. Compiled with
+/// signed-overflow trapping, so a run that relies on undefined behaviour stops.
+fn nontermination_confirmed(ctx: &VerifyCtx, lasso: &saf_svcomp::Lasso) -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+    use std::process::{Command, Stdio};
+    if lasso
+        .nondets
+        .iter()
+        .any(|(name, ..)| !SCALAR_NONDET.iter().any(|(f, _)| f == name))
+    {
+        return Ok(false);
+    }
+    let dir = ctx.tempdir;
+    let driver_src = dir.join("saf_nonterm_driver.c");
+    let harness = dir.join("saf_nonterm_harness");
+    let d = nontermination_driver(lasso);
+    std::fs::write(&driver_src, d).context("writing non-termination driver")?;
+    let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
+    let build = |neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(ctx.clang);
+        cmd.args([
+            "-O0",
+            "-Wno-everything",
+            "-fsanitize=signed-integer-overflow,shift,integer-divide-by-zero",
+            "-fsanitize-trap=all",
+        ])
+        .args(replay_wrap_flags())
+        .args(ctx.data_model.clang_flags())
+        .arg("-include")
+        .arg(ctx.stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include").arg(n);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(ctx.input)
+            .arg(&driver_src)
+            .arg("-lm")
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    if !link_replay_harness(&build, &driver_src, dir, "non-termination replay")? {
+        eprintln!("saf verify: non-termination replay harness did not build");
+        return Ok(false);
+    }
+    let mut cmd = Command::new(&harness);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = harden_replay_spawn(&mut cmd)
+        .spawn()
+        .context("spawning non-termination harness")?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                eprintln!("saf verify: non-termination replay ended ({status})");
+                return Ok(false); // it terminated (or crashed)
+            }
+            Ok(None) if start.elapsed() >= NONTERM_RUN => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => {
+                kill_replay_group(&mut child);
+                return Err(e).context("waiting on non-termination harness");
+            }
+        }
+    }
+    let cpu = process_cpu_seconds(child.id());
+    kill_replay_group(&mut child);
+    eprintln!("saf verify: non-termination replay still running, cpu={cpu:?} s");
+    Ok(cpu.is_some_and(|c| c >= NONTERM_RUN.as_secs_f64() * NONTERM_MIN_CPU_TICKS_FRACTION))
+}
+
+/// The replay driver of [`nontermination_confirmed`]: periodic scalar nondet
+/// values (stem, then the cycle forever), inert definitions of the other
+/// nondet functions, and error calls that terminate.
+fn nontermination_driver(lasso: &saf_svcomp::Lasso) -> String {
+    use std::fmt::Write as _;
+    let mut d = String::new();
+    d.push_str("/* non-termination replay driver (generated) */\n");
+    d.push_str(
+        "#include <stddef.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n",
+    );
+    d.push_str("extern void _exit(int) __attribute__((noreturn));\n");
+    for (fname, cty) in SCALAR_NONDET {
+        let suffix = fname.trim_start_matches("__VERIFIER_nondet_");
+        let mine = |range: &[(String, i64, saf_core::ids::InstId)]| -> Vec<i64> {
+            range
+                .iter()
+                .filter(|(n, ..)| n == fname)
+                .map(|(_, v, _)| *v)
+                .collect()
+        };
+        let cut = lasso.cycle_start.min(lasso.nondets.len());
+        let stem = mine(&lasso.nondets[..cut]);
+        let cycle = mine(&lasso.nondets[cut..]);
+        let all: Vec<String> = stem
+            .iter()
+            .chain(cycle.iter())
+            .map(|v| format!("{v}LL"))
+            .collect();
+        let elems = if all.is_empty() {
+            "0".to_string()
+        } else {
+            all.join(", ")
+        };
+        let _ = writeln!(d, "static long long __saf_v_{suffix}[] = {{ {elems} }};");
+        let _ = writeln!(
+            d,
+            "static unsigned long __saf_i_{suffix} = 0; static const unsigned long __saf_s_{suffix} = {}, __saf_c_{suffix} = {};",
+            stem.len(),
+            cycle.len()
+        );
+        let _ = writeln!(
+            d,
+            "{cty} __VERIFIER_nondet_{suffix}(void) {{ unsigned long i = __saf_i_{suffix}++; if (i < __saf_s_{suffix}) return ({cty})__saf_v_{suffix}[i]; if (__saf_c_{suffix} == 0) return ({cty})0; return ({cty})__saf_v_{suffix}[__saf_s_{suffix} + (i - __saf_s_{suffix}) % __saf_c_{suffix}]; }}"
+        );
+    }
+    let none = saf_svcomp::FalseCandidate {
+        reach_error_inst: saf_core::ids::InstId::new(0),
+        block_path: Vec::new(),
+        assignments: std::collections::BTreeMap::new(),
+        nondet_sequence: Vec::new(),
+    };
+    push_extended_and_pointer_replay_defs(&mut d, &none);
+    push_float_replay_defs(&mut d, &none);
+    d.push_str("void __VERIFIER_atomic_begin(void) { }\nvoid __VERIFIER_atomic_end(void) { }\n");
+    d.push_str("void __VERIFIER_assume(int c) { if (!c) _exit(0); }\n");
+    // Any error call terminates the program (a termination, not a hang).
+    d.push_str("__attribute__((weak)) void reach_error(void) { _exit(0); }\n");
+    d.push_str("__attribute__((weak)) void __VERIFIER_error(void) { _exit(0); }\n");
+    d.push_str(&rand_wrapper(&none));
+    d
+}
+
+/// User + system CPU seconds of a running process (`/proc/<pid>/stat`).
+fn process_cpu_seconds(pid: u32) -> Option<f64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after the parenthesised command name; utime and stime are the
+    // 14th and 15th fields overall (11th and 12th after the name).
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime: f64 = fields.get(11)?.parse().ok()?;
+    let stime: f64 = fields.get(12)?.parse().ok()?;
+    // SAFETY: sysconf has no preconditions.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks <= 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    Some((utime + stime) / ticks as f64)
 }
 
 /// The engine's termination arm ([`saf_svcomp::prove_termination_exhaustive`]):
@@ -8996,12 +9211,24 @@ mod verify_tests {
             (
                 "safe_free",
                 true,
-                "int main(void){ int *a = malloc(4*sizeof(int)); for (int i=0;i<4;i++) a[i]=i; int s=a[3]; free(a); return s; }",
+                "int main(void){ int *a = malloc(4*sizeof(int)); if (!a) return 0; for (int i=0;i<4;i++) a[i]=i; int s=a[3]; free(a); return s; }",
             ),
             (
                 "safe_list",
                 true,
-                "struct n { struct n *next; int v; }; struct n *head; int main(void){ for (int i=0;i<3;i++){ struct n *x = malloc(sizeof *x); x->v=i; x->next=head; head=x; } return 0; }",
+                "struct n { struct n *next; int v; }; struct n *head; int main(void){ for (int i=0;i<3;i++){ struct n *x = malloc(sizeof *x); if (!x) return 0; x->v=i; x->next=head; head=x; } return 0; }",
+            ),
+            // 2027: malloc may return NULL. The wrapper aborts while `main`
+            // still holds the first block: the stack is a root at an abort.
+            (
+                "abort_while_held",
+                true,
+                "static void *safe_malloc(unsigned long n){ void *p = malloc(n); if (!p) abort(); return p; } int main(void){ int *a = safe_malloc(4); int *b = safe_malloc(4); *a = 1; *b = 2; free(b); free(a); return 0; }",
+            ),
+            (
+                "lost_then_abort",
+                false,
+                "int main(void){ int *a = malloc(4); if (!a) return 0; if (__VERIFIER_nondet_int()) { a = 0; abort(); } free(a); return 0; }",
             ),
             (
                 "safe_alloca_loop",
