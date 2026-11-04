@@ -410,10 +410,12 @@ pub fn lower_must_reach(module: &AirModule, chain: &[BlockId]) -> Option<Vec<Sou
 }
 
 /// Lower a replay-confirmed [`FalseCandidate`] to a waypoint list in execution
-/// order: `function_return` waypoints pinning each `__VERIFIER_nondet_*` read to
-/// the confirmed value (`\result == <value>`), interleaved with `branching`
+/// order, ending in the `target` at the `reach_error` call. A program that reads
+/// no input gets the target alone; a candidate whose every read is pinned gets
+/// one `function_return` waypoint per read (`\result == <value>`, in execution
+/// order) and no branchings. Otherwise the reads are interleaved with `branching`
 /// waypoints for each `CondBr` decision along the confirmed path (plan 195 Tier
-/// A), ending in the `target` at the `reach_error` call.
+/// A), as below.
 ///
 /// **Ordering (soundness of the witness, not the verdict):** nondet reads that
 /// execute *before* the error site's own function — the caller reads in an
@@ -452,6 +454,37 @@ pub fn lower_candidate(
             || name == "rand"
             || crate::unreach_prove::is_pinned_extern(name)
     };
+    let target = target_waypoint(target_location.clone(), Some(func.name.clone()));
+    // A program without inputs runs one way: the target alone is the witness.
+    let reads_input = module.functions.iter().any(|f| {
+        f.is_declaration && (f.name.starts_with("__VERIFIER_nondet") || pinned_result(&f.name))
+    });
+    if !reads_input {
+        return Some(vec![target]);
+    }
+    // Every read pinned, each at its call: the inputs alone determine the run,
+    // so the witness is their `function_return` waypoints in execution order and
+    // the target. Branching waypoints add nothing then, and they are fragile: a
+    // `follow` branching must hold at its FIRST evaluation, so a block that runs
+    // more than once (ECA's `calculate_output`, a loop before the error) puts it
+    // out of order — 180 unreach-call witnesses of the 2027 training run were
+    // voted wrong for that.
+    if !cand.nondet_sequence.is_empty()
+        && cand
+            .nondet_sequence
+            .iter()
+            .all(|nc| nc.call_inst.is_some() && pinned_result(&nc.func_name))
+    {
+        let reads: Option<Vec<SourceWaypoint>> = cand
+            .nondet_sequence
+            .iter()
+            .map(|nc| function_return_waypoint(module, nc.call_inst?, nc.value, src_lines))
+            .collect();
+        if let Some(mut waypoints) = reads {
+            waypoints.push(target);
+            return Some(waypoints);
+        }
+    }
     let mut nondet_value: BTreeMap<InstId, i64> = BTreeMap::new();
     for nc in &cand.nondet_sequence {
         if let Some(id) = nc.call_inst {
@@ -506,7 +539,7 @@ pub fn lower_candidate(
         }
     }
 
-    waypoints.push(target_waypoint(target_location, Some(func.name.clone())));
+    waypoints.push(target);
     Some(waypoints)
 }
 
@@ -860,6 +893,9 @@ mod tests {
             bb0,
         ));
         m.functions.push(decl(err_id, "reach_error"));
+        // The program reads input, so the branching path below is taken.
+        m.functions
+            .push(decl(FunctionId::new(99), "__VERIFIER_nondet_int"));
 
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
@@ -902,6 +938,9 @@ mod tests {
             bb0,
         ));
         m.functions.push(decl(err_id, "reach_error"));
+        // The program reads input, so the branching path below is taken.
+        m.functions
+            .push(decl(FunctionId::new(99), "__VERIFIER_nondet_int"));
 
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
@@ -1013,6 +1052,9 @@ mod tests {
             bb0,
         ));
         m.functions.push(decl(err_id, "reach_error"));
+        // The program reads input, so the branching path below is taken.
+        m.functions
+            .push(decl(FunctionId::new(99), "__VERIFIER_nondet_int"));
 
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
@@ -1053,6 +1095,9 @@ mod tests {
             bb0,
         ));
         m.functions.push(decl(err_id, "reach_error"));
+        // The program reads input, so the branching path below is taken.
+        m.functions
+            .push(decl(FunctionId::new(99), "__VERIFIER_nondet_int"));
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
             block_path: vec![bb0, bb1],
@@ -1118,6 +1163,9 @@ mod tests {
             entry,
         ));
         m.functions.push(decl(err_id, "reach_error"));
+        // The program reads input, so the branching path below is taken.
+        m.functions
+            .push(decl(FunctionId::new(99), "__VERIFIER_nondet_int"));
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
             block_path: vec![entry, if_then],
@@ -1166,6 +1214,9 @@ mod tests {
             b0,
         ));
         m.functions.push(decl(err_id, "reach_error"));
+        // The program reads input, so the branching path below is taken.
+        m.functions
+            .push(decl(FunctionId::new(99), "__VERIFIER_nondet_int"));
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
             block_path: vec![b0, lor, if_then],
@@ -1279,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn lower_candidate_emits_function_return_for_path_nondet_before_branch() {
+    fn lower_candidate_pins_every_read_without_branchings() {
         // main: x = nondet(); if (x == 42) reach_error();
         let (main_id, err_id, nd_id) = (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
         let (bb0, bb1, bb2) = (BlockId::new(10), BlockId::new(11), BlockId::new(12));
@@ -1311,8 +1362,10 @@ mod tests {
         };
         const SRC: &str = "int main(void) {\n  int x;\n  int y;\n  x = 0;\n  int x = __VERIFIER_nondet_int();\n  if (x == 42) {\n    reach_error();\n  }\n}\n";
         let wps = lower_candidate(&m, &cand, Some(SRC)).expect("lowered");
-        // function_return (read) -> branching (the if) -> target, in exec order.
-        assert_eq!(wps.len(), 3, "fr + branching + target");
+        // Every read is pinned, so the inputs fix the run: function_return (the
+        // read) -> target, and no branching (it would add nothing and break when
+        // a block runs more than once).
+        assert_eq!(wps.len(), 2, "fr + target");
         assert_eq!(wps[0].kind, WaypointKind::FunctionReturn);
         assert_eq!(wps[0].line, 5);
         assert_eq!(
@@ -1327,10 +1380,38 @@ mod tests {
                 value: "\\result == 42".into(),
             })
         );
-        assert_eq!(wps[1].kind, WaypointKind::Branching);
-        assert_eq!(wps[1].line, 6);
-        assert_eq!(wps[2].kind, WaypointKind::Target);
-        assert_eq!(wps[2].line, 7);
+        assert_eq!(wps[1].kind, WaypointKind::Target);
+        assert_eq!(wps[1].line, 7);
+    }
+
+    /// A program that reads no input runs one way: the target alone.
+    #[test]
+    fn lower_candidate_is_target_only_without_input() {
+        let (main_id, err_id) = (FunctionId::new(1), FunctionId::new(2));
+        let (bb0, bb1, bb2) = (BlockId::new(10), BlockId::new(11), BlockId::new(12));
+        let reach_iid = InstId::new(33);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.source_files.push(SourceFile::new(FileId::new(1), "t.c"));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![
+                blk(bb0, vec![cond_br(2, bb1, bb2, 10, 9)]),
+                blk(bb1, vec![err_at(reach_iid, err_id, 12, 7), ret(4)]),
+                blk(bb2, vec![ret(5)]),
+            ],
+            bb0,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+        let cand = FalseCandidate {
+            reach_error_inst: reach_iid,
+            block_path: vec![bb0, bb1],
+            assignments: BTreeMap::new(),
+            nondet_sequence: vec![],
+        };
+        let wps = lower_candidate(&m, &cand, None).expect("lowered");
+        assert_eq!(wps.len(), 1, "{wps:?}");
+        assert_eq!(wps[0].kind, WaypointKind::Target);
     }
 
     #[test]

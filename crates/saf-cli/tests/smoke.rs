@@ -639,35 +639,40 @@ fn verify_witness_passes_witnesslint() {
     );
 }
 
-/// A branch-guarded (nondet) violation's witness carries a `branching` waypoint
-/// located by LINE ONLY (plan 195 Tier A): the `column` key is present only on
-/// the `target` waypoint, never on the `branching` one (a column pointing into
-/// the condition is mis-parsed by `CPAchecker` as a ternary and rejects the whole
-/// witness). The enriched witness must still pass `witnesslint`.
+/// A branch-guarded (nondet) violation whose read is pinned: the witness is the
+/// read's `function_return` waypoint and the target — no `branching`, which adds
+/// nothing once every input is fixed and breaks when a block runs more than once
+/// (180 unreach-call witnesses of the 2027 training run were voted wrong for it).
+/// Any `branching` that does appear is located by LINE ONLY (a column into the
+/// condition is mis-parsed by `CPAchecker` as a ternary). The witness must still
+/// pass `witnesslint`.
 #[test]
 #[ignore]
-fn verify_nondet_witness_has_branching_no_column_and_lints() {
+fn verify_nondet_witness_pins_the_read_and_lints() {
     let dir = tempfile::tempdir().unwrap();
     let w = dir.path().join("w.yml");
     verify_unreach_witness("unreach_false_nondet.c", "LP64", &w).stdout("false(unreach-call)\n");
     let yaml = std::fs::read_to_string(&w).expect("witness written for a false verdict");
     assert!(
-        yaml.contains("type: branching"),
-        "branch-guarded violation must carry a branching waypoint:\n{yaml}"
+        yaml.contains("type: function_return"),
+        "the nondet read must be pinned:\n{yaml}"
     );
     assert!(yaml.contains("type: target"), "{yaml}");
-    // The branching block precedes the target block; the branching location must
-    // omit `column` (only the target keeps its column).
-    let branching_pos = yaml.find("type: branching").expect("branching waypoint");
+    let read_pos = yaml
+        .find("type: function_return")
+        .expect("function_return waypoint");
     let target_pos = yaml.find("type: target").expect("target waypoint");
     assert!(
-        branching_pos < target_pos,
-        "branching precedes target:\n{yaml}"
+        read_pos < target_pos,
+        "the read precedes the target:\n{yaml}"
     );
-    assert!(
-        !yaml[branching_pos..target_pos].contains("column:"),
-        "branching waypoint must omit column (CPAchecker snaps to the if/while keyword):\n{yaml}"
-    );
+    if let Some(b) = yaml.find("type: branching") {
+        let end = yaml[b..].find("- segment").map_or(yaml.len(), |e| b + e);
+        assert!(
+            !yaml[b..end].contains("column:"),
+            "a branching waypoint must omit column:\n{yaml}"
+        );
+    }
 
     // The enriched witness still passes witnesslint (CPAchecker skipped here; the
     // reservoir sweep measures confirmation).
