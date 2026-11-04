@@ -510,6 +510,84 @@ pub fn lower_candidate(
     Some(waypoints)
 }
 
+/// The column of the full expression containing column `col` of `line` (both
+/// 1-based) — where a violation witness's `target` waypoint must point. A
+/// sanitizer reports the operator (`y = 3*y;` at the `*`, column 8); validators
+/// match the full expression (`y = 3*y`, column 3). Scans back over balanced
+/// parentheses to the nearest `;`, `{`, `}`, the start of the line, or the end of
+/// an `if`/`while`/`for`/`switch` condition (or its opening parenthesis, when
+/// `col` is inside the condition), and returns the first non-blank column after
+/// it. `None` when the line does not exist or `col` is past its end.
+#[must_use]
+pub fn full_expression_column(src: &str, line: u32, col: u32) -> Option<u32> {
+    let text = src
+        .lines()
+        .nth(usize::try_from(line).ok()?.checked_sub(1)?)?;
+    let b = text.as_bytes();
+    let mut i = usize::try_from(col).ok()?.checked_sub(1)?;
+    if i >= b.len() {
+        return None;
+    }
+    let control_before = |open: usize| -> bool {
+        let head = text[..open].trim_end();
+        ["if", "while", "for", "switch"].iter().any(|k| {
+            head.strip_suffix(k).is_some_and(|rest| {
+                rest.chars()
+                    .last()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+            })
+        })
+    };
+    // `start` is the index just after the boundary.
+    let mut start = 0;
+    while i > 0 {
+        let c = b[i - 1];
+        match c {
+            b';' | b'{' | b'}' => {
+                start = i;
+                break;
+            }
+            b')' => {
+                // Skip the balanced group; a control condition ends a statement head.
+                let close = i - 1;
+                let mut depth = 0usize;
+                let mut k = close + 1;
+                let mut open = None;
+                while k > 0 {
+                    k -= 1;
+                    match b[k] {
+                        b')' => depth += 1,
+                        b'(' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                open = Some(k);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(open) = open else {
+                    start = i;
+                    break;
+                };
+                if control_before(open) {
+                    start = close + 1;
+                    break;
+                }
+                i = open;
+            }
+            b'(' if control_before(i - 1) => {
+                start = i;
+                break;
+            }
+            _ => i -= 1,
+        }
+    }
+    let first = text[start..].find(|c: char| !c.is_whitespace())? + start;
+    u32::try_from(first + 1).ok()
+}
+
 /// Lower the module's first `reach_error` / `__VERIFIER_error` call site (in
 /// deterministic module order) to a single-`target` waypoint list — a minimal,
 /// always-valid YAML-2.0 violation-witness anchor for a **concurrency**
@@ -1107,6 +1185,23 @@ mod tests {
         assert_eq!(branchings[0].line, 9);
         assert_eq!(branchings[0].constraint.as_ref().unwrap().value, "true");
         assert_eq!(wps.last().unwrap().kind, WaypointKind::Target);
+    }
+
+    #[test]
+    fn full_expression_column_moves_an_operator_to_its_full_expression() {
+        let src = "  y = 3*y;\n  if (n > 0) s = s + n * 2;\n  for (i = 0; i < n; i++) x += a[i];\n  while (k * 2 < m) k++;\n  f(a * b);\n";
+        // `y = 3*y;`: the `*` (column 8) belongs to `y = 3*y` (column 3).
+        assert_eq!(full_expression_column(src, 1, 8), Some(3));
+        // After an `if` condition: the statement `s = s + n * 2`.
+        assert_eq!(full_expression_column(src, 2, 24), Some(14));
+        // In a `for` header and its body.
+        assert_eq!(full_expression_column(src, 3, 23), Some(22));
+        assert_eq!(full_expression_column(src, 3, 29), Some(27));
+        // Inside a `while` condition: the condition itself.
+        assert_eq!(full_expression_column(src, 4, 12), Some(10));
+        // A call argument belongs to the call statement.
+        assert_eq!(full_expression_column(src, 5, 7), Some(3));
+        assert_eq!(full_expression_column(src, 9, 1), None);
     }
 
     #[test]

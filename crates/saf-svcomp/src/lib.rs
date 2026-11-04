@@ -103,8 +103,8 @@ pub use unreach_prove::{
     prove_termination_exhaustive, prove_unreach_exhaustive, prove_unreach_exhaustive_with_states,
 };
 pub use witness_lower::{
-    find_inst_span, lower_candidate, lower_memsafety_candidate, lower_must_reach,
-    lower_overflow_candidate, lower_reach_error_target, span_to_location,
+    find_inst_span, full_expression_column, lower_candidate, lower_memsafety_candidate,
+    lower_must_reach, lower_overflow_candidate, lower_reach_error_target, span_to_location,
 };
 pub use witness_yaml::{
     Action, Constraint, SourceWaypoint, ViolationWitness, WaypointKind, WitnessMeta,

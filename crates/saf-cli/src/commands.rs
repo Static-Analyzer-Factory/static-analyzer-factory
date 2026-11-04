@@ -1901,6 +1901,14 @@ fn verify_source(ctx: &VerifyCtx) -> Option<String> {
     std::fs::read_to_string(ctx.input).ok()
 }
 
+/// The column a sanitizer reported for the operator at `line`, moved to its full
+/// expression, where the witness `target` must point
+/// ([`saf_svcomp::full_expression_column`]). Unchanged without the source.
+fn full_expression_col(ctx: &VerifyCtx, line: u32, column: Option<u32>) -> Option<u32> {
+    let src = verify_source(ctx)?;
+    column.map(|c| saf_svcomp::full_expression_column(&src, line, c).unwrap_or(c))
+}
+
 fn build_witness(
     ctx: &VerifyCtx,
     waypoints: Option<Vec<saf_svcomp::SourceWaypoint>>,
@@ -4969,7 +4977,11 @@ fn memsafety_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             let witness = if hit.subproperty == "valid-memtrack" {
                 None
             } else {
-                build_witness(ctx, Some(saf_svcomp::lower_memsafety_hit(&hit)))
+                {
+                    let mut at = hit.clone();
+                    at.column = full_expression_col(ctx, at.line, at.column).or(at.column);
+                    build_witness(ctx, Some(saf_svcomp::lower_memsafety_hit(&at)))
+                }
             };
             if witness.is_none() && hit.subproperty != "valid-memtrack" {
                 eprintln!(
@@ -6986,7 +6998,13 @@ fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
                 .unwrap_or_default();
             let witness = build_witness(
                 ctx,
-                Some(saf_svcomp::lower_overflow_hit_enriched(&hit, &assumes)),
+                Some(saf_svcomp::lower_overflow_hit_enriched(
+                    &saf_svcomp::OverflowHit {
+                        column: full_expression_col(ctx, hit.line, hit.column).or(hit.column),
+                        ..hit.clone()
+                    },
+                    &assumes,
+                )),
             );
             if witness.is_none() {
                 eprintln!(
