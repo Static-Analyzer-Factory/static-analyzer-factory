@@ -261,7 +261,8 @@ fn function_return_waypoint(
 /// 1-based column of the `)` closing the call whose expression starts at
 /// 1-based (`line`, `col`): the first `(` at or after `col` on that line and its
 /// matching parenthesis. `None` if the line is out of range or unbalanced.
-fn call_close_paren_column(src_lines: &[&str], line: u32, col: u32) -> Option<u32> {
+#[must_use]
+pub fn call_close_paren_column(src_lines: &[&str], line: u32, col: u32) -> Option<u32> {
     let text = src_lines.get(usize::try_from(line).ok()?.checked_sub(1)?)?;
     let start = usize::try_from(col).ok()?.checked_sub(1)?;
     let open = start + text.get(start..)?.find('(')?;

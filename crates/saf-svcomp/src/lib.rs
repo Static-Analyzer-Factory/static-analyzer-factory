@@ -83,7 +83,8 @@ pub use property::{
 };
 pub use property_kind::{DataModel, Language, Property};
 pub use race::{
-    RaceCandidate, RaceHit, find_race_candidates, parse_tsan_report, race_graphml_witness,
+    RaceAccess, RaceCandidate, RaceFrame, RaceHit, find_race_candidates, parse_tsan_report,
+    race_graphml_witness,
 };
 pub use race_true::{
     is_race_inert_external, program_is_race_free, race_true_verdict, resolve_direct_thread_fn,
@@ -103,10 +104,11 @@ pub use unreach_prove::{
     prove_termination_exhaustive, prove_unreach_exhaustive, prove_unreach_exhaustive_with_states,
 };
 pub use witness_lower::{
-    find_inst_span, full_expression_column, lower_candidate, lower_memsafety_candidate,
-    lower_must_reach, lower_overflow_candidate, lower_reach_error_target, span_to_location,
+    call_close_paren_column, find_inst_span, full_expression_column, lower_candidate,
+    lower_memsafety_candidate, lower_must_reach, lower_overflow_candidate,
+    lower_reach_error_target, span_to_location,
 };
 pub use witness_yaml::{
-    Action, Constraint, SourceWaypoint, ViolationWitness, WaypointKind, WitnessMeta,
-    compute_file_hash,
+    Action, Constraint, SourceWaypoint, ThreadWaypoint, ViolationWitness, WaypointKind,
+    WitnessMeta, compute_file_hash,
 };

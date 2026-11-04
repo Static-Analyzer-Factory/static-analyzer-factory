@@ -406,6 +406,37 @@ pub struct RaceHit {
     pub summary_location: Option<String>,
     /// Source `file:line` of the first (later) racing access, if present.
     pub access_location: Option<String>,
+    /// The two conflicting accesses of the first race, in report order (the
+    /// later access first), when the report has both.
+    pub accesses: Vec<RaceAccess>,
+    /// Creation of each thread the report describes: thread number → (creating
+    /// thread, creation stack). `0` is the main thread.
+    pub creations: ThreadCreations,
+}
+
+/// Thread number → (creating thread, creation stack), `0` being the main thread.
+pub type ThreadCreations = BTreeMap<u32, (u32, Vec<RaceFrame>)>;
+
+/// One racing access of a TSan report: the thread and its stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaceAccess {
+    /// TSan's thread number (`0` = the main thread).
+    pub thread: u32,
+    /// Stack frames, innermost first.
+    pub frames: Vec<RaceFrame>,
+}
+
+/// A symbolized TSan stack frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaceFrame {
+    /// The function.
+    pub function: String,
+    /// The source file as TSan printed it.
+    pub file: String,
+    /// 1-based line.
+    pub line: u32,
+    /// 1-based column, when TSan printed one.
+    pub column: Option<u32>,
 }
 
 /// Parse a ThreadSanitizer stderr report, returning a [`RaceHit`] IFF it
@@ -442,11 +473,148 @@ pub fn parse_tsan_report(stderr: &str) -> Option<RaceHit> {
     // The first stack frame after the "Write of size ..."/"Read of size ..."
     // line carries the racing access location: "    #0 fn <file>:<line> (...)".
     let access_location = extract_first_frame_location(stderr);
+    let (accesses, creations) = race_sections(stderr);
 
     Some(RaceHit {
         summary_location,
         access_location,
+        accesses,
+        creations,
     })
+}
+
+/// The accesses and thread creations of the FIRST data-race report in `stderr`.
+/// Access headers read `  Write of size 4 at 0x… by thread T1:` / `  Previous
+/// read of size 4 at 0x… by main thread:`; creation headers read `  Thread T1
+/// (tid=…, …) created by main thread at:` (or `… by thread T2 at:`). Each header
+/// is followed by its `#k` frames.
+fn race_sections(stderr: &str) -> (Vec<RaceAccess>, ThreadCreations) {
+    enum Section {
+        None,
+        Access(usize),
+        Creation(u32),
+    }
+    let mut accesses: Vec<RaceAccess> = Vec::new();
+    let mut creations: ThreadCreations = BTreeMap::new();
+    let mut section = Section::None;
+    let mut in_race = false;
+    for line in stderr.lines() {
+        let t = line.trim();
+        if t.starts_with("WARNING: ThreadSanitizer:") {
+            if in_race {
+                break; // only the first report
+            }
+            in_race = t.starts_with("WARNING: ThreadSanitizer: data race");
+            continue;
+        }
+        if !in_race {
+            continue;
+        }
+        if t.starts_with("SUMMARY:") {
+            break;
+        }
+        if let Some(rest) = t.strip_prefix('#') {
+            let frame = rest.split_once(' ').and_then(|(_, f)| parse_frame(f));
+            match (&section, frame) {
+                (Section::Access(i), Some(f)) => accesses[*i].frames.push(f),
+                (Section::Creation(k), Some(f)) => {
+                    if let Some(c) = creations.get_mut(k) {
+                        c.1.push(f);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let lower = t.to_ascii_lowercase();
+        let is_access = [
+            "write of size",
+            "read of size",
+            "atomic write of size",
+            "atomic read of size",
+            "previous write of size",
+            "previous read of size",
+            "previous atomic write of size",
+            "previous atomic read of size",
+        ]
+        .iter()
+        .any(|p| lower.starts_with(p));
+        if is_access {
+            section = match thread_after(t, " by ") {
+                Some(thread) => {
+                    accesses.push(RaceAccess {
+                        thread,
+                        frames: Vec::new(),
+                    });
+                    Section::Access(accesses.len() - 1)
+                }
+                None => Section::None,
+            };
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("Thread T") {
+            let num = rest
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap_or("");
+            section = match (num.parse::<u32>(), thread_after(t, " created by ")) {
+                (Ok(k), Some(creator)) => {
+                    creations.insert(k, (creator, Vec::new()));
+                    Section::Creation(k)
+                }
+                _ => Section::None,
+            };
+            continue;
+        }
+        section = Section::None;
+    }
+    (accesses, creations)
+}
+
+/// The thread named after `marker` in a TSan header: `main thread` → 0,
+/// `thread T<k>` → k.
+fn thread_after(header: &str, marker: &str) -> Option<u32> {
+    let rest = &header[header.find(marker)? + marker.len()..];
+    if rest.starts_with("main thread") {
+        return Some(0);
+    }
+    let digits: String = rest
+        .strip_prefix("thread T")?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// `<function> <file>:<line>[:<col>] (<module>+<off>)` → a frame; `None` for an
+/// unsymbolized frame.
+fn parse_frame(text: &str) -> Option<RaceFrame> {
+    let mut toks = text.split_whitespace();
+    let function = toks.next()?.to_string();
+    for tok in toks {
+        let parts: Vec<&str> = tok.rsplitn(3, ':').collect();
+        let num = |s: &str| s.parse::<u32>().ok().filter(|_| !s.is_empty());
+        match parts.as_slice() {
+            [c, l, file] if num(c).is_some() && num(l).is_some() => {
+                return Some(RaceFrame {
+                    function,
+                    file: (*file).to_string(),
+                    line: num(l)?,
+                    column: num(c),
+                });
+            }
+            [l, file] if num(l).is_some() => {
+                return Some(RaceFrame {
+                    function,
+                    file: (*file).to_string(),
+                    line: num(l)?,
+                    column: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Extract the `file:line` from the first `#0` stack frame in a TSan report.
@@ -602,10 +770,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tsan_report_yields_both_accesses_and_the_thread_creations() {
+        let report = "==================\n\
+WARNING: ThreadSanitizer: data race (pid=7)\n\
+  Write of size 4 at 0x55 by thread T1:\n\
+    #0 t_fun /tmp/x/race.c:21:11 (h+0x1)\n\
+    #1 <null> <null> (libc.so.6+0x2)\n\
+\n\
+  Previous write of size 4 at 0x55 by main thread:\n\
+    #0 main /tmp/x/race.c:28:3 (h+0x3)\n\
+\n\
+  Location is global 'data' of size 40 at 0x55 (h+0x4)\n\
+\n\
+  Thread T1 (tid=9, running) created by main thread at:\n\
+    #0 pthread_create tsan_interceptors.cpp:1022 (h+0x5)\n\
+    #1 main /tmp/x/race.c:27:3 (h+0x6)\n\
+\n\
+SUMMARY: ThreadSanitizer: data race /tmp/x/race.c:21:11 in t_fun\n";
+        let hit = parse_tsan_report(report).expect("a data race");
+        assert_eq!(hit.accesses.len(), 2);
+        assert_eq!(hit.accesses[0].thread, 1);
+        assert_eq!(hit.accesses[1].thread, 0);
+        assert_eq!(
+            hit.accesses[0].frames[0],
+            RaceFrame {
+                function: "t_fun".into(),
+                file: "/tmp/x/race.c".into(),
+                line: 21,
+                column: Some(11),
+            }
+        );
+        let (creator, frames) = &hit.creations[&1];
+        assert_eq!(*creator, 0);
+        assert_eq!(frames[0].column, None, "a frame without a column");
+        assert_eq!((frames[1].function.as_str(), frames[1].line), ("main", 27));
+    }
+
+    #[test]
     fn graphml_witness_is_well_formed() {
         let hit = RaceHit {
             summary_location: Some("/tmp/race.c:8".to_string()),
             access_location: Some("/tmp/race.c:8".to_string()),
+            accesses: Vec::new(),
+            creations: BTreeMap::new(),
         };
         let w = race_graphml_witness(
             "CHECK( init(main()), LTL(G ! data-race) )",
@@ -637,6 +844,8 @@ mod tests {
         let hit = RaceHit {
             summary_location: None,
             access_location: None,
+            accesses: Vec::new(),
+            creations: BTreeMap::new(),
         };
         let w = race_graphml_witness("a & b < c > d \"e\"", "p.c", "h", "32bit", &hit);
         assert!(w.contains("a &amp; b &lt; c &gt; d &quot;e&quot;"));

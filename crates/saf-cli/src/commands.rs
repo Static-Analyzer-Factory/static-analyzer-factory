@@ -7215,6 +7215,77 @@ fn termination_engine_proves(ctx: &VerifyCtx) -> bool {
     }
 }
 
+/// The format-2.2 violation witness of a `TSan`-confirmed data race: the
+/// `function_enter` of every thread-creating call up to the highest-numbered
+/// racing thread (`TSan` numbers threads in creation order, and the k-th
+/// registration of the witness creates thread k), then the two accesses as the
+/// final segment's targets, each at its full expression. `None` — no YAML
+/// witness — unless the report gives both accesses in the program's own file and,
+/// for every thread 1..=k, a creation by the main thread at a call in that file.
+fn race_yaml_witness(
+    ctx: &VerifyCtx,
+    hit: &saf_svcomp::RaceHit,
+    programfile: &str,
+) -> Option<saf_svcomp::ViolationWitness> {
+    let src = verify_source(ctx)?;
+    let lines: Vec<&str> = src.lines().collect();
+    let in_program = |frames: &[saf_svcomp::RaceFrame]| {
+        frames
+            .iter()
+            .find(|f| {
+                Path::new(&f.file)
+                    .file_name()
+                    .is_some_and(|n| n == programfile)
+            })
+            .cloned()
+    };
+    let waypoint = |kind, f: &saf_svcomp::RaceFrame, column| saf_svcomp::SourceWaypoint {
+        kind,
+        action: saf_svcomp::Action::Follow,
+        file_name: programfile.to_string(),
+        line: f.line,
+        column,
+        function: Some(f.function.clone()),
+        constraint: None,
+    };
+    let [a, b] = hit.accesses.get(..2)? else {
+        return None;
+    };
+    let mut targets = Vec::new();
+    for acc in [a, b] {
+        let f = in_program(&acc.frames)?;
+        let col = f.column?;
+        let col = saf_svcomp::full_expression_column(&src, f.line, col).unwrap_or(col);
+        targets.push(saf_svcomp::ThreadWaypoint {
+            waypoint: waypoint(saf_svcomp::WaypointKind::Target, &f, Some(col)),
+            thread_id: acc.thread,
+        });
+    }
+    if a.thread == b.thread {
+        return None;
+    }
+    let max = a.thread.max(b.thread);
+    let mut registrations = Vec::new();
+    for k in 1..=max {
+        let (creator, frames) = hit.creations.get(&k)?;
+        if *creator != 0 {
+            return None;
+        }
+        let f = in_program(frames)?;
+        let col = saf_svcomp::call_close_paren_column(&lines, f.line, f.column?)?;
+        registrations.push(saf_svcomp::ThreadWaypoint {
+            waypoint: waypoint(saf_svcomp::WaypointKind::FunctionEnter, &f, Some(col)),
+            thread_id: 0,
+        });
+    }
+    saf_svcomp::ViolationWitness::assemble_race(
+        ctx.meta,
+        &registrations,
+        [&targets[0], &targets[1]],
+    )
+    .ok()
+}
+
 /// `ThreadSanitizer` runtime options for the `no-data-race` confirmer: stop at the
 /// first race so the report is captured promptly; do not `abort()` (which would
 /// mangle the report); a distinct exit code aids debugging (the verdict is driven
@@ -7447,17 +7518,23 @@ fn try_no_data_race_false(ctx: &VerifyCtx, source: &str) -> Option<VerdictOutcom
                 saf_svcomp::DataModel::ILP32 => "32bit",
                 saf_svcomp::DataModel::LP64 => "64bit",
             };
-            let graphml = saf_svcomp::race_graphml_witness(
-                ctx.meta.specification.trim(),
-                &programfile,
-                &programhash,
-                architecture,
-                &hit,
-            );
+            // SV-COMP 2027 scores a data-race violation witness only in format
+            // 2.2; the GraphML 1.0 document is kept for a report the 2.2 witness
+            // cannot be built from (it scores 0 either way).
+            let witness = race_yaml_witness(ctx, &hit, &programfile);
+            let graphml = witness.is_none().then(|| {
+                saf_svcomp::race_graphml_witness(
+                    ctx.meta.specification.trim(),
+                    &programfile,
+                    &programhash,
+                    architecture,
+                    &hit,
+                )
+            });
             Some(VerdictOutcome {
                 verdict: format!("false({})", saf_svcomp::Property::NoDataRace.name()),
-                witness: None,
-                graphml: Some(graphml),
+                witness,
+                graphml,
                 correctness: None,
             })
         }

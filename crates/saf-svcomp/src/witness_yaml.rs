@@ -41,6 +41,11 @@ pub(crate) const FORMAT_VERSION_2_0: &str = FORMAT_VERSION;
 /// argument uses. An empty `invariant_set` is valid in 2.1 exactly as in 2.0
 /// (`content` has no `minItems`).
 pub(crate) const FORMAT_VERSION_2_1: &str = "2.1";
+
+/// Format version 2.2: multi-threaded violation witnesses (`thread_id`, the
+/// multi-follow final segment of a data race). SV-COMP 2027 requires it for
+/// every `C.no-data-race.*` violation witness.
+pub(crate) const FORMAT_VERSION_2_2: &str = "2.2";
 const PRODUCER_NAME: &str = "SAF";
 /// Fixed creation timestamp: witness bytes must be byte-identical for identical
 /// inputs (NFR-DET-001), so the emitter never reads the wall clock.
@@ -142,6 +147,17 @@ pub struct SourceWaypoint {
     pub constraint: Option<Constraint>,
 }
 
+/// A waypoint of a multi-threaded (format 2.2) witness: the waypoint and the
+/// thread executing it (`0` is the main thread; the k-th thread-creating
+/// `function_enter` of the witness creates thread k).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadWaypoint {
+    /// The waypoint.
+    pub waypoint: SourceWaypoint,
+    /// The thread that executes it.
+    pub thread_id: u32,
+}
+
 /// An assembled YAML 2.0 violation witness, ready to serialize.
 #[derive(Debug)]
 pub struct ViolationWitness {
@@ -204,6 +220,56 @@ impl ViolationWitness {
             entry: Entry {
                 entry_type: "violation_sequence",
                 metadata: build_metadata_seeded(meta, &[]),
+                content,
+            },
+        })
+    }
+
+    /// Assemble a format-2.2 `no-data-race` violation witness: one segment per
+    /// `registrations` waypoint — the `function_enter` of each thread-creating
+    /// call, in order, so the k-th creates thread k — then the final multi-follow
+    /// segment holding the two conflicting `accesses` as `target` waypoints
+    /// (keeping both in one segment is what leaves them unordered).
+    ///
+    /// # Errors
+    /// Returns `Err` if a registration is not a `follow` `function_enter`, or an
+    /// access is not a `follow` `target`.
+    pub fn assemble_race(
+        meta: &WitnessMeta,
+        registrations: &[ThreadWaypoint],
+        accesses: [&ThreadWaypoint; 2],
+    ) -> anyhow::Result<Self> {
+        let thread_out = |tw: &ThreadWaypoint| WaypointWrap {
+            waypoint: WaypointOut {
+                thread_id: Some(tw.thread_id),
+                ..waypoint_out(&tw.waypoint)
+            },
+        };
+        let mut content = Vec::new();
+        for r in registrations {
+            anyhow::ensure!(
+                r.waypoint.kind == WaypointKind::FunctionEnter
+                    && matches!(r.waypoint.action, Action::Follow),
+                "a thread registration is a `follow` `function_enter` waypoint"
+            );
+            content.push(SegmentWrap {
+                segment: vec![thread_out(r)],
+            });
+        }
+        for a in accesses {
+            anyhow::ensure!(
+                a.waypoint.kind == WaypointKind::Target
+                    && matches!(a.waypoint.action, Action::Follow),
+                "a racing access is a `follow` `target` waypoint"
+            );
+        }
+        content.push(SegmentWrap {
+            segment: accesses.into_iter().map(thread_out).collect(),
+        });
+        Ok(Self {
+            entry: Entry {
+                entry_type: "violation_sequence",
+                metadata: build_metadata_versioned(meta, b"data-race", FORMAT_VERSION_2_2),
                 content,
             },
         })
@@ -285,6 +351,9 @@ struct WaypointOut {
     action: &'static str,
     #[serde(rename = "type")]
     kind: &'static str,
+    /// Format 2.2: the thread executing the waypoint (absent: the main thread).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_id: Option<u32>,
     location: LocationOut,
     #[serde(skip_serializing_if = "Option::is_none")]
     constraint: Option<ConstraintOut>,
@@ -328,6 +397,7 @@ fn waypoint_out(wp: &SourceWaypoint) -> WaypointOut {
     WaypointOut {
         action: wp.action.as_str(),
         kind: wp.kind.as_str(),
+        thread_id: None,
         location: LocationOut {
             file_name: wp.file_name.clone(),
             line: wp.line,
