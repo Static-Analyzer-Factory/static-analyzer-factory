@@ -507,6 +507,10 @@ struct State {
     seen_alloca: BTreeSet<ValueId>,
     versioned: BTreeMap<ValueId, ValueId>,
     dead_end: bool,
+    /// The outcome of the allocation about to be retried after a
+    /// [`Flow::AllocSplit`]: `Some(false)` returns NULL, `Some(true)` a fresh
+    /// object. `None` everywhere else (it never survives the instruction).
+    alloc_choice: Option<bool>,
 }
 
 /// Concrete content of one footprint slot of a loop-header state.
@@ -1003,8 +1007,10 @@ pub fn prove_no_overflow_exhaustive_shl(
 /// The same engine for `valid-memsafety` (plan 222 §2s): a proof means every
 /// access on every path stayed inside a live object, every `free` was valid and
 /// no heap block was left unreachable from the globals at any path end (see
-/// [`Goal::MemSafety`]). `malloc`/`calloc` never fail (SV-COMP rules); every
-/// other allocator, and a declared `ldv_malloc` (which may fail), abstains.
+/// [`Goal::MemSafety`]). Every allocation may also return NULL (SV-COMP 2027
+/// rules), and a dereference of that NULL abstains; a block size is modelled for
+/// `malloc`/`calloc` only, every other allocator and a declared `ldv_malloc`
+/// abstain.
 #[must_use]
 pub fn prove_memsafety_exhaustive(module: &AirModule, budget: Duration) -> ExhaustiveProof {
     if module
@@ -1093,9 +1099,33 @@ pub fn prove_termination_exhaustive(module: &AirModule, budget: Duration) -> Exh
     }
 }
 
+/// Can this allocation return NULL? `malloc`, `calloc` and `realloc` can (SV-COMP
+/// 2027 rules), and so can any other allocator: a kernel or harness allocator
+/// (`kmalloc`, `ldv_malloc`, …) reports failure the same way. Only C++ `new`
+/// throws instead.
+fn alloc_may_fail(kind: &saf_core::air::HeapAllocKind) -> bool {
+    !matches!(kind, saf_core::air::HeapAllocKind::New)
+}
+
+/// Does the module contain an allocation that may return NULL (see
+/// [`alloc_may_fail`])? The interval sentinels model every heap address as
+/// non-null, so they must not prove such a module: `p = malloc(n); if (!p)
+/// reach_error();` would be "proved".
+#[must_use]
+pub fn module_has_failable_allocation(module: &AirModule) -> bool {
+    module.functions.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(&i.op, Operation::HeapAlloc { kind } if alloc_may_fail(kind)))
+        })
+    })
+}
+
 /// Externs the frontend maps to a `malloc`-kind allocation whose model may
-/// return NULL (the LDV harness allocators): the never-fails rule is
-/// `malloc`'s, not theirs.
+/// return NULL (the LDV harness allocators). Since SV-COMP 2027 `malloc` may fail
+/// too (see [`alloc_may_fail`]); these still abstain for memory safety because
+/// their block size is not modelled.
 const MAY_FAIL_MALLOC: &[&str] = &["ldv_malloc"];
 
 /// Does a `printf` format contain a `%n` conversion (which writes through
@@ -1939,6 +1969,7 @@ impl<'a> Engine<'a> {
             seen_alloca: BTreeSet::new(),
             versioned: BTreeMap::new(),
             dead_end: false,
+            alloc_choice: None,
         };
         for p in &main.params {
             let v = match self.width.get(&p.id) {
@@ -2058,6 +2089,9 @@ impl<'a> Engine<'a> {
     /// content is unknown (escaped: a load is fresh until a store), every
     /// mutable global likewise; constant globals keep their initialiser. Values
     /// defined before the loop become fresh symbols on first use (`val`).
+    // NOTE: most of the length is the full `State` literal (one line per field);
+    // splitting it off would only move that literal elsewhere.
+    #[allow(clippy::too_many_lines)]
     fn arbitrary_header_state(&mut self, main: &saf_core::air::AirFunction) -> State {
         let (lfunc, header, first_non_phi, call_site) = {
             let lp = self.kloop.as_ref().expect("k-induction needs a loop");
@@ -2103,6 +2137,7 @@ impl<'a> Engine<'a> {
             seen_alloca: BTreeSet::new(),
             versioned: BTreeMap::new(),
             dead_end: false,
+            alloc_choice: None,
         };
         // Parameters of main and of the loop's function are unconstrained.
         let mut param_ids: Vec<ValueId> = main.params.iter().map(|p| p.id).collect();
@@ -3104,6 +3139,17 @@ impl<'a> Engine<'a> {
                     }
                     return Ok(());
                 }
+                Flow::AllocSplit => {
+                    trace(|| format!("allocation may fail at block={:?}", st.block));
+                    for ok in [false, true] {
+                        let mut s = st.clone();
+                        s.alloc_choice = Some(ok);
+                        // Same instruction, now with the outcome fixed.
+                        let key = self.order_key(&s);
+                        worklist.push(key, s);
+                    }
+                    return Ok(());
+                }
                 Flow::Fork(mut targets) => {
                     trace(|| format!("fork at block={:?} -> {} targets", st.block, targets.len()));
                     // One live side: just go there (no clone, no queue — a
@@ -3714,7 +3760,27 @@ impl<'a> Engine<'a> {
             // within that), its base is unique per execution of the allocation so
             // two live objects never alias, and nothing frees it (a later access
             // to freed memory is undefined behaviour the engine need not model).
+            //
+            // `malloc`, `calloc` and `realloc` may also return NULL: SV-COMP 2027
+            // dropped the "allocation always succeeds" rule (sv-benchmarks !1686).
+            // A proof covers both outcomes; the NULL path usually ends at the
+            // program's own guard, and an unguarded dereference of it abstains
+            // (`null_deref`). Counterexample mode keeps the success path only: its
+            // verdicts are replayed natively, where the allocation succeeds.
+            // Missing the NULL outcome was a wrong TRUE in the 2027 training run
+            // (`ldv-regression/rule57_ebda_blast_2`).
             Operation::HeapAlloc { kind } => {
+                if !self.cex_mode && alloc_may_fail(kind) {
+                    match st.alloc_choice.take() {
+                        None => return Ok(Flow::AllocSplit),
+                        Some(false) => {
+                            trace(|| "allocation returns NULL".to_string());
+                            set(st, inst, Val::Ptr(Some((NULL_BASE, Vec::new()))));
+                            return Ok(Flow::Next);
+                        }
+                        Some(true) => {}
+                    }
+                }
                 self.fresh_counter += 1;
                 let base = ValueId::new(u128::MAX - u128::from(self.fresh_counter));
                 let zeroing = match kind {
@@ -4206,8 +4272,8 @@ impl<'a> Engine<'a> {
             .ok_or_else(|| "ms-store-width".to_string())
     }
 
-    /// The byte size of a `malloc`/`calloc` block (64-bit), never-failing
-    /// allocation (SV-COMP rules: `malloc` and `alloca` always succeed).
+    /// The byte size of a `malloc`/`calloc` block (64-bit) on the path where the
+    /// allocation succeeded (the NULL outcome is split off before this).
     fn ms_alloc_size(
         &mut self,
         st: &mut State,
@@ -5845,6 +5911,9 @@ enum Flow {
     /// Split the state on these mutually exclusive, jointly exhaustive
     /// conditions (each pins a symbol to one value) and retry the instruction.
     Refine(Vec<(Bool, Vars)>),
+    /// Split the state on the outcome of a `malloc`/`calloc`/`realloc` (NULL or
+    /// a fresh object) and retry the instruction with the outcome fixed.
+    AllocSplit,
     Return(Option<Val>),
     Halt,
 }
@@ -6434,6 +6503,32 @@ mod tests {
             label: None,
             instructions: insts,
         }
+    }
+
+    /// `if (p == NULL) return;` right after an allocation (SV-COMP 2027:
+    /// allocations may fail): the comparison and branch that end the allocating
+    /// block, and the NULL exit block. Execution continues in `cont`.
+    fn null_guard(b: &mut B, p: ValueId, cont: BlockId) -> (Vec<Instruction>, AirBlock) {
+        let null = ValueId::new(b.id());
+        b.m.constants.insert(null, Constant::Null);
+        let (i_eq, eq) = fbin(b, BinaryOp::ICmpEq, p, null, I1);
+        let bb_null = b.bid();
+        let (i_br, _) = b.inst(
+            Operation::CondBr {
+                then_target: bb_null,
+                else_target: cont,
+            },
+            vec![eq],
+            None,
+        );
+        let (i_ret, _) = b.inst(Operation::Ret, vec![], None);
+        (vec![i_eq, i_br], blk(bb_null, vec![i_ret]))
+    }
+
+    /// `a` followed by `b`.
+    fn cat(mut a: Vec<Instruction>, b: Vec<Instruction>) -> Vec<Instruction> {
+        a.extend(b);
+        a
     }
 
     fn prove(m: &AirModule) -> ExhaustiveProof {
@@ -7736,9 +7831,9 @@ mod tests {
         assert_eq!(prove_ovf(&sdiv_program(true)), ExhaustiveProof::Proven);
     }
 
-    /// `int *p = malloc(4), *q = malloc(4); *p = 5; *q = 7; if (*p != 5) reach_error();`
-    /// — two heap objects are distinct cells; the store through `q` does not
-    /// disturb `p`, and the load through `p` is exact.
+    /// `int *p = malloc(4), *q = malloc(4);` (each NULL-checked) `*p = 5; *q = 7;
+    /// if (*p != 5) reach_error();` — two heap objects are distinct cells; the store
+    /// through `q` does not disturb `p`, and the load through `p` is exact.
     #[test]
     fn heap_objects_are_distinct_exact_cells() {
         use saf_core::air::HeapAllocKind;
@@ -7750,15 +7845,18 @@ mod tests {
                 kind: HeapAllocKind::Malloc,
             },
             vec![],
-            Some(I32),
+            Some(PTR),
         );
         let (i_q, q) = b.inst(
             Operation::HeapAlloc {
                 kind: HeapAllocKind::Malloc,
             },
             vec![],
-            Some(I32),
+            Some(PTR),
         );
+        let (c1, c2) = (b.bid(), b.bid());
+        let (g_p, null_p) = null_guard(&mut b, p.unwrap(), c1);
+        let (g_q, null_q) = null_guard(&mut b, q.unwrap(), c2);
         let (five, seven) = (b.konst(5), b.konst(7));
         let (i_sp, _) = b.inst(Operation::Store, vec![five, p.unwrap()], None);
         let (i_sq, _) = b.inst(Operation::Store, vec![seven, q.unwrap()], None);
@@ -7785,7 +7883,11 @@ mod tests {
             "main",
             vec![],
             vec![
-                blk(e, vec![i_p, i_q, i_sp, i_sq, i_ld, i_ne, i_br]),
+                blk(e, cat(vec![i_p], g_p)),
+                blk(c1, cat(vec![i_q], g_q)),
+                blk(c2, vec![i_sp, i_sq, i_ld, i_ne, i_br]),
+                null_p,
+                null_q,
                 blk(bb_then, vec![i_err, i_r1]),
                 blk(bb_end, vec![i_r2]),
             ],
@@ -7793,8 +7895,60 @@ mod tests {
         assert_eq!(prove(&b.m), ExhaustiveProof::Proven);
     }
 
-    /// `int *p = malloc(4); if (*p == 3) reach_error();` — indeterminate contents:
-    /// the load is fresh and the error feasible, never a proof.
+    /// `int *p = malloc(4); if (p == NULL) reach_error();` — SV-COMP 2027:
+    /// allocations may fail, so the error is feasible (a wrong TRUE on
+    /// `rule57_ebda_blast_2` before). C++ `new` throws instead of returning NULL.
+    #[test]
+    fn allocation_may_return_null() {
+        use saf_core::air::HeapAllocKind;
+        fn program(kind: HeapAllocKind) -> AirModule {
+            let mut b = B::new();
+            let err = b.decl("reach_error");
+            let (e, bb_then, bb_end) = (b.bid(), b.bid(), b.bid());
+            let size = b.konst(4);
+            let (i_p, p) = b.inst(Operation::HeapAlloc { kind }, vec![size], Some(PTR));
+            let null = ValueId::new(b.id());
+            b.m.constants.insert(null, Constant::Null);
+            let (i_eq, eq) = fbin(&mut b, BinaryOp::ICmpEq, p.unwrap(), null, I1);
+            let (i_br, _) = b.inst(
+                Operation::CondBr {
+                    then_target: bb_then,
+                    else_target: bb_end,
+                },
+                vec![eq],
+                None,
+            );
+            let (i_err, _) = b.inst(Operation::CallDirect { callee: err }, vec![], None);
+            let (i_r1, _) = b.inst(Operation::Ret, vec![], None);
+            let (i_r2, _) = b.inst(Operation::Ret, vec![], None);
+            b.func(
+                "main",
+                vec![],
+                vec![
+                    blk(e, vec![i_p, i_eq, i_br]),
+                    blk(bb_then, vec![i_err, i_r1]),
+                    blk(bb_end, vec![i_r2]),
+                ],
+            );
+            b.m
+        }
+        for kind in [
+            HeapAllocKind::Malloc,
+            HeapAllocKind::Calloc,
+            HeapAllocKind::Realloc,
+            HeapAllocKind::Other("kmalloc".into()),
+        ] {
+            assert_eq!(
+                prove(&program(kind)),
+                ExhaustiveProof::Abstain("error-feasible".into())
+            );
+        }
+        assert_eq!(prove(&program(HeapAllocKind::New)), ExhaustiveProof::Proven);
+    }
+
+    /// `int *p = malloc(4);` (NULL-checked) `if (*p == 3) reach_error();` —
+    /// indeterminate contents: the load is fresh and the error feasible, never a
+    /// proof.
     #[test]
     fn uninitialised_heap_cell_is_any_value() {
         use saf_core::air::HeapAllocKind;
@@ -7806,8 +7960,10 @@ mod tests {
                 kind: HeapAllocKind::Malloc,
             },
             vec![],
-            Some(I32),
+            Some(PTR),
         );
+        let c1 = b.bid();
+        let (g_p, null_p) = null_guard(&mut b, p.unwrap(), c1);
         let three = b.konst(3);
         let (i_ld, v) = b.inst(Operation::Load, vec![p.unwrap()], Some(I32));
         let (i_eq, eq) = b.inst(
@@ -7832,7 +7988,9 @@ mod tests {
             "main",
             vec![],
             vec![
-                blk(e, vec![i_p, i_ld, i_eq, i_br]),
+                blk(e, cat(vec![i_p], g_p)),
+                blk(c1, vec![i_ld, i_eq, i_br]),
+                null_p,
                 blk(bb_then, vec![i_err, i_r1]),
                 blk(bb_end, vec![i_r2]),
             ],
@@ -9547,6 +9705,8 @@ mod tests {
             let (e, bb_then, bb_end) = (b.bid(), b.bid(), b.bid());
             let size = b.konst(4);
             let (i_p, p) = b.inst(Operation::HeapAlloc { kind }, vec![size], Some(PTR));
+            let c1 = b.bid();
+            let (g_p, null_p) = null_guard(&mut b, p.unwrap(), c1);
             let (i_ld, v) = b.inst(Operation::Load, vec![p.unwrap()], Some(I32));
             let zero = b.konst(0);
             let (i_ne, ne) = fbin(&mut b, BinaryOp::ICmpNe, v.unwrap(), zero, I1);
@@ -9565,7 +9725,9 @@ mod tests {
                 "main",
                 vec![],
                 vec![
-                    blk(e, vec![i_p, i_ld, i_ne, i_br]),
+                    blk(e, cat(vec![i_p], g_p)),
+                    blk(c1, vec![i_ld, i_ne, i_br]),
+                    null_p,
                     blk(bb_then, vec![i_err, i_r1]),
                     blk(bb_end, vec![i_r2]),
                 ],
@@ -9659,6 +9821,8 @@ mod tests {
             let (e, bb_then, bb_end) = (b.bid(), b.bid(), b.bid());
             let size = b.konst(8);
             let (i_p, p) = b.inst(Operation::HeapAlloc { kind }, vec![size], Some(PTR));
+            let c1 = b.bid();
+            let (g_p, null_p) = null_guard(&mut b, p.unwrap(), c1);
             let (i_ld, q) = b.inst(Operation::Load, vec![p.unwrap()], Some(PTR));
             let null = ValueId::new(b.id());
             b.m.constants.insert(null, Constant::Null);
@@ -9678,7 +9842,9 @@ mod tests {
                 "main",
                 vec![],
                 vec![
-                    blk(e, vec![i_p, i_ld, i_ne, i_br]),
+                    blk(e, cat(vec![i_p], g_p)),
+                    blk(c1, vec![i_ld, i_ne, i_br]),
+                    null_p,
                     blk(bb_then, vec![i_err, i_r1]),
                     blk(bb_end, vec![i_r2]),
                 ],

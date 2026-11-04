@@ -97,10 +97,10 @@ pub use termination_witness::{build_ranking_witness, build_termination_witness};
 pub use unreach_prove::{
     CexOptions, Counterexample, ExhaustiveProof, HeaderStates, KEEP_ALIVE, LIFETIME_END,
     LIFETIME_START, PINNED_EXTERNS, StateVar, find_counterexample, find_counterexample_excluding,
-    is_pinned_extern, prove_memsafety_exhaustive, prove_no_overflow_exhaustive,
-    prove_no_overflow_exhaustive_shl, prove_no_overflow_exhaustive_with_states,
-    prove_no_overflow_exhaustive_with_states_shl, prove_termination_exhaustive,
-    prove_unreach_exhaustive, prove_unreach_exhaustive_with_states,
+    is_pinned_extern, module_has_failable_allocation, prove_memsafety_exhaustive,
+    prove_no_overflow_exhaustive, prove_no_overflow_exhaustive_shl,
+    prove_no_overflow_exhaustive_with_states, prove_no_overflow_exhaustive_with_states_shl,
+    prove_termination_exhaustive, prove_unreach_exhaustive, prove_unreach_exhaustive_with_states,
 };
 pub use witness_lower::{
     find_inst_span, lower_candidate, lower_memsafety_candidate, lower_must_reach,

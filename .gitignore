@@ -77,6 +77,8 @@ tests/benchmarks/sv-benchmarks/.compiled-juliet/
 tests/benchmarks/sv-benchmarks/.compiled-juliet-llvm*/
 tests/benchmarks/sv-benchmarks/.task-cache/
 tests/benchmarks/sv-benchmarks/juliet-results*.json
+# SV-COMP 2027 frozen task set (worktree of the sv-benchmarks submodule at the 2026-11-03 freeze)
+tests/benchmarks/sv-benchmarks-27/
 
 # CruxBC benchmark data (only README.md is tracked; .bc source comes from ptaben submodule)
 tests/benchmarks/cruxbc/.compiled/

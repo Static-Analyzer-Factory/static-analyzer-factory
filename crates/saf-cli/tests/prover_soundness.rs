@@ -208,3 +208,70 @@ fn does_not_prove_no_overflow_on_frozen_dispatch_phi() {
 fn still_proves_no_overflow_after_the_sccp_revisit_fix() {
     prove_no_overflow("overflow_true_safe.c", "ILP32").stdout(predicate::str::starts_with("PROVE"));
 }
+
+// ---------------------------------------------------------------------------
+// no-data-race TRUE — element-sensitive aliasing
+//
+// The structural race prover (`race_true.rs`) skips a pair of accesses when the
+// points-to analysis says they cannot alias. `PtaResult::may_alias` answered `No`
+// for `data[4]` vs `data[i]` (two locations of one object with incomparable field
+// paths) although they overlap whenever `i == 4`; locations in one object now always
+// count as overlapping. Reduced from a wrong TRUE in the SV-COMP 2027 training run.
+// ---------------------------------------------------------------------------
+
+/// `saf verify --property no-data-race.prp --data-model ILP32 <fixture>`, asserting exit 0.
+fn verify_no_data_race(name: &str) -> assert_cmd::assert::Assert {
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            fixture("no-data-race.prp").as_str(),
+            "--data-model",
+            "ILP32",
+            fixture(name).as_str(),
+        ])
+        .assert()
+        .success()
+}
+
+/// `data[4]` in the thread vs `data[i]` in `main` must never be proved race-free.
+#[test]
+#[ignore]
+fn does_not_prove_race_free_const_vs_unknown_index() {
+    verify_no_data_race("race_false_const_vs_unknown_index.c")
+        .stdout(predicate::str::contains("true").not());
+}
+
+/// GUARD: accesses to two distinct objects are disjoint and must still be proved.
+#[test]
+#[ignore]
+fn still_proves_race_free_distinct_globals() {
+    verify_no_data_race("race_true_distinct_globals.c").stdout(predicate::eq("true\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Allocation may fail (SV-COMP 2027)
+//
+// SV-COMP 2027 dropped the "allocation always succeeds" rule: `malloc`, `calloc`
+// and `realloc` may return NULL (sv-benchmarks !1686). The exhaustive engine
+// modelled every allocation as a fresh object, so an error reachable only after a
+// failed allocation was "proved" unreachable — a wrong TRUE on
+// `ldv-regression/rule57_ebda_blast_2` in the 2027 training run.
+// ---------------------------------------------------------------------------
+
+/// The error is reachable exactly when `calloc` returns NULL: never PROVE.
+#[test]
+#[ignore]
+fn does_not_prove_unreachable_when_allocation_may_fail() {
+    prove_unreachable("prove_false_alloc_may_fail.c")
+        .stdout(predicate::str::starts_with("PROVE").not());
+}
+
+/// GUARD: a program that aborts on a NULL `malloc` is safe on both outcomes and
+/// must still PROVE.
+#[test]
+#[ignore]
+fn still_proves_unreachable_with_null_guarded_allocation() {
+    prove_unreachable("prove_unreach_alloc_null_guarded.c")
+        .stdout(predicate::str::starts_with("PROVE"));
+}

@@ -43,7 +43,8 @@
 //!
 //! 2. **Under-approximating aliasing / concurrency** (missing a conflicting pair).
 //!    We use the *conservative* alias query ([`AliasResult::may_alias_conservative`],
-//!    which treats untracked pointers as may-alias) and treat **every pair of
+//!    which treats untracked pointers as may-alias), count any two
+//!    locations in one object as overlapping (see `may_overlap`), and treat **every pair of
 //!    distinct spawned threads as possibly-concurrent** — we never trust an MTA
 //!    happens-before result to *rule out* an overlap (that would miss races like
 //!    Peterson/Lamport where two joined threads race on a shared flag). An access
@@ -776,6 +777,9 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
     // invoked-at-most-once main-tree function, not inside a CFG loop).
     let invoked_once = compute_invoked_at_most_once(module, main_id, &main_tree);
     let recurrent = recurrent_thread_ids(module, &mta, &invoked_once);
+    if std::env::var_os("SAF_RACE_TRUE_DEBUG").is_some() {
+        debug_accesses(&accesses, &pta);
+    }
 
     // Pairwise conflict scan. Any conflicting pair without a common unique lock is
     // not provably race-free ⇒ abstain.
@@ -815,7 +819,7 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
             if !concurrent || (!a.write && !b.write) {
                 continue;
             }
-            if !pta.may_alias(a.ptr, b.ptr).may_alias_conservative() {
+            if !may_overlap(&pta, a.ptr, b.ptr) {
                 continue;
             }
             // Conflicting pair — require a provably-common unique lock.
@@ -826,6 +830,56 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// `SAF_RACE_TRUE_DEBUG`: every collected access with the locations its pointer may
+/// name, so a wrong `true` can be traced to a missing access or a missed overlap.
+fn debug_accesses(accesses: &[Access], pta: &PtaResult) {
+    for a in accesses {
+        let locs: Vec<String> = pta
+            .points_to_map()
+            .get(&a.ptr)
+            .map(|s| {
+                s.iter()
+                    .map(|l| match pta.location(*l) {
+                        Some(loc) => format!("{:?}{:?}", loc.obj, loc.path.steps),
+                        None => format!("{l:?}?"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        eprintln!(
+            "race_true: access thread={} write={} pre_spawn={} ptr={:?} pts={locs:?}",
+            a.thread_id, a.write, a.pre_spawn, a.ptr
+        );
+    }
+}
+
+/// May the memory `p` and `q` point to overlap? The conservative alias query first;
+/// when it says no, any two pointees in one **object** still count as overlapping.
+///
+/// `PtaResult::may_alias` separates two locations of one object by their field
+/// paths, but those paths do not encode byte offsets canonically: `data[i]` on
+/// `int data[10]` is `[Field 0, Index(Unknown)]` while the constant-folded `data[4]`
+/// is `[Field 4]`, so `may_alias` called them disjoint although they overlap when
+/// `i == 4` (a wrong TRUE in the SV-COMP 2027 training run). No step-wise comparison
+/// of such paths is sound, so object identity decides. A pointee the factory cannot
+/// resolve may overlap anything.
+fn may_overlap(pta: &PtaResult, p: ValueId, q: ValueId) -> bool {
+    if pta.may_alias(p, q).may_alias_conservative() {
+        return true;
+    }
+    let points_to = pta.points_to_map();
+    let (Some(ps), Some(qs)) = (points_to.get(&p), points_to.get(&q)) else {
+        return true;
+    };
+    ps.iter().any(|&lp| {
+        qs.iter()
+            .any(|&lq| match (pta.location(lp), pta.location(lq)) {
+                (Some(a), Some(b)) => a.obj == b.obj,
+                _ => true,
+            })
+    })
 }
 
 /// Forward, flow-sensitive, intra-procedural **must**-lockset per basic block

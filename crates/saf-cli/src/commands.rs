@@ -1041,6 +1041,10 @@ pub fn prove_no_overflow_cmd(args: &ProveNoOverflowArgs) -> anyhow::Result<()> {
         println!("ABSTAIN:ingest-fidelity");
         return Ok(());
     }
+    if saf_svcomp::module_has_failable_allocation(&bundle.module) {
+        println!("ABSTAIN:failable-allocation");
+        return Ok(());
+    }
 
     match saf_analysis::absint::prove_no_signed_overflow(&bundle.module) {
         saf_analysis::absint::NoOverflowProof::Proven => println!("PROVE"),
@@ -1106,6 +1110,9 @@ pub fn prove_unreachable_cmd(args: &ProveUnreachableArgs) -> anyhow::Result<()> 
     // proves ~0.2 % of the pool and can be slow on large modules).
     let interval = if std::env::var_os("SAF_PROVE_SKIP_INTERVAL").is_some() {
         "skipped".to_string()
+    } else if saf_svcomp::module_has_failable_allocation(&bundle.module) {
+        // Heap addresses are non-null in the interval domain (see `verify`).
+        "failable-allocation".to_string()
     } else {
         match saf_svcomp::prove_unreachable(&bundle.module) {
             saf_svcomp::UnreachProof::Proven => "PROVE".to_string(),
@@ -1943,15 +1950,7 @@ fn bmc_confirm(
         );
     }
     for (idx, candidate) in bmc.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
-        match replay_confirms_false(
-            ctx.input,
-            ctx.data_model,
-            ctx.stub,
-            ctx.tempdir,
-            ctx.clang,
-            2 * MAX_REPLAY_CANDIDATES + idx,
-            candidate,
-        ) {
+        match replay_confirms_false(ctx, 2 * MAX_REPLAY_CANDIDATES + idx, candidate) {
             Ok(true) => {
                 let witness = build_witness(
                     ctx,
@@ -1997,15 +1996,7 @@ fn se_confirm(
         );
     }
     for (idx, candidate) in se.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
-        match replay_confirms_false(
-            ctx.input,
-            ctx.data_model,
-            ctx.stub,
-            ctx.tempdir,
-            ctx.clang,
-            3 * MAX_REPLAY_CANDIDATES + idx,
-            candidate,
-        ) {
+        match replay_confirms_false(ctx, 3 * MAX_REPLAY_CANDIDATES + idx, candidate) {
             Ok(true) => {
                 let witness = build_witness(
                     ctx,
@@ -2166,15 +2157,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             opts.depth_first = true;
             continue;
         };
-        match replay_confirms_false(
-            ctx.input,
-            ctx.data_model,
-            ctx.stub,
-            ctx.tempdir,
-            ctx.clang,
-            MAX_REPLAY_CANDIDATES,
-            &candidate,
-        ) {
+        match replay_confirms_false(ctx, MAX_REPLAY_CANDIDATES, &candidate) {
             Ok(true) => {
                 let witness = build_witness(
                     ctx,
@@ -2211,15 +2194,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     };
     let candidates = saf_svcomp::enumerate_false_candidates(ctx.module, &config);
     for (idx, candidate) in candidates.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
-        match replay_confirms_false(
-            ctx.input,
-            ctx.data_model,
-            ctx.stub,
-            ctx.tempdir,
-            ctx.clang,
-            idx,
-            candidate,
-        ) {
+        match replay_confirms_false(ctx, idx, candidate) {
             Ok(true) => {
                 let witness = build_witness(
                     ctx,
@@ -2265,15 +2240,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         );
     }
     for (idx, candidate) in interproc.iter().take(MAX_REPLAY_CANDIDATES).enumerate() {
-        match replay_confirms_false(
-            ctx.input,
-            ctx.data_model,
-            ctx.stub,
-            ctx.tempdir,
-            ctx.clang,
-            MAX_REPLAY_CANDIDATES + idx,
-            candidate,
-        ) {
+        match replay_confirms_false(ctx, MAX_REPLAY_CANDIDATES + idx, candidate) {
             Ok(true) => {
                 let witness = build_witness(
                     ctx,
@@ -2335,15 +2302,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
                 assignments: std::collections::BTreeMap::new(),
                 nondet_sequence: Vec::new(),
             };
-            match replay_confirms_false(
-                ctx.input,
-                ctx.data_model,
-                ctx.stub,
-                ctx.tempdir,
-                ctx.clang,
-                DETERMINISTIC_REPLAY_IDX,
-                &candidate,
-            ) {
+            match replay_confirms_false(ctx, DETERMINISTIC_REPLAY_IDX, &candidate) {
                 Ok(true) => {
                     let witness = build_witness(
                         ctx,
@@ -2751,11 +2710,7 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
                 nondet_sequence,
             };
             match replay_confirms_false(
-                ctx.input,
-                ctx.data_model,
-                ctx.stub,
-                ctx.tempdir,
-                ctx.clang,
+                ctx,
                 // Offset the replay index well past the Z3 batches so temp files
                 // never collide.
                 2 * MAX_REPLAY_CANDIDATES + i,
@@ -4758,9 +4713,11 @@ fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) ->
     // Honour assumptions at runtime: assume(false) blocks the path WITHOUT a hit.
     s.push_str("void __VERIFIER_assume(int c) { if (!c) _exit(0); }\n");
 
-    // Error sinks: dropping the sentinel is the sole evidence of a violation.
+    // Error sinks: dropping the sentinel is the sole evidence of a violation. It
+    // holds the return address of the error call, so the replay can check WHICH
+    // error call ran (`replay_hit_line`).
     s.push_str(
-        "__attribute__((noreturn)) static void __saf_hit(void) { FILE* f = fopen(__SAF_SENTINEL, \"w\"); if (f) { fputc('1', f); fclose(f); } _exit(0); }\n",
+        "__attribute__((noreturn)) static void __saf_hit(const void* site) { FILE* f = fopen(__SAF_SENTINEL, \"w\"); if (f) { fprintf(f, \"%p\\n\", site); fclose(f); } _exit(0); }\n",
     );
     // reach_error / __VERIFIER_error are WEAK: the canonical sv-benchmarks task
     // DEFINES its own `reach_error(){ __assert_fail(...); }`, which must win the
@@ -4771,10 +4728,16 @@ fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) ->
     // sentinel. `abort` is deliberately NOT overridden: it is too generic to
     // attribute to the property soundly, so reach_error variants calling it
     // directly stay `unknown` (sound, at some recall cost).
-    s.push_str("__attribute__((weak)) void reach_error(void) { __saf_hit(); }\n");
-    s.push_str("__attribute__((weak)) void __VERIFIER_error(void) { __saf_hit(); }\n");
+    // The site is the caller of `reach_error`: frame 0 from our weak definitions,
+    // frame 1 from `__assert_fail` (called by the task's own `reach_error`).
     s.push_str(
-        "__attribute__((noreturn)) void __assert_fail(const char* a, const char* b, unsigned int c, const char* d) { (void)a; (void)b; (void)c; (void)d; __saf_hit(); }\n",
+        "__attribute__((weak)) void reach_error(void) { __saf_hit(__builtin_return_address(0)); }\n",
+    );
+    s.push_str(
+        "__attribute__((weak)) void __VERIFIER_error(void) { __saf_hit(__builtin_return_address(0)); }\n",
+    );
+    s.push_str(
+        "__attribute__((noreturn)) void __assert_fail(const char* a, const char* b, unsigned int c, const char* d) { (void)a; (void)b; (void)c; (void)d; __saf_hit(__builtin_return_address(1)); }\n",
     );
 
     s
@@ -4783,22 +4746,25 @@ fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) ->
 /// Confirm a FALSE candidate by concrete native execution.
 ///
 /// Synthesizes the replay driver, compiles the ORIGINAL program natively
-/// together with it (`clang -O0`, no `-emit-llvm`), and runs it under a short
-/// timeout. The candidate is confirmed iff the run drops the sentinel — an
-/// irrefutable, real execution reaching `reach_error`. Any other outcome (normal
-/// exit, crash, timeout, compile/link failure) is inconclusive ⇒ `Ok(false)` ⇒
+/// together with it (`clang -O0 -g`, no `-emit-llvm`), and runs it under a short
+/// timeout. The candidate is confirmed iff the run drops the sentinel — a real
+/// execution reaching an error call — AND that call is on the candidate's own
+/// error line. A native run can reach a DIFFERENT error call through library or
+/// environment behaviour the task's semantics do not have (real `vasnprintf`
+/// output on `goblint-coreutils/instrumented_interval_df_comb`: a wrong FALSE in
+/// the SV-COMP 2027 training run, whose witness named a call the run never
+/// reached). Any other outcome (normal exit, another error call, an unknown
+/// site, crash, timeout, compile/link failure) is inconclusive ⇒ `Ok(false)` ⇒
 /// the caller keeps `unknown`. Never emits to stdout (subprocess I/O is nulled).
 fn replay_confirms_false(
-    input: &Path,
-    data_model: saf_svcomp::DataModel,
-    stub: &Path,
-    dir: &Path,
-    clang: &str,
+    ctx: &VerifyCtx,
     idx: usize,
     candidate: &saf_svcomp::FalseCandidate,
 ) -> anyhow::Result<bool> {
     use anyhow::Context;
     use std::process::{Command, Stdio};
+    let (input, data_model, stub, dir, clang) =
+        (ctx.input, ctx.data_model, ctx.stub, ctx.tempdir, ctx.clang);
 
     let sentinel = dir.join(format!("saf_reach_{idx}.sentinel"));
     let driver_src = dir.join(format!("saf_driver_{idx}.c"));
@@ -4823,6 +4789,11 @@ fn replay_confirms_false(
             "-Wno-everything",
             "-fsanitize=signed-integer-overflow",
             "-fsanitize-trap=signed-integer-overflow",
+            // The error-call site check: line tables, frame pointers for
+            // `__builtin_return_address(1)`, and absolute addresses.
+            "-g",
+            "-fno-omit-frame-pointer",
+            "-no-pie",
         ])
         .args(replay_wrap_flags())
         .args(data_model.clang_flags())
@@ -4897,9 +4868,81 @@ fn replay_confirms_false(
         }
     }
     // The sentinel is written only by our reach_error/__VERIFIER_error override,
-    // so its presence is an irrefutable witness that the real run reached the
-    // error call.
-    Ok(sentinel.exists())
+    // so its presence is an irrefutable witness that the real run reached AN
+    // error call; it confirms the candidate only if that call is the candidate's.
+    if !sentinel.exists() {
+        return Ok(false);
+    }
+    let expected =
+        saf_svcomp::find_inst_span(ctx.module, candidate.reach_error_inst).map(|(_, line, _)| line);
+    let hit = replay_hit_line(&harness, &sentinel, clang);
+    if debug || expected != hit {
+        eprintln!(
+            "saf verify: replay reached an error call on line {hit:?}, candidate line {expected:?}"
+        );
+    }
+    Ok(expected.is_some() && expected == hit)
+}
+
+/// The source line of the error call recorded in a replay sentinel (a return
+/// address, see [`synthesize_driver`]), from the harness's line table. `None`
+/// when the sentinel holds no address or no symbolizer resolves it.
+fn replay_hit_line(harness: &Path, sentinel: &Path, clang: &str) -> Option<u32> {
+    let text = std::fs::read_to_string(sentinel).ok()?;
+    let addr = u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()?;
+    // The return address follows the call; one byte back is inside it.
+    let addr = format!("0x{:x}", addr.checked_sub(1)?);
+    let symbolizer = find_symbolizer(clang)?;
+    let out = std::process::Command::new(&symbolizer)
+        .arg(format!("--obj={}", harness.display()))
+        .arg(&addr)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    // `function` then `file:line:column`; with inlining, the innermost frame first.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let loc = text.lines().nth(1)?;
+    let mut parts = loc.rsplitn(3, ':');
+    let _column = parts.next()?;
+    parts.next()?.parse().ok()
+}
+
+/// `llvm-symbolizer` for the replay site check: `$ASAN_SYMBOLIZER_PATH` (what the
+/// sanitizer confirmers are pointed at), then `llvm-symbolizer-N` for `clang-N`,
+/// then the one installed next to the real clang binary, then plain
+/// `llvm-symbolizer` on `PATH`.
+fn find_symbolizer(clang: &str) -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("ASAN_SYMBOLIZER_PATH").map(PathBuf::from) {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let on_path = |name: &str| -> Option<PathBuf> {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+        })
+    };
+    let clang_name = Path::new(clang).file_name()?.to_string_lossy().into_owned();
+    if let Some(version) = clang_name.strip_prefix("clang-") {
+        if let Some(p) = on_path(&format!("llvm-symbolizer-{version}")) {
+            return Some(p);
+        }
+    }
+    let clang_path = if Path::new(clang).is_file() {
+        Some(PathBuf::from(clang))
+    } else {
+        on_path(clang)
+    };
+    if let Some(real) = clang_path.and_then(|p| std::fs::canonicalize(p).ok()) {
+        let sibling = real.with_file_name("llvm-symbolizer");
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+    }
+    on_path("llvm-symbolizer")
 }
 
 /// The `valid-memsafety` FALSE pipeline (plan 197, R5): confirmer-first.
@@ -6326,10 +6369,14 @@ fn try_overflow_true(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     if unreach_prover_blocked_by_dropped(ctx.module) {
         return None;
     }
-    let interval_proven = matches!(
-        saf_analysis::absint::prove_no_signed_overflow(ctx.module),
-        saf_analysis::absint::NoOverflowProof::Proven
-    );
+    // The interval domain models every heap address as non-null, so a module whose
+    // allocations may fail (SV-COMP 2027) is left to the engine, which explores
+    // the NULL outcome.
+    let interval_proven = !saf_svcomp::module_has_failable_allocation(ctx.module)
+        && matches!(
+            saf_analysis::absint::prove_no_signed_overflow(ctx.module),
+            saf_analysis::absint::NoOverflowProof::Proven
+        );
     let mut states: Vec<saf_svcomp::HeaderStates> = Vec::new();
     if !interval_proven {
         let budget = unreach_prove_budget(ctx.budget);
