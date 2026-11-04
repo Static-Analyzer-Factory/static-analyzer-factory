@@ -275,3 +275,59 @@ fn still_proves_unreachable_with_null_guarded_allocation() {
     prove_unreachable("prove_unreach_alloc_null_guarded.c")
         .stdout(predicate::str::starts_with("PROVE"));
 }
+
+// ---------------------------------------------------------------------------
+// valid-memcleanup
+//
+// Every allocated block must be freed before the program terminates; both
+// verdicts score without a witness. FALSE comes from a native run that
+// terminates normally with blocks still allocated, TRUE from the engine.
+// ---------------------------------------------------------------------------
+
+/// `saf verify --property valid-memcleanup.prp --data-model LP64 <fixture>`, asserting exit 0.
+fn verify_memcleanup(name: &str) -> assert_cmd::assert::Assert {
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            fixture("valid-memcleanup.prp").as_str(),
+            "--data-model",
+            "LP64",
+            fixture(name).as_str(),
+        ])
+        .assert()
+        .success()
+}
+
+/// A block still allocated (though reachable) when `main` returns: FALSE.
+#[test]
+#[ignore]
+fn memcleanup_false_when_a_block_outlives_main() {
+    verify_memcleanup("memcleanup_false_global_kept.c")
+        .stdout(predicate::eq("false(valid-memcleanup)\n"));
+}
+
+/// The program's own `atexit` handler frees the block: never FALSE.
+#[test]
+#[ignore]
+fn memcleanup_not_false_when_freed_in_atexit_handler() {
+    verify_memcleanup("memcleanup_true_freed_in_atexit.c")
+        .stdout(predicate::str::contains("false").not());
+}
+
+/// The only unfreed block is on a path a false assumption cuts: never FALSE, and
+/// the engine proves it.
+#[test]
+#[ignore]
+fn memcleanup_true_when_the_leak_is_assumed_away() {
+    verify_memcleanup("memcleanup_true_assume_cuts_leak.c").stdout(predicate::eq("true\n"));
+}
+
+/// `reach_error()` aborts while the block is allocated: an abort is a
+/// termination for valid-memcleanup, so FALSE.
+#[test]
+#[ignore]
+fn memcleanup_false_when_an_error_call_aborts_with_a_block_allocated() {
+    verify_memcleanup("memcleanup_false_error_leaves_block.c")
+        .stdout(predicate::eq("false(valid-memcleanup)\n"));
+}

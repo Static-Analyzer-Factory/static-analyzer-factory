@@ -887,6 +887,9 @@ struct Engine<'a> {
     /// (which may not return) and a NULL dereference abstain instead of being
     /// modelled as havoc / the end of the path.
     termination: bool,
+    /// [`Goal::MemSafety`] for `valid-memcleanup`: a termination with ANY heap
+    /// block not freed is a violation, not only an unreachable one.
+    memcleanup: bool,
     cex: Option<Counterexample>,
     /// Counterexample mode: violations at these instructions are passed over
     /// (a candidate there did not replay), so the search goes on to the next
@@ -1013,6 +1016,20 @@ pub fn prove_no_overflow_exhaustive_shl(
 /// abstain.
 #[must_use]
 pub fn prove_memsafety_exhaustive(module: &AirModule, budget: Duration) -> ExhaustiveProof {
+    prove_heap_goal(module, budget, false)
+}
+
+/// `valid-memcleanup` TRUE from the memory-safety goal: on top of every
+/// [`Goal::MemSafety`] check, no heap block may be left allocated at any
+/// termination (return from `main`, `exit`, `abort`, an error call), reachable or
+/// not. A path cut by a false assumption is not a termination.
+#[must_use]
+pub fn prove_memcleanup_exhaustive(module: &AirModule, budget: Duration) -> ExhaustiveProof {
+    prove_heap_goal(module, budget, true)
+}
+
+/// [`prove_memsafety_exhaustive`] / [`prove_memcleanup_exhaustive`].
+fn prove_heap_goal(module: &AirModule, budget: Duration, memcleanup: bool) -> ExhaustiveProof {
     if module
         .functions
         .iter()
@@ -1032,7 +1049,7 @@ pub fn prove_memsafety_exhaustive(module: &AirModule, budget: Duration) -> Exhau
     if has_alloca && !module.functions.iter().any(|f| f.name == LIFETIME_START) {
         return ExhaustiveProof::Abstain("ms-no-lifetime-markers".to_string());
     }
-    prove_exhaustive_opts(module, budget, Goal::MemSafety, None).0
+    prove_exhaustive_cfg(module, budget, Goal::MemSafety, None, memcleanup).0
 }
 
 /// The memory-safety ingestion recipe's names for `llvm.lifetime.start/end`
@@ -1316,6 +1333,18 @@ fn prove_exhaustive_opts(
     goal: Goal,
     signed_shl_locs: Option<&BTreeSet<(u32, u32)>>,
 ) -> (ExhaustiveProof, Vec<HeaderStates>) {
+    prove_exhaustive_cfg(module, budget, goal, signed_shl_locs, false)
+}
+
+/// [`prove_exhaustive_opts`] with the `valid-memcleanup` strengthening of the
+/// leak check (see [`Engine::ms_memtrack`]).
+fn prove_exhaustive_cfg(
+    module: &AirModule,
+    budget: Duration,
+    goal: Goal,
+    signed_shl_locs: Option<&BTreeSet<(u32, u32)>>,
+    memcleanup: bool,
+) -> (ExhaustiveProof, Vec<HeaderStates>) {
     if has_global_ctors_dtors(module) {
         return (
             ExhaustiveProof::Abstain("global-ctors-dtors".to_string()),
@@ -1338,6 +1367,7 @@ fn prove_exhaustive_opts(
     let setup = Instant::now();
     let mut engine = Engine::new(module, budget);
     engine.goal = goal;
+    engine.memcleanup = memcleanup;
     engine.signed_shl_locs = signed_shl_locs.cloned();
     trace(|| format!("engine ready after {:?}", setup.elapsed()));
     // The budget is exploration time: table building on a 170 k-line ECA
@@ -1664,6 +1694,7 @@ impl<'a> Engine<'a> {
             fixpoint: false,
             cex_mode: false,
             termination: false,
+            memcleanup: false,
             cex: None,
             cex_skip: BTreeSet::new(),
             cex_depth_first: false,
@@ -4448,6 +4479,15 @@ impl<'a> Engine<'a> {
         // witnesses are demo-mode only): the counterexample search ignores it.
         if self.cex_mode {
             return Ok(());
+        }
+        // `valid-memcleanup`: every block must be freed by now (a block freed on
+        // one merged side only counts as not freed).
+        if self.memcleanup {
+            return if st.heap.values().all(|h| h.status == HeapStatus::Freed) {
+                Ok(())
+            } else {
+                Err("mc-not-freed".to_string())
+            };
         }
         let live: Vec<ValueId> = st
             .heap

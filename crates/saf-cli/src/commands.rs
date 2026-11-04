@@ -1792,6 +1792,7 @@ fn strategy_for(property: saf_svcomp::Property) -> Option<StrategyFn> {
         saf_svcomp::Property::NoOverflow => Some(overflow_strategy),
         saf_svcomp::Property::Termination => Some(termination_strategy),
         saf_svcomp::Property::NoDataRace => Some(no_data_race_strategy),
+        saf_svcomp::Property::ValidMemcleanup => Some(memcleanup_strategy),
         _ => None,
     }
 }
@@ -5208,6 +5209,12 @@ fn asan_replay_sequence(
 /// the same gates as the other engine TRUE arms (OpenMP, a reachable thread
 /// spawn, any dropped instruction or intrinsic). Verdict-only: no witness.
 fn try_memsafety_engine_true(ctx: &VerifyCtx) -> bool {
+    try_heap_engine_true(ctx, false)
+}
+
+/// [`try_memsafety_engine_true`], or with `memcleanup` the engine's
+/// `valid-memcleanup` strengthening ([`saf_svcomp::prove_memcleanup_exhaustive`]).
+fn try_heap_engine_true(ctx: &VerifyCtx, memcleanup: bool) -> bool {
     let Ok(source) = std::fs::read_to_string(ctx.input) else {
         return false;
     };
@@ -5235,18 +5242,284 @@ fn try_memsafety_engine_true(ctx: &VerifyCtx) -> bool {
         return false;
     }
     let budget = unreach_prove_budget(ctx.budget);
-    match saf_svcomp::prove_memsafety_exhaustive(&module, budget) {
+    let (what, proof) = if memcleanup {
+        (
+            "memcleanup",
+            saf_svcomp::prove_memcleanup_exhaustive(&module, budget),
+        )
+    } else {
+        (
+            "memsafety",
+            saf_svcomp::prove_memsafety_exhaustive(&module, budget),
+        )
+    };
+    match proof {
         saf_svcomp::ExhaustiveProof::Proven => {
-            eprintln!(
-                "saf verify: exhaustive memsafety prover PROVED every path memory-safe -> true"
-            );
+            eprintln!("saf verify: exhaustive {what} prover PROVED every path -> true");
             true
         }
         saf_svcomp::ExhaustiveProof::Abstain(reason) => {
-            eprintln!("saf verify: exhaustive memsafety prover abstained ({reason}) -> unknown");
+            eprintln!("saf verify: exhaustive {what} prover abstained ({reason}) -> unknown");
             false
         }
     }
+}
+
+/// The `valid-memcleanup` strategy: every block the program allocates must be
+/// freed before it terminates. Both verdicts score without a witness (the 2027
+/// rules support none for this property).
+///
+/// FALSE first, because it is cheap: [`memcleanup_confirm`] runs the program
+/// natively and sees a normal termination with blocks still allocated. Then the
+/// engine's memcleanup goal for TRUE.
+fn memcleanup_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
+    match memcleanup_confirm(ctx) {
+        Ok(Some(live)) => {
+            eprintln!(
+                "saf verify: native run terminated with {live} block(s) still allocated -> false(valid-memcleanup)"
+            );
+            return VerdictOutcome {
+                verdict: "false(valid-memcleanup)".to_string(),
+                witness: None,
+                graphml: None,
+                correctness: None,
+            };
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("saf verify: memcleanup replay failed: {e:#}"),
+    }
+    if try_heap_engine_true(ctx, true) {
+        return VerdictOutcome {
+            verdict: "true".to_string(),
+            witness: None,
+            graphml: None,
+            correctness: None,
+        };
+    }
+    unknown_outcome()
+}
+
+/// Functions the memcleanup replay wraps (`-Wl,--wrap=<name>`): the allocators it
+/// tracks, and `abort`, a termination it checks.
+const MEMCLEANUP_WRAPPED: &[&str] = &["malloc", "calloc", "realloc", "free", "abort"];
+
+/// The scope of [`memcleanup_confirm`]: no reachable thread spawn, no allocator
+/// defined by the program, no destructor and no `on_exit` handler.
+fn memcleanup_in_scope(module: &saf_core::air::AirModule) -> bool {
+    let callgraph = saf_analysis::callgraph::CallGraph::build(module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(module, &callgraph) {
+        return false;
+    }
+    if module
+        .functions
+        .iter()
+        .any(|f| !f.is_declaration && MEMCLEANUP_WRAPPED.contains(&f.name.as_str()))
+    {
+        return false;
+    }
+    // A destructor (`llvm.global_dtors`) or an `on_exit` handler could run after
+    // the check. (A text search would not do: every preprocessed task declares
+    // `on_exit` through <stdlib.h>.)
+    let calls_on_exit = module.functions.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(&i.op, saf_core::air::Operation::CallDirect { callee }
+                    if module.function(*callee).is_some_and(|t| t.name == "on_exit"))
+            })
+        })
+    });
+    if calls_on_exit || module.globals.iter().any(|g| g.name == "llvm.global_dtors") {
+        return false;
+    }
+    true
+}
+
+/// Confirm a `valid-memcleanup` FALSE by native execution: the program, built with
+/// `AddressSanitizer` (no leak detection) and signed-overflow traps, runs with the
+/// `ASan` driver's nondet values (the same constant sweep as [`asan_confirm`]) while
+/// [`synthesize_memcleanup_tracker`] records every block it allocates through
+/// `malloc`/`calloc`/`realloc` and frees through `free`/`realloc`, on the constant
+/// sweep and then split inputs (the first `n` nondet calls 1, the rest 0).
+/// `Ok(Some(n))` when a run TERMINATED with `n > 0` of those blocks still allocated. The
+/// terminations checked: return from `main` and `exit` (the check is the last
+/// `atexit` handler), the program's own `abort()` calls, and `__assert_fail`
+/// (what a task's `reach_error` calls). An abort is a termination for this
+/// property: the 2027 tasks label a program whose only unfreed block is left
+/// behind by `reach_error(); abort();` FALSE (`list-ext-properties/simple-ext-memcleanup`).
+///
+/// Sound, never a wrong FALSE: each run is a real execution on legal nondet
+/// values. A false assumption leaves through `_exit` (no check), and so do an
+/// `ASan` error and an overflow trap (undefined behaviour: no verdict).
+/// Blocks the C library allocates itself (`strdup`, `fopen`) are not tracked,
+/// which can only miss a violation. Out of scope, so `Ok(None)`: a reachable
+/// thread spawn (schedule-dependent), a program that defines an allocator (the
+/// wrap would not see its internal calls), and a destructor or a call of
+/// `on_exit` (its handler could run after the check).
+fn memcleanup_confirm(ctx: &VerifyCtx) -> anyhow::Result<Option<u64>> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+
+    if !memcleanup_in_scope(ctx.module) {
+        return Ok(None);
+    }
+
+    let dir = ctx.tempdir;
+    let driver_src = dir.join("saf_mc_driver.c");
+    let harness = dir.join("saf_mc_harness");
+    let sentinel = dir.join("saf_mc.sentinel");
+    let mut driver = synthesize_asan_driver();
+    driver.push_str(&synthesize_memcleanup_tracker());
+    std::fs::write(&driver_src, driver).with_context(|| "writing memcleanup driver")?;
+
+    let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
+    let build = |neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(ctx.clang);
+        cmd.args([
+            "-O0",
+            "-g",
+            "-fsanitize=address,signed-integer-overflow",
+            "-fno-sanitize-recover=address",
+            "-fsanitize-trap=signed-integer-overflow",
+            "-Wno-everything",
+            "-Wl,--wrap=rand",
+            "-Wl,--wrap=srand",
+        ])
+        .args(MEMCLEANUP_WRAPPED.iter().map(|n| format!("-Wl,--wrap={n}")))
+        .args(ctx.data_model.clang_flags())
+        .arg("-include")
+        .arg(ctx.stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include").arg(n);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(ctx.input)
+            .arg(&driver_src)
+            .arg("-lm")
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    if !link_replay_harness(&build, &driver_src, dir, "memcleanup replay")? {
+        return Ok(None);
+    }
+
+    // Inputs: the constant sweep, then split runs where the first `n` nondet
+    // calls (bools included, `SAF_BOOL_SPLIT`) return 1 and every later one 0, so a
+    // `while (nondet()) insert(...)` loop builds `n` elements and ends; a constant
+    // either skips it or never leaves it.
+    let mut inputs: Vec<Vec<(&str, String)>> = replay_candidates(NONDET_CONSTS, ctx.module)
+        .into_iter()
+        .map(|k| vec![("SAF_NONDET_CONST", k.to_string())])
+        .collect();
+    for n in [1, 2, 3, 5, 8] {
+        inputs.push(vec![
+            ("SAF_SPLIT_IDX", n.to_string()),
+            ("SAF_BASE_VAL", "1".to_string()),
+            ("SAF_TARGET_VAL", "0".to_string()),
+            ("SAF_BOOL_SPLIT", "1".to_string()),
+        ]);
+    }
+    let timeout = memsafety_replay_timeout();
+    for env in &inputs {
+        let _ = std::fs::remove_file(&sentinel);
+        let mut cmd = Command::new(&harness);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("ASAN_OPTIONS", ASAN_OPTS)
+            .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
+            .env("SAF_MC_SENTINEL", &sentinel);
+        let mut child = harden_replay_spawn(&mut cmd)
+            .spawn()
+            .with_context(|| "spawning memcleanup harness")?;
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break Some(status);
+            }
+            if start.elapsed() >= timeout {
+                kill_replay_group(&mut child);
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        // A time-out is no termination; any other end counts only through the
+        // sentinel, which the check writes at a termination it saw (an abort
+        // then ends the run by `SIGABRT`).
+        if status.is_none() {
+            continue;
+        }
+        let live = std::fs::read_to_string(&sentinel)
+            .ok()
+            .and_then(|t| t.trim().parse::<u64>().ok());
+        if std::env::var_os("SAF_CEX_DEBUG").is_some() {
+            eprintln!("saf verify: memcleanup run {env:?} status={status:?} live={live:?}");
+        }
+        if let Some(n) = live.filter(|&n| n > 0) {
+            return Ok(Some(n));
+        }
+    }
+    Ok(None)
+}
+
+/// The allocation tracker of the memcleanup replay: `--wrap` definitions of
+/// [`MEMCLEANUP_WRAPPED`] keeping the set of live blocks the program allocated
+/// (open addressing, tombstones), and the termination check writing the number of
+/// live blocks to `$SAF_MC_SENTINEL`: an `atexit` handler registered before the
+/// program runs — so it runs LAST, after the program's own handlers — plus the
+/// `abort` wrapper and an `__assert_fail` definition. A tracker allocation
+/// failure disables the check (no verdict).
+fn synthesize_memcleanup_tracker() -> String {
+    "#include <stdio.h>\n\
+     extern void *__real_malloc(size_t); extern void *__real_calloc(size_t, size_t);\n\
+     extern void *__real_realloc(void *, size_t); extern void __real_free(void *);\n\
+     #define __SAF_MC_TOMB ((void *)1)\n\
+     static void **__saf_mc_tab; static size_t __saf_mc_cap, __saf_mc_used, __saf_mc_live; static int __saf_mc_bad;\n\
+     static size_t __saf_mc_h(void *p) { return (((size_t)p >> 4) * 2654435761u) & (__saf_mc_cap - 1); }\n\
+     static void __saf_mc_add(void *p);\n\
+     static void __saf_mc_rehash(void) {\n\
+     \x20 size_t oc = __saf_mc_cap; void **ot = __saf_mc_tab; size_t nc = oc ? oc * 2 : 1024;\n\
+     \x20 void **nt = __real_calloc(nc, sizeof(void *)); if (!nt) { __saf_mc_bad = 1; return; }\n\
+     \x20 __saf_mc_tab = nt; __saf_mc_cap = nc; __saf_mc_used = 0; __saf_mc_live = 0;\n\
+     \x20 for (size_t i = 0; i < oc; i++) if (ot[i] && ot[i] != __SAF_MC_TOMB) __saf_mc_add(ot[i]);\n\
+     \x20 __real_free(ot);\n\
+     }\n\
+     static void __saf_mc_add(void *p) {\n\
+     \x20 if (!p || __saf_mc_bad) return;\n\
+     \x20 if ((__saf_mc_used + 1) * 2 > __saf_mc_cap) { __saf_mc_rehash(); if (__saf_mc_bad) return; }\n\
+     \x20 size_t i = __saf_mc_h(p);\n\
+     \x20 while (__saf_mc_tab[i] && __saf_mc_tab[i] != __SAF_MC_TOMB) { if (__saf_mc_tab[i] == p) return; i = (i + 1) & (__saf_mc_cap - 1); }\n\
+     \x20 if (!__saf_mc_tab[i]) __saf_mc_used++;\n\
+     \x20 __saf_mc_tab[i] = p; __saf_mc_live++;\n\
+     }\n\
+     static int __saf_mc_del(void *p) {\n\
+     \x20 if (!p || !__saf_mc_cap) return 0;\n\
+     \x20 size_t i = __saf_mc_h(p);\n\
+     \x20 while (__saf_mc_tab[i]) { if (__saf_mc_tab[i] == p) { __saf_mc_tab[i] = __SAF_MC_TOMB; __saf_mc_live--; return 1; } i = (i + 1) & (__saf_mc_cap - 1); }\n\
+     \x20 return 0;\n\
+     }\n\
+     void *__wrap_malloc(size_t n) { void *p = __real_malloc(n); __saf_mc_add(p); return p; }\n\
+     void *__wrap_calloc(size_t a, size_t b) { void *p = __real_calloc(a, b); __saf_mc_add(p); return p; }\n\
+     void *__wrap_realloc(void *q, size_t n) {\n\
+     \x20 void *p = __real_realloc(q, n);\n\
+     \x20 if (!q) { __saf_mc_add(p); return p; }\n\
+     \x20 if (p) { if (__saf_mc_del(q)) __saf_mc_add(p); } else if (n == 0) { __saf_mc_del(q); }\n\
+     \x20 return p;\n\
+     }\n\
+     void __wrap_free(void *p) { __saf_mc_del(p); __real_free(p); }\n\
+     extern void __real_abort(void) __attribute__((noreturn));\n\
+     static void __saf_mc_check(void);\n\
+     __attribute__((noreturn)) void __wrap_abort(void) { __saf_mc_check(); __real_abort(); }\n\
+     __attribute__((noreturn)) void __assert_fail(const char *a, const char *b, unsigned int c, const char *d) { (void)a; (void)b; (void)c; (void)d; __wrap_abort(); }\n\
+     static void __saf_mc_check(void) {\n\
+     \x20 const char *s = getenv(\"SAF_MC_SENTINEL\"); if (!s || __saf_mc_bad) return;\n\
+     \x20 FILE *f = fopen(s, \"w\"); if (f) { fprintf(f, \"%lu\\n\", (unsigned long)__saf_mc_live); fclose(f); }\n\
+     }\n\
+     __attribute__((constructor(101))) static void __saf_mc_init(void) { atexit(__saf_mc_check); }\n"
+        .to_string()
 }
 
 /// Build the `ASan`-replay driver: defines the SV-COMP nondet generators (all
@@ -5326,6 +5599,7 @@ fn synthesize_asan_driver() -> String {
             // occupies its execution-order index (keeping int/bool targeting aligned).
             s.push_str(
                 "_Bool __VERIFIER_nondet_bool(void) {\n\
+                 \x20 if (getenv(\"SAF_BOOL_SPLIT\")) return (_Bool)(__saf_nv() != 0);\n\
                  \x20 const char *b = getenv(\"SAF_BOOL_CONST\");\n\
                  \x20 if (b) { __saf_idx++; return (_Bool)(atoi(b) & 1); }\n\
                  \x20 const char *ti = getenv(\"SAF_TARGET_IDX\");\n\
