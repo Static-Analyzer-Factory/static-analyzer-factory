@@ -141,9 +141,18 @@ impl Frontend for LlvmFrontend {
         let fingerprint_bytes = if is_bitcode {
             bytes.clone()
         } else {
-            // Hash the normalized IR text
+            // Hash the IR text without the lines that only say WHERE it was
+            // compiled (NFR-DET): every ID derives from this fingerprint, so a
+            // temp-directory path in it gave each run different IDs, a
+            // different exploration order, and verdicts that changed between
+            // identical runs.
             let mut hasher = Hasher::new();
-            hasher.update(&bytes);
+            for line in bytes.split(|&b| b == b'\n') {
+                if !is_location_line(line) {
+                    hasher.update(line);
+                    hasher.update(b"\n");
+                }
+            }
             hasher.finalize().as_bytes().to_vec()
         };
 
@@ -199,6 +208,17 @@ impl Frontend for LlvmFrontend {
     }
 }
 
+/// A text-IR line that records only where the module was compiled — the module
+/// ID, the source file name, and debug-info file / directory entries. These
+/// carry temp-directory paths that differ between identical runs, so the module
+/// fingerprint leaves them out.
+#[cfg(any(feature = "llvm-18", feature = "llvm-21", feature = "llvm-22"))]
+fn is_location_line(line: &[u8]) -> bool {
+    line.starts_with(b"; ModuleID = ")
+        || line.starts_with(b"source_filename = ")
+        || line.windows(8).any(|w| w == b"!DIFile(")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +259,21 @@ mod tests {
 
         #[cfg(feature = "llvm-22")]
         assert!(version.starts_with("22"));
+    }
+
+    #[cfg(any(feature = "llvm-18", feature = "llvm-21", feature = "llvm-22"))]
+    #[test]
+    fn fingerprint_ignores_where_the_module_was_compiled() {
+        assert!(is_location_line(b"; ModuleID = '/tmp/.tmpAbC/input.c'"));
+        assert!(is_location_line(
+            b"source_filename = \"/tmp/.tmpAbC/input.c\""
+        ));
+        assert!(is_location_line(
+            b"!1 = !DIFile(filename: \"x.c\", directory: \"/tmp/.tmpAbC\")"
+        ));
+        assert!(!is_location_line(b"  %x = load i32, ptr %p, align 4"));
+        assert!(!is_location_line(
+            b"@s = private constant [6 x i8] c\"DIFile\00\""
+        ));
     }
 }
