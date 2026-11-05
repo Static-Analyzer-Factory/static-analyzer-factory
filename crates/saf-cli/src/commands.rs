@@ -1142,7 +1142,8 @@ pub fn prove_unreachable_cmd(args: &ProveUnreachableArgs) -> anyhow::Result<()> 
         return Ok(());
     }
     if std::env::var("SAF_PROVE_GOAL").is_ok_and(|g| g == "valid-memsafety") {
-        let Some(module) = compile_to_ir_memsafety(&args.input, data_model, &stub, dir.path())?
+        let Some(module) =
+            compile_to_ir_memsafety(&args.input, data_model, &stub, dir.path(), false)?
         else {
             println!("ABSTAIN:interval=skipped|exhaustive=ms-unmarked-stack-object");
             return Ok(());
@@ -1485,11 +1486,16 @@ fn compile_to_ir_termination(
 /// a parameter spill (`*.addr`) or an ABI coercion temporary (`coerce*`): a
 /// compound literal (`.compoundliteral`) or any unnamed / unknown temporary
 /// dies at the end of its block, which the IR would no longer say.
+///
+/// `pin_pointers` also keeps every pointer-typed local a stack object (see
+/// [`memsafety_pin_escaped`]): what the leak check at an `exit()` needs, at
+/// some cost elsewhere (a loop over `*x` loses its k-induction proof).
 fn compile_to_ir_memsafety(
     input: &Path,
     data_model: saf_svcomp::DataModel,
     stub: &Path,
     dir: &Path,
+    pin_pointers: bool,
 ) -> anyhow::Result<Option<saf_core::air::AirModule>> {
     use anyhow::Context as _;
     let ir = compile_to_ir_with(
@@ -1516,7 +1522,8 @@ fn compile_to_ir_memsafety(
     // that forwards a value through a dead object's slot and erases the
     // dangling dereference itself (`memsafety-ext3/scopes1`).
     let pinned = dir.join("memsafety-pinned.ll");
-    std::fs::write(&pinned, memsafety_pin_escaped(&text)).context("write pinned IR")?;
+    std::fs::write(&pinned, memsafety_pin_escaped(&text, pin_pointers))
+        .context("write pinned IR")?;
     let opt_bin = std::env::var("SAF_OPT").unwrap_or_else(|_| DEFAULT_OPT.to_string());
     let status = std::process::Command::new(&opt_bin)
         .arg("-S")
@@ -1559,7 +1566,13 @@ fn llvm_name_char(c: char) -> bool {
 /// `text` with a `call void @__saf_keep(ptr %x)` after every alloca `%x` whose
 /// address is used other than as the address of a load or store or by its own
 /// lifetime marker, so `mem2reg` leaves it a stack object.
-fn memsafety_pin_escaped(text: &str) -> String {
+///
+/// With `pin_pointers`, a pointer-typed local (`alloca ptr`) is pinned too: its slot then holds the
+/// variable's CURRENT value, which is what keeps a block reachable at an
+/// `exit()` (C locals stay in scope, `valid-memtrack`). Promoted, it would be
+/// an SSA register the engine can only count as a root while it is still
+/// used, so `p = malloc(..); if (!q) exit(1);` looked like a leak.
+fn memsafety_pin_escaped(text: &str, pin_pointers: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(text.len() + 256);
     let mut func: Vec<&str> = Vec::new();
@@ -1576,6 +1589,14 @@ fn memsafety_pin_escaped(text: &str) -> String {
             .iter()
             .filter(|name| {
                 let needle = format!("%{name}");
+                if pin_pointers
+                    && func.iter().any(|l| {
+                        l.trim_start()
+                            .starts_with(&format!("{needle} = alloca ptr"))
+                    })
+                {
+                    return true;
+                }
                 func.iter().any(|l| {
                     let t = l.trim_start();
                     let mut from = 0;
@@ -5076,7 +5097,7 @@ fn memsafety_engine_counterexample(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     }
     // The memory-safety recipe's module (block-scope lifetimes); the shared
     // module when the recipe refuses (the candidate is replay-gated either way).
-    let recipe = compile_to_ir_memsafety(ctx.input, ctx.data_model, ctx.stub, ctx.tempdir)
+    let recipe = compile_to_ir_memsafety(ctx.input, ctx.data_model, ctx.stub, ctx.tempdir, false)
         .ok()
         .flatten();
     let module = recipe.as_ref().unwrap_or(ctx.module);
@@ -5237,21 +5258,49 @@ fn try_heap_engine_true(ctx: &VerifyCtx, memcleanup: bool) -> bool {
     if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
         return false;
     }
-    let module = match compile_to_ir_memsafety(ctx.input, ctx.data_model, ctx.stub, ctx.tempdir) {
+    match heap_engine_attempt(ctx, memcleanup, false) {
+        Some(Ok(())) => true,
+        // Gave up on a leak: the promoted pointer locals were not roots at an
+        // `exit()`. Again with them kept as stack slots (C semantics there).
+        Some(Err(reason))
+            if !memcleanup
+                && (reason.contains("ms-leak") || reason.contains("ms-memtrack-unknown")) =>
+        {
+            matches!(heap_engine_attempt(ctx, memcleanup, true), Some(Ok(())))
+        }
+        _ => false,
+    }
+}
+
+/// One run of [`try_heap_engine_true`]'s engine on the memory-safety recipe's
+/// module: `Some(Ok)` proved, `Some(Err(reason))` abstained, `None` when the
+/// recipe refused the program.
+fn heap_engine_attempt(
+    ctx: &VerifyCtx,
+    memcleanup: bool,
+    pin_pointers: bool,
+) -> Option<Result<(), String>> {
+    let module = match compile_to_ir_memsafety(
+        ctx.input,
+        ctx.data_model,
+        ctx.stub,
+        ctx.tempdir,
+        pin_pointers,
+    ) {
         Ok(Some(m)) => m,
         Ok(None) => {
             eprintln!(
                 "saf verify: memsafety recipe: a stack object without lifetime markers -> unknown"
             );
-            return false;
+            return None;
         }
         Err(e) => {
             eprintln!("saf verify: memsafety recipe failed: {e:#} -> unknown");
-            return false;
+            return None;
         }
     };
     if module.dropped_unknown_opcode || !module.dropped_intrinsics.is_empty() {
-        return false;
+        return None;
     }
     let budget = unreach_prove_budget(ctx.budget);
     let (what, proof) = if memcleanup {
@@ -5265,14 +5314,21 @@ fn try_heap_engine_true(ctx: &VerifyCtx, memcleanup: bool) -> bool {
             saf_svcomp::prove_memsafety_exhaustive(&module, budget),
         )
     };
+    let pinned = if pin_pointers {
+        " (pointer locals pinned)"
+    } else {
+        ""
+    };
     match proof {
         saf_svcomp::ExhaustiveProof::Proven => {
-            eprintln!("saf verify: exhaustive {what} prover PROVED every path -> true");
-            true
+            eprintln!("saf verify: exhaustive {what} prover{pinned} PROVED every path -> true");
+            Some(Ok(()))
         }
         saf_svcomp::ExhaustiveProof::Abstain(reason) => {
-            eprintln!("saf verify: exhaustive {what} prover abstained ({reason}) -> unknown");
-            false
+            eprintln!(
+                "saf verify: exhaustive {what} prover{pinned} abstained ({reason}) -> unknown"
+            );
+            Some(Err(reason))
         }
     }
 }
@@ -9289,10 +9345,15 @@ mod verify_tests {
         for (name, safe, body) in cases {
             let src = dir.path().join(format!("{name}.c"));
             std::fs::write(&src, body).expect("source");
-            let module =
-                compile_to_ir_memsafety(&src, saf_svcomp::DataModel::LP64, &stub, dir.path())
-                    .expect("compile")
-                    .expect("every stack object has lifetime markers");
+            let module = compile_to_ir_memsafety(
+                &src,
+                saf_svcomp::DataModel::LP64,
+                &stub,
+                dir.path(),
+                false,
+            )
+            .expect("compile")
+            .expect("every stack object has lifetime markers");
             let proof =
                 saf_svcomp::prove_memsafety_exhaustive(&module, std::time::Duration::from_secs(30));
             assert_eq!(
@@ -9373,11 +9434,15 @@ mod verify_tests {
             "    #dbg_declare(ptr %argv.addr, !18, !DIExpression(), !19)",
         ] {
             let ir = format!(
-                "define i32 @main(ptr %argv) {{\n  %argv.addr = alloca ptr\n  %p = alloca ptr\n  %x = alloca i32\n  store ptr %argv, ptr %argv.addr\n{dbg}\n  store ptr %x, ptr %p\n  ret i32 0\n}}\n"
-            );
-            let out = memsafety_pin_escaped(&ir);
-            assert!(!out.contains(&format!("{keep}argv.addr)")), "{out}");
-            assert!(!out.contains(&format!("{keep}p)")), "{out}");
+                "define i32 @main(i32 %argc) {{\n  %argc.addr = alloca i32\n  %p = alloca ptr\n  %x = alloca i32\n  store i32 %argc, ptr %argc.addr\n{dbg}\n  store ptr %x, ptr %p\n  ret i32 0\n}}\n"
+            )
+            .replace("argv.addr", "argc.addr");
+            let out = memsafety_pin_escaped(&ir, true);
+            // A debug record is not a use: the integer spill stays promotable.
+            assert!(!out.contains(&format!("{keep}argc.addr)")), "{out}");
+            // A pointer local is always pinned (its slot is a root at `exit`).
+            assert!(out.contains(&format!("{keep}p)")), "{out}");
+            // An escaped local is pinned.
             assert!(out.contains(&format!("{keep}x)")), "{out}");
         }
     }

@@ -368,3 +368,116 @@ fn memcleanup_false_when_an_error_call_aborts_with_a_block_allocated() {
     verify_memcleanup("memcleanup_false_error_leaves_block.c")
         .stdout(predicate::eq("false(valid-memcleanup)\n"));
 }
+
+// ---------------------------------------------------------------------------
+// Library-code models (uthash, SV-COMP SoftwareSystems)
+//
+// Pointer differences inside one object, negative byte steps, `memset` to 0
+// of a whole block, `memcmp`, structural bounds that exclude an overflow,
+// empty infinite loops, and pointer locals kept as stack slots for the leak
+// check at `exit`. Each recall fixture has a soundness twin that must never
+// become TRUE.
+// ---------------------------------------------------------------------------
+
+/// `saf verify --property <prop>.prp --data-model LP64 <fixture>`, asserting exit 0.
+fn verify(prop: &str, name: &str) -> assert_cmd::assert::Assert {
+    cargo_bin_cmd!("saf")
+        .args([
+            "verify",
+            "--property",
+            fixture(&format!("{prop}.prp")).as_str(),
+            "--data-model",
+            "LP64",
+            fixture(name).as_str(),
+        ])
+        .assert()
+        .success()
+}
+
+#[test]
+#[ignore]
+fn unreach_true_with_constant_pointer_difference_in_one_object() {
+    verify("unreach-call", "unreach_true_ptrdiff_same_object.c").stdout(predicate::eq("true\n"));
+}
+
+#[test]
+#[ignore]
+fn unreach_never_true_on_a_difference_of_two_objects() {
+    verify("unreach-call", "unreach_false_ptrdiff_two_objects.c")
+        .stdout(predicate::str::contains("true").not());
+}
+
+#[test]
+#[ignore]
+fn unreach_true_through_a_negative_byte_step() {
+    verify("unreach-call", "unreach_true_negative_gep.c").stdout(predicate::eq("true\n"));
+}
+
+#[test]
+#[ignore]
+fn unreach_true_after_memset_of_the_whole_block() {
+    verify("unreach-call", "unreach_true_memset_whole_object.c").stdout(predicate::eq("true\n"));
+}
+
+#[test]
+#[ignore]
+fn unreach_never_true_after_a_partial_memset() {
+    verify("unreach-call", "unreach_false_memset_partial.c")
+        .stdout(predicate::str::contains("true").not());
+}
+
+#[test]
+#[ignore]
+fn unreach_true_with_memcmp_on_equal_and_different_bytes() {
+    verify("unreach-call", "unreach_true_memcmp.c").stdout(predicate::eq("true\n"));
+}
+
+#[test]
+#[ignore]
+fn unreach_never_true_when_memcmp_may_find_equal_bytes() {
+    verify("unreach-call", "unreach_false_memcmp_nondet.c")
+        .stdout(predicate::str::contains("true").not());
+}
+
+#[test]
+#[ignore]
+fn no_overflow_true_on_a_sum_of_shorts() {
+    verify("no-overflow", "overflow_true_short_sum.c").stdout(predicate::eq("true\n"));
+}
+
+#[test]
+#[ignore]
+fn no_overflow_never_true_on_a_sum_of_ints() {
+    verify("no-overflow", "overflow_false_int_sum.c")
+        .stdout(predicate::str::contains("true").not());
+}
+
+#[test]
+#[ignore]
+fn memcleanup_true_when_a_failed_allocation_spins_forever() {
+    verify("valid-memcleanup", "memcleanup_true_spin_on_null.c").stdout(predicate::eq("true\n"));
+}
+
+#[test]
+#[ignore]
+fn termination_never_true_when_a_failed_allocation_spins_forever() {
+    verify("termination", "termination_false_spin_on_null.c")
+        .stdout(predicate::str::contains("true").not());
+}
+
+#[test]
+#[ignore]
+fn memsafety_true_when_exit_happens_while_a_local_holds_the_block() {
+    verify("valid-memsafety", "memsafety_true_exit_while_local_holds.c")
+        .stdout(predicate::eq("true\n"));
+}
+
+#[test]
+#[ignore]
+fn memsafety_never_true_when_the_pointer_is_overwritten_before_exit() {
+    verify(
+        "valid-memsafety",
+        "memsafety_false_overwritten_before_exit.c",
+    )
+    .stdout(predicate::str::contains("true").not());
+}

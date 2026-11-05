@@ -472,6 +472,9 @@ struct State {
     /// cell reads 0. Merging keeps the intersection (an object zeroed on one
     /// side only reads fresh afterwards — any value, sound).
     zeroed: BTreeSet<ValueId>,
+    /// Every heap object allocated on this path, with its byte size when
+    /// that is a constant (a fresh base per allocation, never reused).
+    heap_objs: BTreeMap<ValueId, Option<u64>>,
     constraints: Vec<(Bool, Vars)>,
     visits: BTreeMap<BlockId, u32>,
     /// A Z3 `UNKNOWN` was treated as feasible somewhere on this path, so a
@@ -1000,6 +1003,9 @@ struct Engine<'a> {
     /// Reverse-postorder index of every block, per function (scheduling).
     rpo: BTreeMap<(FunctionId, BlockId), usize>,
     fresh_counter: u64,
+    /// The symbolic address of a heap object or global, created on its first
+    /// `ptrtoint` (see [`Engine::ptr_to_int`]).
+    addr_syms: BTreeMap<ValueId, (BV, Vars)>,
     steps: u64,
     solver_calls: u64,
     /// States popped from the worklist by the current `run`.
@@ -1849,6 +1855,7 @@ impl<'a> Engine<'a> {
             block_local,
             rpo,
             fresh_counter: 0,
+            addr_syms: BTreeMap::new(),
             steps: 0,
             solver_calls: 0,
             states: 0,
@@ -2121,6 +2128,7 @@ impl<'a> Engine<'a> {
             memory: BTreeMap::new(),
             escaped: BTreeSet::new(),
             zeroed: BTreeSet::new(),
+            heap_objs: BTreeMap::new(),
             constraints: Vec::new(),
             visits: BTreeMap::new(),
             has_unknown: false,
@@ -2288,6 +2296,7 @@ impl<'a> Engine<'a> {
             memory: BTreeMap::new(),
             escaped: BTreeSet::new(),
             zeroed: BTreeSet::new(),
+            heap_objs: BTreeMap::new(),
             constraints: Vec::new(),
             // Iteration 1. When the header has no phis the state starts at index
             // 0 and the entry bookkeeping below counts this entry itself.
@@ -2922,6 +2931,7 @@ impl<'a> Engine<'a> {
         a.seen_alloca.extend(b.seen_alloca);
         a.versioned.extend(b.versioned);
         a.zeroed = a.zeroed.intersection(&b.zeroed).copied().collect();
+        a.heap_objs.extend(b.heap_objs);
         for (blk, n) in b.visits {
             let e = a.visits.entry(blk).or_insert(0);
             *e = (*e).max(n);
@@ -3377,6 +3387,14 @@ impl<'a> Engine<'a> {
                 let v = st.visits.entry(st.block).or_insert(0);
                 *v += 1;
                 if *v > VISIT_CAP {
+                    trace(|| {
+                        let b = self.block(st.func, st.block).ok();
+                        format!(
+                            "unwind-cap at block={:?}: {:?}",
+                            st.block,
+                            b.map(|b| b.instructions.iter().map(|i| &i.op).collect::<Vec<_>>())
+                        )
+                    });
                     return Err("unwind-cap".to_string());
                 }
                 if let Some(stop) = self.loop_bookkeeping(&st) {
@@ -3524,7 +3542,7 @@ impl<'a> Engine<'a> {
                         st.dead.extend(dying.into_iter().map(|(_, b)| b));
                         st.stack = live;
                         if depth == 0 {
-                            self.ms_memtrack(&st, false)?;
+                            self.ms_end_check(&mut st, false)?;
                         }
                     }
                     let Some(frame) = st.frames.pop() else {
@@ -3568,7 +3586,7 @@ impl<'a> Engine<'a> {
                 Flow::Halt => {
                     trace(|| format!("halt at block={:?}", st.block));
                     if self.goal == Goal::MemSafety && !st.dead_end {
-                        self.ms_memtrack(&st, true)?;
+                        self.ms_end_check(&mut st, true)?;
                     }
                     return Ok(());
                 }
@@ -3884,7 +3902,9 @@ impl<'a> Engine<'a> {
                     && !unsigned_shl
                     && !(self.cex_mode && !self.cex_check_shl && *kind == BinaryOp::Shl)
                 {
-                    if let Some(ovf) = overflow_condition(inst, *kind, &a, &b) {
+                    if overflow_excluded_by_bounds(inst, *kind, &a, &b) {
+                        trace(|| format!("overflow excluded by bounds: {kind:?} at {:?}", inst.id));
+                    } else if let Some(ovf) = overflow_condition(inst, *kind, &a, &b) {
                         trace(|| format!("overflow check: {kind:?} at {:?}", inst.id));
                         self.check_violation(st, Some((&ovf, &vars)), inst.id)?;
                     }
@@ -3934,13 +3954,12 @@ impl<'a> Engine<'a> {
                             _ => return Err("bitcast-unmodelled".to_string()),
                         }
                     }
-                    // A pointer's integer image is unknown to the engine (no
-                    // address model): any value. Sound because the way back,
-                    // `inttoptr`, yields an opaque pointer (stores abstain).
+                    // A pointer's integer image: its object's symbolic address
+                    // plus the offset (see `ptr_to_int`). The way back,
+                    // `inttoptr`, still yields an opaque pointer (stores abstain).
                     CastKind::PtrToInt => {
                         let bits = self.result_bits(inst)?;
-                        trace(|| "fresh: ptrtoint".to_string());
-                        self.fresh_val(bits)
+                        self.ptr_to_int(st, src, bits)?
                     }
                     // An integer turned pointer may point anywhere: opaque (a
                     // store through it abstains, a load is fresh).
@@ -4140,7 +4159,12 @@ impl<'a> Engine<'a> {
                 if zeroing {
                     st.zeroed.insert(base);
                 }
-                trace(|| format!("heap object {base:?} zeroed={zeroing}"));
+                let size = self
+                    .ms_alloc_size(st, inst, kind)
+                    .ok()
+                    .and_then(|(b, _)| b.simplify().as_u64());
+                st.heap_objs.insert(base, size);
+                trace(|| format!("heap object {base:?} zeroed={zeroing} size={size:?}"));
                 set(st, inst, Val::Ptr(Some((base, Vec::new()))));
                 Ok(Flow::Next)
             }
@@ -4183,7 +4207,10 @@ impl<'a> Engine<'a> {
                                         None
                                     } else {
                                         match self.val(st, op, self.width.get(&op).copied())? {
-                                            Val::Bv(b, _) => b.simplify().as_i64(),
+                                            // GEP indices are signed: `p - k`
+                                            // is a negative index (uthash's
+                                            // `ELMT_FROM_HH`).
+                                            Val::Bv(b, _) => signed_numeral(&b.simplify()),
                                             Val::Ptr(_) => None,
                                         }
                                     };
@@ -4290,6 +4317,19 @@ impl<'a> Engine<'a> {
             // pruning there dropped values still used after the call (lost the
             // XCSP proofs: `assume(var0 >= 0); assume(var0 <= 1);` in one block).
             Operation::Br { target } => {
+                // `while (1) {}`: a cycle of blocks that only jump on never
+                // ends and changes nothing, so nothing further happens on this
+                // path (except under termination, where it IS the violation).
+                // A memtrack goal still checks the leaks so far, as at a halt.
+                if !self.termination && !self.nonterm && self.spin_cycle(st.func, st.block, *target)
+                {
+                    trace(|| format!("empty infinite loop at block={:?}", st.block));
+                    if self.goal == Goal::MemSafety && !self.memcleanup && !st.dead_end {
+                        self.ms_end_check(st, true)?;
+                    }
+                    st.dead_end = true;
+                    return Ok(Flow::Halt);
+                }
                 self.prune_block_locals(st);
                 Ok(Flow::Jump(*target))
             }
@@ -4389,42 +4429,185 @@ impl<'a> Engine<'a> {
             // fresh). The source is only read. An opaque destination could alias
             // any modelled cell — abstain, as for an unknown extern.
             Operation::Memcpy | Operation::Memset => {
-                let dst = inst
-                    .operands
-                    .first()
-                    .copied()
-                    .ok_or("mem-intrinsic-arity")?;
-                if self.goal == Goal::MemSafety {
-                    // `(dst, src|val, len, ...)`: a concrete length, checked
-                    // against the destination (and the source of a copy).
-                    let len_id = inst.operands.get(2).copied().ok_or("mem-intrinsic-arity")?;
-                    let len = match self.val(st, len_id, self.width.get(&len_id).copied())? {
-                        Val::Bv(b, _) => b.simplify().as_u64(),
-                        Val::Ptr(_) => None,
-                    }
-                    .ok_or("ms-mem-intrinsic-symbolic-length")?;
-                    if len > 0 {
-                        let cell = self.ptr(st, dst)?;
-                        self.ms_check_access(st, cell.as_ref(), len, inst.id, "memwrite")?;
-                        if matches!(inst.op, Operation::Memcpy) {
-                            let src = inst.operands.get(1).copied().ok_or("mem-intrinsic-arity")?;
-                            let cell = self.ptr(st, src)?;
-                            self.ms_check_access(st, cell.as_ref(), len, inst.id, "memread")?;
-                        }
-                    }
-                }
-                let Some((base, _)) = self.ptr(st, dst)? else {
-                    return Err("mem-intrinsic-opaque-dest".to_string());
-                };
-                if matches!(self.globals.get(&base), Some((_, true))) {
-                    return Err("store-const-global".to_string());
-                }
-                trace(|| format!("mem-intrinsic havocs {base:?}"));
-                st.memory.retain(|k, _| k.0 != base);
-                st.escaped.insert(base);
+                self.mem_op(
+                    st,
+                    inst.id,
+                    matches!(inst.op, Operation::Memcpy),
+                    &inst.operands,
+                )?;
                 Ok(Flow::Next)
             }
         }
+    }
+
+    /// `memcpy`/`memmove`/`memset` (the intrinsics and the libc calls alike):
+    /// `(dst, src|val, len, ...)`. A `memset` to 0 of a whole heap object of
+    /// known size leaves it zeroed: every cell is dropped and reads 0, as for
+    /// `calloc`. Otherwise the destination object may now hold anything (its
+    /// cells are dropped and it is marked escaped: later loads are fresh). The
+    /// source is only read. An opaque destination could alias any modelled
+    /// cell — abstain, as for an unknown extern.
+    fn mem_op(&mut self, st: &mut State, id: InstId, copy: bool, ops: &[ValueId]) -> Res<()> {
+        let dst = ops.first().copied().ok_or("mem-intrinsic-arity")?;
+        let len_id = ops.get(2).copied().ok_or("mem-intrinsic-arity")?;
+        let len = match self.val(st, len_id, self.width.get(&len_id).copied())? {
+            Val::Bv(b, _) => b.simplify().as_u64(),
+            Val::Ptr(_) => None,
+        };
+        if self.goal == Goal::MemSafety {
+            // A concrete length, checked against the destination (and the
+            // source of a copy).
+            let len = len.ok_or("ms-mem-intrinsic-symbolic-length")?;
+            if len > 0 {
+                let cell = self.ptr(st, dst)?;
+                self.ms_check_access(st, cell.as_ref(), len, id, "memwrite")?;
+                if copy {
+                    let src = ops.get(1).copied().ok_or("mem-intrinsic-arity")?;
+                    let cell = self.ptr(st, src)?;
+                    self.ms_check_access(st, cell.as_ref(), len, id, "memread")?;
+                }
+            }
+        }
+        let Some((base, path)) = self.ptr(st, dst)? else {
+            return Err("mem-intrinsic-opaque-dest".to_string());
+        };
+        if matches!(self.globals.get(&base), Some((_, true))) {
+            return Err("store-const-global".to_string());
+        }
+        if base == NULL_BASE {
+            return Err("mem-intrinsic-null-dest".to_string());
+        }
+        if !copy && len.is_some() && cell_offset(&(base, path)) == Some(0) {
+            let val = ops.get(1).copied().ok_or("mem-intrinsic-arity")?;
+            let zero = match self.val(st, val, self.width.get(&val).copied())? {
+                Val::Bv(b, _) => b.simplify().as_u64() == Some(0),
+                Val::Ptr(_) => false,
+            };
+            if zero && st.heap_objs.get(&base).copied().flatten() == len {
+                trace(|| format!("memset 0 zeroes heap object {base:?}"));
+                st.memory.retain(|k, _| k.0 != base);
+                st.escaped.remove(&base);
+                st.zeroed.insert(base);
+                return Ok(());
+            }
+        }
+        trace(|| format!("mem-intrinsic havocs {base:?}"));
+        st.memory.retain(|k, _| k.0 != base);
+        st.escaped.insert(base);
+        Ok(())
+    }
+
+    /// `memcmp(a, b, n)` with a constant `n` (at most [`MEMCMP_MAX`] bytes)
+    /// over two exactly-known pointers: the bytes are read like `char` loads,
+    /// and the result is 0 when all `n` pairs agree, else a fresh value that is
+    /// negative or positive by the first differing pair compared as `unsigned
+    /// char` (the C standard fixes only the sign). Anything else abstains.
+    fn memcmp(&mut self, st: &mut State, inst: &Instruction, args: &[ValueId]) -> Res<Flow> {
+        const MEMCMP_MAX: u64 = 64;
+        let n = match self.val(st, args[2], self.width.get(&args[2]).copied())? {
+            Val::Bv(b, _) => b.simplify().as_u64(),
+            Val::Ptr(_) => None,
+        }
+        .filter(|n| *n <= MEMCMP_MAX)
+        .ok_or("memcmp-length")?;
+        let mut cells = Vec::new();
+        for &p in &args[..2] {
+            let cell = self.ptr(st, p)?;
+            if self.goal == Goal::MemSafety && n > 0 {
+                self.ms_check_access(st, cell.as_ref(), n, inst.id, "memread")?;
+            }
+            let cell = cell.ok_or("memcmp-opaque-pointer")?;
+            if cell.0 == NULL_BASE {
+                return self.null_deref(st, "memcmp");
+            }
+            let off = cell_offset(&cell).ok_or("memcmp-unknown-offset")?;
+            cells.push((cell.0, off));
+        }
+        let mut vars = no_vars();
+        let mut pairs = Vec::new();
+        for i in 0..u32::try_from(n).map_err(|_| "memcmp-length")? {
+            let byte = |this: &mut Self, st: &mut State, (base, off): (ValueId, u32)| match this
+                .load_scalar(st, Some(cell_at(base, off + i)), 8)?
+            {
+                Val::Bv(b, vs) => Ok((b, vs)),
+                Val::Ptr(_) => Err("memcmp-pointer-byte".to_string()),
+            };
+            let (x, vx) = byte(self, st, cells[0])?;
+            let (y, vy) = byte(self, st, cells[1])?;
+            vars = union(&vars, &union(&vx, &vy));
+            pairs.push((x, y));
+        }
+        // From the last pair back: `lt` is "a < b at the first difference".
+        let mut all_eq = Bool::from_bool(true);
+        let mut lt = Bool::from_bool(false);
+        for (x, y) in pairs.iter().rev() {
+            let same = eq(x, y);
+            lt = same.ite(&lt, &x.bvult(y));
+            all_eq = Bool::and(&[&same, &all_eq]);
+        }
+        let bits = match inst.dst {
+            Some(d) => self.width.get(&d).copied().unwrap_or(32),
+            None => 32,
+        };
+        let (neg, vn) = self.fresh(bits);
+        let (pos, vp) = self.fresh(bits);
+        st.constraints
+            .push((neg.bvslt(int_bv(0, bits)), vn.clone()));
+        st.constraints
+            .push((pos.bvsgt(int_bv(0, bits)), vp.clone()));
+        let r = all_eq.ite(&int_bv(0, bits), &lt.ite(&neg, &pos));
+        let vars = union(&vars, &union(&vn, &vp));
+        if let Some(d) = inst.dst {
+            st.values.insert(d, Self::mk(r, vars));
+        }
+        Ok(Flow::Next)
+    }
+
+    /// `ptrtoint`: a heap object's or a global's address is a symbol of its
+    /// own (created once per object: heap bases are never reused), so the
+    /// image of `base + off` is `addr(base) + off` and the difference of two
+    /// pointers into one object is the constant difference of their offsets
+    /// (`(char*)&u->hh - (char*)u`, uthash's `hho`). Nothing is assumed about
+    /// the symbols (alignment, distinctness): any addresses, sound. NULL is 0.
+    /// A stack object (an `alloca` may be re-entered under the same id), an
+    /// unknown offset or an opaque pointer gives any value, as before.
+    fn ptr_to_int(&mut self, st: &mut State, src: ValueId, bits: u32) -> Res<Val> {
+        let ptr_bits = self.module.target_pointer_width * 8;
+        let cell = self.ptr(st, src)?;
+        let off = cell.as_ref().and_then(cell_offset);
+        let addr = match (&cell, off) {
+            (Some((base, _)), Some(off)) if *base == NULL_BASE => {
+                Some((int_bv(i64::from(off), ptr_bits), no_vars()))
+            }
+            (Some((base, _)), Some(off))
+                if st.heap_objs.contains_key(base) || self.globals.contains_key(base) =>
+            {
+                let (sym, vars) = if let Some(x) = self.addr_syms.get(base) {
+                    x.clone()
+                } else {
+                    let x = self.fresh(ptr_bits);
+                    self.addr_syms.insert(*base, x.clone());
+                    x
+                };
+                let a = if off == 0 {
+                    sym
+                } else {
+                    sym.bvadd(int_bv(i64::from(off), ptr_bits))
+                };
+                Some((a, vars))
+            }
+            _ => None,
+        };
+        let Some((a, vars)) = addr else {
+            trace(|| "fresh: ptrtoint".to_string());
+            return Ok(self.fresh_val(bits));
+        };
+        let a = match bits.cmp(&ptr_bits) {
+            std::cmp::Ordering::Equal => a,
+            std::cmp::Ordering::Less => a.extract(bits - 1, 0),
+            std::cmp::Ordering::Greater => a.zero_ext(bits - ptr_bits),
+        };
+        Ok(Self::mk(a, vars))
     }
 
     /// A pointer-typed load: the stored pointer; otherwise, for a cell never
@@ -4782,6 +4965,53 @@ impl<'a> Engine<'a> {
     /// memory-safe. The stack roots are only the values each frame can still use
     /// (see [`Engine::halt_stack_roots`]): a pointer the program overwrote or
     /// will never read again does not hold its block.
+    /// `block` holds nothing but `br target`, and following such blocks from
+    /// `target` comes back to `block` (within a few steps): an empty cycle.
+    fn spin_cycle(&self, func: FunctionId, block: BlockId, target: BlockId) -> bool {
+        let only_br = |b: BlockId| match self.block(func, b) {
+            Ok(blk) => match blk.instructions.as_slice() {
+                [i] => match i.op {
+                    Operation::Br { target } => Some(target),
+                    _ => None,
+                },
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        if only_br(block).is_none() {
+            return false;
+        }
+        let mut b = target;
+        for _ in 0..8 {
+            if b == block {
+                return true;
+            }
+            match only_br(b) {
+                Some(next) => b = next,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// [`Self::ms_memtrack`] at a path end, where a leak or an unfreed block
+    /// counts only on a feasible path (the exhaustive mode does not test the
+    /// branches it takes: the `reach_error` arm of an assertion that always
+    /// holds would otherwise end in a spurious `mc-not-freed`).
+    fn ms_end_check(&mut self, st: &mut State, halted: bool) -> Res<()> {
+        match self.ms_memtrack(st, halted) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.path_alive(st)? {
+                    Err(e)
+                } else {
+                    trace(|| format!("{e} on an infeasible path: dead"));
+                    Ok(())
+                }
+            }
+        }
+    }
+
     fn ms_memtrack(&self, st: &State, halted: bool) -> Res<()> {
         // A leak is not confirmed by the replay (`valid-memtrack` violation
         // witnesses are demo-mode only): the counterexample search ignores it.
@@ -5199,6 +5429,23 @@ impl<'a> Engine<'a> {
                     Some(&w) => self.fresh_val(w),
                     None => Val::Ptr(None),
                 };
+                st.values.insert(d, v);
+            }
+            return Ok(Flow::Next);
+        }
+        if !defined && !self.cex_mode && name == "memcmp" && args.len() == 3 {
+            return self.memcmp(st, inst, args);
+        }
+        // The libc block copies and fills: the intrinsics' semantics (proofs
+        // only; the counterexample search keeps the havocking extern model).
+        if !defined
+            && !self.cex_mode
+            && matches!(name, "memset" | "memcpy" | "memmove")
+            && args.len() == 3
+        {
+            self.mem_op(st, inst.id, name != "memset", args)?;
+            if let Some(d) = inst.dst {
+                let v = self.val(st, args[0], self.width.get(&args[0]).copied())?;
                 st.values.insert(d, v);
             }
             return Ok(Flow::Next);
@@ -6316,6 +6563,156 @@ enum Flow {
 
 /// The condition under which `a <kind> b` is a signed overflow (see
 /// [`Goal::SignedOverflow`]); `None` when the operation cannot be one.
+/// The value of a bit-vector numeral read as a SIGNED integer of its width
+/// (Z3's `as_i64` reads numerals as unsigned: a 32-bit `-8` is 4294967288).
+fn signed_numeral(b: &BV) -> Option<i64> {
+    let w = b.get_size();
+    let u = b.as_u64()?;
+    match w {
+        0 => None,
+        64 => Some(i64::from_ne_bytes(u.to_ne_bytes())),
+        w if w < 64 => {
+            let u = i128::from(u);
+            let v = if u >= 1i128 << (w - 1) {
+                u - (1i128 << w)
+            } else {
+                u
+            };
+            i64::try_from(v).ok()
+        }
+        _ => None,
+    }
+}
+
+/// The signed range of a `bits`-wide bit-vector: `[-2^(bits-1), 2^(bits-1) - 1]`.
+fn full_signed(bits: u32) -> (i128, i128) {
+    let half = 1i128 << (bits - 1);
+    (-half, half - 1)
+}
+
+/// Sound bounds `[lo, hi]` on the SIGNED value of a term of at most 64 bits,
+/// read off its structure alone (no path constraints): numerals are exact; a
+/// sign extension keeps its operand's signed value; a zero extension of a
+/// non-negative operand too; `ite` is the hull of its branches; a sum,
+/// difference or product whose exact range fits the width cannot wrap, so the
+/// range is that of the mathematical result. Anything else (a symbol, a
+/// shift, a term past the visit budget) is the full range of its width.
+fn signed_bounds(e: &BV) -> (i128, i128) {
+    fn rec(
+        e: &BV,
+        memo: &mut std::collections::HashMap<usize, (i128, i128)>,
+        budget: &mut u32,
+    ) -> (i128, i128) {
+        let w = e.get_size();
+        let full = full_signed(w);
+        if let Some(u) = e.as_u64() {
+            let u = i128::from(u);
+            return if w < 128 && u >= 1i128 << (w - 1) {
+                (u - (1i128 << w), u - (1i128 << w))
+            } else {
+                (u, u)
+            };
+        }
+        if *budget == 0 || !e.is_app() {
+            return full;
+        }
+        *budget -= 1;
+        let key = e.get_z3_ast().as_ptr() as usize;
+        if let Some(r) = memo.get(&key) {
+            return *r;
+        }
+        let kids: Vec<BV> = e.children().iter().filter_map(Dynamic::as_bv).collect();
+        let fits = |r: (i128, i128)| {
+            if r.0 >= full.0 && r.1 <= full.1 {
+                r
+            } else {
+                full
+            }
+        };
+        let r = match e.decl().kind() {
+            z3::DeclKind::BADD if !kids.is_empty() => {
+                let mut acc = (0i128, 0i128);
+                for k in &kids {
+                    let b = rec(k, memo, budget);
+                    acc = (acc.0 + b.0, acc.1 + b.1);
+                }
+                fits(acc)
+            }
+            z3::DeclKind::BSUB if kids.len() == 2 => {
+                let (x, y) = (rec(&kids[0], memo, budget), rec(&kids[1], memo, budget));
+                fits((x.0 - y.1, x.1 - y.0))
+            }
+            z3::DeclKind::BMUL if !kids.is_empty() => {
+                let mut acc = Some((1i128, 1i128));
+                for k in &kids {
+                    let b = rec(k, memo, budget);
+                    acc = acc.and_then(|(lo, hi)| {
+                        let c = [
+                            lo.checked_mul(b.0)?,
+                            lo.checked_mul(b.1)?,
+                            hi.checked_mul(b.0)?,
+                            hi.checked_mul(b.1)?,
+                        ];
+                        Some((*c.iter().min()?, *c.iter().max()?))
+                    });
+                }
+                acc.map_or(full, fits)
+            }
+            z3::DeclKind::SIGN_EXT if kids.len() == 1 => rec(&kids[0], memo, budget),
+            z3::DeclKind::ZERO_EXT if kids.len() == 1 => {
+                let k = rec(&kids[0], memo, budget);
+                if k.0 >= 0 {
+                    k
+                } else {
+                    let wk = kids[0].get_size();
+                    fits((0, (1i128 << wk) - 1))
+                }
+            }
+            z3::DeclKind::ITE if kids.len() == 2 => {
+                let (x, y) = (rec(&kids[0], memo, budget), rec(&kids[1], memo, budget));
+                (x.0.min(y.0), x.1.max(y.1))
+            }
+            _ => full,
+        };
+        memo.insert(key, r);
+        r
+    }
+    if e.get_size() == 0 || e.get_size() > 64 {
+        return (i128::MIN, i128::MAX);
+    }
+    let mut budget = 20_000;
+    rec(e, &mut std::collections::HashMap::new(), &mut budget)
+}
+
+/// A signed (`nsw`) add, sub or mul whose operands' structural bounds
+/// ([`signed_bounds`]) put every exact result inside the type: no overflow on
+/// any path, so the solver need not be asked (it can spend its whole budget
+/// on `Σ sext(short)` adder chains it cannot refute).
+fn overflow_excluded_by_bounds(inst: &Instruction, kind: BinaryOp, a: &BV, b: &BV) -> bool {
+    let bits = a.get_size();
+    if bits == 0 || bits > 64 || b.get_size() != bits || !inst.has_no_signed_wrap() {
+        return false;
+    }
+    let (lhs, rhs) = (signed_bounds(a), signed_bounds(b));
+    let full = full_signed(bits);
+    if lhs.0 < full.0 || lhs.1 > full.1 || rhs.0 < full.0 || rhs.1 > full.1 {
+        return false;
+    }
+    let exact = match kind {
+        BinaryOp::Add => (lhs.0 + rhs.0, lhs.1 + rhs.1),
+        BinaryOp::Sub => (lhs.0 - rhs.1, lhs.1 - rhs.0),
+        BinaryOp::Mul => {
+            let corners = [lhs.0 * rhs.0, lhs.0 * rhs.1, lhs.1 * rhs.0, lhs.1 * rhs.1];
+            (
+                corners.iter().copied().min().unwrap_or(i128::MIN),
+                corners.iter().copied().max().unwrap_or(i128::MAX),
+            )
+        }
+        _ => return false,
+    };
+    exact.0 >= full.0 && exact.1 <= full.1
+}
+
 fn overflow_condition(inst: &Instruction, kind: BinaryOp, a: &BV, b: &BV) -> Option<Bool> {
     let bits = a.get_size();
     Some(match kind {
