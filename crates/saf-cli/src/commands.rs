@@ -1954,28 +1954,14 @@ fn memsafety_rewrite_ir(text: &str, whole_function: &FunctionLocals) -> Option<S
     let mut marked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let empty = std::collections::BTreeSet::new();
     let mut func_locals = &empty;
+    let mut define = "";
     let flush = |allocas: &mut Vec<(String, String)>,
                  marked: &mut std::collections::BTreeSet<String>,
-                 func_locals: &std::collections::BTreeSet<String>| {
-        let ok = allocas.iter().all(|(a, rhs)| {
-            marked.contains(a)
-                || func_locals.contains(a)
-                || a == "retval"
-                || a == "cleanup.dest.slot"
-                || a.rsplit_once('.').is_some_and(|(_, suffix)| suffix == "addr")
-                || a.starts_with("coerce")
-                // `__builtin_alloca(n)`: `%0 = alloca i8, i64 n` — lives until
-                // the function returns, like the C `alloca` it is.
-                || (a.chars().all(|c| c.is_ascii_digit()) && rhs.starts_with("alloca i8, i"))
-                // A C variable-length array: its scope ends at the
-                // `stackrestore` of the `stacksave` before it (renamed below,
-                // modelled by the engine), and its slot for the save token.
-                || (numbered(a, "vla") && vla_count(rhs))
-                || (numbered(a, "saved_stack") && rhs.starts_with("alloca ptr"))
-                // clang's debug-info slot for a VLA's element count: an
-                // integer local of the whole function, never a C object.
-                || (numbered(a, "__vla_expr") && rhs.starts_with("alloca i"))
-        });
+                 func_locals: &std::collections::BTreeSet<String>,
+                 define: &str| {
+        let ok = allocas
+            .iter()
+            .all(|(a, rhs)| recipe_slot_ok(a, rhs, marked, func_locals, define));
         allocas.clear();
         marked.clear();
         ok
@@ -1983,9 +1969,10 @@ fn memsafety_rewrite_ir(text: &str, whole_function: &FunctionLocals) -> Option<S
     for line in text.lines() {
         let t = line.trim_start();
         if t.starts_with("define ") || t == "}" {
-            if !flush(&mut allocas, &mut marked, func_locals) {
+            if !flush(&mut allocas, &mut marked, func_locals, define) {
                 return None;
             }
+            define = if t.starts_with("define ") { t } else { "" };
             func_locals = t
                 .strip_prefix("define ")
                 .and_then(|r| r.split_once('@'))
@@ -2011,7 +1998,7 @@ fn memsafety_rewrite_ir(text: &str, whole_function: &FunctionLocals) -> Option<S
             }
         }
     }
-    if !flush(&mut allocas, &mut marked, func_locals) {
+    if !flush(&mut allocas, &mut marked, func_locals, define) {
         return None;
     }
     let mut out = String::with_capacity(text.len() + 128);
@@ -2052,6 +2039,40 @@ fn memsafety_rewrite_ir(text: &str, whole_function: &FunctionLocals) -> Option<S
         saf_svcomp::STACK_RESTORE
     );
     Some(out)
+}
+
+/// May the alloca `%a = <rhs>` of a function lack its own lifetime markers
+/// (see [`memsafety_rewrite_ir`])?
+fn recipe_slot_ok(
+    a: &str,
+    rhs: &str,
+    marked: &std::collections::BTreeSet<String>,
+    func_locals: &std::collections::BTreeSet<String>,
+    define: &str,
+) -> bool {
+    marked.contains(a)
+            || func_locals.contains(a)
+            // A parameter passed in coerced pieces (`%x.coerce0`, an
+            // `i128` split in two) is reassembled in a slot named after
+            // it, and a coerced return value goes through `retval.coerce`:
+            // clang's slots for the whole function.
+            || define.contains(&format!("%{a}.coerce"))
+            || a.ends_with(".coerce")
+            || a == "retval"
+            || a == "cleanup.dest.slot"
+            || a.rsplit_once('.').is_some_and(|(_, suffix)| suffix == "addr")
+            || a.starts_with("coerce")
+            // `__builtin_alloca(n)`: `%0 = alloca i8, i64 n` — lives until
+            // the function returns, like the C `alloca` it is.
+            || (a.chars().all(|c| c.is_ascii_digit()) && rhs.starts_with("alloca i8, i"))
+            // A C variable-length array: its scope ends at the
+            // `stackrestore` of the `stacksave` before it (renamed below,
+            // modelled by the engine), and its slot for the save token.
+            || (numbered(a, "vla") && vla_count(rhs))
+            || (numbered(a, "saved_stack") && rhs.starts_with("alloca ptr"))
+            // clang's debug-info slot for a VLA's element count: an
+            // integer local of the whole function, never a C object.
+            || (numbered(a, "__vla_expr") && rhs.starts_with("alloca i"))
 }
 
 /// `name` is `prefix` followed by nothing or by digits (clang's `%vla`,
