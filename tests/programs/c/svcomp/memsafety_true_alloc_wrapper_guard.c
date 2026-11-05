@@ -1,7 +1,7 @@
 /* Hacl-Star shape: an allocation wrapper with an overflow guard returns
    NULL or a fresh block; the caller checks it. Merging the two returns lost
    the pointer (ms-store-opaque-pointer). Expected: true. */
-typedef unsigned long size_t;
+typedef __SIZE_TYPE__ size_t;
 typedef unsigned char uint8_t;
 extern void *malloc(size_t);
 extern void free(void *);

@@ -1212,11 +1212,17 @@ pub fn memsafe_prove_cmd(args: &MemsafeProveArgs) -> anyhow::Result<()> {
     let dir = tempfile::tempdir().context("create tempdir")?;
     let ir =
         compile_to_ir(&args.input, data_model, &stub, dir.path()).context("compile to LLVM IR")?;
+    let raw_dir = dir.path().join("raw");
+    std::fs::create_dir_all(&raw_dir).context("create raw-IR dir")?;
+    let raw = compile_to_ir_with(&args.input, data_model, &stub, &raw_dir, &[], "verify")
+        .context("compile raw IR")?;
+    let ir_text = std::fs::read_to_string(&raw).context("read raw IR")?;
     let bundle = driver::AnalysisDriver::ingest(&[ir], CliFrontend::Llvm).context("ingest IR")?;
 
     // `bundle.fidelity` — not a default — is what makes the proof honest about
     // what ingestion could not represent. See `saf_core::air::IngestFidelity`.
-    match saf_svcomp::memsafe::prove_memsafe(&bundle.module, bundle.fidelity) {
+    let escaping = escaping_block_locals(&ir_text);
+    match saf_svcomp::memsafe::prove_memsafe(&bundle.module, bundle.fidelity, &escaping) {
         saf_svcomp::memsafe::MemSafeProof::Proven => println!("PROVE"),
         saf_svcomp::memsafe::MemSafeProof::Abstain(reason) => println!("ABSTAIN:{reason}"),
     }
@@ -1513,8 +1519,32 @@ fn compile_to_ir_memsafety(
         "verify",
     )?;
     let text = std::fs::read_to_string(&ir).context("read memsafety IR")?;
-    if memsafety_unmarked_object(&text) {
-        return Ok(None);
+    // Locals without lifetime markers that are declared in a function's
+    // outermost block (clang drops the markers of a variable a `goto` jumps
+    // over) live as long as the function: found from a `-g` compile.
+    let mut whole_function = FunctionLocals::new();
+    if memsafety_rewrite_ir(&text, &whole_function).is_none() {
+        let gdir = dir.join("dbg");
+        std::fs::create_dir_all(&gdir).context("create debug-info dir")?;
+        let debug_ir = compile_to_ir_with(
+            input,
+            data_model,
+            stub,
+            &gdir,
+            &[
+                "-O1",
+                "-Xclang",
+                "-disable-llvm-passes",
+                "-fno-discard-value-names",
+                "-g",
+            ],
+            "verify",
+        )?;
+        let gtext = std::fs::read_to_string(&debug_ir).context("read debug-info IR")?;
+        whole_function = function_scope_locals(&gtext);
+        if memsafety_rewrite_ir(&text, &whole_function).is_none() {
+            return Ok(None);
+        }
     }
     // Pin every local whose address escapes (anything but a direct load/store
     // or its own lifetime marker), then promote the rest: `mem2reg` must not
@@ -1539,7 +1569,7 @@ fn compile_to_ir_memsafety(
         "{opt_bin} mem2reg failed on the pinned IR"
     );
     let text = std::fs::read_to_string(&pinned).context("read promoted IR")?;
-    let Some(text) = memsafety_rewrite_ir(&text) else {
+    let Some(text) = memsafety_rewrite_ir(&text, &whole_function) else {
         return Ok(None);
     };
     let out = dir.join("memsafety.ll");
@@ -1554,8 +1584,252 @@ fn compile_to_ir_memsafety(
 
 /// Does a stack object of `text` lack lifetime markers while it may die
 /// before its function returns (see [`compile_to_ir_memsafety`])?
-fn memsafety_unmarked_object(text: &str) -> bool {
-    memsafety_rewrite_ir(text).is_none()
+/// Debug-info metadata of an IR text: the `DISubprogram` ids, and each
+/// non-parameter `DILocalVariable` id with its name and scope id.
+fn debug_variables(
+    text: &str,
+) -> (
+    std::collections::BTreeSet<&str>,
+    std::collections::BTreeMap<&str, (&str, &str)>,
+) {
+    let mut subprograms = std::collections::BTreeSet::new();
+    let mut vars = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let Some((id, rest)) = line.split_once(" = ") else {
+            continue;
+        };
+        if !id.starts_with('!') {
+            continue;
+        }
+        let rest = rest.trim_start_matches("distinct ");
+        if rest.starts_with("!DISubprogram(") {
+            subprograms.insert(id);
+        } else if let Some(body) = rest.strip_prefix("!DILocalVariable(") {
+            let field = |k: &str| {
+                body.split(", ")
+                    .find_map(|f| f.strip_prefix(k))
+                    .map(|v| v.trim_end_matches(')'))
+            };
+            if field("arg: ").is_some() {
+                continue;
+            }
+            if let (Some(name), Some(scope)) = (field("name: "), field("scope: ")) {
+                vars.insert(id, (name.trim_matches('"'), scope));
+            }
+        }
+    }
+    (subprograms, vars)
+}
+
+/// The block-scoped C locals (debug-info scope not the function itself) whose
+/// address flows anywhere but the address operand of a load or store, as
+/// `(function, C variable)`, read from the IR BEFORE `mem2reg`: stored as a
+/// value, passed to a call, merged by a phi or select, returned, cast to an
+/// integer. Followed through `getelementptr` and casts. After promotion such a
+/// local's dangling dereference can vanish altogether (`{ int y; p = &y; }
+/// *p = 1;` becomes no access at all), so the Anchored-Object prover must not
+/// argue over that IR. See [`saf_svcomp::memsafe::prove_memsafe`].
+fn escaping_block_locals(text: &str) -> std::collections::BTreeSet<(String, String)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let (subprograms, vars) = debug_variables(text);
+    let mut out = BTreeSet::new();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut func: Option<String> = None;
+    let mut check = |func: &str, lines: &[&str]| {
+        // Block-scoped slots of this function.
+        let mut slot_var: BTreeMap<String, &str> = BTreeMap::new();
+        for l in lines {
+            if let Some(r) = l.trim_start().strip_prefix("#dbg_declare(ptr %") {
+                if let Some((slot, rest)) = r.split_once(", ") {
+                    let var = rest.split(',').next().unwrap_or_default();
+                    if let Some((name, scope)) = vars.get(var) {
+                        if !subprograms.contains(scope) {
+                            slot_var.insert(slot.trim_matches('"').to_string(), name);
+                        }
+                    }
+                }
+            }
+        }
+        // A slot with no `#dbg_declare` may still be a block object: a
+        // compound literal, or a variable whose declaration a `goto` jumps
+        // over (clang emits neither its marker nor its debug record). Only
+        // clang's own temporaries are left out: names with a `.` (no C
+        // identifier has one) and the fixed function-lifetime slots.
+        for l in lines {
+            let Some((slot, _)) = l
+                .trim_start()
+                .strip_prefix('%')
+                .and_then(|r| r.split_once(" = alloca "))
+            else {
+                continue;
+            };
+            let slot = slot.trim_matches('"');
+            let temp = (slot.contains('.') && !slot.starts_with(".compoundliteral"))
+                || slot == "retval"
+                || numbered(slot, "saved_stack")
+                || numbered(slot, "__vla_expr")
+                || slot.chars().all(|c| c.is_ascii_digit());
+            if !temp && !slot_var.contains_key(slot) && !lines_declare(lines, slot) {
+                slot_var.insert(slot.to_string(), "<no debug variable>");
+            }
+        }
+        for (slot, name) in &slot_var {
+            let mut tainted: BTreeSet<String> = BTreeSet::from([slot.clone()]);
+            let mut escapes = false;
+            // Two passes reach derived values defined after their use in text
+            // order (a phi of a later block); a phi or select is an escape anyway.
+            for _ in 0..2 {
+                for l in lines {
+                    let t = l.trim_start();
+                    let used: Vec<&String> = tainted.iter().filter(|v| mentions(t, v)).collect();
+                    if used.is_empty() || t.starts_with("#dbg_declare(") {
+                        continue;
+                    }
+                    let def = t
+                        .strip_prefix('%')
+                        .and_then(|r| r.split_once(" = "))
+                        .map(|(d, rhs)| (d.trim_matches('"').to_string(), rhs));
+                    match def {
+                        // The slot's own definition.
+                        Some((_, rhs)) if rhs.starts_with("alloca ") => {}
+                        Some((_, rhs)) if rhs.starts_with("load ") => {
+                            // `load T, ptr %s`: only the address may be tainted.
+                        }
+                        Some((d, rhs))
+                            if rhs.starts_with("getelementptr")
+                                || rhs.starts_with("bitcast")
+                                || rhs.starts_with("addrspacecast") =>
+                        {
+                            tainted.insert(d);
+                        }
+                        Some((_, rhs)) if rhs.starts_with("icmp ") => {}
+                        None if t.starts_with("store ") => {
+                            // `store T %v, ptr %s`: the value must not be tainted.
+                            let value = t.split(", ptr ").next().unwrap_or(t);
+                            if used.iter().any(|v| mentions(value, v)) {
+                                escapes = true;
+                            }
+                        }
+                        _ => escapes = true,
+                    }
+                }
+            }
+            if escapes {
+                out.insert((func.to_string(), (*name).to_string()));
+            }
+        }
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("define ") {
+            func = rest
+                .split_once('@')
+                .and_then(|(_, r)| r.split_once('('))
+                .map(|(n, _)| n.trim_matches('"').to_string());
+            lines.clear();
+            continue;
+        }
+        if line == "}" {
+            if let Some(f) = func.take() {
+                check(&f, &lines);
+            }
+            lines.clear();
+            continue;
+        }
+        if func.is_some() {
+            lines.push(line);
+        }
+    }
+    out
+}
+
+/// Does a `#dbg_declare` among `lines` describe the slot `%slot`?
+fn lines_declare(lines: &[&str], slot: &str) -> bool {
+    lines.iter().any(|l| {
+        l.trim_start()
+            .strip_prefix("#dbg_declare(ptr %")
+            .and_then(|r| r.split_once(", "))
+            .is_some_and(|(s, _)| s.trim_matches('"') == slot)
+    })
+}
+
+/// Does `line` mention the local `%name` (as a whole token)?
+fn mentions(line: &str, name: &str) -> bool {
+    let pat = format!("%{name}");
+    line.match_indices(&pat).any(|(i, _)| {
+        !line[i + pat.len()..]
+            .chars()
+            .next()
+            .is_some_and(llvm_name_char)
+    })
+}
+
+/// Per function name, local slots declared in the function's outermost block.
+type FunctionLocals = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
+
+/// From IR compiled with `-g`: per function, the allocas whose
+/// `#dbg_declare` variable is scoped to the function itself (its
+/// `DISubprogram`), not to a nested lexical block. Parameters are left out.
+fn function_scope_locals(text: &str) -> FunctionLocals {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut subprograms: BTreeSet<&str> = BTreeSet::new();
+    let mut var_scope: BTreeMap<&str, &str> = BTreeMap::new();
+    for line in text.lines() {
+        let Some((id, rest)) = line.split_once(" = ") else {
+            continue;
+        };
+        if !id.starts_with('!') {
+            continue;
+        }
+        let rest = rest.trim_start_matches("distinct ");
+        if rest.starts_with("!DISubprogram(") {
+            subprograms.insert(id);
+        } else if let Some(body) = rest.strip_prefix("!DILocalVariable(") {
+            if body.contains(" arg: ") || body.starts_with("arg: ") {
+                continue;
+            }
+            let scope = body
+                .split(", ")
+                .find_map(|f| f.strip_prefix("scope: "))
+                .map(|s| s.trim_end_matches(')'));
+            if let Some(scope) = scope {
+                var_scope.insert(id, scope);
+            }
+        }
+    }
+    let mut out = FunctionLocals::new();
+    let mut func: Option<String> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("define ") {
+            func = rest
+                .split_once('@')
+                .and_then(|(_, r)| r.split_once('('))
+                .map(|(n, _)| n.trim_matches('"').to_string());
+            continue;
+        }
+        if line == "}" {
+            func = None;
+            continue;
+        }
+        let (Some(f), Some(rest)) = (
+            func.as_ref(),
+            line.trim_start().strip_prefix("#dbg_declare(ptr %"),
+        ) else {
+            continue;
+        };
+        let Some((name, rest)) = rest.split_once(", ") else {
+            continue;
+        };
+        let var = rest.split(',').next().unwrap_or_default();
+        if var_scope
+            .get(var)
+            .is_some_and(|sc| subprograms.contains(sc))
+        {
+            out.entry(f.clone())
+                .or_default()
+                .insert(name.trim_matches('"').to_string());
+        }
+    }
+    out
 }
 
 /// Is `c` part of an LLVM local name?
@@ -1674,14 +1948,18 @@ fn memsafety_pin_escaped(text: &str, pin_pointers: bool) -> String {
 /// The text half of [`compile_to_ir_memsafety`]: the marker check and the
 /// renaming. `None` when an unmarked stack object may die before its function
 /// returns.
-fn memsafety_rewrite_ir(text: &str) -> Option<String> {
+fn memsafety_rewrite_ir(text: &str, whole_function: &FunctionLocals) -> Option<String> {
     use std::fmt::Write as _;
     let mut allocas: Vec<(String, String)> = Vec::new();
     let mut marked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let empty = std::collections::BTreeSet::new();
+    let mut func_locals = &empty;
     let flush = |allocas: &mut Vec<(String, String)>,
-                 marked: &mut std::collections::BTreeSet<String>| {
+                 marked: &mut std::collections::BTreeSet<String>,
+                 func_locals: &std::collections::BTreeSet<String>| {
         let ok = allocas.iter().all(|(a, rhs)| {
             marked.contains(a)
+                || func_locals.contains(a)
                 || a == "retval"
                 || a == "cleanup.dest.slot"
                 || a.rsplit_once('.').is_some_and(|(_, suffix)| suffix == "addr")
@@ -1689,6 +1967,14 @@ fn memsafety_rewrite_ir(text: &str) -> Option<String> {
                 // `__builtin_alloca(n)`: `%0 = alloca i8, i64 n` — lives until
                 // the function returns, like the C `alloca` it is.
                 || (a.chars().all(|c| c.is_ascii_digit()) && rhs.starts_with("alloca i8, i"))
+                // A C variable-length array: its scope ends at the
+                // `stackrestore` of the `stacksave` before it (renamed below,
+                // modelled by the engine), and its slot for the save token.
+                || (numbered(a, "vla") && vla_count(rhs))
+                || (numbered(a, "saved_stack") && rhs.starts_with("alloca ptr"))
+                // clang's debug-info slot for a VLA's element count: an
+                // integer local of the whole function, never a C object.
+                || (numbered(a, "__vla_expr") && rhs.starts_with("alloca i"))
         });
         allocas.clear();
         marked.clear();
@@ -1697,9 +1983,15 @@ fn memsafety_rewrite_ir(text: &str) -> Option<String> {
     for line in text.lines() {
         let t = line.trim_start();
         if t.starts_with("define ") || t == "}" {
-            if !flush(&mut allocas, &mut marked) {
+            if !flush(&mut allocas, &mut marked, func_locals) {
                 return None;
             }
+            func_locals = t
+                .strip_prefix("define ")
+                .and_then(|r| r.split_once('@'))
+                .and_then(|(_, r)| r.split_once('('))
+                .and_then(|(n, _)| whole_function.get(n.trim_matches('"')))
+                .unwrap_or(&empty);
             continue;
         }
         if let Some(rest) = t.strip_prefix('%') {
@@ -1719,12 +2011,15 @@ fn memsafety_rewrite_ir(text: &str) -> Option<String> {
             }
         }
     }
-    if !flush(&mut allocas, &mut marked) {
+    if !flush(&mut allocas, &mut marked, func_locals) {
         return None;
     }
     let mut out = String::with_capacity(text.len() + 128);
     for line in text.lines() {
-        if line.starts_with("declare void @llvm.lifetime.") {
+        if line.starts_with("declare void @llvm.lifetime.")
+            || line.starts_with("declare ptr @llvm.stacksave.")
+            || line.starts_with("declare void @llvm.stackrestore.")
+        {
             continue;
         }
         let line = line
@@ -1735,17 +2030,44 @@ fn memsafety_rewrite_ir(text: &str) -> Option<String> {
             .replace(
                 "@llvm.lifetime.end.p0(",
                 &format!("@{}(", saf_svcomp::LIFETIME_END),
+            )
+            .replace(
+                "@llvm.stacksave.p0(",
+                &format!("@{}(", saf_svcomp::STACK_SAVE),
+            )
+            .replace(
+                "@llvm.stackrestore.p0(",
+                &format!("@{}(", saf_svcomp::STACK_RESTORE),
             );
         out.push_str(&line);
         out.push('\n');
     }
     let _ = write!(
         out,
-        "declare void @{}(i64, ptr)\ndeclare void @{}(i64, ptr)\n",
+        "declare void @{}(i64, ptr)\ndeclare void @{}(i64, ptr)\n\
+         declare ptr @{}()\ndeclare void @{}(ptr)\n",
         saf_svcomp::LIFETIME_START,
-        saf_svcomp::LIFETIME_END
+        saf_svcomp::LIFETIME_END,
+        saf_svcomp::STACK_SAVE,
+        saf_svcomp::STACK_RESTORE
     );
     Some(out)
+}
+
+/// `name` is `prefix` followed by nothing or by digits (clang's `%vla`,
+/// `%vla12`, `%saved_stack3`).
+fn numbered(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// An alloca right-hand side with a non-constant element count
+/// (`alloca i32, i64 %n, align 16`).
+fn vla_count(rhs: &str) -> bool {
+    rhs.split(", ").nth(1).is_some_and(|c| {
+        c.split_once(' ')
+            .is_some_and(|(ty, v)| ty.starts_with('i') && v.starts_with('%'))
+    })
 }
 
 /// The result of a verdict computation: the stdout line plus an optional
@@ -5044,7 +5366,19 @@ fn memsafety_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
 /// is no validator to satisfy. Same shape as [`race_true_outcome`], and unlike
 /// `termination_strategy`, which does need a 2.1+ correctness witness.
 fn memsafety_true_or_unknown(ctx: &VerifyCtx, why_no_false: &str) -> VerdictOutcome {
-    match saf_svcomp::memsafe::prove_memsafe(ctx.module, ctx.fidelity) {
+    // The IR text of the very compile that produced `ctx.module` (same recipe,
+    // deterministic names): which block-scoped locals a pointer variable held.
+    let escaping = (|| -> anyhow::Result<std::collections::BTreeSet<(String, String)>> {
+        let d = ctx.tempdir.join("anchor");
+        std::fs::create_dir_all(&d)?;
+        let ir = compile_to_ir_with(ctx.input, ctx.data_model, ctx.stub, &d, &[], "verify")?;
+        Ok(escaping_block_locals(&std::fs::read_to_string(ir)?))
+    })();
+    let Ok(escaping) = escaping else {
+        eprintln!("{why_no_false}; Anchored-Object: IR re-read failed -> unknown");
+        return unknown_outcome();
+    };
+    match saf_svcomp::memsafe::prove_memsafe(ctx.module, ctx.fidelity, &escaping) {
         saf_svcomp::memsafe::MemSafeProof::Proven => {
             eprintln!("{why_no_false}; Anchored-Object proof succeeded -> true");
             VerdictOutcome {
@@ -9405,7 +9739,8 @@ mod verify_tests {
     #[test]
     fn memsafety_rewrite_renames_markers_and_rejects_unmarked_objects() {
         let ok = "define i32 @main() {\n  %retval = alloca i32\n  %x.addr = alloca i32\n  %buf = alloca [8 x i8]\n  call void @llvm.lifetime.start.p0(i64 8, ptr %buf)\n  call void @llvm.lifetime.end.p0(i64 8, ptr %buf)\n  ret i32 0\n}\ndeclare void @llvm.lifetime.start.p0(i64 immarg, ptr nocapture)\n";
-        let out = memsafety_rewrite_ir(ok).expect("all objects accounted for");
+        let out =
+            memsafety_rewrite_ir(ok, &FunctionLocals::new()).expect("all objects accounted for");
         assert!(
             out.contains("call void @__saf_lifetime_start(i64 8, ptr %buf)"),
             "{out}"
@@ -9420,7 +9755,7 @@ mod verify_tests {
             "{out}"
         );
         let lit = "define i32 @main() {\n  %.compoundliteral = alloca [2 x i32]\n  ret i32 0\n}\n";
-        assert!(memsafety_rewrite_ir(lit).is_none());
+        assert!(memsafety_rewrite_ir(lit, &FunctionLocals::new()).is_none());
     }
 
     /// Debug info is no use of a local's address, in either spelling: the

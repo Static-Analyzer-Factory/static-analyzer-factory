@@ -1587,6 +1587,27 @@ fn convert_instruction(
                 serde_json::Value::from(n),
             );
         }
+        // A variable-length alloca: its count operand and element size, so a
+        // prover can size the object when it executes.
+        if let (Some(BasicValueEnum::IntValue(count)), Some(td), Ok(elem_ty)) = (
+            inst.get_operand(0).and_then(operand_as_value),
+            ctx.target_data.as_ref(),
+            inst.get_allocated_type(),
+        ) {
+            if !count.is_const() {
+                let elem = td.get_abi_size(&elem_ty);
+                let count_id = ctx.get_or_create_value_id(BasicValueEnum::IntValue(count));
+                if let Ok(v) = serde_json::to_value(count_id) {
+                    air_inst
+                        .extensions
+                        .insert(saf_core::air::ALLOCA_VLA_COUNT_KEY.to_string(), v);
+                    air_inst.extensions.insert(
+                        saf_core::air::ALLOCA_VLA_ELEM_KEY.to_string(),
+                        serde_json::Value::from(elem),
+                    );
+                }
+            }
+        }
     }
 
     // Extract debug info

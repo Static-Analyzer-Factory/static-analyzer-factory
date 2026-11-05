@@ -188,3 +188,22 @@ fn anchoring_does_not_cross_a_call() {
     memsafe_prove("memsafe_unanchored_param.c")
         .stdout(predicate::str::starts_with("ABSTAIN:store-unanchored"));
 }
+
+/// A LOCAL pointer variable outlives the block of the object it points to.
+/// `mem2reg` promotes the pointer, so `*p` names the dead slot DIRECTLY, the
+/// shape the anchoring rule used to accept as an in-scope access.
+#[test]
+#[ignore = "requires clang (Docker); run via `make test-ignored`"]
+fn stack_anchoring_rejects_a_promoted_pointer_past_scope() {
+    memsafe_prove("memsafety_false_local_ptr_after_scope.c")
+        .stdout(predicate::str::starts_with("ABSTAIN:"));
+}
+
+/// The same through a `goto` into the block: clang emits no lifetime markers
+/// for the bypassed declaration, so no ASan replay catches it either.
+#[test]
+#[ignore = "requires clang (Docker); run via `make test-ignored`"]
+fn stack_anchoring_rejects_a_dangling_slot_after_a_goto_into_its_block() {
+    memsafe_prove("memsafety_false_goto_into_block.c")
+        .stdout(predicate::str::starts_with("ABSTAIN:"));
+}

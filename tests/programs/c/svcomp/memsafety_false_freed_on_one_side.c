@@ -1,7 +1,7 @@
 /* One branch frees the block, the join then writes to it. The two sides
    disagree on the block's status; the prover must never say true.
    Expected: false(valid-deref). */
-typedef unsigned long size_t;
+typedef __SIZE_TYPE__ size_t;
 extern void *malloc(size_t);
 extern void free(void *);
 int __VERIFIER_nondet_int();

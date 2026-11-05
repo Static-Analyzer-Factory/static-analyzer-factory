@@ -475,6 +475,10 @@ struct State {
     /// Every heap object allocated on this path, with its byte size when
     /// that is a constant (a fresh base per allocation, never reused).
     heap_objs: BTreeMap<ValueId, Option<u64>>,
+    /// Byte size of each executed variable-length stack object (by base).
+    vla_sizes: BTreeMap<ValueId, (BV, Vars)>,
+    /// `stacksave` snapshots: the stack objects that existed at each save.
+    stack_saves: BTreeMap<u32, BTreeSet<ValueId>>,
     constraints: Vec<(Bool, Vars)>,
     visits: BTreeMap<BlockId, u32>,
     /// A Z3 `UNKNOWN` was treated as feasible somewhere on this path, so a
@@ -934,6 +938,10 @@ struct Engine<'a> {
     layouts: BTreeMap<ValueId, Layout>,
     /// Exact byte sizes of the allocas the frontend could size.
     alloca_sizes: BTreeMap<ValueId, u64>,
+    /// Variable-length allocas: count operand and element bytes.
+    vla: BTreeMap<ValueId, (ValueId, u64)>,
+    /// `stacksave` executions so far (token numbers).
+    stack_save_count: u32,
     /// Fresh objects handed out to re-executed allocas ([`Goal::MemSafety`]).
     alloca_versions: u64,
     /// Per-step byte arithmetic of every GEP the frontend could size.
@@ -1143,6 +1151,16 @@ pub const LIFETIME_END: &str = "__saf_lifetime_end";
 /// The memory-safety ingestion recipe's pin: a call taking the address of a
 /// local whose address escapes, so `mem2reg` leaves it a stack object. Inert.
 pub const KEEP_ALIVE: &str = "__saf_keep";
+/// The memory-safety recipe's name for `llvm.stacksave`: returns a token for
+/// the stack objects that exist now.
+pub const STACK_SAVE: &str = "__saf_stacksave";
+/// The memory-safety recipe's name for `llvm.stackrestore`: every stack object
+/// of the current frame allocated since the token's save dies (the end of a
+/// variable-length array's scope).
+pub const STACK_RESTORE: &str = "__saf_stackrestore";
+/// Base of a `stacksave` token pointer (its single path step is the save
+/// number). Never a real object: an access through it abstains.
+const STACK_TOKEN_BASE: ValueId = ValueId::new(u128::MAX / 4);
 
 /// `termination` TRUE from the same engine: every path of the program ends
 /// within the engine's bounds. Only the plain lazy and eager passes run — no
@@ -1747,6 +1765,7 @@ impl<'a> Engine<'a> {
             .collect();
         let mut gep_bytes = BTreeMap::new();
         let mut alloca_sizes = BTreeMap::new();
+        let mut vla = BTreeMap::new();
         for f in &module.functions {
             for b in &f.blocks {
                 for i in &b.instructions {
@@ -1761,6 +1780,16 @@ impl<'a> Engine<'a> {
                             .and_then(serde_json::Value::as_u64)
                         {
                             alloca_sizes.insert(d, n);
+                        }
+                        if let (Some(c), Some(e)) = (
+                            i.extensions
+                                .get(saf_core::air::ALLOCA_VLA_COUNT_KEY)
+                                .and_then(|v| serde_json::from_value::<ValueId>(v.clone()).ok()),
+                            i.extensions
+                                .get(saf_core::air::ALLOCA_VLA_ELEM_KEY)
+                                .and_then(serde_json::Value::as_u64),
+                        ) {
+                            vla.insert(d, (c, e));
                         }
                     }
                 }
@@ -1827,6 +1856,8 @@ impl<'a> Engine<'a> {
             layouts,
             gep_bytes,
             alloca_sizes,
+            vla,
+            stack_save_count: 0,
             alloca_versions: 0,
             opaque_globals,
             join_blocks,
@@ -2129,6 +2160,8 @@ impl<'a> Engine<'a> {
             escaped: BTreeSet::new(),
             zeroed: BTreeSet::new(),
             heap_objs: BTreeMap::new(),
+            vla_sizes: BTreeMap::new(),
+            stack_saves: BTreeMap::new(),
             constraints: Vec::new(),
             visits: BTreeMap::new(),
             has_unknown: false,
@@ -2297,6 +2330,8 @@ impl<'a> Engine<'a> {
             escaped: BTreeSet::new(),
             zeroed: BTreeSet::new(),
             heap_objs: BTreeMap::new(),
+            vla_sizes: BTreeMap::new(),
+            stack_saves: BTreeMap::new(),
             constraints: Vec::new(),
             // Iteration 1. When the header has no phis the state starts at index
             // 0 and the entry bookkeeping below counts this entry itself.
@@ -2942,6 +2977,20 @@ impl<'a> Engine<'a> {
         a.versioned.extend(b.versioned);
         a.zeroed = a.zeroed.intersection(&b.zeroed).copied().collect();
         a.heap_objs.extend(b.heap_objs);
+        for (k, v) in b.vla_sizes {
+            match a.vla_sizes.get(&k) {
+                Some(x) if x.0 != v.0 => {
+                    a.vla_sizes.remove(&k);
+                }
+                Some(_) => {}
+                None => {
+                    a.vla_sizes.insert(k, v);
+                }
+            }
+        }
+        for (k, v) in b.stack_saves {
+            a.stack_saves.entry(k).or_insert(v);
+        }
         for (blk, n) in b.visits {
             let e = a.visits.entry(blk).or_insert(0);
             *e = (*e).max(n);
@@ -4119,6 +4168,19 @@ impl<'a> Engine<'a> {
                     st.stack.push((st.frames.len(), base));
                     st.memory.retain(|k, _| k.0 != base);
                     st.escaped.remove(&base);
+                    // A variable-length object: `count × elem` bytes, as the
+                    // count is on this path (64-bit, so the product of a
+                    // 32-bit count cannot wrap).
+                    if let Some(&(count, elem)) = self.vla.get(&d) {
+                        let (c, vars) = self.bv(st, count)?;
+                        let c = match c.get_size() {
+                            64 => c,
+                            w if w < 64 => c.zero_ext(64 - w),
+                            _ => return Err("ms-vla-count-width".to_string()),
+                        };
+                        let size = c.bvmul(BV::from_u64(elem, 64)).simplify();
+                        st.vla_sizes.insert(base, (size, vars));
+                    }
                     set(st, inst, Val::Ptr(Some((base, Vec::new()))));
                     return Ok(Flow::Next);
                 }
@@ -4757,6 +4819,17 @@ impl<'a> Engine<'a> {
             let oob = size.bvult(&end_bv);
             return self.check_violation(st, Some((&oob, &vars)), at);
         }
+        if let Some((size, vars)) = st.vla_sizes.get(&cell.0).cloned() {
+            if let Some(n) = size.as_u64() {
+                return if end <= n {
+                    Ok(())
+                } else {
+                    self.ms_violation(st, at, format!("ms-{what}-out-of-bounds"))
+                };
+            }
+            let oob = size.bvult(BV::from_u64(end, 64));
+            return self.check_violation(st, Some((&oob, &vars)), at);
+        }
         let Some(size) = self.ms_static_size(st, cell.0) else {
             return self.ms_undecided(format!("ms-{what}-unknown-object"));
         };
@@ -4847,6 +4920,47 @@ impl<'a> Engine<'a> {
     /// of an object that ended before begins a NEW object — a fresh one when any
     /// pointer to the old one survives anywhere (it must stay dead: `scopes3`,
     /// `derefInLoop1`), else the same one with indeterminate contents.
+    /// `stacksave` / `stackrestore` under [`Goal::MemSafety`] (see [`STACK_SAVE`]).
+    fn ms_stack_save_restore(
+        &mut self,
+        st: &mut State,
+        inst: &Instruction,
+        args: &[ValueId],
+        save: bool,
+    ) -> Res<Flow> {
+        if save {
+            let k = self.stack_save_count;
+            self.stack_save_count += 1;
+            if k == IMPRECISE {
+                return Err("ms-stacksave-count".to_string());
+            }
+            let snapshot = st.stack.iter().map(|(_, b)| *b).collect();
+            st.stack_saves.insert(k, snapshot);
+            if let Some(d) = inst.dst {
+                st.values
+                    .insert(d, Val::Ptr(Some((STACK_TOKEN_BASE, vec![k]))));
+            }
+            return Ok(Flow::Next);
+        }
+        let p = args.first().copied().ok_or("stackrestore-arity")?;
+        let k = match self.ptr(st, p)? {
+            Some((b, path)) if b == STACK_TOKEN_BASE && path.len() == 1 => path[0],
+            _ => return Err("ms-stackrestore-opaque-token".to_string()),
+        };
+        let Some(snapshot) = st.stack_saves.get(&k).cloned() else {
+            return Err("ms-stackrestore-unknown-token".to_string());
+        };
+        let depth = st.frames.len();
+        let (dying, live): (Vec<_>, Vec<_>) = st
+            .stack
+            .iter()
+            .partition(|(d, b)| *d == depth && !snapshot.contains(b));
+        trace(|| format!("stackrestore: {} stack objects die", dying.len()));
+        st.dead.extend(dying.into_iter().map(|(_, b)| b));
+        st.stack = live;
+        Ok(Flow::Next)
+    }
+
     fn ms_lifetime(&mut self, st: &mut State, args: &[ValueId], start: bool) -> Res<Flow> {
         let p = args.get(1).copied().ok_or("lifetime-arity")?;
         let Some((base, path)) = self.ptr(st, p)? else {
@@ -5070,6 +5184,16 @@ impl<'a> Engine<'a> {
         }
         while let Some(b) = work.pop() {
             if !reached.insert(b) {
+                continue;
+            }
+            // A stack object whose scope has ended, or a freed block, tracks
+            // nothing: what its bytes still say is not a reference.
+            if st.dead.contains(&b)
+                || st
+                    .heap
+                    .get(&b)
+                    .is_some_and(|h| h.status == HeapStatus::Freed)
+            {
                 continue;
             }
             if st.escaped.contains(&b) {
@@ -5390,6 +5514,12 @@ impl<'a> Engine<'a> {
         }
         if !defined && name == KEEP_ALIVE {
             return Ok(Flow::Next);
+        }
+        if !defined && (name == STACK_SAVE || name == STACK_RESTORE) {
+            if self.goal != Goal::MemSafety {
+                return Err(format!("{name}-outside-memsafety"));
+            }
+            return self.ms_stack_save_restore(st, inst, args, name == STACK_SAVE);
         }
         if !defined && (name == LIFETIME_START || name == LIFETIME_END) {
             if self.goal != Goal::MemSafety {

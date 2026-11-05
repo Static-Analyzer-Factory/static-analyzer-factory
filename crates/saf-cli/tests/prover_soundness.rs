@@ -505,3 +505,51 @@ fn memsafety_never_true_when_one_side_freed_the_block() {
     verify("valid-memsafety", "memsafety_false_freed_on_one_side.c")
         .stdout(predicate::str::contains("true").not());
 }
+
+#[test]
+#[ignore]
+fn memcleanup_never_true_when_the_only_reference_left_scope() {
+    verify("valid-memsafety", "memsafety_false_scope_ended_root.c")
+        .stdout(predicate::str::contains("true").not());
+}
+
+#[test]
+#[ignore]
+fn memsafety_true_with_variable_length_arrays() {
+    verify("valid-memsafety", "memsafety_true_vla.c").stdout(predicate::eq("true\n"));
+}
+
+#[test]
+#[ignore]
+fn memsafety_never_true_when_a_vla_is_used_after_its_scope() {
+    verify("valid-memsafety", "memsafety_false_vla_after_scope.c")
+        .stdout(predicate::str::contains("true").not());
+}
+
+#[test]
+#[ignore]
+fn memsafety_never_true_when_a_vla_index_runs_one_past_the_end() {
+    verify("valid-memsafety", "memsafety_false_vla_out_of_bounds.c")
+        .stdout(predicate::str::contains("true").not());
+}
+
+#[test]
+#[ignore]
+fn memsafety_true_when_a_goto_bypasses_function_scope_locals() {
+    verify("valid-memsafety", "memsafety_true_goto_bypassed_local.c")
+        .stdout(predicate::eq("true\n"));
+}
+
+#[test]
+#[ignore]
+fn memsafety_never_true_after_a_goto_into_a_nested_block() {
+    verify("valid-memsafety", "memsafety_false_goto_into_block.c")
+        .stdout(predicate::str::contains("true").not());
+}
+
+#[test]
+#[ignore]
+fn memsafety_never_true_when_a_local_pointer_outlives_the_block() {
+    verify("valid-memsafety", "memsafety_false_local_ptr_after_scope.c")
+        .stdout(predicate::str::contains("true").not());
+}

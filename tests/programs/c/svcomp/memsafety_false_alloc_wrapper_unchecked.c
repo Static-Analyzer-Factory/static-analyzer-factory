@@ -1,6 +1,6 @@
 /* The wrapper's NULL (allocation failure or overflow guard) reaches an
    unchecked store. Expected: false(valid-deref); the prover must never say true. */
-typedef unsigned long size_t;
+typedef __SIZE_TYPE__ size_t;
 extern void *malloc(size_t);
 extern void free(void *);
 unsigned long __VERIFIER_nondet_ulong();

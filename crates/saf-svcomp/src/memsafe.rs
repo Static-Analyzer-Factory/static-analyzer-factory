@@ -319,16 +319,31 @@ fn value_width(module: &AirModule, defs: &BTreeMap<ValueId, TypeId>, v: ValueId)
 /// ingestion that produced `module`. Passing a default here would assert that
 /// nothing was collapsed or dropped, which is exactly the claim this prover is not
 /// entitled to make on its own.
+///
+/// `escaping_locals` names, as `(function, C variable)`, the block-scoped
+/// locals whose address escaped (read from the IR before `mem2reg`). Any one
+/// of them makes the prover abstain: `mem2reg` can promote such a local after
+/// the pointer that held it, which forwards a value through the dead object
+/// and erases the dangling dereference (`{ int y; p = &y; } *p = 1;` becomes
+/// no access at all).
 #[must_use]
-pub fn prove_memsafe(module: &AirModule, fidelity: IngestFidelity) -> MemSafeProof {
-    match memsafe_classify(module, fidelity) {
+pub fn prove_memsafe(
+    module: &AirModule,
+    fidelity: IngestFidelity,
+    escaping_locals: &BTreeSet<(String, String)>,
+) -> MemSafeProof {
+    match memsafe_classify(module, fidelity, escaping_locals) {
         Ok(()) => MemSafeProof::Proven,
         Err(reason) => MemSafeProof::Abstain(reason),
     }
 }
 
 /// Core of [`prove_memsafe`]. `Ok(())` = proven, `Err(reason)` = abstain.
-fn memsafe_classify(module: &AirModule, fidelity: IngestFidelity) -> Result<(), String> {
+fn memsafe_classify(
+    module: &AirModule,
+    fidelity: IngestFidelity,
+    escaping_locals: &BTreeSet<(String, String)>,
+) -> Result<(), String> {
     // (F) INGESTION FIDELITY, first and cheapest. Every obligation below reasons
     //     "the AIR shows no unsafe access", which is evidence only if the AIR is a
     //     faithful picture. A collapsed constant pointer expression turns an
@@ -340,6 +355,12 @@ fn memsafe_classify(module: &AirModule, fidelity: IngestFidelity) -> Result<(), 
     }
     if fidelity.dropped_instruction {
         return Err("ingest-dropped-instruction".into());
+    }
+    // (S) SCOPE. A block-scoped local whose address escaped can be used after
+    //     its block ends, and the promoted IR this prover reads may no longer
+    //     show that access at all (see `prove_memsafe`).
+    if let Some((f, v)) = escaping_locals.iter().next() {
+        return Err(format!("escaping-block-local:{f}:{v}"));
     }
 
     // FAST PATH. `universe::reachable_universe` is the authoritative entry gate;

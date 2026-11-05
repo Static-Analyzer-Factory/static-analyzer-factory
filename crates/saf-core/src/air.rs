@@ -1653,6 +1653,15 @@ pub const GEP_BYTES_KEY: &str = "llvm.gep_bytes";
 /// a data layout. Absent for a variable-length alloca or without a layout.
 pub const ALLOCA_LAYOUT_SIZE_KEY: &str = "llvm.alloca_layout_size";
 
+/// Extension key on a variable-length `Alloca` (`alloca T, i64 %n`): the
+/// element count operand, as a serialized `ValueId`. Present together with
+/// [`ALLOCA_VLA_ELEM_KEY`]; the object holds `count × elem` bytes.
+pub const ALLOCA_VLA_COUNT_KEY: &str = "llvm.alloca_vla_count";
+
+/// Extension key on a variable-length `Alloca`: the byte size of one element
+/// by the target data layout (see [`ALLOCA_VLA_COUNT_KEY`]).
+pub const ALLOCA_VLA_ELEM_KEY: &str = "llvm.alloca_vla_elem";
+
 /// The bundle produced by a frontend's `ingest()` call.
 ///
 /// Contains the full AIR module plus metadata needed for caching and
