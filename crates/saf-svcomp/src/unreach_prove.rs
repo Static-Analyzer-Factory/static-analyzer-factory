@@ -2743,6 +2743,16 @@ impl<'a> Engine<'a> {
                 if !state.constraints.is_empty() || debug_flag("mergeall") {
                     let mk = merge_key(&state);
                     for other in worklist.take_mergeable(&key, &mk) {
+                        // Memory safety: a merge that would lose a pointer or a
+                        // block's status (an allocation that failed on one side
+                        // only) makes every later access through it abstain.
+                        // Not merging only costs states; each side is explored
+                        // on its own.
+                        if self.goal == Goal::MemSafety && !ms_merge_compatible(&state, &other) {
+                            let k = self.order_key(&other);
+                            worklist.push(k, other);
+                            continue;
+                        }
                         let t0 = Instant::now();
                         state = self.merge(state, other);
                         self.t_merge += t0.elapsed();
@@ -3466,7 +3476,20 @@ impl<'a> Engine<'a> {
             }
             st.parked = false;
             let flow = self.exec(&mut st, inst).map_err(|e| {
-                trace(|| format!("abstain `{e}` at {:?}", inst.op));
+                trace(|| {
+                    let fname = self
+                        .module
+                        .functions
+                        .iter()
+                        .find(|f| f.id == st.func)
+                        .map_or("?", |f| f.name.as_str());
+                    let ops: Vec<String> =
+                        inst.operands.iter().map(|o| self.describe(*o)).collect();
+                    format!(
+                        "abstain `{e}` at {:?} in {fname}; operands {ops:?}",
+                        inst.op
+                    )
+                });
                 e
             })?;
             match flow {
@@ -6455,6 +6478,33 @@ fn restart_state(st: &State, key: &ConcreteKey) -> State {
     out.parked_here = true;
     out.restarted = true;
     out
+}
+
+/// Under [`Goal::MemSafety`]: two states agree on every pointer they both hold
+/// (SSA values and memory cells) and on the status of every heap block, so a
+/// merge keeps all of them exact.
+fn ms_merge_compatible(a: &State, b: &State) -> bool {
+    let ptr_agree = |x: Option<&Val>, y: Option<&Val>| match (x, y) {
+        (Some(Val::Ptr(p)), Some(Val::Ptr(q))) => p == q,
+        (Some(Val::Ptr(_)), _) | (_, Some(Val::Ptr(_))) => x.is_none() || y.is_none(),
+        _ => true,
+    };
+    let values = a
+        .values
+        .iter()
+        .all(|(k, v)| ptr_agree(Some(v), b.values.get(k)));
+    let cells = a
+        .memory
+        .iter()
+        .all(|(k, v)| ptr_agree(Some(v), b.memory.get(k)))
+        && b.memory
+            .iter()
+            .all(|(k, v)| ptr_agree(a.memory.get(k), Some(v)));
+    let heap = a.heap.len() == b.heap.len()
+        && a.heap
+            .iter()
+            .all(|(k, h)| b.heap.get(k).is_some_and(|g| g.status == h.status));
+    values && cells && heap
 }
 
 fn merge_key(st: &State) -> MergeKey {

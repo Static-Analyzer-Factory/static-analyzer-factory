@@ -407,7 +407,17 @@ impl MappingContext<'_> {
         // address-level prover must not read the collapse as "offset 0". Record
         // it. Deliberately coarse: one flag for the whole module, set on any such
         // expression whether or not it was decomposed.
-        if repr.contains('@') {
+        //
+        // A bare FUNCTION is not an expression and applies no offset. It gets
+        // here when its name is not in `function_ids` (intrinsic declarations
+        // such as `@llvm.memset.p0.i64`, passed as the callee operand of the
+        // intrinsic call), and its printed text, the whole declaration,
+        // contains '@'. Flagging it marked every module that memsets or copies
+        // a struct as unfaithful.
+        // SAFETY: `value` is a live LLVM value of this module.
+        let is_function =
+            unsafe { !inkwell::llvm_sys::core::LLVMIsAFunction(value.as_value_ref()).is_null() };
+        if repr.contains('@') && !is_function {
             tracing::debug!("collapsed constant pointer expression: {repr}");
             self.fidelity.collapsed_const_ptr_expr = true;
             // Attribute the collapse to its global so an address-level prover can

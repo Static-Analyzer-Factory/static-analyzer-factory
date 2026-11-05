@@ -481,3 +481,27 @@ fn memsafety_never_true_when_the_pointer_is_overwritten_before_exit() {
     )
     .stdout(predicate::str::contains("true").not());
 }
+
+#[test]
+#[ignore]
+fn memsafety_true_through_an_allocation_wrapper_with_an_overflow_guard() {
+    verify("valid-memsafety", "memsafety_true_alloc_wrapper_guard.c")
+        .stdout(predicate::eq("true\n"));
+}
+
+#[test]
+#[ignore]
+fn memsafety_never_true_when_the_wrapper_null_is_stored_through() {
+    verify(
+        "valid-memsafety",
+        "memsafety_false_alloc_wrapper_unchecked.c",
+    )
+    .stdout(predicate::str::contains("true").not());
+}
+
+#[test]
+#[ignore]
+fn memsafety_never_true_when_one_side_freed_the_block() {
+    verify("valid-memsafety", "memsafety_false_freed_on_one_side.c")
+        .stdout(predicate::str::contains("true").not());
+}
