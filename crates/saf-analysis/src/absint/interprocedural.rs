@@ -1756,6 +1756,8 @@ fn solve_single_function_with_pta_and_summaries(
     let cfg = Cfg::build(func);
     let cond_inst_map = build_cond_inst_map(func);
     let loop_headers = detect_loop_headers(&cfg);
+    let loop_values = super::fixpoint::loop_defined_values(func, &cfg, &loop_headers);
+    let no_values = BTreeSet::new();
     let thresholds = if config.use_threshold_widening {
         extract_thresholds(module)
     } else {
@@ -1955,7 +1957,12 @@ fn solve_single_function_with_pta_and_summaries(
             let old_state = block_entry_states.get(succ_id).cloned();
             let mut new_state = if let Some(old) = &old_state {
                 if loop_headers.contains(*succ_id) {
-                    widen_state(old, &propagated_state, &thresholds)
+                    widen_state(
+                        old,
+                        &propagated_state,
+                        &thresholds,
+                        loop_values.get(succ_id).unwrap_or(&no_values),
+                    )
                 } else {
                     old.join(&propagated_state)
                 }

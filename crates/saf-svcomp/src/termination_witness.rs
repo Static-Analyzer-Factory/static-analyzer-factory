@@ -45,8 +45,8 @@ use saf_core::air::AirModule;
 use saf_core::ids::ValueId;
 
 use crate::correctness_driver::{
-    build_value_names, c_value_literal, header_has_function_call, is_c_identifier,
-    leftmost_non_ws_column, loop_head_location, source_has_openmp,
+    build_value_names, c_value_literal, header_has_function_call, header_variable_names,
+    is_c_identifier, leftmost_non_ws_column, loop_head_location, source_has_openmp,
 };
 use crate::correctness_witness::{InvariantKind, InvariantSetWitness, SourceInvariant};
 use crate::ranking::{Ranked, RankingFunction, rank_loops};
@@ -612,14 +612,18 @@ pub fn build_nontermination_witness(
         .filter(|g| scalar(g.value_type))
         .map(|g| (g.id, g.name.as_str()))
         .collect();
+    // A reassigned parameter's entry value is not the C variable at the loop
+    // head (its header phi is), and a local shadows a global of the same name.
+    let variables = header_variable_names(&header_phis, &params, &value_names);
+    let local_names: std::collections::BTreeSet<&str> = variables.values().copied().collect();
     let mut conj: Vec<String> = Vec::new();
     for (var, v, bits) in &lasso.state {
         let name = match var {
-            StateVar::Value(id) if header_phis.contains(id) || params.contains(id) => {
-                value_names.get(id).map(String::as_str)
-            }
-            StateVar::Value(_) => None,
-            StateVar::Global(g) => global_names.get(g).copied(),
+            StateVar::Value(id) => variables.get(id).copied(),
+            StateVar::Global(g) => global_names
+                .get(g)
+                .copied()
+                .filter(|n| !local_names.contains(n)),
         };
         let Some(name) = name.filter(|n| is_c_identifier(n)) else {
             continue;

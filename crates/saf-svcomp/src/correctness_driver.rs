@@ -138,18 +138,15 @@ fn interval_invariants(module: &AirModule, source: &str) -> Vec<SourceInvariant>
             // Conjoin every named, non-trivial variable bound at the header. Each
             // kept bound is a true fact over the converged solution; unnamed
             // values and type-trivial/top bounds are dropped.
+            let variables = header_variable_names(&header_phis, &params, &value_names);
             let mut exprs: Vec<String> = Vec::new();
             for (vid, iv) in result.invariants_at_inst(read_inst.id) {
-                let Some(name) = value_names.get(&vid) else {
+                // The variable at this header: its phi here, or a parameter the
+                // loop does not reassign (see `header_variable_names`).
+                let Some(name) = variables.get(&vid) else {
                     continue;
                 };
-                if !is_c_identifier(name) {
-                    continue;
-                }
-                // The variable at this header: its phi here, or a parameter.
-                let represents_variable = (header_phis.contains(&vid) || params.contains(&vid))
-                    && !pointer_values.contains(&vid);
-                if !represents_variable {
+                if !is_c_identifier(name) || pointer_values.contains(&vid) {
                     continue;
                 }
                 if let Some(expr) = interval_to_c_expr(name, iv.lo(), iv.hi(), iv.bits()) {
@@ -264,13 +261,16 @@ fn state_set_invariants(
             })
             .map(|p| p.id)
             .collect();
+        let variables = header_variable_names(&header_phis, &params, value_names);
+        let local_names: std::collections::BTreeSet<&str> = variables.values().copied().collect();
         let name_of = |var: &StateVar| -> Option<&str> {
             match var {
-                StateVar::Value(v) if header_phis.contains(v) || params.contains(v) => {
-                    value_names.get(v).map(String::as_str)
-                }
-                StateVar::Value(_) => None,
-                StateVar::Global(g) => global_names.get(g).copied(),
+                StateVar::Value(v) => variables.get(v).copied(),
+                // A local or parameter of the same name shadows the global.
+                StateVar::Global(g) => global_names
+                    .get(g)
+                    .copied()
+                    .filter(|n| !local_names.contains(n)),
             }
         };
         let mut disjuncts: Vec<String> = Vec::new();
@@ -436,6 +436,49 @@ fn line_starts_with_loop_keyword(src_lines: &[&str], line: u32, column: u32) -> 
     })
 }
 
+/// Which of a loop header's candidate values name the C variable at the loop
+/// head, keyed by value: header phis, then non-phi parameters. A parameter the
+/// loop assigns gets a header phi of the same name. The parameter's own SSA
+/// value is then only its ENTRY value, which no C expression at the loop head
+/// can denote, so the phi takes the name. A name two phis share (variables of
+/// different scopes) names neither.
+///
+/// Stating both was a contradiction (`len == 3 && len == 1`). CPAchecker
+/// refuted 12 of 19 no-overflow.Memory witnesses on it (`dll_nullified-1.i`,
+/// `dll2n_update_all.i`, 2026-11-09).
+pub(crate) fn header_variable_names<'a>(
+    header_phis: &std::collections::BTreeSet<ValueId>,
+    params: &std::collections::BTreeSet<ValueId>,
+    value_names: &'a BTreeMap<ValueId, String>,
+) -> BTreeMap<ValueId, &'a str> {
+    let named = |set: &std::collections::BTreeSet<ValueId>| -> Vec<(ValueId, &'a str)> {
+        set.iter()
+            .filter_map(|v| value_names.get(v).map(|n| (*v, n.as_str())))
+            .collect()
+    };
+    let phis = named(header_phis);
+    let mut phi_count: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, n) in &phis {
+        *phi_count.entry(n).or_default() += 1;
+    }
+    let mut out: BTreeMap<ValueId, &'a str> = phis
+        .into_iter()
+        .filter(|(_, n)| phi_count[n] == 1)
+        .collect();
+    let non_phi_params: std::collections::BTreeSet<ValueId> =
+        params.difference(header_phis).copied().collect();
+    let mut param_count: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, n) in named(&non_phi_params) {
+        *param_count.entry(n).or_default() += 1;
+    }
+    for (v, n) in named(&non_phi_params) {
+        if !phi_count.contains_key(n) && param_count[n] == 1 {
+            out.insert(v, n);
+        }
+    }
+    out
+}
+
 /// `true` iff `name` is a C identifier (rejects the `%<hex>` fallback the display
 /// resolver returns for an un-named/anonymous SSA value).
 pub(crate) fn is_c_identifier(name: &str) -> bool {
@@ -460,7 +503,41 @@ pub(crate) fn leftmost_non_ws_column(src_lines: &[&str], line: u32) -> Option<u3
 
 #[cfg(test)]
 mod state_set_tests {
-    use super::c_value_literal;
+    use super::{BTreeMap, ValueId, c_value_literal, header_variable_names};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn a_header_phi_shadows_the_parameter_it_reassigns() {
+        // `dll_create(int len) { while (len > 0) { ...; len--; } }`: param `len`
+        // (entry value) and the header phi `len` (current value).
+        let (param, phi, other) = (ValueId::new(1), ValueId::new(2), ValueId::new(3));
+        let names: BTreeMap<ValueId, String> = [(param, "len"), (phi, "len"), (other, "n")]
+            .into_iter()
+            .map(|(v, n)| (v, n.to_string()))
+            .collect();
+        let got = header_variable_names(
+            &BTreeSet::from([phi]),
+            &BTreeSet::from([param, other]),
+            &names,
+        );
+        assert_eq!(got.get(&phi), Some(&"len"));
+        assert_eq!(got.get(&param), None, "the entry value is not `len` here");
+        assert_eq!(
+            got.get(&other),
+            Some(&"n"),
+            "an unassigned param is its variable"
+        );
+    }
+
+    #[test]
+    fn a_name_two_phis_share_names_neither() {
+        let (a, b) = (ValueId::new(1), ValueId::new(2));
+        let names: BTreeMap<ValueId, String> = [(a, "i".to_string()), (b, "i".to_string())]
+            .into_iter()
+            .collect();
+        let got = header_variable_names(&BTreeSet::from([a, b]), &BTreeSet::new(), &names);
+        assert!(got.is_empty());
+    }
 
     #[test]
     fn literals_read_the_same_for_either_signedness() {

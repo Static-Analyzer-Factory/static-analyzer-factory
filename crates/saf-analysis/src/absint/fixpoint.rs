@@ -359,6 +359,8 @@ fn solve_function_impl(
     let cond_inst_map = build_cond_inst_map(func);
     let loop_headers = detect_loop_headers(cfg);
     let loop_bounds = extract_loop_bound_constants(cfg, &loop_headers, func, module);
+    let loop_values = loop_defined_values(func, cfg, &loop_headers);
+    let no_values = BTreeSet::new();
 
     // Pre-compute which blocks contain Load instructions, so
     // `propagate_refinement_to_loc_memory` is only called for blocks that
@@ -611,7 +613,12 @@ fn solve_function_impl(
                 };
                 let old_merged = old_partitioned.merge_all();
                 let prop_merged = propagated_partitioned.merge_all();
-                let mut widened = widen_state(&old_merged, &prop_merged, &merged_thresholds);
+                let mut widened = widen_state(
+                    &old_merged,
+                    &prop_merged,
+                    &merged_thresholds,
+                    loop_values.get(succ_id).unwrap_or(&no_values),
+                );
                 // Re-apply persisted refinements after widening
                 if let Some(refinements) = block_refinements.get(succ_id) {
                     apply_refinements(&mut widened, refinements);
@@ -957,6 +964,8 @@ pub fn solve_function_with_params(
 
     // Detect loop headers
     let loop_headers = detect_loop_headers(&cfg);
+    let loop_values = loop_defined_values(func, &cfg, &loop_headers);
+    let no_values = BTreeSet::new();
     let loop_bounds = extract_loop_bound_constants(&cfg, &loop_headers, func, module);
 
     // Initialize states
@@ -1066,7 +1075,12 @@ pub fn solve_function_with_params(
                     } else {
                         thresholds.clone()
                     };
-                    widen_state(old, &propagated_state, &merged_thresholds)
+                    widen_state(
+                        old,
+                        &propagated_state,
+                        &merged_thresholds,
+                        loop_values.get(succ_id).unwrap_or(&no_values),
+                    )
                 } else {
                     old.join(&propagated_state)
                 }
@@ -1150,10 +1164,16 @@ pub fn solve_function_with_params(
 }
 
 /// Widen state point-wise using threshold widening.
+///
+/// `loop_defined` is the set of values defined inside this header's loop (see
+/// [`loop_defined_values`]). It decides what a key that `new` has but `old` lacks
+/// means. Only a loop-defined value may take its back-edge interval. Every other
+/// absent key, and every absent memory entry, is ⊤ in `old` and stays ⊤.
 pub fn widen_state(
     old: &AbstractState,
     new: &AbstractState,
     thresholds: &BTreeSet<i128>,
+    loop_defined: &BTreeSet<ValueId>,
 ) -> AbstractState {
     if old.is_unreachable() {
         return new.clone();
@@ -1179,12 +1199,20 @@ pub fn widen_state(
         // One-sided entries in old → treated as TOP after widening (dropped)
     }
 
-    // Include new-only value entries (values from back-edge not yet in old).
-    // These represent values computed in the loop body that flow into the
-    // loop header for the first time. Without including them, phi inputs
-    // from the back-edge are lost and the fixpoint converges prematurely.
+    // Include new-only entries for values DEFINED IN THE LOOP: computed in the
+    // body, they reach the header for the first time on this back edge.
+    // Without them, phi inputs from the back edge are lost and the fixpoint
+    // converges prematurely.
+    //
+    // A key defined outside the loop is absent from `old` because it is ⊤
+    // there: either it entered ⊤ or an earlier widening reached ⊤ and was
+    // dropped. Copying its back-edge interval under-approximated the header.
+    // A parameter `size` got `1 <= size` at `for (i = 0; i <= size; i++)`
+    // although the loop is entered with `size == 0`, and every correctness
+    // validator refuted the witness that stated it
+    // (ldv-memsafety/ArraysWithLenghtAtDeclaration.c, 2026-11-09).
     for (key, new_val) in new.entries() {
-        if old.get_opt(*key).is_none() && !new_val.is_top() {
+        if old.get_opt(*key).is_none() && !new_val.is_top() && loop_defined.contains(key) {
             result.set(*key, new_val.clone());
         }
     }
@@ -1202,12 +1230,10 @@ pub fn widen_state(
             }
         }
     }
-    // Include new-only loc_memory entries
-    for (loc, new_val) in new.loc_memory_entries() {
-        if old.load_loc(*loc).is_none() && !new_val.is_top() {
-            result.store_loc(*loc, new_val.clone());
-        }
-    }
+    // No new-only loc_memory or memory entries: a location the old header
+    // state has no interval for holds ⊤ there (never written before the loop,
+    // or widened to ⊤ and dropped). The back edge's stored value holds only
+    // from the second iteration on.
 
     // Widen memory from both states
     for (ptr, old_val) in old.memory_entries() {
@@ -1222,13 +1248,6 @@ pub fn widen_state(
             }
         }
     }
-    // Include new-only memory entries
-    for (ptr, new_val) in new.memory_entries() {
-        if old.load(*ptr).is_none() && !new_val.is_top() {
-            result.store(*ptr, new_val.clone());
-        }
-    }
-
     // Preserve gep_targets from both states (union)
     for (vid, targets) in old.gep_targets() {
         let mut merged = targets.clone();
@@ -1542,6 +1561,56 @@ fn dfs_find_back_edges(
     }
 
     on_stack.remove(&node);
+}
+
+/// For each loop header, the SSA values defined INSIDE its loop: in a block the
+/// header reaches that also reaches the header back (the cycle(s) through it).
+///
+/// [`widen_state`] needs this to read a key that is absent from the header's old
+/// state. A value defined inside the loop is absent because no back edge has
+/// carried it yet, and its back-edge interval is the first one it has. Any other
+/// value (a parameter, or one computed before the loop) is absent because it is
+/// ⊤ on the way in, and copying its back-edge interval would claim a bound that
+/// only holds from the second iteration on.
+#[must_use]
+pub fn loop_defined_values(
+    func: &AirFunction,
+    cfg: &Cfg,
+    loop_headers: &IdBitSet<BlockId>,
+) -> BTreeMap<BlockId, BTreeSet<ValueId>> {
+    let reach = |start: BlockId, forward: bool| -> BTreeSet<BlockId> {
+        let mut seen = BTreeSet::from([start]);
+        let mut stack = vec![start];
+        while let Some(b) = stack.pop() {
+            let next = if forward {
+                cfg.successors_of(b)
+            } else {
+                cfg.predecessors_of(b)
+            };
+            for &n in next.into_iter().flatten() {
+                if seen.insert(n) {
+                    stack.push(n);
+                }
+            }
+        }
+        seen
+    };
+    let mut out = BTreeMap::new();
+    for header in loop_headers.iter() {
+        let backward = reach(header, false);
+        let in_loop: BTreeSet<BlockId> = reach(header, true)
+            .intersection(&backward)
+            .copied()
+            .collect();
+        let values: BTreeSet<ValueId> = func
+            .blocks
+            .iter()
+            .filter(|b| in_loop.contains(&b.id))
+            .flat_map(|b| b.instructions.iter().filter_map(|i| i.dst))
+            .collect();
+        out.insert(header, values);
+    }
+    out
 }
 
 /// Extract comparison constants from loop header blocks for per-loop widening thresholds.
