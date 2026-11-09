@@ -1275,6 +1275,140 @@ fn resolve_svcomp_stub() -> Option<PathBuf> {
     None
 }
 
+/// The type a program's own `typedef <type> <name>;` gives `name`, as the
+/// words before `name` (e.g. `["short", "unsigned", "int"]`), for the first
+/// such statement.
+///
+/// Matches a statement that contains the word `typedef` and ends in the
+/// identifier `name` directly before its `;`. Comments are not stripped: SV-COMP
+/// inputs are preprocessed.
+fn own_typedef_words<'a>(src: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = src.as_bytes();
+    let mut from = 0;
+    while let Some(off) = src[from..].find(name) {
+        let at = from + off;
+        from = at + name.len();
+        if at > 0 && is_ident(bytes[at - 1]) {
+            continue;
+        }
+        if !src[from..].trim_start().starts_with(';') {
+            continue;
+        }
+        let start = src[..at].rfind([';', '{', '}']).map_or(0, |i| i + 1);
+        let words: Vec<&str> = src[start..at]
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        if let Some(i) = words.iter().position(|w| *w == "typedef") {
+            return Some(words[i + 1..].to_vec());
+        }
+    }
+    None
+}
+
+/// Whether `words` (from [`own_typedef_words`]) spell a builtin integer type
+/// that differs from `target` (also builtin words). Only plain keyword spellings
+/// count: a typedef through another name (`typedef __kernel_size_t size_t;`)
+/// may well be the same type, so it is never treated as a conflict.
+fn conflicting_builtin(words: &[&str], target: &[&str]) -> bool {
+    const KEYWORDS: [&str; 6] = ["unsigned", "signed", "short", "long", "int", "char"];
+    let canon = |ws: &[&str]| -> Option<Vec<String>> {
+        if ws.is_empty() || !ws.iter().all(|w| KEYWORDS.contains(w)) {
+            return None;
+        }
+        // `int` is implied by any other integer keyword except `char`.
+        let mut v: Vec<String> = ws
+            .iter()
+            .filter(|w| **w != "int" || ws.len() == 1)
+            .map(|w| (*w).to_string())
+            .collect();
+        v.sort();
+        Some(v)
+    };
+    match (canon(words), canon(target)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
+/// The stub header to `-include` for `input`.
+///
+/// Usually the bundled stub itself. The stub includes `<stddef.h>`, which
+/// typedefs `wchar_t` (`int`) and `size_t` (`unsigned int` under ILP32,
+/// `unsigned long` under LP64). A program whose own typedef of one of them spells
+/// a different type (the Windows `ntdrivers` family: `typedef unsigned short
+/// wchar_t;`; `typedef unsigned long size_t;` in an ILP32 task) fails with
+/// "typedef redefinition with different types", a hard error that
+/// `-Wno-everything` does not silence. gcc never predefines either type in C, so
+/// the program's own typedef is what it really compiles with.
+///
+/// Only for such a conflict, this writes a wrapper into `dir` that keeps clang's
+/// typedef out of the program while the stub is read, then undefines clang's guard
+/// macro (`_WCHAR_T` / `_SIZE_T`) so a second translation unit in the same
+/// compile (a replay driver that includes `<stdlib.h>`) still gets the library
+/// typedef:
+/// - `wchar_t`: the stub does not use it, so the guard is predefined around the
+///   stub and the typedef is skipped. Wide literals keep the target width.
+/// - `size_t`: the stub declares `__VERIFIER_nondet_size_t` with it, so the
+///   stub's `size_t` is renamed to the private `__saf_stub_size_t`, which is
+///   clang's `__SIZE_TYPE__` — the same type a replay driver's `size_t` has.
+///
+/// Every other program (no own typedef, an identical one, or one through another
+/// typedef name) keeps the plain stub, as do `.i` inputs (clang ignores
+/// `-include` for them), unreadable inputs and wrapper write failures.
+fn program_stub(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    stub: &Path,
+    dir: &Path,
+) -> PathBuf {
+    use std::fmt::Write as _;
+    // clang compiles a `.i` input as already preprocessed and ignores `-include`
+    // for it, so the stub cannot conflict there; leave such compiles untouched.
+    if input.extension().is_some_and(|e| e == "i") {
+        return stub.to_path_buf();
+    }
+    let Ok(bytes) = std::fs::read(input) else {
+        return stub.to_path_buf();
+    };
+    let src = String::from_utf8_lossy(&bytes);
+    let size_target: &[&str] = match data_model {
+        saf_svcomp::DataModel::LP64 => &["unsigned", "long"],
+        saf_svcomp::DataModel::ILP32 => &["unsigned", "int"],
+    };
+    let conflicts = |name: &str, target: &[&str]| {
+        own_typedef_words(&src, name).is_some_and(|w| conflicting_builtin(&w, target))
+    };
+    let own_wchar = conflicts("wchar_t", &["int"]);
+    let own_size = conflicts("size_t", size_target);
+    if !own_wchar && !own_size {
+        return stub.to_path_buf();
+    }
+    let Ok(real) = std::fs::canonicalize(stub) else {
+        return stub.to_path_buf();
+    };
+    let mut text = String::new();
+    if own_wchar {
+        text.push_str("#define _WCHAR_T\n");
+    }
+    if own_size {
+        text.push_str("#define size_t __saf_stub_size_t\n");
+    }
+    let _ = writeln!(text, "#include \"{}\"", real.display());
+    if own_size {
+        text.push_str("#undef size_t\n#undef _SIZE_T\n");
+    }
+    if own_wchar {
+        text.push_str("#undef _WCHAR_T\n");
+    }
+    let wrapper = dir.join("saf_stub_own_types.h");
+    if std::fs::write(&wrapper, text).is_err() {
+        return stub.to_path_buf();
+    }
+    wrapper
+}
+
 /// Write a one-shot header that neutralizes the stub's `__VERIFIER_assert` MACRO,
 /// returning its path for a second `-include`. The stub guards the macro with
 /// `#ifndef __VERIFIER_assert`, but `-include`ing the stub first still defines it;
@@ -2220,6 +2354,7 @@ fn run_verdict(
             return unknown_outcome();
         }
     };
+    let stub = program_stub(input, data_model, &stub, dir.path());
     let ir = match compile_to_ir(input, data_model, &stub, dir.path()) {
         Ok(p) => p,
         Err(e) => {
@@ -9602,6 +9737,134 @@ pub fn specs(args: &SpecsArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod verify_tests {
     use super::*;
+
+    #[test]
+    fn own_typedef_conflicts_only_for_a_different_builtin_spelling() {
+        let src =
+            "typedef unsigned long size_t;\ntypedef short unsigned int wchar_t;\nint main(void);";
+        assert_eq!(
+            own_typedef_words(src, "size_t"),
+            Some(vec!["unsigned", "long"])
+        );
+        assert_eq!(
+            own_typedef_words(src, "wchar_t"),
+            Some(vec!["short", "unsigned", "int"])
+        );
+        // Uses of the type, other identifiers ending in the name, and a typedef of
+        // a different name that merely mentions it are not own typedefs.
+        assert_eq!(
+            own_typedef_words("wchar_t *p; int f(wchar_t c);", "wchar_t"),
+            None
+        );
+        assert_eq!(
+            own_typedef_words("typedef unsigned long ssize_t;", "size_t"),
+            None
+        );
+        assert_eq!(own_typedef_words("typedef size_t len_t;", "size_t"), None);
+        let ilp32_size = ["unsigned", "int"];
+        let lp64_size = ["unsigned", "long"];
+        assert!(conflicting_builtin(&["unsigned", "long"], &ilp32_size));
+        assert!(conflicting_builtin(
+            &["long", "unsigned", "int"],
+            &ilp32_size
+        ));
+        assert!(!conflicting_builtin(
+            &["long", "unsigned", "int"],
+            &lp64_size
+        ));
+        assert!(!conflicting_builtin(&["unsigned", "int"], &ilp32_size));
+        assert!(!conflicting_builtin(&["unsigned"], &ilp32_size));
+        assert!(conflicting_builtin(&["short", "unsigned", "int"], &["int"]));
+        assert!(!conflicting_builtin(&["int"], &["int"]));
+        // Through another typedef name: possibly the same type, never a conflict.
+        assert!(!conflicting_builtin(&["__kernel_size_t"], &ilp32_size));
+        assert!(!conflicting_builtin(&["__SIZE_TYPE__"], &ilp32_size));
+    }
+
+    /// Programs that declare their own `wchar_t` (the Windows `ntdrivers` family:
+    /// `typedef unsigned short wchar_t;`) or their own `size_t` (`typedef unsigned
+    /// long size_t;` under ILP32) compile with the stub, whose `<stddef.h>` would
+    /// otherwise inject clang's conflicting typedef. The size_t program also calls
+    /// the stub's `__VERIFIER_nondet_size_t`. A second translation unit that needs
+    /// the library types (a replay driver including `<stdlib.h>` that defines the
+    /// nondet function with the library `size_t`) still compiles and links
+    /// alongside. Needs clang (Docker).
+    #[test]
+    #[ignore = "needs clang"]
+    fn own_typedef_programs_compile_with_the_stub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("stub.h");
+        std::fs::write(
+            &stub,
+            "#include <stddef.h>\nextern size_t __VERIFIER_nondet_size_t(void);\n",
+        )
+        .expect("stub");
+        let driver = dir.path().join("driver.c");
+        std::fs::write(
+            &driver,
+            "#include <stdlib.h>\nsize_t __VERIFIER_nondet_size_t(void) { return 3; }\n\
+             int saf_driver_probe(void) { wchar_t w = 0; return mbtowc(&w, \"a\", 1); }\n",
+        )
+        .expect("driver");
+        let clang = std::env::var("SAF_CLANG").unwrap_or_else(|_| DEFAULT_CLANG.to_string());
+        let compile = |stub: &Path, prog: &Path| {
+            std::process::Command::new(&clang)
+                .args(["-m32", "-Wno-everything", "-include"])
+                .arg(stub)
+                .arg(prog)
+                .arg(&driver)
+                .arg("-o")
+                .arg(dir.path().join("a.out"))
+                .current_dir(dir.path())
+                .status()
+                .expect("spawn clang")
+                .success()
+        };
+        for (name, text) in [
+            (
+                "wchar.c",
+                "typedef unsigned short wchar_t;\nwchar_t g = 1;\nint main(void) { return g != 1; }\n",
+            ),
+            (
+                "size.c",
+                "typedef unsigned long size_t;\nsize_t n;\n\
+                 int main(void) { n = __VERIFIER_nondet_size_t(); return n != 3; }\n",
+            ),
+        ] {
+            let prog = dir.path().join(name);
+            std::fs::write(&prog, text).expect("prog");
+            assert!(
+                !compile(&stub, &prog),
+                "{name}: the plain stub must reproduce the conflict"
+            );
+            let wrapped = program_stub(&prog, saf_svcomp::DataModel::ILP32, &stub, dir.path());
+            assert_ne!(wrapped, stub, "{name}: an own typedef gets the wrapper");
+            assert!(
+                compile(&wrapped, &prog),
+                "{name}: compiles with the wrapper"
+            );
+            let run = std::process::Command::new(dir.path().join("a.out"))
+                .status()
+                .expect("run");
+            assert!(run.success(), "{name}: the linked program runs correctly");
+        }
+        let plain = dir.path().join("plain.c");
+        std::fs::write(&plain, "int main(void) { return 0; }\n").expect("plain");
+        assert_eq!(
+            program_stub(&plain, saf_svcomp::DataModel::ILP32, &stub, dir.path()),
+            stub
+        );
+        // An own typedef identical to clang's keeps the plain stub.
+        std::fs::write(
+            &plain,
+            "typedef unsigned int size_t;\ntypedef int wchar_t;\n",
+        )
+        .expect("plain");
+        assert_eq!(
+            program_stub(&plain, saf_svcomp::DataModel::ILP32, &stub, dir.path()),
+            stub
+        );
+    }
 
     /// The engine's `valid-memsafety` goal (plan 222 §2s) on small C programs:
     /// the safe ones are proven, every unsafe one abstains — out-of-bounds
