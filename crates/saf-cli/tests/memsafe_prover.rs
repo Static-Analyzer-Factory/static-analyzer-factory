@@ -207,3 +207,43 @@ fn stack_anchoring_rejects_a_dangling_slot_after_a_goto_into_its_block() {
     memsafe_prove("memsafety_false_goto_into_block.c")
         .stdout(predicate::str::starts_with("ABSTAIN:"));
 }
+
+// =============================================================================
+// Obligation 2 — printf with a scalar-only constant format
+// =============================================================================
+
+/// `printf` whose format is a constant string literal and whose every
+/// conversion reads a scalar argument dereferences nothing but that literal, so
+/// it is admitted.
+#[test]
+#[ignore = "requires clang (Docker); run via `make test-ignored`"]
+fn printf_with_scalar_conversions_is_inert() {
+    memsafe_prove("memsafe_printf_scalar.c").stdout(predicate::str::starts_with("PROVE"));
+}
+
+/// A `%s` conversion walks a caller-supplied pointer: here a `char[4]` with no
+/// NUL. RED if `printf` is admitted without reading its format.
+#[test]
+#[ignore = "requires clang (Docker); run via `make test-ignored`"]
+fn printf_with_string_conversion_stays_non_inert() {
+    memsafe_prove("memsafe_printf_string_arg.c")
+        .stdout(predicate::str::starts_with("ABSTAIN:printf-format"));
+}
+
+/// `%n` writes through its argument (4 bytes into a 1-byte global).
+#[test]
+#[ignore = "requires clang (Docker); run via `make test-ignored`"]
+fn printf_with_percent_n_stays_non_inert() {
+    memsafe_prove("memsafe_printf_percent_n.c")
+        .stdout(predicate::str::starts_with("ABSTAIN:printf-format"));
+}
+
+/// A format in a mutable global can be rewritten before the call (here to
+/// `%s` over an unterminated buffer); only a constant literal is read as the
+/// format.
+#[test]
+#[ignore = "requires clang (Docker); run via `make test-ignored`"]
+fn printf_with_mutable_format_stays_non_inert() {
+    memsafe_prove("memsafe_printf_mutable_format.c")
+        .stdout(predicate::str::starts_with("ABSTAIN:printf-format"));
+}

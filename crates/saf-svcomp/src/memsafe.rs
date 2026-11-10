@@ -123,7 +123,9 @@ fn memsafe_admits_base(name: &str) -> bool {
     if name.starts_with("__VERIFIER_nondet_") {
         return true;
     }
-    MEMSAFE_INERT_EXTERNALS.contains(&name)
+    // `printf` dereferences its format and any `%s`/`%n` argument; it is admitted
+    // here and its format is checked per call (see `check_printf_format`).
+    name == "printf" || MEMSAFE_INERT_EXTERNALS.contains(&name)
 }
 
 /// Backing predicate for [`MEMSAFE_POLICY_SEQ`] — no spawn primitive admitted, so
@@ -644,6 +646,13 @@ fn check_external_call(
     // known non-pointer width — a deliberately coarse test that errs towards
     // rejecting. `AirType::Pointer` is the only pointer type, so a value whose
     // width `exact_size_of` declines to give is treated as possibly a pointer.
+    if f.name == "printf" {
+        // The format is a constant global literal and no conversion dereferences
+        // an argument, so no other operand is ever read through: nothing more to
+        // anchor (a `double` constant has no AIR width and would otherwise be
+        // taken for a possible pointer).
+        return check_printf_format(module, inst);
+    }
     let spawns = SPAWN_FUNCTIONS.contains(&f.name.as_str());
     for &arg in &inst.operands {
         if globals.contains_key(&arg) || stack_slots.contains_key(&arg) {
@@ -688,6 +697,72 @@ fn check_external_call(
             continue;
         }
         return Err(format!("{}:handle-unanchored", f.name));
+    }
+    Ok(())
+}
+
+/// Admit one `printf` call only if it reads nothing but its own format.
+///
+/// The format (operand 0) must be a CONSTANT global whose initializer is a string
+/// literal — a mutable global could be rewritten before the call — and every
+/// conversion in it must take a scalar argument: `d i o u x X c f F e E g G a A`,
+/// `p` (prints the pointer value, never dereferences it) and `%%`, with any flags,
+/// width, precision (`*` included: an `int` argument) and length modifier. `%s`
+/// and `%n` (and every other conversion) dereference a caller-supplied pointer, so
+/// they abstain, as does a format that is not a constant string literal or that
+/// ends inside a conversion. The literal itself is NUL-terminated by
+/// construction, so reading it stays in bounds.
+fn check_printf_format(
+    module: &AirModule,
+    inst: &saf_core::air::Instruction,
+) -> Result<(), String> {
+    let fmt = *inst.operands.first().ok_or("printf-format:missing")?;
+    let global = module
+        .globals
+        .iter()
+        .find(|g| g.id == fmt)
+        .ok_or("printf-format:not-a-global")?;
+    if !global.is_constant {
+        return Err("printf-format:mutable".into());
+    }
+    let Some(Constant::String { value }) = &global.init else {
+        return Err("printf-format:not-a-string-literal".into());
+    };
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            continue;
+        }
+        // Flags, width, precision and length modifiers, then the conversion.
+        let conv = loop {
+            match chars.next() {
+                Some(
+                    '-'
+                    | '+'
+                    | ' '
+                    | '#'
+                    | '0'..='9'
+                    | '.'
+                    | '*'
+                    | 'h'
+                    | 'l'
+                    | 'j'
+                    | 'z'
+                    | 't'
+                    | 'L'
+                    | 'q',
+                ) => {}
+                other => break other,
+            }
+        };
+        match conv {
+            Some(
+                'd' | 'i' | 'o' | 'u' | 'x' | 'X' | 'c' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G' | 'a'
+                | 'A' | 'p' | '%',
+            ) => {}
+            Some(other) => return Err(format!("printf-format:conversion-{other}")),
+            None => return Err("printf-format:truncated".into()),
+        }
     }
     Ok(())
 }
