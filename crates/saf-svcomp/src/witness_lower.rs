@@ -175,16 +175,13 @@ pub fn lower_overflow_candidate(
     let src_lines = src_lines.as_deref();
     let mut waypoints = Vec::new();
     for nc in &cand.nondet_sequence {
-        if !(is_scalar_integer_nondet(&nc.func_name)
-            || nc.func_name == "rand"
-            || crate::unreach_prove::is_pinned_extern(&nc.func_name))
-        {
+        if !pins_result(&nc.func_name) {
             continue;
         }
         let Some(id) = nc.call_inst else {
             continue;
         };
-        if let Some(wp) = function_return_waypoint(module, id, nc.value, src_lines) {
+        if let Some(wp) = function_return_waypoint(module, id, &nc.func_name, nc.value, src_lines) {
             waypoints.push(wp);
         }
     }
@@ -207,16 +204,13 @@ pub fn lower_memsafety_candidate(
     let src_lines = src_lines.as_deref();
     let mut waypoints = Vec::new();
     for nc in &cand.nondet_sequence {
-        if !(is_scalar_integer_nondet(&nc.func_name)
-            || nc.func_name == "rand"
-            || crate::unreach_prove::is_pinned_extern(&nc.func_name))
-        {
+        if !pins_result(&nc.func_name) {
             continue;
         }
         let Some(id) = nc.call_inst else {
             continue;
         };
-        if let Some(wp) = function_return_waypoint(module, id, nc.value, src_lines) {
+        if let Some(wp) = function_return_waypoint(module, id, &nc.func_name, nc.value, src_lines) {
             waypoints.push(wp);
         }
     }
@@ -231,12 +225,90 @@ pub fn find_inst_span(module: &AirModule, inst_id: InstId) -> Option<(String, u3
     span_to_location(module, inst.span.as_ref()?)
 }
 
+/// Whether a read's RESULT is the value its replay pinned, so that it gets a
+/// `\result == v` waypoint: the integer and floating nondet functions, `rand`
+/// and the pinned externs (`atoi`, `recv`, …). A pinned `fscanf` conversion
+/// (plan 222 §2n) is written through a pointer (its result is the count), and
+/// `fgets` is pinned to "returned its buffer": neither gets a waypoint.
+fn pins_result(name: &str) -> bool {
+    is_scalar_integer_nondet(name)
+        || is_float_nondet_name(name)
+        || name == "rand"
+        || crate::unreach_prove::is_pinned_extern(name)
+}
+
+fn is_float_nondet_name(name: &str) -> bool {
+    matches!(name, "__VERIFIER_nondet_float" | "__VERIFIER_nondet_double")
+}
+
+/// The C constant of a pinned read's value. A floating read's value is its
+/// bit pattern (as the replay driver takes it); it is written as the shortest
+/// decimal that reads back as the same `double` — exact for a `float` too,
+/// whose `\result` is promoted to `double` by the comparison — without an `f`
+/// suffix or hex digits, which Witch and witness2test-match reject. `None`
+/// for a NaN or an infinity, which have no C constant.
+fn result_literal(name: &str, value: i64) -> Option<String> {
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    // INVARIANT: the replay stores a float's 32 or a double's 64 bits in `value`.
+    let x = match name {
+        "__VERIFIER_nondet_float" => f64::from(f32::from_bits(value as u32)),
+        "__VERIFIER_nondet_double" => f64::from_bits(value as u64),
+        _ => return Some(value.to_string()),
+    };
+    // `{:?}` is Rust's shortest round-trip form (`0.75`, `1e-7`, `100.0`).
+    x.is_finite().then(|| format!("{x:?}"))
+}
+
+/// Above this many reads a trace's unplaced reads stay unplaced: a witness of
+/// one waypoint per read (an array filled with input, 10^5 reads) runs to
+/// megabytes that no validator parses in time, while the target alone is often
+/// confirmed.
+const MAX_PLACED_READS: usize = 1000;
+
+/// The reads of `cand` with every unplaced one (a fuzz or CBMC trace names the
+/// function but not the call) placed at its function's call site when the
+/// module calls that function from exactly one site: every read of it is then
+/// a read at that site. Unchanged above [`MAX_PLACED_READS`] reads.
+fn placed_reads(module: &AirModule, cand: &FalseCandidate) -> Vec<crate::property::NondetCall> {
+    if cand.nondet_sequence.len() > MAX_PLACED_READS {
+        return cand.nondet_sequence.clone();
+    }
+    let mut sites: BTreeMap<&str, Vec<InstId>> = BTreeMap::new();
+    for f in &module.functions {
+        for b in &f.blocks {
+            for i in &b.instructions {
+                if let Operation::CallDirect { callee } = &i.op {
+                    if let Some(c) = module.function(*callee) {
+                        if c.is_declaration && pins_result(&c.name) {
+                            sites.entry(c.name.as_str()).or_default().push(i.id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cand.nondet_sequence
+        .iter()
+        .map(|nc| {
+            let mut nc = nc.clone();
+            if nc.call_inst.is_none() {
+                if let Some([only]) = sites.get(nc.func_name.as_str()).map(Vec::as_slice) {
+                    nc.call_inst = Some(*only);
+                }
+            }
+            nc
+        })
+        .collect()
+}
+
 fn function_return_waypoint(
     module: &AirModule,
     call_inst: InstId,
+    name: &str,
     value: i64,
     src_lines: Option<&[&str]>,
 ) -> Option<SourceWaypoint> {
+    let literal = result_literal(name, value)?;
     let (func, inst) = find_inst(module, call_inst)?;
     let (file_name, line, col) = span_to_location(module, inst.span.as_ref()?)?;
     let column = call_close_paren_column(src_lines?, line, col)?;
@@ -252,8 +324,9 @@ fn function_return_waypoint(
             // `\result <op> <const>` is the only function_return form the format
             // supports; a bare integer is a valid constant expression for every
             // integer return type (a negative value from a signed model still
-            // compares equal to the unsigned wrap the replay produced).
-            value: format!("\\result == {value}"),
+            // compares equal to the unsigned wrap the replay produced), and a
+            // floating one is the value's shortest round-trip decimal.
+            value: format!("\\result == {literal}"),
         }),
     })
 }
@@ -444,17 +517,11 @@ pub fn lower_candidate(
     let target_location = span_to_location(module, inst.span.as_ref()?)?;
 
     // Value to pin at each nondet call site (first occurrence wins; a Z3/interproc
-    // path is simple so every scalar-int read appears exactly once).
-    // Only reads whose RESULT is the pinned value get a `\result == v`
-    // waypoint: the nondet functions, `rand` and the pinned externs (`atoi`,
-    // `recv`, …). A pinned `fscanf` conversion (plan 222 §2n) is written through
-    // a pointer (its result is the count), and `fgets` is pinned to "returned
-    // its buffer": neither gets a waypoint.
-    let pinned_result = |name: &str| {
-        is_scalar_integer_nondet(name)
-            || name == "rand"
-            || crate::unreach_prove::is_pinned_extern(name)
-    };
+    // path is simple so every scalar-int read appears exactly once). Only reads
+    // whose RESULT is the pinned value get a `\result == v` waypoint
+    // ([`pins_result`]).
+    let pinned_result = pins_result;
+    let reads = placed_reads(module, cand);
     let target = target_waypoint(target_location.clone(), Some(func.name.clone()));
     // A program without inputs runs one way: the target alone is the witness.
     let reads_input = module.functions.iter().any(|f| {
@@ -470,27 +537,29 @@ pub fn lower_candidate(
     // more than once (ECA's `calculate_output`, a loop before the error) puts it
     // out of order — 180 unreach-call witnesses of the 2027 training run were
     // voted wrong for that.
-    if !cand.nondet_sequence.is_empty()
-        && cand
-            .nondet_sequence
+    if !reads.is_empty()
+        && reads
             .iter()
             .all(|nc| nc.call_inst.is_some() && pinned_result(&nc.func_name))
     {
-        let reads: Option<Vec<SourceWaypoint>> = cand
-            .nondet_sequence
+        let reads: Option<Vec<SourceWaypoint>> = reads
             .iter()
-            .map(|nc| function_return_waypoint(module, nc.call_inst?, nc.value, src_lines))
+            .map(|nc| {
+                function_return_waypoint(module, nc.call_inst?, &nc.func_name, nc.value, src_lines)
+            })
             .collect();
         if let Some(mut waypoints) = reads {
             waypoints.push(target);
             return Some(waypoints);
         }
     }
-    let mut nondet_value: BTreeMap<InstId, i64> = BTreeMap::new();
-    for nc in &cand.nondet_sequence {
+    let mut nondet_value: BTreeMap<InstId, (&str, i64)> = BTreeMap::new();
+    for nc in &reads {
         if let Some(id) = nc.call_inst {
             if pinned_result(&nc.func_name) {
-                nondet_value.entry(id).or_insert(nc.value);
+                nondet_value
+                    .entry(id)
+                    .or_insert((nc.func_name.as_str(), nc.value));
             }
         }
     }
@@ -510,14 +579,14 @@ pub fn lower_candidate(
 
     // 1. Interprocedural prefix: caller reads (execute before the error function),
     //    in whole-program execution order.
-    for nc in &cand.nondet_sequence {
+    for nc in &reads {
         let Some(id) = nc.call_inst else {
             continue;
         };
         if !pinned_result(&nc.func_name) || inpath_insts.contains(&id) {
             continue; // emitted during the block walk below, in place
         }
-        if let Some(wp) = function_return_waypoint(module, id, nc.value, src_lines) {
+        if let Some(wp) = function_return_waypoint(module, id, &nc.func_name, nc.value, src_lines) {
             waypoints.push(wp);
         }
     }
@@ -529,8 +598,8 @@ pub fn lower_candidate(
             continue;
         };
         for ins in &block.instructions {
-            if let Some(&value) = nondet_value.get(&ins.id) {
-                if let Some(wp) = function_return_waypoint(module, ins.id, value, src_lines) {
+            if let Some(&(name, value)) = nondet_value.get(&ins.id) {
+                if let Some(wp) = function_return_waypoint(module, ins.id, name, value, src_lines) {
                     waypoints.push(wp);
                 }
             }
@@ -1503,6 +1572,165 @@ mod tests {
         let wps = lower_candidate(&m, &cand, None).expect("lowered");
         assert_eq!(wps.len(), 1, "no fr without an AIR identity");
         assert_eq!(wps[0].kind, WaypointKind::Target);
+    }
+
+    /// `main`: one (or two) `__VERIFIER_nondet_float` call sites in `bb0`, then
+    /// a branch to `reach_error`.
+    fn float_read_module(two_sites: bool) -> (AirModule, InstId, BlockId, BlockId) {
+        let (main_id, err_id, nd_id) = (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let (bb0, bb1, bb2) = (BlockId::new(10), BlockId::new(11), BlockId::new(12));
+        let reach_iid = InstId::new(33);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.source_files.push(SourceFile::new(FileId::new(1), "t.c"));
+        let mut entry = vec![nondet_at(50, nd_id, 5, 13)];
+        if two_sites {
+            entry.push(nondet_at(51, nd_id, 6, 13));
+        }
+        entry.push(cond_br(2, bb1, bb2, 7, 3));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![
+                blk(bb0, entry),
+                blk(bb1, vec![err_at(reach_iid, err_id, 8, 5), ret(4)]),
+                blk(bb2, vec![ret(5)]),
+            ],
+            bb0,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+        m.functions.push(decl(nd_id, "__VERIFIER_nondet_float"));
+        (m, reach_iid, bb0, bb1)
+    }
+
+    const FLOAT_SRC: &str = "int main(void) {\n  float x;\n  float y;\n  x = 0;\n  float x = __VERIFIER_nondet_float();\n  float y = __VERIFIER_nondet_float();\n  if (x < y) {\n    reach_error();\n  }\n}\n";
+
+    fn unplaced(name: &str, value: i64) -> crate::property::NondetCall {
+        crate::property::NondetCall {
+            func_name: name.into(),
+            value,
+            call_inst: None,
+        }
+    }
+
+    /// A fuzz trace names the function, not the call: with one call site every
+    /// read is a read there, so the reads are pinned in order, each a float
+    /// written as its shortest round-trip decimal.
+    #[test]
+    fn unplaced_reads_are_pinned_at_their_functions_only_call_site() {
+        let (m, reach_iid, bb0, bb1) = float_read_module(false);
+        let cand = FalseCandidate {
+            reach_error_inst: reach_iid,
+            block_path: vec![bb0, bb1],
+            assignments: BTreeMap::new(),
+            nondet_sequence: vec![
+                unplaced("__VERIFIER_nondet_float", 0x3F40_0000), // 0.75f
+                unplaced("__VERIFIER_nondet_float", 0xC020_0000), // -2.5f
+            ],
+        };
+        let wps = lower_candidate(&m, &cand, Some(FLOAT_SRC)).expect("lowered");
+        let values: Vec<_> = wps
+            .iter()
+            .map(|w| {
+                (
+                    w.kind,
+                    w.line,
+                    w.column,
+                    w.constraint.as_ref().map(|c| c.value.clone()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                (
+                    WaypointKind::FunctionReturn,
+                    5,
+                    Some(37),
+                    Some("\\result == 0.75".into())
+                ),
+                (
+                    WaypointKind::FunctionReturn,
+                    5,
+                    Some(37),
+                    Some("\\result == -2.5".into())
+                ),
+                (WaypointKind::Target, 8, Some(5), None),
+            ]
+        );
+    }
+
+    /// A long trace keeps its reads unplaced: the target alone.
+    #[test]
+    fn unplaced_reads_stay_unpinned_above_the_read_cap() {
+        let (m, reach_iid, bb0, bb1) = float_read_module(false);
+        let cand = FalseCandidate {
+            reach_error_inst: reach_iid,
+            block_path: vec![bb0, bb1],
+            assignments: BTreeMap::new(),
+            nondet_sequence: vec![unplaced("__VERIFIER_nondet_float", 0); MAX_PLACED_READS + 1],
+        };
+        let wps = lower_candidate(&m, &cand, Some(FLOAT_SRC)).expect("lowered");
+        assert!(
+            wps.iter().all(|w| w.kind != WaypointKind::FunctionReturn),
+            "{wps:?}"
+        );
+    }
+
+    /// With two call sites a read's site is unknown: no `function_return`.
+    #[test]
+    fn unplaced_reads_stay_unpinned_when_their_function_has_two_call_sites() {
+        let (m, reach_iid, bb0, bb1) = float_read_module(true);
+        let cand = FalseCandidate {
+            reach_error_inst: reach_iid,
+            block_path: vec![bb0, bb1],
+            assignments: BTreeMap::new(),
+            nondet_sequence: vec![
+                unplaced("__VERIFIER_nondet_float", 0x3F40_0000),
+                unplaced("__VERIFIER_nondet_float", 0xC020_0000),
+            ],
+        };
+        let wps = lower_candidate(&m, &cand, Some(FLOAT_SRC)).expect("lowered");
+        assert!(
+            wps.iter().all(|w| w.kind != WaypointKind::FunctionReturn),
+            "{wps:?}"
+        );
+    }
+
+    #[test]
+    fn result_literal_writes_integers_and_finite_floating_values() {
+        assert_eq!(
+            result_literal("__VERIFIER_nondet_int", -5).as_deref(),
+            Some("-5")
+        );
+        let bits = |d: f64| i64::from_ne_bytes(d.to_bits().to_ne_bytes());
+        assert_eq!(
+            result_literal("__VERIFIER_nondet_double", bits(0.1)).as_deref(),
+            Some("0.1")
+        );
+        assert_eq!(
+            result_literal("__VERIFIER_nondet_double", bits(1e-7)).as_deref(),
+            Some("1e-7")
+        );
+        assert_eq!(
+            result_literal("__VERIFIER_nondet_double", bits(100.0)).as_deref(),
+            Some("100.0")
+        );
+        // A float's exact value, read back as a double, is the float again.
+        let f = result_literal("__VERIFIER_nondet_float", i64::from(0.1f32.to_bits())).unwrap();
+        #[allow(clippy::cast_possible_truncation)]
+        let back = f.parse::<f64>().unwrap() as f32;
+        assert_eq!(back, 0.1f32);
+        assert_eq!(
+            result_literal("__VERIFIER_nondet_double", bits(f64::NAN)),
+            None
+        );
+        assert_eq!(
+            result_literal(
+                "__VERIFIER_nondet_float",
+                i64::from(f32::INFINITY.to_bits())
+            ),
+            None
+        );
     }
 
     #[test]
