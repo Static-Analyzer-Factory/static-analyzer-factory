@@ -8025,26 +8025,76 @@ fn race_yaml_witness(
     if a.thread == b.thread {
         return None;
     }
-    let max = a.thread.max(b.thread);
-    let mut registrations = Vec::new();
-    for k in 1..=max {
-        let (creator, frames) = hit.creations.get(&k)?;
-        if *creator != 0 {
-            return None;
-        }
+    let registration = |k: u32, creator_id: u32| {
+        let (_, frames) = hit.creations.get(&k)?;
         let f = in_program(frames)?;
         let col = saf_svcomp::call_close_paren_column(&lines, f.line, f.column?)?;
-        registrations.push(saf_svcomp::ThreadWaypoint {
+        Some(saf_svcomp::ThreadWaypoint {
             waypoint: waypoint(saf_svcomp::WaypointKind::FunctionEnter, &f, Some(col)),
-            thread_id: 0,
-        });
-    }
+            thread_id: creator_id,
+        })
+    };
+    // Every thread 1..=k created by main, in order, when the report has them all.
+    let max = a.thread.max(b.thread);
+    let full: Option<Vec<_>> = (1..=max)
+        .map(|k| match hit.creations.get(&k) {
+            Some((0, _)) => registration(k, 0),
+            _ => None,
+        })
+        .collect();
+    let (registrations, targets) = match full {
+        Some(r) => (r, targets),
+        None => race_witness_threads(hit, a.thread, b.thread).and_then(|chain| {
+            // Only the racing threads and their creators, renumbered 1.. in
+            // creation order: the n-th registration creates witness thread n, from
+            // the witness thread of its creator.
+            let id = |t: u32| -> Option<u32> {
+                if t == 0 {
+                    return Some(0);
+                }
+                let i = chain.iter().position(|&c| c == t)?;
+                u32::try_from(i + 1).ok()
+            };
+            let regs = chain
+                .iter()
+                .map(|&t| registration(t, id(hit.creations.get(&t)?.0)?))
+                .collect::<Option<Vec<_>>>()?;
+            let tg = targets
+                .into_iter()
+                .map(|mut tw| {
+                    tw.thread_id = id(tw.thread_id)?;
+                    Some(tw)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((regs, tg))
+        })?,
+    };
     saf_svcomp::ViolationWitness::assemble_race(
         ctx.meta,
         &registrations,
         [&targets[0], &targets[1]],
     )
     .ok()
+}
+
+/// The threads a compressed race witness registers, in creation (`TSan`
+/// number) order: the two racing threads and, transitively, the threads that
+/// created them, excluding main. `None` when a creation the chain needs is not
+/// in the report.
+fn race_witness_threads(hit: &saf_svcomp::RaceHit, a: u32, b: u32) -> Option<Vec<u32>> {
+    let mut chain = std::collections::BTreeSet::new();
+    for start in [a, b] {
+        let mut t = start;
+        while t != 0 && chain.insert(t) {
+            let (creator, _) = hit.creations.get(&t)?;
+            // TSan numbers threads in creation order, so a creator precedes its child.
+            if *creator >= t {
+                return None;
+            }
+            t = *creator;
+        }
+    }
+    Some(chain.into_iter().collect())
 }
 
 /// `ThreadSanitizer` runtime options for the `no-data-race` confirmer: stop at the
@@ -9737,6 +9787,39 @@ pub fn specs(args: &SpecsArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod verify_tests {
     use super::*;
+
+    fn race_hit(creations: &[(u32, u32)]) -> saf_svcomp::RaceHit {
+        saf_svcomp::RaceHit {
+            summary_location: None,
+            access_location: None,
+            accesses: Vec::new(),
+            creations: creations
+                .iter()
+                .map(|&(t, c)| (t, (c, Vec::new())))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn race_witness_threads_keeps_racing_threads_and_their_creators() {
+        // Loop-created threads T3 and T5 (T1, T2, T4 not in the report).
+        assert_eq!(
+            race_witness_threads(&race_hit(&[(3, 0), (5, 0)]), 5, 3),
+            Some(vec![3, 5])
+        );
+        // T4 created by T1; main races with T4.
+        assert_eq!(
+            race_witness_threads(&race_hit(&[(1, 0), (4, 1)]), 0, 4),
+            Some(vec![1, 4])
+        );
+        // T4's creator T1 has no creation in the report.
+        assert_eq!(race_witness_threads(&race_hit(&[(4, 1)]), 0, 4), None);
+        // A creator numbered after its child is not a creation order.
+        assert_eq!(
+            race_witness_threads(&race_hit(&[(2, 3), (3, 0)]), 0, 2),
+            None
+        );
+    }
 
     #[test]
     fn own_typedef_conflicts_only_for_a_different_builtin_spelling() {
