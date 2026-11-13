@@ -890,6 +890,7 @@ mod tests {
 
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![],
@@ -1010,6 +1011,7 @@ mod tests {
 
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb1],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![],
@@ -1055,6 +1057,7 @@ mod tests {
 
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb2],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![],
@@ -1095,6 +1098,7 @@ mod tests {
 
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb1],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![],
@@ -1124,6 +1128,7 @@ mod tests {
 
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb1],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![],
@@ -1169,6 +1174,7 @@ mod tests {
 
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb1, bb2],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![],
@@ -1211,6 +1217,7 @@ mod tests {
             .push(decl(FunctionId::new(99), "__VERIFIER_nondet_int"));
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb1],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![],
@@ -1279,6 +1286,7 @@ mod tests {
             .push(decl(FunctionId::new(99), "__VERIFIER_nondet_int"));
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![entry, if_then],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![],
@@ -1330,6 +1338,7 @@ mod tests {
             .push(decl(FunctionId::new(99), "__VERIFIER_nondet_int"));
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![b0, lor, if_then],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![],
@@ -1392,6 +1401,7 @@ mod tests {
             .push(decl(FunctionId::new(99), "__VERIFIER_nondet_int"));
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![b0, c_true, c_end, if_then],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![],
@@ -1467,6 +1477,7 @@ mod tests {
         m.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb1],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![nc("__VERIFIER_nondet_int", 42, 50)],
@@ -1523,6 +1534,7 @@ mod tests {
 
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb1],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![nc("__VERIFIER_nondet_int", 42, nd_iid)],
@@ -1572,6 +1584,7 @@ mod tests {
         m.functions.push(decl(err_id, "reach_error"));
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb1],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![],
@@ -1623,6 +1636,7 @@ mod tests {
 
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb_f],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![nc("__VERIFIER_nondet_int", 7, nd_iid)],
@@ -1658,6 +1672,7 @@ mod tests {
 
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![crate::property::NondetCall {
@@ -1717,6 +1732,7 @@ mod tests {
         let (m, reach_iid, bb0, bb1) = float_read_module(false);
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb1],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![
@@ -1762,6 +1778,7 @@ mod tests {
         let (m, reach_iid, bb0, bb1) = float_read_module(false);
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb1],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![unplaced("__VERIFIER_nondet_float", 0); MAX_PLACED_READS + 1],
@@ -1779,6 +1796,7 @@ mod tests {
         let (m, reach_iid, bb0, bb1) = float_read_module(true);
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb1],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![
@@ -1858,6 +1876,7 @@ mod tests {
         m.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
         let cand = FalseCandidate {
             reach_error_inst: reach_iid,
+            alloc_fails: Vec::new(),
             block_path: vec![bb0, bb1],
             assignments: BTreeMap::new(),
             nondet_sequence: vec![nc("__VERIFIER_nondet_int", 42, nd_iid)],

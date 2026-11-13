@@ -91,6 +91,12 @@ pub fn parse_asan_report(stderr: &str) -> Option<AsanHit> {
     // ambiguous bad-free and abstained — never guess a sub-property (a wrong one is
     // −16). Non-SEGV free violations (`double-free`) map via R2 and are unaffected.
     let is_segv = class_line.starts_with("SEGV");
+    // An access to a dead stack object (its scope or its function has ended) is
+    // no output-helper artifact: the helper's rejection below exists for the
+    // string over-read of a buffer without its terminator, which these classes
+    // never are (Juliet CWE590 passes an out-of-scope struct to `printStructLine`).
+    let dead_stack_object =
+        class_line.contains("use-after-scope") || class_line.contains("use-after-return");
 
     // Walk the stack top-down. R1: reject if the faulting access is inside a libc
     // formatted-I/O function/interceptor, a Juliet `print*Line` output helper, or an
@@ -105,7 +111,10 @@ pub fn parse_asan_report(stderr: &str) -> Option<AsanHit> {
             continue;
         };
         let func = frame_function(descr);
-        if is_format_io(func) || is_print_helper(func) || is_harness_memory_model(func) {
+        if is_format_io(func)
+            || (is_print_helper(func) && !dead_stack_object)
+            || is_harness_memory_model(func)
+        {
             return None; // R1
         }
         if is_segv && is_deallocator(func) {
@@ -324,6 +333,23 @@ READ of size 21 at 0x503 thread T0
     #2 0x555 in printLine /workspace/x/file.i:204:32
     #3 0x555 in goodB2G /workspace/x/file.i:873:7
 ";
+
+    #[test]
+    fn dead_stack_object_in_a_print_helper_is_a_deref() {
+        // Juliet CWE590: an out-of-scope struct read by `printStructLine`.
+        let uas = "\
+==12==ERROR: AddressSanitizer: stack-use-after-scope on address 0x7b6 at pc 0x55c bp 0x7ff sp 0x7ff
+READ of size 4 at 0x7b6 thread T0
+    #0 0x55c in printStructLine /workspace/x/cwe590.i:313:44
+    #1 0x55c in bad /workspace/x/cwe590.i:662:3
+";
+        let hit = parse_asan_report(uas).expect("a dead stack object is a real deref");
+        assert_eq!(hit.subproperty, "valid-deref");
+        assert_eq!((hit.line, hit.column), (313, Some(44)));
+        // A buffer over-read in the same helper stays rejected (unterminated string).
+        let overread = uas.replace("stack-use-after-scope", "heap-buffer-overflow");
+        assert!(parse_asan_report(&overread).is_none());
+    }
 
     const DOUBLE_FREE: &str = "\
 ==368==ERROR: AddressSanitizer: attempting double-free on 0x502 in thread T0:

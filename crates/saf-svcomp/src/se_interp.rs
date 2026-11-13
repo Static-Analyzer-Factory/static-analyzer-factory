@@ -913,6 +913,7 @@ impl<'a> Interp<'a> {
         }
         Some(FalseCandidate {
             reach_error_inst: err_inst,
+            alloc_fails: Vec::new(),
             block_path: state.trace.clone(),
             assignments: BTreeMap::new(),
             nondet_sequence,

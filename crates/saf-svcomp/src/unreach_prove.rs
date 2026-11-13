@@ -288,6 +288,9 @@ pub struct Counterexample {
     pub nondets: Vec<(String, i64, InstId)>,
     pub error_inst: InstId,
     pub block_path: Vec<BlockId>,
+    /// The `malloc`/`calloc`/`realloc` calls (0-based over all of them, in
+    /// execution order) that return NULL ([`CexOptions::alloc_fail`]).
+    pub alloc_fails: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -522,6 +525,11 @@ struct State {
     /// [`Flow::AllocSplit`]: `Some(false)` returns NULL, `Some(true)` a fresh
     /// object. `None` everywhere else (it never survives the instruction).
     alloc_choice: Option<bool>,
+    /// Counterexample mode: `malloc`/`calloc`/`realloc` calls executed on this
+    /// path, and which of them (by that count) returned NULL — the replay
+    /// harness fails exactly those.
+    alloc_seq: u32,
+    alloc_failed: Vec<u32>,
     /// Non-termination search only: the concrete loop-header states this path
     /// has passed, each with the number of nondet reads before it (see
     /// [`Engine::nonterm_check`]).
@@ -1001,6 +1009,9 @@ struct Engine<'a> {
     cex_skip: BTreeSet<InstId>,
     /// Counterexample mode: depth-first worklist order.
     cex_depth_first: bool,
+    /// Counterexample mode: a `malloc`/`calloc`/`realloc` may return NULL (the
+    /// replay harness fails the same calls).
+    cex_alloc_fail: bool,
     /// Counterexample mode: also report `shl` overflows (the replay then runs
     /// with `-fsanitize=shift-base`); off by default because an unsigned shift
     /// looks the same in the IR and would stop the search before the real
@@ -1456,6 +1467,9 @@ pub fn prove_no_overflow_exhaustive(module: &AirModule, budget: Duration) -> Exh
 /// first feasible violation's model fixes the inputs. The result is a replay
 /// CANDIDATE only — nothing here decides a verdict.
 /// Knobs of the counterexample search (see [`find_counterexample_excluding`]).
+// NOTE: each flag is an independent search switch set by a different strategy;
+// an enum would have to enumerate their combinations.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default, Clone)]
 pub struct CexOptions {
     /// Violations at these instructions are passed over (a candidate there did
@@ -1474,6 +1488,14 @@ pub struct CexOptions {
     /// the `overflow` flag's goal. Run it on the memory-safety ingestion
     /// recipe's module (lifetime markers).
     pub memsafety: bool,
+    /// Let a `malloc`/`calloc`/`realloc` return NULL (SV-COMP 2027); the
+    /// counterexample lists the failed calls in
+    /// [`Counterexample::alloc_fails`].
+    pub alloc_fail: bool,
+    /// With [`Self::memsafety`]: search for a `valid-memcleanup` violation — a
+    /// path that terminates with a heap block still allocated — instead of an
+    /// invalid access (those are passed over).
+    pub memcleanup: bool,
 }
 
 /// A `reach_error` counterexample for a program whose violation the
@@ -1598,6 +1620,8 @@ pub fn find_counterexample_excluding(
     };
     engine.cex_mode = true;
     engine.cex_depth_first = opts.depth_first;
+    engine.cex_alloc_fail = opts.alloc_fail;
+    engine.memcleanup = opts.memsafety && opts.memcleanup;
     engine.cex_check_shl = opts.check_shl;
     engine.cex_skip.clone_from(&opts.skip);
     engine.signed_shl_locs.clone_from(&opts.signed_shl_locs);
@@ -2028,6 +2052,7 @@ impl<'a> Engine<'a> {
             cex: None,
             cex_skip: BTreeSet::new(),
             cex_depth_first: false,
+            cex_alloc_fail: false,
             cex_check_shl: false,
             signed_shl_locs: None,
             symbols: BTreeMap::new(),
@@ -2335,6 +2360,8 @@ impl<'a> Engine<'a> {
             versioned: BTreeMap::new(),
             dead_end: false,
             alloc_choice: None,
+            alloc_seq: 0,
+            alloc_failed: Vec::new(),
             nt_seen: BTreeMap::new(),
         };
         for p in &main.params {
@@ -2507,6 +2534,8 @@ impl<'a> Engine<'a> {
             versioned: BTreeMap::new(),
             dead_end: false,
             alloc_choice: None,
+            alloc_seq: 0,
+            alloc_failed: Vec::new(),
             nt_seen: BTreeMap::new(),
         };
         // Parameters of main and of the loop's function are unconstrained.
@@ -3811,7 +3840,7 @@ impl<'a> Engine<'a> {
                         st.dead.extend(dying.into_iter().map(|(_, b)| b));
                         st.stack = live;
                         if depth == 0 {
-                            self.ms_end_check(&mut st, false)?;
+                            self.ms_end_check(&mut st, false, inst.id)?;
                         }
                     }
                     let Some(frame) = st.frames.pop() else {
@@ -3855,7 +3884,7 @@ impl<'a> Engine<'a> {
                 Flow::Halt => {
                     trace(|| format!("halt at block={:?}", st.block));
                     if self.goal == Goal::MemSafety && !st.dead_end {
-                        self.ms_end_check(&mut st, true)?;
+                        self.ms_end_check(&mut st, true, inst.id)?;
                     }
                     return Ok(());
                 }
@@ -4402,16 +4431,33 @@ impl<'a> Engine<'a> {
             // Missing the NULL outcome was a wrong TRUE in the 2027 training run
             // (`ldv-regression/rule57_ebda_blast_2`).
             Operation::HeapAlloc { kind } => {
-                if !self.cex_mode && alloc_may_fail(kind) {
+                // The replay harness wraps exactly these three by name.
+                let replayable = matches!(
+                    kind,
+                    saf_core::air::HeapAllocKind::Malloc
+                        | saf_core::air::HeapAllocKind::Calloc
+                        | saf_core::air::HeapAllocKind::Realloc
+                );
+                let may_fail = if self.cex_mode {
+                    self.cex_alloc_fail && replayable
+                } else {
+                    alloc_may_fail(kind)
+                };
+                if may_fail {
                     match st.alloc_choice.take() {
                         None => return Ok(Flow::AllocSplit),
                         Some(false) => {
                             trace(|| "allocation returns NULL".to_string());
+                            st.alloc_failed.push(st.alloc_seq);
+                            st.alloc_seq += 1;
                             set(st, inst, Val::Ptr(Some((NULL_BASE, Vec::new()))));
                             return Ok(Flow::Next);
                         }
                         Some(true) => {}
                     }
+                }
+                if replayable {
+                    st.alloc_seq += 1;
                 }
                 self.fresh_counter += 1;
                 let base = ValueId::new(u128::MAX - u128::from(self.fresh_counter));
@@ -4607,7 +4653,7 @@ impl<'a> Engine<'a> {
                 {
                     trace(|| format!("empty infinite loop at block={:?}", st.block));
                     if self.goal == Goal::MemSafety && !self.memcleanup && !st.dead_end {
-                        self.ms_end_check(st, true)?;
+                        self.ms_end_check(st, true, inst.id)?;
                     }
                     st.dead_end = true;
                     return Ok(Flow::Halt);
@@ -5049,6 +5095,11 @@ impl<'a> Engine<'a> {
     /// candidate — only an AddressSanitizer replay ever confirms it.
     fn ms_violation(&mut self, st: &mut State, at: InstId, reason: String) -> Res<()> {
         if self.cex_mode {
+            // The memcleanup search looks for an unfreed block at a termination
+            // only (its replay confirms nothing else).
+            if self.memcleanup {
+                return Ok(());
+            }
             return self.check_violation(st, None, at);
         }
         Err(reason)
@@ -5332,7 +5383,16 @@ impl<'a> Engine<'a> {
     /// counts only on a feasible path (the exhaustive mode does not test the
     /// branches it takes: the `reach_error` arm of an assertion that always
     /// holds would otherwise end in a spurious `mc-not-freed`).
-    fn ms_end_check(&mut self, st: &mut State, halted: bool) -> Res<()> {
+    fn ms_end_check(&mut self, st: &mut State, halted: bool, at: InstId) -> Res<()> {
+        // The memcleanup counterexample search: a feasible termination (the
+        // instruction `at` ends the path) with a block not freed is a candidate,
+        // confirmed only by the native memcleanup replay.
+        if self.cex_mode {
+            if self.memcleanup && st.heap.values().any(|h| h.status != HeapStatus::Freed) {
+                return self.check_violation(st, None, at);
+            }
+            return Ok(());
+        }
         match self.ms_memtrack(st, halted) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -6059,6 +6119,16 @@ impl<'a> Engine<'a> {
         if FENV_SETTERS.contains(&name) || name.starts_with("llvm.set.rounding") {
             return Err(format!("fenv-{name}"));
         }
+        // Counterexample mode: `atexit` registers its handler and succeeds,
+        // touching no program memory. The engine runs no handler at exit — the
+        // replay does, so a block a handler frees does not replay as a leak.
+        if self.cex_mode && name == "atexit" {
+            if let Some(d) = inst.dst {
+                let w = self.width.get(&d).copied().unwrap_or(32);
+                st.values.insert(d, Val::Bv(int_bv(0, w), no_vars()));
+            }
+            return Ok(Flow::Next);
+        }
         if self.goal == Goal::MemSafety && !self.cex_mode {
             let stream = STREAM_ARG.iter().find(|(n, _)| *n == name).map(|(_, i)| *i);
             for (i, &arg) in args.iter().enumerate() {
@@ -6391,6 +6461,7 @@ impl<'a> Engine<'a> {
             nondets,
             error_inst: at,
             block_path,
+            alloc_fails: st.alloc_failed.clone(),
         });
         Ok(())
     }
@@ -9191,6 +9262,30 @@ mod tests {
             );
         }
         assert_eq!(prove(&program(HeapAllocKind::New)), ExhaustiveProof::Proven);
+
+        // The counterexample search takes the NULL outcome only when asked
+        // (`alloc_fail`), only for the allocators the replay can fail, and
+        // reports which allocation calls fail.
+        let opts = CexOptions {
+            alloc_fail: true,
+            ..CexOptions::default()
+        };
+        let budget = Duration::from_secs(10);
+        for kind in [
+            HeapAllocKind::Malloc,
+            HeapAllocKind::Calloc,
+            HeapAllocKind::Realloc,
+        ] {
+            let m = program(kind);
+            let cex = find_counterexample_excluding(&m, budget, false, &opts)
+                .expect("the NULL outcome reaches the error");
+            assert_eq!(cex.alloc_fails, vec![0]);
+            assert!(
+                find_counterexample_excluding(&m, budget, false, &CexOptions::default()).is_none()
+            );
+        }
+        let kmalloc = program(HeapAllocKind::Other("kmalloc".into()));
+        assert!(find_counterexample_excluding(&kmalloc, budget, false, &opts).is_none());
     }
 
     /// `int *p = malloc(4);` (NULL-checked) `if (*p == 3) reach_error();` —

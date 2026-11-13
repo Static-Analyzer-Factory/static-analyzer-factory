@@ -2823,6 +2823,7 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         if let Some(&reach_error_inst) = saf_svcomp::reach_error_call_sites(ctx.module).first() {
             let candidate = saf_svcomp::FalseCandidate {
                 reach_error_inst,
+                alloc_fails: Vec::new(),
                 block_path: Vec::new(),
                 assignments: std::collections::BTreeMap::new(),
                 nondet_sequence: Vec::new(),
@@ -3328,6 +3329,7 @@ fn fuzz_confirm_false(ctx: &VerifyCtx) -> Option<saf_svcomp::FalseCandidate> {
             let nondet_sequence = fuzz::parse_fuzz_log(&log);
             let candidate = saf_svcomp::FalseCandidate {
                 reach_error_inst,
+                alloc_fails: Vec::new(),
                 block_path: Vec::new(),
                 assignments: std::collections::BTreeMap::new(),
                 nondet_sequence,
@@ -5278,8 +5280,15 @@ fn candidate_from_counterexample(
         let span = saf_svcomp::find_inst_span(module, found.error_inst);
         eprintln!("saf verify:   violation at {span:?}");
     }
+    if !found.alloc_fails.is_empty() {
+        eprintln!(
+            "saf verify:   allocation calls failing (NULL): {:?}",
+            found.alloc_fails
+        );
+    }
     saf_svcomp::FalseCandidate {
         reach_error_inst: found.error_inst,
+        alloc_fails: found.alloc_fails,
         block_path: found.block_path,
         assignments: std::collections::BTreeMap::new(),
         nondet_sequence: found
@@ -5513,6 +5522,45 @@ fn replay_wrap_flags() -> Vec<String> {
     flags
 }
 
+/// The allocators a replay fails on a candidate's `alloc_fails`
+/// (`-Wl,--wrap`, so only the program's own calls are counted and failed).
+const FAILABLE_ALLOCATORS: [&str; 3] = ["malloc", "calloc", "realloc"];
+
+/// The `-Wl,--wrap` flags for [`alloc_fail_wrapper`]; none when no allocation
+/// fails (the replay then links the real allocators directly).
+fn alloc_fail_wrap_flags(fails: &[u32]) -> Vec<String> {
+    if fails.is_empty() {
+        return Vec::new();
+    }
+    FAILABLE_ALLOCATORS
+        .iter()
+        .map(|n| format!("-Wl,--wrap={n}"))
+        .collect()
+}
+
+/// The replay driver's allocator wrappers: the program's `malloc` / `calloc` /
+/// `realloc` calls are counted together, in execution order, and the ones in
+/// `fails` return NULL (an execution SV-COMP 2027 allows: an allocation may
+/// fail). Empty when nothing fails.
+fn alloc_fail_wrapper(fails: &[u32]) -> String {
+    if fails.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = fails.iter().map(|k| format!("{k}u")).collect();
+    format!(
+        "#include <stddef.h>\n\
+void *__real_malloc(size_t); void *__real_calloc(size_t, size_t); void *__real_realloc(void *, size_t);\n\
+static const unsigned __saf_af[] = {{{}}};\n\
+static unsigned __saf_an = 0, __saf_ai = 0;\n\
+static int __saf_alloc_fails(void) {{ unsigned k = __saf_an++; const unsigned n = sizeof __saf_af / sizeof __saf_af[0];\n\
+  while (__saf_ai < n && __saf_af[__saf_ai] < k) __saf_ai++; return __saf_ai < n && __saf_af[__saf_ai] == k; }}\n\
+void *__wrap_malloc(size_t s) {{ return __saf_alloc_fails() ? NULL : __real_malloc(s); }}\n\
+void *__wrap_calloc(size_t c, size_t s) {{ return __saf_alloc_fails() ? NULL : __real_calloc(c, s); }}\n\
+void *__wrap_realloc(void *p, size_t s) {{ return __saf_alloc_fails() ? NULL : __real_realloc(p, s); }}\n",
+        list.join(", ")
+    )
+}
+
 /// The format walker shared by the `fscanf` wrappers of [`rand_wrapper`].
 const FSCANF_WRAPPER_BODY: &str = "static int __saf_scan(const char *fmt, va_list ap) {\n\
     int n = 0; const char *p = fmt;\n\
@@ -5648,6 +5696,48 @@ fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) ->
         "#define __SAF_SENTINEL \"{}\"",
         escape_c_string(sentinel)
     );
+    s.push_str(&synthesize_input_defs(candidate));
+
+    // Error sinks: dropping the sentinel is the sole evidence of a violation. It
+    // holds the return address of the error call, so the replay can check WHICH
+    // error call ran (`replay_hit_line`).
+    s.push_str(
+        "__attribute__((noreturn)) static void __saf_hit(const void* site) { FILE* f = fopen(__SAF_SENTINEL, \"w\"); if (f) { fprintf(f, \"%p\\n\", site); fclose(f); } _exit(0); }\n",
+    );
+    // reach_error / __VERIFIER_error are WEAK: the canonical sv-benchmarks task
+    // DEFINES its own `reach_error(){ __assert_fail(...); }`, which must win the
+    // link (a strong symbol overrides our weak one); when the task only declares
+    // reach_error, our weak definition supplies it. __assert_fail is overridden
+    // (a safe libc override — libc is a shared object, so no multiple-definition)
+    // so the task-defined `reach_error -> __assert_fail` path still trips the
+    // sentinel. `abort` is deliberately NOT overridden: it is too generic to
+    // attribute to the property soundly, so reach_error variants calling it
+    // directly stay `unknown` (sound, at some recall cost).
+    // The site is the caller of `reach_error`: frame 0 from our weak definitions,
+    // frame 1 from `__assert_fail` (called by the task's own `reach_error`).
+    s.push_str(
+        "__attribute__((weak)) void reach_error(void) { __saf_hit(__builtin_return_address(0)); }\n",
+    );
+    s.push_str(
+        "__attribute__((weak)) void __VERIFIER_error(void) { __saf_hit(__builtin_return_address(0)); }\n",
+    );
+    s.push_str(
+        "__attribute__((noreturn)) void __assert_fail(const char* a, const char* b, unsigned int c, const char* d) { (void)a; (void)b; (void)c; (void)d; __saf_hit(__builtin_return_address(1)); }\n",
+    );
+
+    s
+}
+
+/// The replay driver's input side: the C headers, the pinned
+/// `__VERIFIER_nondet_*` definitions (each returns the candidate's values in
+/// order, then `0`), the extended/pointer/float pinned reads, the atomic markers
+/// and `__VERIFIER_assume` (a false assumption leaves through `_exit(0)`). No
+/// error sink: [`synthesize_driver`] adds the sentinel ones; the memcleanup
+/// replay adds its termination check.
+fn synthesize_input_defs(candidate: &saf_svcomp::FalseCandidate) -> String {
+    use std::fmt::Write as _;
+
+    let mut s = String::new();
     s.push_str("#include <stddef.h>\n");
     s.push_str("#include <stdio.h>\n");
     s.push_str("#include <stdlib.h>\n");
@@ -5694,34 +5784,6 @@ fn synthesize_driver(candidate: &saf_svcomp::FalseCandidate, sentinel: &Path) ->
 
     // Honour assumptions at runtime: assume(false) blocks the path WITHOUT a hit.
     s.push_str("void __VERIFIER_assume(int c) { if (!c) _exit(0); }\n");
-
-    // Error sinks: dropping the sentinel is the sole evidence of a violation. It
-    // holds the return address of the error call, so the replay can check WHICH
-    // error call ran (`replay_hit_line`).
-    s.push_str(
-        "__attribute__((noreturn)) static void __saf_hit(const void* site) { FILE* f = fopen(__SAF_SENTINEL, \"w\"); if (f) { fprintf(f, \"%p\\n\", site); fclose(f); } _exit(0); }\n",
-    );
-    // reach_error / __VERIFIER_error are WEAK: the canonical sv-benchmarks task
-    // DEFINES its own `reach_error(){ __assert_fail(...); }`, which must win the
-    // link (a strong symbol overrides our weak one); when the task only declares
-    // reach_error, our weak definition supplies it. __assert_fail is overridden
-    // (a safe libc override — libc is a shared object, so no multiple-definition)
-    // so the task-defined `reach_error -> __assert_fail` path still trips the
-    // sentinel. `abort` is deliberately NOT overridden: it is too generic to
-    // attribute to the property soundly, so reach_error variants calling it
-    // directly stay `unknown` (sound, at some recall cost).
-    // The site is the caller of `reach_error`: frame 0 from our weak definitions,
-    // frame 1 from `__assert_fail` (called by the task's own `reach_error`).
-    s.push_str(
-        "__attribute__((weak)) void reach_error(void) { __saf_hit(__builtin_return_address(0)); }\n",
-    );
-    s.push_str(
-        "__attribute__((weak)) void __VERIFIER_error(void) { __saf_hit(__builtin_return_address(0)); }\n",
-    );
-    s.push_str(
-        "__attribute__((noreturn)) void __assert_fail(const char* a, const char* b, unsigned int c, const char* d) { (void)a; (void)b; (void)c; (void)d; __saf_hit(__builtin_return_address(1)); }\n",
-    );
-
     s
 }
 
@@ -6050,6 +6112,11 @@ fn memsafety_true_or_engine_false(ctx: &VerifyCtx, why_no_false: &str) -> Verdic
 /// `AddressSanitizer`, and only an `ASan` trap in the program's own code confirms
 /// it (the sub-property is the `ASan` report's, as in [`asan_confirm`]). A candidate that
 /// does not reproduce is excluded and the search runs again.
+///
+/// With `SAF_ALLOC_FAIL=1` the search first lets allocations fail (SV-COMP
+/// 2027: `malloc` may return NULL); when that finds nothing it runs again with
+/// every allocation succeeding — the NULL branches widen the search, and a
+/// violation on the all-succeed paths can be missed within its budget.
 fn memsafety_engine_counterexample(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     let source = std::fs::read_to_string(ctx.input).ok()?;
     if saf_svcomp::source_has_openmp(&source) {
@@ -6065,8 +6132,53 @@ fn memsafety_engine_counterexample(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
         .ok()
         .flatten();
     let module = recipe.as_ref().unwrap_or(ctx.module);
+    let mut search = MemsafetyCexSearch::NoCandidate;
+    // NOTE: off unless `SAF_ALLOC_FAIL=1`. The benchmark labels lag the 2027
+    // convention: expected-TRUE tasks (Hacl-Star, argv-c getdelim) dereference
+    // unchecked allocations, and their NULL counterexamples score as wrong.
+    let modes: &[bool] = if std::env::var("SAF_ALLOC_FAIL").is_ok_and(|v| v == "1") {
+        &[true, false]
+    } else {
+        &[false]
+    };
+    for &alloc_fail in modes {
+        search = memsafety_cex_search(ctx, module, &source, alloc_fail);
+        match search {
+            MemsafetyCexSearch::Found(outcome) => return Some(*outcome),
+            MemsafetyCexSearch::Errored => return None,
+            MemsafetyCexSearch::NoCandidate | MemsafetyCexSearch::Exhausted => {}
+        }
+    }
+    if matches!(search, MemsafetyCexSearch::NoCandidate) {
+        eprintln!("saf verify: no engine memsafety counterexample -> unknown");
+        return late_cex_pass(ctx, || memsafety_engine_counterexample(ctx)).flatten();
+    }
+    None
+}
+
+/// How one memory-safety counterexample search ([`memsafety_cex_search`]) ended.
+enum MemsafetyCexSearch {
+    /// A candidate replayed under `ASan`.
+    Found(Box<VerdictOutcome>),
+    /// The search found no (further) candidate.
+    NoCandidate,
+    /// Every retry's candidate failed to replay.
+    Exhausted,
+    /// The replay itself failed.
+    Errored,
+}
+
+/// One counterexample search of [`memsafety_engine_counterexample`] (with or
+/// without allocation failure), each candidate replayed under `ASan`.
+fn memsafety_cex_search(
+    ctx: &VerifyCtx,
+    module: &saf_core::air::AirModule,
+    source: &str,
+    alloc_fail: bool,
+) -> MemsafetyCexSearch {
     let mut opts = saf_svcomp::CexOptions {
         memsafety: true,
+        alloc_fail,
         ..saf_svcomp::CexOptions::default()
     };
     for attempt in 0..=cex_retries() {
@@ -6075,8 +6187,7 @@ fn memsafety_engine_counterexample(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
                 opts.depth_first = true;
                 continue;
             }
-            eprintln!("saf verify: no engine memsafety counterexample -> unknown");
-            return late_cex_pass(ctx, || memsafety_engine_counterexample(ctx)).flatten();
+            return MemsafetyCexSearch::NoCandidate;
         };
         match asan_replay_sequence(ctx, module, &candidate) {
             Ok(Some(hit)) => {
@@ -6086,19 +6197,19 @@ fn memsafety_engine_counterexample(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
                         module,
                         &candidate,
                         &hit,
-                        Some(&source),
+                        Some(source),
                     )),
                 );
                 eprintln!(
                     "saf verify: engine memsafety counterexample confirmed by ASan ({}) -> false",
                     hit.subproperty
                 );
-                return Some(VerdictOutcome {
+                return MemsafetyCexSearch::Found(Box::new(VerdictOutcome {
                     verdict: saf_svcomp::memsafety_verdict(hit.subproperty),
                     witness,
                     graphml: None,
                     correctness: None,
-                });
+                }));
             }
             Ok(None) => eprintln!(
                 "saf verify: engine memsafety counterexample did not replay (attempt {})",
@@ -6106,12 +6217,12 @@ fn memsafety_engine_counterexample(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             ),
             Err(e) => {
                 eprintln!("saf verify: memsafety counterexample replay errored: {e:#} -> unknown");
-                return None;
+                return MemsafetyCexSearch::Errored;
             }
         }
         opts.skip.insert(candidate.reach_error_inst);
     }
-    None
+    MemsafetyCexSearch::Exhausted
 }
 
 /// Replay an engine counterexample's inputs under `AddressSanitizer` (the driver
@@ -6132,6 +6243,7 @@ fn asan_replay_sequence(
     let errpath = dir.join("saf_mcex_stderr.txt");
     let mut driver = synthesize_driver(candidate, &sentinel);
     driver.push_str(&rand_wrapper(candidate));
+    driver.push_str(&alloc_fail_wrapper(&candidate.alloc_fails));
     std::fs::write(&driver_src, driver)
         .with_context(|| "writing memsafety counterexample driver")?;
     let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
@@ -6145,6 +6257,7 @@ fn asan_replay_sequence(
             "-Wno-everything",
         ])
         .args(replay_wrap_flags())
+        .args(alloc_fail_wrap_flags(&candidate.alloc_fails))
         .args(ctx.data_model.clang_flags())
         .arg("-include")
         .arg(ctx.stub);
@@ -6328,12 +6441,70 @@ fn memcleanup_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
             correctness: None,
         };
     }
-    unknown_outcome()
+    memcleanup_engine_counterexample(ctx).unwrap_or_else(unknown_outcome)
+}
+
+/// `valid-memcleanup` FALSE from the engine: the memcleanup goal's
+/// counterexample search finds a feasible termination with a heap block still
+/// allocated; the program is replayed natively on the counterexample's inputs
+/// under the memcleanup tracker ([`memcleanup_run`]), and only a run that
+/// terminates with a block still allocated confirms it. A candidate that does
+/// not reproduce is excluded and the search runs again.
+fn memcleanup_engine_counterexample(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    if !memcleanup_in_scope(ctx.module) {
+        return None;
+    }
+    let recipe = compile_to_ir_memsafety(ctx.input, ctx.data_model, ctx.stub, ctx.tempdir, false)
+        .ok()
+        .flatten();
+    let module = recipe.as_ref().unwrap_or(ctx.module);
+    let mut opts = saf_svcomp::CexOptions {
+        memsafety: true,
+        memcleanup: true,
+        ..saf_svcomp::CexOptions::default()
+    };
+    for attempt in 0..=cex_retries() {
+        let Some(candidate) = engine_false_candidate_in(ctx, module, false, &opts) else {
+            if opts.skip.is_empty() && !opts.depth_first {
+                opts.depth_first = true;
+                continue;
+            }
+            eprintln!("saf verify: no engine memcleanup counterexample -> unknown");
+            return late_cex_pass(ctx, || memcleanup_engine_counterexample(ctx)).flatten();
+        };
+        let mut driver = synthesize_input_defs(&candidate);
+        driver.push_str(&rand_wrapper(&candidate));
+        driver.push_str(&synthesize_memcleanup_tracker());
+        match memcleanup_run(ctx, &driver, &[Vec::new()], true) {
+            Ok(Some(live)) => {
+                eprintln!(
+                    "saf verify: engine memcleanup counterexample terminated with {live} block(s) still allocated -> false(valid-memcleanup)"
+                );
+                return Some(VerdictOutcome {
+                    verdict: "false(valid-memcleanup)".to_string(),
+                    witness: None,
+                    graphml: None,
+                    correctness: None,
+                });
+            }
+            Ok(None) => eprintln!(
+                "saf verify: engine memcleanup counterexample did not replay (attempt {})",
+                attempt + 1
+            ),
+            Err(e) => {
+                eprintln!("saf verify: memcleanup counterexample replay errored: {e:#} -> unknown");
+                return None;
+            }
+        }
+        opts.skip.insert(candidate.reach_error_inst);
+    }
+    None
 }
 
 /// Functions the memcleanup replay wraps (`-Wl,--wrap=<name>`): the allocators it
-/// tracks, and `abort`, a termination it checks.
-const MEMCLEANUP_WRAPPED: &[&str] = &["malloc", "calloc", "realloc", "free", "abort"];
+/// tracks, and `abort` and `_Exit`, terminations it checks (an `_Exit` runs no
+/// `atexit` handler, so the program's own cleanup handlers are skipped).
+const MEMCLEANUP_WRAPPED: &[&str] = &["malloc", "calloc", "realloc", "free", "abort", "_Exit"];
 
 /// The scope of [`memcleanup_confirm`]: no reachable thread spawn, no allocator
 /// defined by the program, no destructor and no `on_exit` handler.
@@ -6374,7 +6545,7 @@ fn memcleanup_in_scope(module: &saf_core::air::AirModule) -> bool {
 /// sweep and then split inputs (the first `n` nondet calls 1, the rest 0).
 /// `Ok(Some(n))` when a run TERMINATED with `n > 0` of those blocks still allocated. The
 /// terminations checked: return from `main` and `exit` (the check is the last
-/// `atexit` handler), the program's own `abort()` calls, and `__assert_fail`
+/// `atexit` handler), the program's own `abort()` and `_Exit()` calls, and `__assert_fail`
 /// (what a task's `reach_error` calls). An abort is a termination for this
 /// property: the 2027 tasks label a program whose only unfreed block is left
 /// behind by `reach_error(); abort();` FALSE (`list-ext-properties/simple-ext-memcleanup`).
@@ -6388,19 +6559,50 @@ fn memcleanup_in_scope(module: &saf_core::air::AirModule) -> bool {
 /// wrap would not see its internal calls), and a destructor or a call of
 /// `on_exit` (its handler could run after the check).
 fn memcleanup_confirm(ctx: &VerifyCtx) -> anyhow::Result<Option<u64>> {
-    use anyhow::Context;
-    use std::process::{Command, Stdio};
-
     if !memcleanup_in_scope(ctx.module) {
         return Ok(None);
     }
+    let mut driver = synthesize_asan_driver();
+    driver.push_str(&synthesize_memcleanup_tracker());
+    // Inputs: the constant sweep, then split runs where the first `n` nondet
+    // calls (bools included, `SAF_BOOL_SPLIT`) return 1 and every later one 0, so a
+    // `while (nondet()) insert(...)` loop builds `n` elements and ends; a constant
+    // either skips it or never leaves it.
+    let mut inputs: Vec<Vec<(&str, String)>> = replay_candidates(NONDET_CONSTS, ctx.module)
+        .into_iter()
+        .map(|k| vec![("SAF_NONDET_CONST", k.to_string())])
+        .collect();
+    for n in [1, 2, 3, 5, 8] {
+        inputs.push(vec![
+            ("SAF_SPLIT_IDX", n.to_string()),
+            ("SAF_BASE_VAL", "1".to_string()),
+            ("SAF_TARGET_VAL", "0".to_string()),
+            ("SAF_BOOL_SPLIT", "1".to_string()),
+        ]);
+    }
+    memcleanup_run(ctx, &driver, &inputs, false)
+}
+
+/// Build the memcleanup replay harness from `driver` (input definitions plus
+/// [`synthesize_memcleanup_tracker`]) and run it on each environment of
+/// `inputs` in turn: `Ok(Some(n))` for the first run that TERMINATED with
+/// `n > 0` blocks still allocated (see [`memcleanup_confirm`] for the
+/// terminations checked and why a hit is never a wrong FALSE). `pinned`: the
+/// driver holds [`synthesize_input_defs`]' pinned reads, whose library
+/// wrappers need [`replay_wrap_flags`].
+fn memcleanup_run(
+    ctx: &VerifyCtx,
+    driver: &str,
+    inputs: &[Vec<(&str, String)>],
+    pinned: bool,
+) -> anyhow::Result<Option<u64>> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
 
     let dir = ctx.tempdir;
     let driver_src = dir.join("saf_mc_driver.c");
     let harness = dir.join("saf_mc_harness");
     let sentinel = dir.join("saf_mc.sentinel");
-    let mut driver = synthesize_asan_driver();
-    driver.push_str(&synthesize_memcleanup_tracker());
     std::fs::write(&driver_src, driver).with_context(|| "writing memcleanup driver")?;
 
     let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
@@ -6417,6 +6619,11 @@ fn memcleanup_confirm(ctx: &VerifyCtx) -> anyhow::Result<Option<u64>> {
             "-Wl,--wrap=srand",
         ])
         .args(MEMCLEANUP_WRAPPED.iter().map(|n| format!("-Wl,--wrap={n}")))
+        .args(if pinned {
+            replay_wrap_flags()
+        } else {
+            Vec::new()
+        })
         .args(ctx.data_model.clang_flags())
         .arg("-include")
         .arg(ctx.stub);
@@ -6437,25 +6644,8 @@ fn memcleanup_confirm(ctx: &VerifyCtx) -> anyhow::Result<Option<u64>> {
     if !link_replay_harness(&build, &driver_src, dir, "memcleanup replay")? {
         return Ok(None);
     }
-
-    // Inputs: the constant sweep, then split runs where the first `n` nondet
-    // calls (bools included, `SAF_BOOL_SPLIT`) return 1 and every later one 0, so a
-    // `while (nondet()) insert(...)` loop builds `n` elements and ends; a constant
-    // either skips it or never leaves it.
-    let mut inputs: Vec<Vec<(&str, String)>> = replay_candidates(NONDET_CONSTS, ctx.module)
-        .into_iter()
-        .map(|k| vec![("SAF_NONDET_CONST", k.to_string())])
-        .collect();
-    for n in [1, 2, 3, 5, 8] {
-        inputs.push(vec![
-            ("SAF_SPLIT_IDX", n.to_string()),
-            ("SAF_BASE_VAL", "1".to_string()),
-            ("SAF_TARGET_VAL", "0".to_string()),
-            ("SAF_BOOL_SPLIT", "1".to_string()),
-        ]);
-    }
     let timeout = memsafety_replay_timeout();
-    for env in &inputs {
+    for env in inputs {
         let _ = std::fs::remove_file(&sentinel);
         let mut cmd = Command::new(&harness);
         cmd.stdin(Stdio::null())
@@ -6545,6 +6735,8 @@ fn synthesize_memcleanup_tracker() -> String {
      extern void __real_abort(void) __attribute__((noreturn));\n\
      static void __saf_mc_check(void);\n\
      __attribute__((noreturn)) void __wrap_abort(void) { __saf_mc_check(); __real_abort(); }\n\
+     extern void __real__Exit(int) __attribute__((noreturn));\n\
+     __attribute__((noreturn)) void __wrap__Exit(int c) { __saf_mc_check(); __real__Exit(c); }\n\
      __attribute__((noreturn)) void __assert_fail(const char *a, const char *b, unsigned int c, const char *d) { (void)a; (void)b; (void)c; (void)d; __wrap_abort(); }\n\
      static void __saf_mc_check(void) {\n\
      \x20 const char *s = getenv(\"SAF_MC_SENTINEL\"); if (!s || __saf_mc_bad) return;\n\
@@ -6919,19 +7111,33 @@ fn asan_confirm(
     // and register — untracked, a `valid-memtrack` violation. Only a leak whose
     // allocation stack reaches the task's own source counts; a run that ends in
     // `abort` never reports (LeakSanitizer runs at exit only).
-    if harness.exists() {
+    //
+    // The run uses its own build ([`lsan_scrub_harness`]) when it links: `main`
+    // is wrapped and, once it has returned, the dead stack below its frame is
+    // zeroed before the exit-time leak check. LeakSanitizer scans the stack
+    // conservatively, so a stale copy of a lost pointer in a returned callee's
+    // frame (`data` in Juliet's CWE401 `bad()`) hid the leak, depending on the
+    // stack layout. Zeroing frames that have returned removes only values no
+    // live variable holds (`main`'s locals are dead once it returns, as for the
+    // engine's end-of-`main` leak check), so it never invents a leak.
+    let lsan_harness = lsan_scrub_harness(input, data_model, stub, dir, clang)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| harness.clone());
+    if lsan_harness.exists() {
         let task_file = input
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let errfile =
             std::fs::File::create(&errpath).with_context(|| "creating LSan stderr file")?;
-        let mut cmd = Command::new(&harness);
+        let mut cmd = Command::new(&lsan_harness);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(errfile))
             .env("ASAN_OPTIONS", ASAN_OPTS_LEAKS)
-            .env("SAF_NONDET_CONST", "0");
+            .env("SAF_NONDET_CONST", "0")
+            .env("SAF_SCRUB_STACK", "1");
         let mut child = harden_replay_spawn(&mut cmd)
             .spawn()
             .with_context(|| "spawning LSan harness")?;
@@ -6955,6 +7161,68 @@ fn asan_confirm(
         }
     }
     Ok(None)
+}
+
+/// The leak pass's harness: the `ASan` replay build of [`asan_confirm`] (driver
+/// [`synthesize_asan_driver`], `rand`/`srand` wrapped) with `main` wrapped too,
+/// so that with `$SAF_SCRUB_STACK` set the 64 KiB of stack below `main`'s frame
+/// are zeroed after `main` returns, before the `atexit`-time leak check. `None`
+/// when it does not link (the caller then uses the plain harness).
+fn lsan_scrub_harness(
+    input: &Path,
+    data_model: saf_svcomp::DataModel,
+    stub: &Path,
+    dir: &Path,
+    clang: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+    let driver_src = dir.join("saf_lsan_driver.c");
+    let harness = dir.join("saf_lsan_harness");
+    let mut driver = synthesize_asan_driver();
+    driver.push_str(
+        "#include <string.h>\n\
+         extern int __real_main(int, char **, char **);\n\
+         __attribute__((noinline)) static void __saf_scrub(void) { volatile char b[1 << 16]; memset((char *)b, 0, sizeof b); }\n\
+         int __wrap_main(int c, char **v, char **e) { int r = __real_main(c, v, e); if (getenv(\"SAF_SCRUB_STACK\")) __saf_scrub(); return r; }\n",
+    );
+    std::fs::write(&driver_src, driver).with_context(|| "writing LSan driver")?;
+    let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
+    let build = |neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(clang);
+        cmd.args([
+            "-O0",
+            "-g",
+            "-fsanitize=address",
+            "-fno-sanitize-recover=address",
+            "-Wno-everything",
+            "-Wl,--wrap=rand",
+            "-Wl,--wrap=srand",
+            "-Wl,--wrap=main",
+        ])
+        .args(data_model.clang_flags())
+        .arg("-include")
+        .arg(stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include").arg(n);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(input)
+            .arg(&driver_src)
+            .arg("-lm")
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    let mut linked = build(None).status()?.success();
+    if !linked {
+        let neutralizer = write_assert_neutralizer(dir)?;
+        linked = build(Some(&neutralizer)).status()?.success();
+    }
+    Ok(linked.then_some(harness))
 }
 
 /// Byte-stream depth-guided greybox `ASan` mini-fuzz (memsafety pass 3, lever
@@ -8398,6 +8666,7 @@ fn nontermination_driver(lasso: &saf_svcomp::Lasso) -> String {
     }
     let none = saf_svcomp::FalseCandidate {
         reach_error_inst: saf_core::ids::InstId::new(0),
+        alloc_fails: Vec::new(),
         block_path: Vec::new(),
         assignments: std::collections::BTreeMap::new(),
         nondet_sequence: Vec::new(),
@@ -10901,6 +11170,7 @@ mod verify_tests {
         let sentinel = std::path::Path::new("/tmp/saf_det.sentinel");
         let candidate = saf_svcomp::FalseCandidate {
             reach_error_inst: saf_core::ids::InstId::new(1),
+            alloc_fails: Vec::new(),
             block_path: Vec::new(),
             assignments: std::collections::BTreeMap::new(),
             nondet_sequence: Vec::new(),
@@ -10953,6 +11223,7 @@ mod verify_tests {
         // pointer must be the same lazy-init object the fuzz shim produced (R6).
         let candidate = saf_svcomp::FalseCandidate {
             reach_error_inst: InstId(make_id("inst", b"err")),
+            alloc_fails: Vec::new(),
             block_path: Vec::new(),
             assignments: BTreeMap::new(),
             nondet_sequence: vec![saf_svcomp::NondetCall {
@@ -10991,6 +11262,7 @@ mod verify_tests {
         // unchanged — the object branch is reachable only for fuzz-recorded selectors.
         let candidate = saf_svcomp::FalseCandidate {
             reach_error_inst: InstId(make_id("inst", b"err")),
+            alloc_fails: Vec::new(),
             block_path: Vec::new(),
             assignments: BTreeMap::new(),
             nondet_sequence: Vec::new(),
@@ -11063,6 +11335,28 @@ mod verify_tests {
         module.functions.push(main);
         module.constants = constants;
         module
+    }
+
+    #[test]
+    fn alloc_fail_wrapper_fails_only_the_listed_calls() {
+        assert!(alloc_fail_wrapper(&[]).is_empty());
+        assert!(alloc_fail_wrap_flags(&[]).is_empty());
+        let w = alloc_fail_wrapper(&[0, 3]);
+        assert!(
+            w.contains("static const unsigned __saf_af[] = {0u, 3u};"),
+            "{w}"
+        );
+        for f in FAILABLE_ALLOCATORS {
+            assert!(w.contains(&format!("__wrap_{f}(")), "{w}");
+        }
+        assert_eq!(
+            alloc_fail_wrap_flags(&[1]),
+            vec![
+                "-Wl,--wrap=malloc".to_string(),
+                "-Wl,--wrap=calloc".to_string(),
+                "-Wl,--wrap=realloc".to_string()
+            ]
+        );
     }
 
     #[test]

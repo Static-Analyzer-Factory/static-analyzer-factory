@@ -147,6 +147,7 @@ pub fn enumerate_bmc_candidates(
                 let nondet_sequence = resolve_nondet_sequence(module, func_id, path, &assignments);
                 candidates.push(FalseCandidate {
                     reach_error_inst: error_inst,
+                    alloc_fails: Vec::new(),
                     block_path: path.clone(),
                     assignments,
                     nondet_sequence,
@@ -236,6 +237,7 @@ fn enumerate_assert_wrapper_candidates(
                     resolve_nondet_sequence(module, site.caller, path, &assignments);
                 out.push(FalseCandidate {
                     reach_error_inst: site.reach_error_inst,
+                    alloc_fails: Vec::new(),
                     block_path: path.clone(),
                     assignments,
                     nondet_sequence,

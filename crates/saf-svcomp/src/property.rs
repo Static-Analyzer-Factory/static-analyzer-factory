@@ -2018,6 +2018,10 @@ pub struct FalseCandidate {
     /// (model value, or `0` when unconstrained). The harness groups these per
     /// function name into the pinned input arrays.
     pub nondet_sequence: Vec<NondetCall>,
+    /// The `malloc` / `calloc` / `realloc` calls (0-based, in execution order
+    /// over all of them) that return NULL on this path — SV-COMP 2027 lets an
+    /// allocation fail. The replay harness fails exactly these calls.
+    pub alloc_fails: Vec<u32>,
 }
 
 /// Scalar-*integer* `__VERIFIER_nondet_*` names whose result the replay harness
@@ -2080,6 +2084,7 @@ pub fn enumerate_false_candidates(
             let nondet_sequence = resolve_nondet_sequence(module, func_id, &path, &result.model);
             candidates.push(FalseCandidate {
                 reach_error_inst: inst_id,
+                alloc_fails: Vec::new(),
                 block_path: path,
                 assignments: result.model,
                 nondet_sequence,
@@ -2317,6 +2322,7 @@ pub fn enumerate_false_candidates_interproc(
             let nondet_sequence = resolve_nondet_sequence_interproc(module, &block_seq, &model);
             candidates.push(FalseCandidate {
                 reach_error_inst: err_inst,
+                alloc_fails: Vec::new(),
                 block_path: err_path.clone(),
                 assignments: model,
                 nondet_sequence,

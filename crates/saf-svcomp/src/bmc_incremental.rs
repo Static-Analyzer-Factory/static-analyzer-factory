@@ -506,6 +506,7 @@ fn run_incremental(
                         }
                         return Some(FalseCandidate {
                             reach_error_inst: error_inst,
+                            alloc_fails: Vec::new(),
                             block_path: build_trace(info, k, exit_path),
                             assignments: BTreeMap::new(),
                             nondet_sequence: seq,
