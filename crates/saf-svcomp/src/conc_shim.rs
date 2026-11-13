@@ -72,7 +72,7 @@ use std::fmt::Write as _;
 use saf_analysis::callgraph::CallGraph;
 use saf_core::air::{AirModule, Operation};
 
-use crate::conc_seq::conc_schedulable;
+use crate::conc_seq::{conc_schedulable, conc_schedulable_allowing_nondet};
 
 /// Highest global yield-point index the confirmer forces a preemption at. Sized so the small
 /// mutex-guarded sv-benchmarks bugs (whose winning schedules preempt within the first handful
@@ -185,6 +185,42 @@ pub fn conc_shim_schedulable(module: &AirModule, callgraph: &CallGraph) -> bool 
     conc_schedulable(module, callgraph) && !uses_verifier_atomic(module) && !uses_mutex_attr(module)
 }
 
+/// Is `module` amenable to the nondet-aware variant of the shim confirmer
+/// ([`synthesize_conc_shim_driver_nondet`]) but NOT to the plain one?
+///
+/// Exactly [`conc_shim_schedulable`] with one relaxation: calls to the scalar integer
+/// `__VERIFIER_nondet_*` functions ([`crate::conc_seq::REPLAY_NONDET_FNS`]) are admitted,
+/// because the nondet driver defines each to return a value of its own C type (a legal
+/// nondet result, so every run stays a real execution). Programs the plain shim already
+/// takes are excluded, so a task runs at most one of the two searches.
+#[must_use]
+pub fn conc_shim_nondet_schedulable(module: &AirModule, callgraph: &CallGraph) -> bool {
+    !conc_shim_schedulable(module, callgraph)
+        && conc_schedulable_allowing_nondet(module, callgraph)
+        && !uses_verifier_atomic(module)
+        && !uses_mutex_attr(module)
+}
+
+/// The nondet-aware shim driver: [`synthesize_conc_shim_driver`] plus the shared nondet
+/// runtime (weak typed `__VERIFIER_nondet_*` definitions seeded by `SAF_REPLAY_NDSEED`).
+/// `SAF_REPLAY_SENTINEL`, when set, overrides the sentinel path so several runs can go in
+/// parallel, each with a file of its own.
+#[must_use]
+pub fn synthesize_conc_shim_driver_nondet(sentinel_c_literal: &str) -> String {
+    let base = synthesize_conc_shim_driver(sentinel_c_literal);
+    let plain_open = "FILE* f=fopen(__SAF_SENTINEL,\"w\");";
+    debug_assert!(
+        base.contains(plain_open),
+        "shim driver sentinel write changed"
+    );
+    let mut s = base.replace(
+        plain_open,
+        "const char* __p=getenv(\"SAF_REPLAY_SENTINEL\"); FILE* f=fopen(__p ? __p : __SAF_SENTINEL,\"w\");",
+    );
+    s.push_str(&crate::conc_replay::nondet_runtime_c("NS "));
+    s
+}
+
 /// Generate the C source of the systematic bounded-preemption replay driver.
 ///
 /// Linked with the ORIGINAL program via `-Wl,--wrap=pthread_create,--wrap=pthread_join,
@@ -223,6 +259,7 @@ pub fn synthesize_conc_shim_driver(sentinel_c_literal: &str) -> String {
     s.push_str("#include <stdlib.h>\n");
     s.push_str("#include <stdint.h>\n");
     s.push_str("#include <pthread.h>\n");
+    s.push_str("#include <sys/prctl.h>\n");
     s.push_str("extern void _exit(int) __attribute__((noreturn));\n");
     // Every driver function is exempt from coverage instrumentation, so the shared-access
     // load/store callbacks never fire on the scheduler's own memory (no reentrancy).
@@ -262,6 +299,7 @@ pub fn synthesize_conc_shim_driver(sentinel_c_literal: &str) -> String {
 
     s.push_str(
         "NS __attribute__((constructor)) static void __saf_init(void){\n\
+         \x20 prctl(PR_SET_DUMPABLE, 0, 0, 0, 0); /* no core-dump helper on abort/trap */\n\
          \x20 const char* a=getenv(\"SAF_SHIM_P1\"); __saf_p1 = a?strtol(a,0,10):-1;\n\
          \x20 const char* b=getenv(\"SAF_SHIM_P2\"); __saf_p2 = b?strtol(b,0,10):-1;\n\
          \x20 __saf_state[0]=ST_RUN; __saf_cur=0; __saf_nthreads=1; __saf_tid=0;\n\
@@ -423,10 +461,36 @@ pub fn synthesize_conc_shim_driver(sentinel_c_literal: &str) -> String {
         "NS void __VERIFIER_atomic_begin(void){ __saf_yield(); __saf_in_atomic[__saf_tid]++; }\n",
     );
     s.push_str("NS void __VERIFIER_atomic_end(void){ int me=__saf_tid; if(__saf_in_atomic[me]>0) __saf_in_atomic[me]--; }\n");
-    // R1: the sentinel drops ONLY on the property's violation event.
+    // R1: the sentinel drops ONLY on the property's violation event. Built with
+    // `-DSAF_SHIM_OVF` (the no-overflow confirmer) that event is a signed overflow instead:
+    // the harness is compiled with non-trapping, non-recovering
+    // `-fsanitize=signed-integer-overflow` WITHOUT the UBSan runtime, so the driver supplies
+    // the `__ubsan_handle_*` entry points, writing the operation's `line:column` (from the
+    // handler's leading `SourceLocation`) to the sentinel; `reach_error` then only ends the run.
+    s.push_str("#ifdef SAF_SHIM_OVF\n");
+    s.push_str("NS __attribute__((noreturn)) static void __saf_hit(void){ _exit(0); }\n");
+    s.push_str("struct __saf_srcloc { const char* file; unsigned line; unsigned col; };\n");
+    s.push_str(
+        "NS __attribute__((noreturn)) static void __saf_ovf(void* d){ const struct __saf_srcloc* l=(const struct __saf_srcloc*)d; FILE* f=fopen(__SAF_SENTINEL,\"w\"); if(f){fprintf(f,\"%u:%u:%s\\n\",l->line,l->col,l->file?l->file:\"\");fclose(f);} _exit(0); }\n",
+    );
+    for op in ["add", "sub", "mul"] {
+        let _ = writeln!(
+            s,
+            "NS void __ubsan_handle_{op}_overflow_abort(void* d,void* a,void* b){{(void)a;(void)b;__saf_ovf(d);}}\n\
+             NS void __ubsan_handle_{op}_overflow(void* d,void* a,void* b){{(void)a;(void)b;__saf_ovf(d);}}"
+        );
+    }
+    s.push_str(
+        "NS void __ubsan_handle_negate_overflow_abort(void* d,void* a){(void)a;__saf_ovf(d);}\n\
+         NS void __ubsan_handle_negate_overflow(void* d,void* a){(void)a;__saf_ovf(d);}\n\
+         NS void __ubsan_handle_divrem_overflow_abort(void* d,void* a,void* b){(void)a;(void)b;__saf_ovf(d);}\n\
+         NS void __ubsan_handle_divrem_overflow(void* d,void* a,void* b){(void)a;(void)b;__saf_ovf(d);}\n",
+    );
+    s.push_str("#else\n");
     s.push_str(
         "NS __attribute__((noreturn)) static void __saf_hit(void){ FILE* f=fopen(__SAF_SENTINEL,\"w\"); if(f){fputc('1',f);fclose(f);} _exit(0); }\n",
     );
+    s.push_str("#endif\n");
     s.push_str("NS __attribute__((weak)) void reach_error(void){ __saf_hit(); }\n");
     s.push_str("NS __attribute__((weak)) void __VERIFIER_error(void){ __saf_hit(); }\n");
     s.push_str(
@@ -548,6 +612,76 @@ mod tests {
         }
         let cg = CallGraph::build(&m);
         assert!(!conc_shim_schedulable(&m, &cg));
+        // ...but the nondet-aware variant takes it (a scalar integer nondet).
+        assert!(conc_shim_nondet_schedulable(&m, &cg));
+    }
+
+    /// The nondet-aware shim gate: scalar integer nondets yes; pointer / float nondets,
+    /// `__VERIFIER_atomic`, and programs the plain shim already takes, no.
+    #[test]
+    fn nondet_shim_gate_is_disjoint_and_scalar_only() {
+        let gate = |names: &[&str]| {
+            let create = decl(1, "pthread_create");
+            let mut m = AirModule::new(ModuleId::new(1));
+            let mut ids = vec![create.id];
+            m.functions.push(create);
+            for (i, n) in names.iter().enumerate() {
+                let d = decl(10 + i as u128, n);
+                ids.push(d.id);
+                m.functions.push(d);
+            }
+            m.functions.push(func(99, "main", &ids));
+            let cg = CallGraph::build(&m);
+            conc_shim_nondet_schedulable(&m, &cg)
+        };
+        assert!(gate(&["__VERIFIER_nondet_uint", "pthread_mutex_lock"]));
+        assert!(!gate(&["pthread_mutex_lock"]));
+        assert!(!gate(&["__VERIFIER_nondet_pointer"]));
+        assert!(!gate(&["__VERIFIER_nondet_float"]));
+        assert!(!gate(&["__VERIFIER_nondet_int", "__VERIFIER_atomic_begin"]));
+    }
+
+    /// The nondet shim driver defines the typed nondets (exempt from coverage), reads the
+    /// sentinel override, and both shim drivers disable core dumps.
+    #[test]
+    fn nondet_shim_driver_defines_nondets_and_sentinel_override() {
+        let d = synthesize_conc_shim_driver_nondet("/tmp/sent");
+        assert!(d.contains("NS __attribute__((weak)) int __VERIFIER_nondet_int(void)"));
+        assert!(d.contains("getenv(\"SAF_REPLAY_SENTINEL\")"));
+        assert!(d.contains("getenv(\"SAF_REPLAY_NDSEED\")"));
+        assert!(d.contains("prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);"));
+        let plain = synthesize_conc_shim_driver("/tmp/sent");
+        assert!(!plain.contains("__VERIFIER_nondet"));
+        assert!(plain.contains("prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);"));
+    }
+
+    /// The overflow mode is compiled in only under `SAF_SHIM_OVF`: it defines every UBSan
+    /// signed-overflow entry point (abort and recover forms) and its `reach_error` hit no
+    /// longer drops the sentinel. In the nondet driver its sentinel write honours the
+    /// per-run `SAF_REPLAY_SENTINEL` override too.
+    #[test]
+    fn shim_driver_overflow_mode_defines_ubsan_handlers() {
+        let d = synthesize_conc_shim_driver("/tmp/sent");
+        let ovf = d
+            .split("#ifdef SAF_SHIM_OVF\n")
+            .nth(1)
+            .and_then(|r| r.split("#else\n").next())
+            .expect("overflow section");
+        for h in [
+            "add_overflow",
+            "sub_overflow",
+            "mul_overflow",
+            "negate_overflow",
+            "divrem_overflow",
+        ] {
+            assert!(ovf.contains(&format!("__ubsan_handle_{h}_abort(")), "{h}");
+            assert!(ovf.contains(&format!("__ubsan_handle_{h}(")), "{h}");
+        }
+        assert!(ovf.contains("static void __saf_hit(void){ _exit(0); }"));
+        assert!(ovf.contains("l->line,l->col,l->file"));
+        let nd = synthesize_conc_shim_driver_nondet("/tmp/sent");
+        let nd_ovf = nd.split("#ifdef SAF_SHIM_OVF\n").nth(1).expect("section");
+        assert!(nd_ovf.contains("getenv(\"SAF_REPLAY_SENTINEL\")"));
     }
 
     /// No reachable spawn ⇒ not our job (inherited from `conc_schedulable`).

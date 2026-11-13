@@ -469,6 +469,41 @@ fn branching_for_path_step(
     ))
 }
 
+/// The `branching` waypoints of every source decision along an execution's
+/// block path (blocks of all functions, in the order entered), each with the
+/// index in `path` of the block the decision led to — the time it was taken —
+/// sorted by that index. A decision's successor is the next block entered in
+/// the same function (a call in between enters the callee's blocks first).
+/// Decisions [`branching_for_path_step`] cannot recover are left out.
+#[must_use]
+pub fn lower_path_decisions(
+    module: &AirModule,
+    path: &[(saf_core::ids::FunctionId, BlockId)],
+) -> Vec<(usize, SourceWaypoint)> {
+    // Successor blocks scanned per decision: enough for any `&&`/`||` chain.
+    const LOOKAHEAD: usize = 32;
+    let mut out = Vec::new();
+    for (i, (func, _)) in path.iter().enumerate() {
+        let local: Vec<(usize, BlockId)> = path
+            .iter()
+            .enumerate()
+            .skip(i)
+            .filter(|(_, (f, _))| f == func)
+            .take(LOOKAHEAD)
+            .map(|(k, (_, b))| (k, *b))
+            .collect();
+        let Some(&(entered, _)) = local.get(1) else {
+            continue;
+        };
+        let blocks: Vec<BlockId> = local.iter().map(|(_, b)| *b).collect();
+        if let Some(wp) = branching_for_path_step(module, &blocks, 0) {
+            out.push((entered, wp));
+        }
+    }
+    out.sort_by_key(|(k, _)| *k);
+    out
+}
+
 /// Lower a `must_reach_error` block chain to a target-only waypoint list.
 ///
 /// The `reach_error` call lives in the LAST block of the chain. Returns `None`

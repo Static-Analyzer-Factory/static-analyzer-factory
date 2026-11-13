@@ -49,15 +49,16 @@ pub mod witness_yaml;
 pub use bmc::enumerate_bmc_candidates;
 pub use conc_overflow::{ConcOverflowProof, prove_no_overflow_concurrent};
 pub use conc_replay::{
-    ReplayPlan, conc_replay_schedulable, replay_plans, synthesize_conc_replay_driver,
+    ReplayPlan, conc_replay_nondet_schedulable, conc_replay_schedulable, replay_plans,
+    synthesize_conc_replay_driver, synthesize_conc_replay_driver_nondet,
 };
 pub use conc_seq::{
     CONC_SCHEDULES, ConcSchedule, ConcWitnessSites, conc_graphml_witness,
     conc_graphml_witness_labeled, conc_schedulable, synthesize_conc_driver,
 };
 pub use conc_shim::{
-    SHIM_CBOUND, SHIM_MAX_STEP, ShimPlan, conc_shim_schedulable, shim_preemption_plans,
-    synthesize_conc_shim_driver,
+    SHIM_CBOUND, SHIM_MAX_STEP, ShimPlan, conc_shim_nondet_schedulable, conc_shim_schedulable,
+    shim_preemption_plans, synthesize_conc_shim_driver, synthesize_conc_shim_driver_nondet,
 };
 pub use correctness_driver::{
     build_correctness_witness, build_interval_invariant_witness, source_has_openmp,
@@ -100,11 +101,12 @@ pub use termination_witness::{
 pub use unreach_prove::{
     CexOptions, Counterexample, ExhaustiveProof, HeaderStates, KEEP_ALIVE, LIFETIME_END,
     LIFETIME_START, Lasso, PINNED_EXTERNS, STACK_RESTORE, STACK_SAVE, StateVar,
-    find_counterexample, find_counterexample_excluding, find_nontermination, is_pinned_extern,
-    module_has_failable_allocation, prove_memcleanup_exhaustive, prove_memsafety_exhaustive,
-    prove_no_overflow_exhaustive, prove_no_overflow_exhaustive_shl,
-    prove_no_overflow_exhaustive_with_states, prove_no_overflow_exhaustive_with_states_shl,
-    prove_termination_exhaustive, prove_unreach_exhaustive, prove_unreach_exhaustive_with_states,
+    find_counterexample, find_counterexample_excluding, find_counterexample_via_model,
+    find_nontermination, is_pinned_extern, module_has_failable_allocation,
+    prove_memcleanup_exhaustive, prove_memsafety_exhaustive, prove_no_overflow_exhaustive,
+    prove_no_overflow_exhaustive_shl, prove_no_overflow_exhaustive_with_states,
+    prove_no_overflow_exhaustive_with_states_shl, prove_termination_exhaustive,
+    prove_unreach_exhaustive, prove_unreach_exhaustive_with_states,
 };
 pub use witness_lower::{
     call_close_paren_column, find_inst_span, full_expression_column, lower_candidate,

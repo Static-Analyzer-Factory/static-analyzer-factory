@@ -530,6 +530,40 @@ mod tests {
         assert_eq!(one, scalar);
     }
 
+    fn lasso_on(path: &[u128], start: usize) -> Lasso {
+        use saf_core::ids::{BlockId, FunctionId};
+        let f = FunctionId::new(1);
+        Lasso {
+            func: f,
+            block: BlockId::new(10),
+            state: Vec::new(),
+            path: path.iter().map(|b| (f, BlockId::new(*b))).collect(),
+            path_cycle_start: start,
+            nondets: Vec::new(),
+            cycle_start: 0,
+            latches: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn assumption_lasso_only_for_a_first_visit_one_round_cycle() {
+        // entry, head, body, head: recurs at the first visit after one round.
+        assert!(lasso_starts_at_first_visit_of_one_round(&lasso_on(
+            &[1, 10, 11, 10],
+            1
+        )));
+        // The recurring state is the head's second visit (`or-05`).
+        assert!(!lasso_starts_at_first_visit_of_one_round(&lasso_on(
+            &[1, 10, 11, 10, 11, 10],
+            3
+        )));
+        // Two rounds (`Swingers`).
+        assert!(!lasso_starts_at_first_visit_of_one_round(&lasso_on(
+            &[1, 10, 11, 10, 11, 10],
+            1
+        )));
+    }
+
     #[test]
     fn an_opaque_ranking_renders_nothing() {
         assert!(transition_invariant(&Ranked::Opaque, &names(&[(1, "i")])).is_none());
@@ -653,8 +687,59 @@ pub fn build_nontermination_witness(
             value: value.clone(),
         }),
     };
+    if !lasso_starts_at_first_visit_of_one_round(lasso) {
+        if let Some(w) = branching_lasso(module, meta, lasso) {
+            return Some(w);
+        }
+    }
     ViolationWitness::assemble_lasso(meta, &[at_head(Action::Follow)], &[at_head(Action::Cycle)])
         .ok()
+}
+
+/// Does the lasso's recurring state sit at the header's FIRST visit, with a
+/// cycle of one round? Then the loop-head assumption holds at every pass of
+/// the head, which is what validators check of an assumption lasso. Otherwise
+/// (`or-05`: the first pass has `y == 0`; `Swingers`: two alternating states)
+/// they reject it, and the witness lists the branches taken instead.
+fn lasso_starts_at_first_visit_of_one_round(lasso: &Lasso) -> bool {
+    let head = (lasso.func, lasso.block);
+    let first = lasso.path.iter().position(|p| *p == head);
+    let rounds = lasso
+        .path
+        .get(lasso.path_cycle_start + 1..)
+        .map_or(0, |c| c.iter().filter(|p| **p == head).count());
+    first == Some(lasso.path_cycle_start) && rounds == 1
+}
+
+/// Most waypoints of a branching non-termination witness (a longer stem falls
+/// back to the loop-head assumption).
+const MAX_LASSO_BRANCHINGS: usize = 4_000;
+
+/// The branching form of a non-termination witness (what CPAchecker emits and
+/// validates): one `branching` waypoint per decision of the stem (`follow`),
+/// then one per decision of one round of the cycle (`cycle`), in execution
+/// order. `None` when the cycle has no decision to list.
+fn branching_lasso(
+    module: &AirModule,
+    meta: &WitnessMeta,
+    lasso: &Lasso,
+) -> Option<ViolationWitness> {
+    let split = lasso.path_cycle_start;
+    let decisions = crate::witness_lower::lower_path_decisions(module, &lasso.path);
+    let mut stem = Vec::new();
+    let mut cycle = Vec::new();
+    for (entered, mut wp) in decisions {
+        if entered <= split {
+            stem.push(wp);
+        } else {
+            wp.action = Action::Cycle;
+            cycle.push(wp);
+        }
+    }
+    if cycle.is_empty() || stem.len() + cycle.len() > MAX_LASSO_BRANCHINGS {
+        return None;
+    }
+    ViolationWitness::assemble_lasso(meta, &stem, &cycle).ok()
 }
 
 /// A loop without a loop statement (`goto` loops of CIL-generated code): the

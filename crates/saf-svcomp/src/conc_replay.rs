@@ -84,6 +84,11 @@ pub enum ReplayPlan {
     RoundRobin,
     /// PCT-style randomized priority schedule with the given deterministic seed.
     Pct(u32),
+    /// At every scheduling point, a uniformly random runnable spawned thread (seeded);
+    /// `main` only when no spawned thread can run, or one time in 8, 32 or 128 (by seed), because a
+    /// `main` that checks before its threads finish usually fails its `assume`. Used by
+    /// the nondet-aware search only; [`replay_plans`] never yields it.
+    Uniform(u32),
 }
 
 /// Number of PCT seeds tried after the round-robin plan. Sized so the observed
@@ -112,6 +117,7 @@ impl ReplayPlan {
         match self {
             ReplayPlan::RoundRobin => "rr",
             ReplayPlan::Pct(_) => "pct",
+            ReplayPlan::Uniform(_) => "uni",
         }
     }
 
@@ -120,7 +126,7 @@ impl ReplayPlan {
     pub fn seed_env(self) -> u32 {
         match self {
             ReplayPlan::RoundRobin => 0,
-            ReplayPlan::Pct(s) => s,
+            ReplayPlan::Pct(s) | ReplayPlan::Uniform(s) => s,
         }
     }
 
@@ -130,6 +136,7 @@ impl ReplayPlan {
         match self {
             ReplayPlan::RoundRobin => "rr".to_string(),
             ReplayPlan::Pct(s) => format!("pct:{s}"),
+            ReplayPlan::Uniform(s) => format!("uni:{s}"),
         }
     }
 }
@@ -190,6 +197,115 @@ pub fn conc_replay_schedulable(module: &AirModule, callgraph: &CallGraph) -> boo
     conc_schedulable(module, callgraph) && uses_verifier_atomic(module) && !uses_mutex_lock(module)
 }
 
+/// Is `module` in scope for the NONDET-aware replay (and NOT already for the plain one)?
+///
+/// Same model as [`conc_replay_schedulable`], but the program may also call the
+/// scalar integer nondet functions in [`crate::conc_seq::REPLAY_NONDET_FNS`]; the driver
+/// from [`synthesize_conc_replay_driver_nondet`] supplies their values. Every value is
+/// a value of the function's own C type, so a replay that reaches the sentinel is a
+/// real execution of the program on legal inputs under a serialized SC schedule.
+#[must_use]
+pub fn conc_replay_nondet_schedulable(module: &AirModule, callgraph: &CallGraph) -> bool {
+    !conc_replay_schedulable(module, callgraph)
+        && crate::conc_seq::conc_schedulable_allowing_nondet(module, callgraph)
+        && uses_verifier_atomic(module)
+        && !uses_mutex_lock(module)
+}
+
+/// [`synthesize_conc_replay_driver`] plus WEAK definitions of every function in
+/// [`crate::conc_seq::REPLAY_NONDET_FNS`] (a program that defines its own keeps it).
+/// Values come from a generator of their own, seeded by `SAF_REPLAY_NDSEED` and
+/// separate from the schedule's, so one `(policy, seed, ndseed)` triple names one
+/// deterministic run (re-confirmation, R6). Execution is serialized by the token, so
+/// the generator is only ever advanced by the one running thread. Half the integer
+/// draws are small values (-4..=4, cast to the type), half are full-width random bits;
+/// a `_Bool` is true with a per-run probability picked by the seed (0.5, 0.2, 0.8, 0.05,
+/// 0.95). The `return (T)v;` cast keeps every value inside the type's range.
+///
+/// `SAF_REPLAY_SENTINEL`, when set, overrides the sentinel path, so several runs can go
+/// in parallel, each with a file of its own.
+#[must_use]
+pub fn synthesize_conc_replay_driver_nondet(sentinel_c_literal: &str) -> String {
+    let base = synthesize_conc_replay_driver(sentinel_c_literal);
+    let plain_open = "FILE* f=fopen(__SAF_SENTINEL,\"w\");";
+    debug_assert!(
+        base.contains(plain_open),
+        "replay driver sentinel write changed"
+    );
+    let mut s = base.replace(
+        plain_open,
+        "const char* __p=getenv(\"SAF_REPLAY_SENTINEL\"); FILE* f=fopen(__p ? __p : __SAF_SENTINEL,\"w\");",
+    );
+    // The schedule generator's state must be 64-bit on ILP32 too: as `unsigned long` it
+    // is 32 bits there, `>> 33` is undefined (x86 masks it to `>> 1`), and the low bits
+    // cycle with period 16, so "random" schedules repeat. (Left as-is in the plain
+    // driver, whose found schedules are tuned to it.)
+    let narrow_state = "static unsigned long __saf_rng_state = 0;";
+    debug_assert!(s.contains(narrow_state), "replay driver rng state changed");
+    s = s.replace(
+        narrow_state,
+        "static unsigned long long __saf_rng_state = 0;",
+    );
+    s.push_str(&nondet_runtime_c(""));
+    s
+}
+
+/// C source of the nondet-input runtime shared by the nondet-aware replay drivers: a
+/// splitmix-style generator seeded from `SAF_REPLAY_NDSEED` and weak definitions of the
+/// scalar integer `__VERIFIER_nondet_*` functions ([`crate::conc_seq::REPLAY_NONDET_FNS`]).
+/// Each returns a value of the function's own C type, half the time small (`-4..=4`), half
+/// the time uniformly random; `_Bool` uses a seed-chosen bias (`k % 5`). Any value of the
+/// type is a legal nondet return, so a run under these inputs is a real execution.
+/// `attr` prefixes every function definition (the shim driver passes its no-coverage
+/// attribute, so the load/store callbacks never fire inside the generator).
+#[must_use]
+pub(crate) fn nondet_runtime_c(attr: &str) -> String {
+    let mut s = String::new();
+    s.push_str("static unsigned long long __saf_nd_state = 0;\n");
+    s.push_str("static unsigned __saf_nd_true_permille = 500;\n");
+    let _ = write!(
+        s,
+        "{attr}__attribute__((constructor)) static void __saf_nd_init(void){{\n\
+         \x20 const char* s = getenv(\"SAF_REPLAY_NDSEED\");\n\
+         \x20 unsigned long long k = s ? strtoull(s,0,10) : 0;\n\
+         \x20 static const unsigned bias[5] = {{500, 200, 800, 50, 950}};\n\
+         \x20 __saf_nd_true_permille = bias[k % 5];\n\
+         \x20 __saf_nd_state = k * 0x9E3779B97F4A7C15ULL + 0x632BE59BD9B4E019ULL;\n\
+         }}\n"
+    );
+    let _ = write!(
+        s,
+        "{attr}static unsigned long long __saf_nd(void){{\n\
+         \x20 __saf_nd_state = __saf_nd_state*6364136223846793005ULL + 1442695040888963407ULL;\n\
+         \x20 unsigned long long z = __saf_nd_state;\n\
+         \x20 z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL; z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;\n\
+         \x20 return z ^ (z >> 31);\n\
+         }}\n"
+    );
+    let _ = write!(
+        s,
+        "{attr}static long long __saf_ndv(void){{\n\
+         \x20 unsigned long long r = __saf_nd();\n\
+         \x20 if (r & 1ULL) return (long long)((r >> 8) % 9ULL) - 4;\n\
+         \x20 return (long long)__saf_nd();\n\
+         }}\n"
+    );
+    for (name, ty) in crate::conc_seq::REPLAY_NONDET_FNS {
+        if *ty == "_Bool" {
+            let _ = writeln!(
+                s,
+                "{attr}__attribute__((weak)) _Bool {name}(void){{ return (_Bool)((__saf_nd() % 1000ULL) < __saf_nd_true_permille); }}"
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "{attr}__attribute__((weak)) {ty} {name}(void){{ return ({ty})__saf_ndv(); }}"
+            );
+        }
+    }
+    s
+}
+
 /// Generate the C source of the cooperative single-token replay driver.
 ///
 /// Linked with the ORIGINAL program via
@@ -220,6 +336,7 @@ pub fn synthesize_conc_replay_driver(sentinel_c_literal: &str) -> String {
     s.push_str("#include <stdio.h>\n");
     s.push_str("#include <stdlib.h>\n");
     s.push_str("#include <pthread.h>\n");
+    s.push_str("#include <sys/prctl.h>\n");
     // Bounded thread table (sv-benchmarks spawn counts fit comfortably; overflow just
     // refuses to record extra threads — a partial schedule, never a wrong verdict).
     s.push_str("#define __SAF_MAXT 4096\n");
@@ -241,6 +358,7 @@ pub fn synthesize_conc_replay_driver(sentinel_c_literal: &str) -> String {
     s.push_str("static int __saf_prio[__SAF_MAXT];\n");
     s.push_str("static long __saf_last_run[__SAF_MAXT];\n");
     s.push_str("static long __saf_rr = 0;\n");
+    s.push_str("static unsigned long __saf_main_div = 8;\n");
     s.push_str("static int __saf_policy = 0; /* 0=pct, 1=rr */\n");
     s.push_str("static void* (*__saf_routine[__SAF_MAXT])(void*);\n");
     s.push_str("static void* __saf_arg[__SAF_MAXT];\n");
@@ -265,10 +383,12 @@ pub fn synthesize_conc_replay_driver(sentinel_c_literal: &str) -> String {
 
     s.push_str(
         "__attribute__((constructor)) static void __saf_init(void){\n\
+         \x20 prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);\n\
          \x20 const char* s = getenv(\"SAF_REPLAY_SEED\");\n\
          \x20 __saf_rng_state = s ? strtoul(s,0,10) : 0;\n\
          \x20 const char* pol = getenv(\"SAF_REPLAY_POLICY\");\n\
-         \x20 __saf_policy = (pol && pol[0]=='r') ? 1 : 0;\n\
+         \x20 __saf_policy = (pol && pol[0]=='r') ? 1 : ((pol && pol[0]=='u') ? 2 : 0);\n\
+         \x20 { static const unsigned long d[3] = {8UL, 32UL, 128UL}; __saf_main_div = d[__saf_rng_state % 3UL]; }\n\
          \x20 __saf_state[0]=ST_RUN; __saf_cur=0; __saf_nthreads=1; __saf_tid=0;\n\
          \x20 __saf_prio[0]=__saf_prio_new();\n\
          \x20 for(int i=0;i<__SAF_PCT_D;i++){ __saf_pc_step[i]=(long)(__saf_rng()%__SAF_PCT_BOUND); __saf_pc_used[i]=0; }\n\
@@ -286,6 +406,10 @@ pub fn synthesize_conc_replay_driver(sentinel_c_literal: &str) -> String {
          \x20     long key = __saf_last_run[i] + (i==0 ? 1000000000L : 0);\n\
          \x20     if(best<0 || key<bestkey){ best=i; bestkey=key; }\n\
          \x20   }\n\
+         \x20 } else if(__saf_policy==2){\n\
+         \x20   int n=0; for(int i=1;i<__saf_nthreads;i++) if(__saf_state[i]==ST_PARKED) n++;\n\
+         \x20   if(__saf_state[0]==ST_PARKED && (n==0 || __saf_rng()%__saf_main_div==0)) best=0;\n\
+         \x20   else if(n>0){ int r=(int)(__saf_rng()%(unsigned long)n); for(int i=1;i<__saf_nthreads;i++) if(__saf_state[i]==ST_PARKED && r--==0){ best=i; break; } }\n\
          \x20 } else {\n\
          \x20   for(int i=0;i<__saf_nthreads;i++)\n\
          \x20     if(__saf_state[i]==ST_PARKED && (best<0 || __saf_prio[i]>__saf_prio[best])) best=i;\n\
@@ -568,6 +692,59 @@ mod tests {
         m.functions.push(main);
         let cg = CallGraph::build(&m);
         assert!(!conc_replay_schedulable(&m, &cg));
+        // ...but it is exactly the nondet-aware replay's scope.
+        assert!(conc_replay_nondet_schedulable(&m, &cg));
+    }
+
+    /// The nondet-aware gate admits only the scalar integer nondets its driver defines,
+    /// and never overlaps the plain gate.
+    #[test]
+    fn nondet_gate_admits_only_scalar_integer_nondets() {
+        let module_calling = |name: &str| {
+            let create = decl(1, "pthread_create");
+            let ab = decl(2, "__VERIFIER_atomic_begin");
+            let nondet = decl(3, name);
+            let main = func(4, "main", &[create.id, ab.id, nondet.id]);
+            let mut m = AirModule::new(ModuleId::new(1));
+            m.functions.push(create);
+            m.functions.push(ab);
+            m.functions.push(nondet);
+            m.functions.push(main);
+            m
+        };
+        for ok in [
+            "__VERIFIER_nondet_bool",
+            "__VERIFIER_nondet_uchar",
+            "__VERIFIER_nondet_ulong",
+        ] {
+            let m = module_calling(ok);
+            assert!(
+                conc_replay_nondet_schedulable(&m, &CallGraph::build(&m)),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "__VERIFIER_nondet_float",
+            "__VERIFIER_nondet_pointer",
+            "__VERIFIER_nondet_size_t",
+        ] {
+            let m = module_calling(bad);
+            assert!(
+                !conc_replay_nondet_schedulable(&m, &CallGraph::build(&m)),
+                "{bad}"
+            );
+        }
+        // A nondet-free program belongs to the plain gate, not this one.
+        let create = decl(1, "pthread_create");
+        let ab = decl(2, "__VERIFIER_atomic_begin");
+        let main = func(3, "main", &[create.id, ab.id]);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.functions.push(create);
+        m.functions.push(ab);
+        m.functions.push(main);
+        let cg = CallGraph::build(&m);
+        assert!(conc_replay_schedulable(&m, &cg));
+        assert!(!conc_replay_nondet_schedulable(&m, &cg));
     }
 
     /// No reachable spawn ⇒ not our job (inherited from `conc_schedulable`).
@@ -619,5 +796,36 @@ mod tests {
         assert!(d.contains("__VERIFIER_atomic_begin"));
         assert!(d.contains("__VERIFIER_assume"));
         assert!(d.contains("\"/tmp/sent\""));
+    }
+
+    #[test]
+    fn nondet_driver_defines_typed_weak_nondets_and_a_sentinel_override() {
+        let d = synthesize_conc_replay_driver_nondet("/tmp/sent");
+        assert!(d.contains("__attribute__((weak)) _Bool __VERIFIER_nondet_bool(void)"));
+        assert!(d.contains(
+            "__attribute__((weak)) unsigned char __VERIFIER_nondet_uchar(void){ return (unsigned char)__saf_ndv(); }"
+        ));
+        assert!(d.contains("getenv(\"SAF_REPLAY_SENTINEL\")"));
+        assert!(d.contains("getenv(\"SAF_REPLAY_NDSEED\")"));
+        // The plain driver is unchanged: no nondet definitions, fixed sentinel.
+        let plain = synthesize_conc_replay_driver("/tmp/sent");
+        assert!(!plain.contains("__VERIFIER_nondet"));
+        assert!(!plain.contains("SAF_REPLAY_SENTINEL"));
+        // Both drivers mark the harness non-dumpable: an `abort()` (failed assume) must
+        // not hand a core to a piped `core_pattern` helper, which costs ~130 ms a run.
+        assert!(plain.contains("prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);"));
+        assert!(d.contains("prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);"));
+    }
+
+    #[test]
+    fn uniform_plan_maps_to_its_own_policy() {
+        assert_eq!(ReplayPlan::Uniform(9).policy_env(), "uni");
+        assert_eq!(ReplayPlan::Uniform(9).seed_env(), 9);
+        assert_eq!(ReplayPlan::Uniform(9).label(), "uni:9");
+        assert!(
+            !replay_plans()
+                .iter()
+                .any(|p| matches!(p, ReplayPlan::Uniform(_)))
+        );
     }
 }

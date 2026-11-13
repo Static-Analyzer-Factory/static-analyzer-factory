@@ -109,10 +109,28 @@ impl ConcSchedule {
 
 /// Reachable calls that make the non-preemptive native model unfaithful — see the
 /// module docs. A reachable direct call to any of these ⇒ abstain.
-fn is_disallowed_conc_call(name: &str) -> bool {
-    // No forced nondet inputs in this engine (keep it deterministic-modulo-schedule).
+/// The scalar integer `__VERIFIER_nondet_*` functions the nondet-aware replay driver
+/// (`conc_replay::synthesize_conc_replay_driver_nondet`) defines, each returning a value
+/// of its own C type. Any other nondet function stays disallowed.
+pub const REPLAY_NONDET_FNS: &[(&str, &str)] = &[
+    ("__VERIFIER_nondet_bool", "_Bool"),
+    ("__VERIFIER_nondet_char", "char"),
+    ("__VERIFIER_nondet_uchar", "unsigned char"),
+    ("__VERIFIER_nondet_short", "short"),
+    ("__VERIFIER_nondet_ushort", "unsigned short"),
+    ("__VERIFIER_nondet_int", "int"),
+    ("__VERIFIER_nondet_uint", "unsigned int"),
+    ("__VERIFIER_nondet_long", "long"),
+    ("__VERIFIER_nondet_ulong", "unsigned long"),
+    ("__VERIFIER_nondet_longlong", "long long"),
+    ("__VERIFIER_nondet_ulonglong", "unsigned long long"),
+];
+
+fn is_disallowed_conc_call_with(name: &str, allow_scalar_nondet: bool) -> bool {
+    // No forced nondet inputs in this engine (keep it deterministic-modulo-schedule),
+    // except, for the nondet-aware replay, the scalar integer ones its driver defines.
     if name.starts_with("__VERIFIER_nondet") {
-        return true;
+        return !(allow_scalar_nondet && REPLAY_NONDET_FNS.iter().any(|(n, _)| *n == name));
     }
     // Blocking coordination needing a concurrent peer, or unmodelled primitives.
     if name.starts_with("pthread_cond")
@@ -152,7 +170,7 @@ fn is_disallowed_conc_call(name: &str) -> bool {
 ///
 /// Requires a thread spawn reachable from `main` (else it is not concurrent — the
 /// sequential stages handle it) AND that NO defined function contains a call that
-/// breaks the non-preemptive native model (see [`is_disallowed_conc_call`] and the
+/// breaks the non-preemptive native model (see [`is_disallowed_conc_call_with`] and the
 /// module docs). An indirect call anywhere also forces abstention (its target could
 /// be a disallowed primitive).
 ///
@@ -164,6 +182,17 @@ fn is_disallowed_conc_call(name: &str) -> bool {
 /// all defined functions is a sound over-approximation: any doubt ⇒ `false` (abstain).
 #[must_use]
 pub fn conc_schedulable(module: &AirModule, callgraph: &CallGraph) -> bool {
+    conc_schedulable_with(module, callgraph, false)
+}
+
+/// [`conc_schedulable`], but admitting calls to the scalar nondet functions in
+/// [`REPLAY_NONDET_FNS`] (for the nondet-aware replay confirmer only).
+#[must_use]
+pub fn conc_schedulable_allowing_nondet(module: &AirModule, callgraph: &CallGraph) -> bool {
+    conc_schedulable_with(module, callgraph, true)
+}
+
+fn conc_schedulable_with(module: &AirModule, callgraph: &CallGraph, allow_nondet: bool) -> bool {
     // Must actually spawn a thread reachable from main.
     if !reachable_spawns_threads(module, callgraph) {
         return false;
@@ -178,7 +207,7 @@ pub fn conc_schedulable(module: &AirModule, callgraph: &CallGraph) -> bool {
                 match &inst.op {
                     Operation::CallDirect { callee } => {
                         if let Some(target) = module.function(*callee) {
-                            if is_disallowed_conc_call(&target.name) {
+                            if is_disallowed_conc_call_with(&target.name, allow_nondet) {
                                 return false;
                             }
                         }

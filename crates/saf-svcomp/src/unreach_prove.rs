@@ -525,7 +525,7 @@ struct State {
     /// Non-termination search only: the concrete loop-header states this path
     /// has passed, each with the number of nondet reads before it (see
     /// [`Engine::nonterm_check`]).
-    nt_seen: BTreeMap<ConcreteKey, usize>,
+    nt_seen: BTreeMap<ConcreteKey, (usize, usize)>,
 }
 
 /// Concrete content of one footprint slot of a loop-header state.
@@ -975,6 +975,24 @@ struct Engine<'a> {
     /// Non-termination search ([`find_nontermination`]): counterexample-mode
     /// exploration that looks for a loop-header state recurring on one path.
     nonterm: bool,
+    /// Non-termination probe ([`find_nontermination`]): every scalar integer
+    /// nondet read returns the next value of this cycle instead of a fresh
+    /// symbol, so a loop whose header state never becomes concrete under
+    /// symbolic inputs can still be caught recurring on concrete ones.
+    nt_probe: Option<Vec<i64>>,
+    /// Probe reads served so far (zero after a run: the program reads none,
+    /// and every further probe would repeat the same execution).
+    nt_probe_reads: usize,
+    /// Model capture ([`find_counterexample_via_model`]): every integer nondet
+    /// read's symbol and call instruction, and, at the first feasible error,
+    /// a model of the path's condition (the reads' values, per instruction in
+    /// symbol order).
+    capture_model: bool,
+    sym_inst: Vec<(u64, InstId)>,
+    error_model: Option<BTreeMap<InstId, std::collections::VecDeque<u64>>>,
+    /// Counterexample mode seeded by a model: a nondet read at an instruction
+    /// with a value left takes it (pinned) instead of a fresh symbol.
+    cex_seed: Option<BTreeMap<InstId, std::collections::VecDeque<u64>>>,
     lasso: Option<Lasso>,
     cex: Option<Counterexample>,
     /// Counterexample mode: violations at these instructions are passed over
@@ -1251,6 +1269,12 @@ pub struct Lasso {
     pub block: BlockId,
     /// The recurring state at the header (after its phis).
     pub state: HeaderState,
+    /// Every block the execution entered, from `main`'s entry up to the second
+    /// visit of the header (the last element), in order.
+    pub path: Vec<(FunctionId, BlockId)>,
+    /// Index into `path` of the header's FIRST visit in the recurring state:
+    /// `path[path_cycle_start..]` is one round of the cycle (header to header).
+    pub path_cycle_start: usize,
     /// `(nondet function, value, call instruction)` of every read up to the
     /// recurrence.
     pub nondets: Vec<(String, i64, InstId)>,
@@ -1275,26 +1299,102 @@ pub fn find_nontermination(module: &AirModule, budget: Duration) -> Option<Lasso
     if has_global_ctors_dtors(module) {
         return None;
     }
-    let main = module
+    let start = Instant::now();
+    let probe_total = (budget / 4).min(NT_PROBE_TOTAL);
+    for probe in nt_probes() {
+        let left = probe_total.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        let (res, reads) = nonterm_run(module, left.min(NT_PROBE_EACH), Some(probe));
+        if res.is_some() {
+            return res;
+        }
+        if reads == 0 {
+            break; // no nondet read: every probe is the same execution
+        }
+    }
+    nonterm_run(module, budget.saturating_sub(start.elapsed()), None).0
+}
+
+/// Total time and per-probe time of [`find_nontermination`]'s concrete probes.
+const NT_PROBE_TOTAL: Duration = Duration::from_secs(60);
+const NT_PROBE_EACH: Duration = Duration::from_millis(500);
+
+/// The input cycles [`find_nontermination`] probes, in order: every constant
+/// of a small set, then every pair and triple of a smaller one, then
+/// pseudo-random vectors of small values (a fixed generator: deterministic).
+fn nt_probes() -> Vec<Vec<i64>> {
+    const ONE: [i64; 16] = [0, 1, -1, 2, -2, 3, -3, 4, 5, 7, 8, 10, 16, 100, -100, 1000];
+    const TWO: [i64; 8] = [0, 1, -1, 2, -2, 3, 5, 10];
+    const THREE: [i64; 6] = [0, 1, -1, 2, -2, 5];
+    let mut out: Vec<Vec<i64>> = ONE.iter().map(|&c| vec![c]).collect();
+    for &a in &TWO {
+        for &b in &TWO {
+            if a != b {
+                out.push(vec![a, b]);
+            }
+        }
+    }
+    for &a in &THREE {
+        for &b in &THREE {
+            for &c in &THREE {
+                if !(a == b && b == c) {
+                    out.push(vec![a, b, c]);
+                }
+            }
+        }
+    }
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for _ in 0..256 {
+        let mut v = Vec::with_capacity(8);
+        for _ in 0..8 {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            #[allow(clippy::cast_possible_wrap)]
+            v.push(((x >> 33) % 41) as i64 - 20);
+        }
+        out.push(v);
+    }
+    out
+}
+
+/// One non-termination search (see [`find_nontermination`]), symbolic or on
+/// the probe's concrete inputs; also the number of probe reads served.
+fn nonterm_run(
+    module: &AirModule,
+    budget: Duration,
+    probe: Option<Vec<i64>>,
+) -> (Option<Lasso>, usize) {
+    let Some(main) = module
         .functions
         .iter()
-        .find(|f| f.name == "main" && !f.is_declaration)?;
-    let entry = main
+        .find(|f| f.name == "main" && !f.is_declaration)
+    else {
+        return (None, 0);
+    };
+    let Some(entry) = main
         .entry_block
-        .or_else(|| main.blocks.first().map(|b| b.id))?;
+        .or_else(|| main.blocks.first().map(|b| b.id))
+    else {
+        return (None, 0);
+    };
     let mut engine = Engine::new(module, budget);
     engine.goal = Goal::SignedOverflow;
     engine.termination = true;
     engine.cex_mode = true;
     engine.cex_depth_first = true;
     engine.nonterm = true;
+    engine.nt_probe = probe;
     engine.deadline = Instant::now() + budget;
     let init = engine.initial_state(main, entry);
     let res = engine.run(init);
     trace(|| format!("non-termination search ended: {res:?}"));
+    let reads = engine.nt_probe_reads;
     match res {
-        Err(e) if e == NT_FOUND => engine.lasso.take(),
-        _ => None,
+        Err(e) if e == NT_FOUND => (engine.lasso.take(), reads),
+        _ => (None, reads),
     }
 }
 
@@ -1374,6 +1474,55 @@ pub struct CexOptions {
     /// the `overflow` flag's goal. Run it on the memory-safety ingestion
     /// recipe's module (lifetime markers).
     pub memsafety: bool,
+}
+
+/// A `reach_error` counterexample for a program whose violation the
+/// counterexample search cannot reach by enumerating paths (the XCSP
+/// constraint problems: a wide conjunction of branches over many inputs). The
+/// lazy exhaustive pass (merging, one query per error call) finds the error
+/// feasible and yields a model of the merged path condition; a counterexample
+/// search then runs with every nondet read pinned to the model's value for its
+/// instruction, which makes it one concrete path. A CANDIDATE like any other:
+/// the caller replays it natively. `None` when either step runs out of
+/// `budget` (each gets half) or finds nothing.
+#[must_use]
+pub fn find_counterexample_via_model(
+    module: &AirModule,
+    budget: Duration,
+) -> Option<Counterexample> {
+    if has_global_ctors_dtors(module) {
+        return None;
+    }
+    let main = module
+        .functions
+        .iter()
+        .find(|f| f.name == "main" && !f.is_declaration)?;
+    let entry = main
+        .entry_block
+        .or_else(|| main.blocks.first().map(|b| b.id))?;
+    let start = Instant::now();
+    let mut engine = Engine::new(module, budget);
+    engine.goal = Goal::ReachError;
+    engine.lazy_exhaustive = true;
+    engine.capture_model = true;
+    engine.deadline = start + budget / 2;
+    let init = engine.initial_state(main, entry);
+    let res = engine.run(init);
+    trace(|| format!("model capture ended: {res:?}"));
+    let seed = engine.error_model.take()?;
+    let mut engine = Engine::new(module, budget);
+    engine.goal = Goal::ReachError;
+    engine.cex_mode = true;
+    engine.cex_depth_first = true;
+    engine.cex_seed = Some(seed);
+    engine.deadline = start + budget;
+    let init = engine.initial_state(main, entry);
+    let res = engine.run(init);
+    trace(|| format!("seeded counterexample search ended: {res:?}"));
+    match res {
+        Err(reason) if reason == "error-feasible" => engine.cex.take(),
+        Ok(()) | Err(_) => None,
+    }
 }
 
 #[must_use]
@@ -1869,6 +2018,12 @@ impl<'a> Engine<'a> {
             memcleanup: false,
             live_out: std::cell::RefCell::new(BTreeMap::new()),
             nonterm: false,
+            nt_probe: None,
+            nt_probe_reads: 0,
+            capture_model: false,
+            sym_inst: Vec::new(),
+            error_model: None,
+            cex_seed: None,
             lasso: None,
             cex: None,
             cex_skip: BTreeSet::new(),
@@ -3057,6 +3212,54 @@ impl<'a> Engine<'a> {
             .collect()
     }
 
+    /// Non-termination probe: the nondet read `inst` returns the probe's next
+    /// value (cycling), clamped to what the function can return (`_Bool`: 0 or
+    /// 1, `rand`: `0..=RAND_MAX`, otherwise the type's two's-complement range,
+    /// all of which `__VERIFIER_nondet_*` may return). Recorded as a pinned
+    /// read, so the lasso and its replay see the same value.
+    fn probe_read(&mut self, st: &mut State, inst: &Instruction, name: &str, bits: u32) -> Flow {
+        let probe = self.nt_probe.as_deref().unwrap_or(&[0]);
+        let raw = probe
+            .get(st.nondets.len() % probe.len().max(1))
+            .copied()
+            .unwrap_or(0);
+        let value = if name.ends_with("_bool") {
+            raw & 1
+        } else if name == "rand" {
+            raw & 0x7fff_ffff
+        } else {
+            raw
+        };
+        self.nt_probe_reads += 1;
+        self.pinned_read(st, inst, name, bits, value)
+    }
+
+    /// A nondet read that returns `value` (truncated to `bits`): a fresh symbol
+    /// pinned to it, recorded like any read of the path.
+    fn pinned_read(
+        &mut self,
+        st: &mut State,
+        inst: &Instruction,
+        name: &str,
+        bits: u32,
+        value: i64,
+    ) -> Flow {
+        let (_, _) = self.fresh(bits);
+        let n = self.fresh_counter - 1;
+        #[allow(clippy::cast_sign_loss)]
+        let masked = if bits >= 64 {
+            value as u64
+        } else {
+            (value as u64) & ((1u64 << bits) - 1)
+        };
+        st.pinned.insert(n, masked);
+        st.nondets.push((name.to_string(), bits, n, inst.id));
+        if let Some(d) = inst.dst {
+            st.values.insert(d, Val::Bv(int_bv(value, bits), no_vars()));
+        }
+        Flow::Next
+    }
+
     /// Non-termination search, at a loop-header entry: the state restricted to
     /// what the continuation can read (each active frame's live values, all
     /// memory and object bookkeeping) is fully concrete and was already seen on
@@ -3074,9 +3277,11 @@ impl<'a> Engine<'a> {
         if !syms.is_empty() {
             return Ok(());
         }
-        let Some(&cycle_start) = st.nt_seen.get(&key) else {
+        let Some(&(cycle_start, path_cycle_start)) = st.nt_seen.get(&key) else {
             if st.nt_seen.len() < NT_SEEN_CAP {
-                st.nt_seen.insert(key, st.nondets.len());
+                // The header was pushed onto the path at its entry.
+                let at = st.path.len().saturating_sub(1);
+                st.nt_seen.insert(key, (st.nondets.len(), at));
             }
             return Ok(());
         };
@@ -3120,6 +3325,8 @@ impl<'a> Engine<'a> {
             func: st.func,
             block: st.block,
             state,
+            path: st.path.clone(),
+            path_cycle_start,
             nondets,
             cycle_start,
             latches,
@@ -5553,7 +5760,24 @@ impl<'a> Engine<'a> {
         let float_nondet = matches!(name, "__VERIFIER_nondet_float" | "__VERIFIER_nondet_double");
         if !defined && (is_scalar_integer_nondet(name) || name == "rand" || float_nondet) {
             let bits = self.result_bits(inst)?;
+            if !float_nondet && self.nt_probe.is_some() {
+                return Ok(self.probe_read(st, inst, name, bits));
+            }
+            if !float_nondet {
+                let seeded = self
+                    .cex_seed
+                    .as_mut()
+                    .and_then(|m| m.get_mut(&inst.id))
+                    .and_then(std::collections::VecDeque::pop_front);
+                if let Some(raw) = seeded {
+                    #[allow(clippy::cast_possible_wrap)]
+                    return Ok(self.pinned_read(st, inst, name, bits, raw as i64));
+                }
+            }
             let v = self.fresh_val(bits);
+            if self.capture_model && !float_nondet {
+                self.sym_inst.push((self.fresh_counter - 1, inst.id));
+            }
             // A float read is not recorded: the replay driver cannot hand a
             // bit pattern back through `__VERIFIER_nondet_double`.
             if self.cex_mode && !float_nondet {
@@ -6003,6 +6227,9 @@ impl<'a> Engine<'a> {
         if self.cex_mode && feas == Feas::Sat && !st.has_unknown {
             self.record_counterexample(st, cond.map(|(c, _)| c), at)?;
         }
+        if self.capture_model && !self.cex_mode && feas == Feas::Sat && !st.has_unknown {
+            self.capture_error_model(st, cond.map(|(c, _)| c));
+        }
         match feas {
             Feas::Unsat => Ok(()),
             Feas::Unknown => Err("error-unknown".to_string()),
@@ -6104,6 +6331,38 @@ impl<'a> Engine<'a> {
             st.nondets.push((name.to_string(), bits, n, inst.id));
         }
         Ok(())
+    }
+
+    /// Model capture: one model of the path condition (plus the violation
+    /// condition) at a feasible error, as the value of every nondet read's
+    /// symbol (pinned symbols their pin; unconstrained ones any value), grouped
+    /// by call instruction in symbol order. A seed only: nothing is decided here.
+    fn capture_error_model(&mut self, st: &mut State, cond: Option<&Bool>) {
+        let (pc, _) = path_condition(st);
+        let query = match cond {
+            Some(c) => Bool::and(&[&pc, c]),
+            None => pc,
+        };
+        self.solver.reset();
+        self.solver.assert(&query);
+        self.solver_calls += 1;
+        if self.solver.check() != SatResult::Sat {
+            return;
+        }
+        let Some(model) = self.solver.get_model() else {
+            return;
+        };
+        let mut out: BTreeMap<InstId, std::collections::VecDeque<u64>> = BTreeMap::new();
+        for (n, inst) in &self.sym_inst {
+            let v = st.pinned.get(n).copied().or_else(|| {
+                self.symbols
+                    .get(n)
+                    .and_then(|sym| model.eval(sym, true))
+                    .and_then(|b| b.as_u64())
+            });
+            out.entry(*inst).or_default().push_back(v.unwrap_or(0));
+        }
+        self.error_model = Some(out);
     }
 
     /// Counterexample mode: one query over the WHOLE path condition (plus the
@@ -9118,6 +9377,85 @@ mod tests {
         );
     }
 
+    /// `int x = nondet(); while (x != 0) x = 0 - x;` — symbolically the header
+    /// state never becomes concrete; the concrete probes catch `x = 1` (or any
+    /// non-zero probe) recurring after two rounds, and `x = 0` terminates.
+    #[test]
+    fn nontermination_probes_find_a_lasso_on_concrete_inputs() {
+        let mut b = B::new();
+        let nd = b.decl("__VERIFIER_nondet_int");
+        let (e, hdr, body, exit) = (b.bid(), b.bid(), b.bid(), b.bid());
+        let (i_x, x) = b.inst(Operation::CallDirect { callee: nd }, vec![], Some(I32));
+        let (i_j, _) = b.inst(Operation::Br { target: hdr }, vec![], None);
+        let (mut i_p, p) = b.inst(Operation::Phi { incoming: vec![] }, vec![], Some(I32));
+        let zero = b.konst(0);
+        let (i_c, c) = b.inst(
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpNe,
+            },
+            vec![p.unwrap(), zero],
+            Some(I1),
+        );
+        let (i_br, _) = b.inst(
+            Operation::CondBr {
+                then_target: body,
+                else_target: exit,
+            },
+            vec![c.unwrap()],
+            None,
+        );
+        let (i_neg, neg) = b.inst(
+            Operation::BinaryOp {
+                kind: BinaryOp::Sub,
+            },
+            vec![zero, p.unwrap()],
+            Some(I32),
+        );
+        i_p.op = Operation::Phi {
+            incoming: vec![(e, x.unwrap()), (body, neg.unwrap())],
+        };
+        let (i_back, _) = b.inst(Operation::Br { target: hdr }, vec![], None);
+        let (i_ret, _) = b.inst(Operation::Ret, vec![], None);
+        b.func(
+            "main",
+            vec![],
+            vec![
+                blk(e, vec![i_x, i_j]),
+                blk(hdr, vec![i_p, i_c, i_br]),
+                blk(body, vec![i_neg, i_back]),
+                blk(exit, vec![i_ret]),
+            ],
+        );
+        let lasso = find_nontermination(&b.m, Duration::from_secs(20)).expect("a lasso");
+        assert_eq!(lasso.nondets.len(), 1, "{lasso:?}");
+        let (name, v, _) = &lasso.nondets[0];
+        assert_eq!(name, "__VERIFIER_nondet_int");
+        assert_ne!(*v, 0, "x = 0 terminates");
+        assert_eq!(lasso.cycle_start, 1, "the cycle reads nothing");
+        // The path ends at the header's second visit in the recurring state;
+        // the cycle starts at its first and goes round the body (two rounds:
+        // `x = v`, then `x = -v`).
+        assert_eq!(lasso.path.last(), Some(&(lasso.func, lasso.block)));
+        assert_eq!(
+            lasso.path[lasso.path_cycle_start],
+            (lasso.func, lasso.block)
+        );
+        let rounds = lasso.path[lasso.path_cycle_start + 1..]
+            .iter()
+            .filter(|(_, b)| *b == lasso.block)
+            .count();
+        assert!(rounds >= 2, "{lasso:?}");
+    }
+
+    #[test]
+    fn nontermination_probes_are_deterministic_and_start_small() {
+        let a = nt_probes();
+        assert_eq!(a, nt_probes());
+        assert_eq!(a[0], vec![0]);
+        assert!(a.iter().all(|v| !v.is_empty()));
+        assert!(a.iter().flatten().all(|v| (-1000..=1000).contains(v)));
+    }
+
     /// `int x = nondet(); int y = nondet(); if (x == 7 && y == 3) reach_error();` —
     /// the counterexample search returns the two reads with their model values.
     #[test]
@@ -9189,8 +9527,19 @@ mod tests {
             ]
         );
         assert!(cex.block_path.contains(&bb_then));
+        // The model-seeded search finds the same pinned path.
+        let seeded = find_counterexample_via_model(&b.m, Duration::from_secs(30))
+            .expect("a model-seeded counterexample");
+        assert_eq!(seeded.error_inst, err_id);
+        let seeded_vals: Vec<(String, i64)> = seeded
+            .nondets
+            .iter()
+            .map(|(n, v, _)| (n.clone(), *v))
+            .collect();
+        assert_eq!(seeded_vals, vals);
         // A safe program yields none.
         assert!(find_counterexample(&toggle_loop(5), Duration::from_secs(10), false).is_none());
+        assert!(find_counterexample_via_model(&toggle_loop(5), Duration::from_secs(10)).is_none());
     }
 
     /// The toggle never reaches 5: proven by the header fixpoint (2 states).

@@ -823,6 +823,16 @@ pub fn index(args: &IndexArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// When `verify` started: the late stages measure what is left of the task's
+/// wall budget from here ([`verify_time_left`]).
+static VERIFY_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// What is left of the task's wall budget (`ctx.budget`, from `--timeout`).
+fn verify_time_left(ctx: &VerifyCtx) -> std::time::Duration {
+    let start = VERIFY_START.get_or_init(std::time::Instant::now);
+    ctx.budget.saturating_sub(start.elapsed())
+}
+
 /// Run `saf verify` — the blind SV-COMP verifier entry point (plan 192, slice 1).
 ///
 /// Prints exactly one verdict line to stdout — `false(<prop>)`, `true`, or
@@ -841,6 +851,7 @@ pub fn index(args: &IndexArgs) -> anyhow::Result<()> {
 // 0), but the `Result` return is required by the `Commands` dispatch signature.
 #[allow(clippy::unnecessary_wraps)]
 pub fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
+    VERIFY_START.get_or_init(std::time::Instant::now);
     // Determinism pins (plan 192 §2.3): make verdicts independent of these
     // verdict-affecting env toggles regardless of the competition environment.
     // Must run before the worker thread is spawned (the unsafe `remove_var`
@@ -2695,6 +2706,12 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         }
         opts.skip.insert(candidate.reach_error_inst);
     }
+    // The path enumeration's blind spot, a wide conjunction of branches over
+    // many inputs (XCSP): a model of the merged path condition seeds one
+    // concrete counterexample path. Replay-gated like every candidate.
+    if let Some(outcome) = model_seeded_unreach_false(ctx) {
+        return outcome;
+    }
 
     let config = saf_svcomp::PropertyAnalysisConfig {
         conservative: false,
@@ -2875,8 +2892,106 @@ fn unreach_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         }
     }
 
+    // Last: the engine's counterexample search again, on what is left of the
+    // budget (its stage above gets 20 s each way; a deep violation of an ECA or
+    // token-ring combination needs minutes). Replay-gated like every candidate.
+    if let Some(outcome) = late_counterexample_unreach_false(ctx) {
+        return outcome;
+    }
     eprintln!("saf verify: portfolio exhausted (no lever reproduced reach_error) -> unknown");
     unknown_outcome()
+}
+
+/// Time kept back from the late counterexample search for its replays and the
+/// verdict's output.
+const LATE_CEX_MARGIN: std::time::Duration = std::time::Duration::from_secs(90);
+/// Below this much time left the late search is not started.
+const LATE_CEX_MIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The late counterexample search of `unreach_strategy`: breadth-first on
+/// three fifths of the time left (less [`LATE_CEX_MARGIN`]), then depth-first on
+/// what remains, each passing over up to [`cex_retries`] candidates that do not
+/// replay. A confirmed replay is `false(unreach-call)`, as in the early stage.
+fn late_counterexample_unreach_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    let mut opts = saf_svcomp::CexOptions::default();
+    for depth_first in [false, true] {
+        opts.depth_first = depth_first;
+        for _ in 0..=cex_retries() {
+            let left = verify_time_left(ctx).saturating_sub(LATE_CEX_MARGIN);
+            if left < LATE_CEX_MIN {
+                return None;
+            }
+            let budget = if depth_first { left } else { left * 3 / 5 };
+            eprintln!(
+                "saf verify: late counterexample search ({}, {} s)",
+                if depth_first {
+                    "depth-first"
+                } else {
+                    "breadth-first"
+                },
+                budget.as_secs()
+            );
+            let Some(found) =
+                saf_svcomp::find_counterexample_excluding(ctx.module, budget, false, &opts)
+            else {
+                break; // none in time: the other search order
+            };
+            let candidate = candidate_from_counterexample(ctx.module, found, &opts);
+            match replay_confirms_false(ctx, MAX_REPLAY_CANDIDATES, &candidate) {
+                Ok(true) => {
+                    let witness = build_witness(
+                        ctx,
+                        saf_svcomp::lower_candidate(
+                            ctx.module,
+                            &candidate,
+                            verify_source(ctx).as_deref(),
+                        ),
+                    );
+                    return Some(VerdictOutcome {
+                        verdict: format!("false({})", saf_svcomp::Property::UnreachCall.name()),
+                        witness,
+                        graphml: None,
+                        correctness: None,
+                    });
+                }
+                Ok(false) => eprintln!("saf verify: late counterexample did not replay"),
+                Err(e) => eprintln!("saf verify: late counterexample replay errored: {e:#}"),
+            }
+            opts.skip.insert(candidate.reach_error_inst);
+        }
+    }
+    None
+}
+
+/// `false(unreach-call)` from [`saf_svcomp::find_counterexample_via_model`]'s
+/// candidate, confirmed by the native replay (the sole arbiter, as for every
+/// engine candidate). Budget: three counterexample budgets.
+fn model_seeded_unreach_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    let found = saf_svcomp::find_counterexample_via_model(ctx.module, cex_budget() * 3)?;
+    eprintln!("saf verify: model-seeded counterexample found");
+    let candidate =
+        candidate_from_counterexample(ctx.module, found, &saf_svcomp::CexOptions::default());
+    match replay_confirms_false(ctx, MAX_REPLAY_CANDIDATES, &candidate) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("saf verify: model-seeded counterexample did not replay");
+            return None;
+        }
+        Err(e) => {
+            eprintln!("saf verify: model-seeded counterexample replay errored: {e:#}");
+            return None;
+        }
+    }
+    let witness = build_witness(
+        ctx,
+        saf_svcomp::lower_candidate(ctx.module, &candidate, verify_source(ctx).as_deref()),
+    );
+    Some(VerdictOutcome {
+        verdict: format!("false({})", saf_svcomp::Property::UnreachCall.name()),
+        witness,
+        graphml: None,
+        correctness: None,
+    })
 }
 
 /// Deterministic cap on blind-fuzz iterations (mutation trials), overridable via
@@ -3576,6 +3691,142 @@ const CONC_REPLAY_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// abstain (no verdict lost — the schedule is the sole arbiter).
 const CONC_REPLAY_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Upper bound on (schedule, inputs) pairs the nondet-aware replay tries; the total
+/// budget below usually ends the search first.
+const CONC_REPLAY_NONDET_PLANS: u32 = 200_000;
+
+/// Wall-clock budget of the nondet-aware search, and how many runs it keeps in flight.
+/// 150 s x 3 runs bounds its CPU use at ~450 s of the 900 s task limit.
+const CONC_REPLAY_NONDET_BUDGET: std::time::Duration = std::time::Duration::from_secs(150);
+const CONC_REPLAY_NONDET_JOBS: usize = 3;
+
+/// The k-th (schedule, inputs) pair of the nondet-aware search: of every seven, one
+/// round-robin, three uniform-random and three PCT schedules; the input seed is `k`
+/// (which also picks the `_Bool` bias, `k % 5`, in the driver).
+fn conc_replay_nondet_plan(k: u32) -> (saf_svcomp::ReplayPlan, u32) {
+    let p = match k % 7 {
+        0 => saf_svcomp::ReplayPlan::RoundRobin,
+        1..=3 => saf_svcomp::ReplayPlan::Uniform(k),
+        _ => saf_svcomp::ReplayPlan::Pct(k),
+    };
+    (p, k)
+}
+
+/// Run the `k`-th harness configurations (`envs_of(k)`, `k = 0, 1, …`) in parallel,
+/// keeping [`CONC_REPLAY_NONDET_JOBS`] runs in flight, each with its own sentinel file
+/// (`SAF_REPLAY_SENTINEL` = `dir/saf_<tag>_<k>.sentinel`), until one drops its sentinel,
+/// `budget` elapses, or `max` runs were started. Returns the hitting `k` and the number of
+/// finished runs. It only nominates: callers re-run the configuration (twice, default
+/// sentinel) before any verdict, so nothing here can produce `false` on its own.
+fn parallel_sentinel_search(
+    harness: &Path,
+    dir: &Path,
+    tag: &str,
+    run_timeout: std::time::Duration,
+    envs_of: &dyn Fn(u32) -> Vec<(&'static str, String)>,
+) -> (Option<u32>, u32) {
+    use std::process::{Command, Stdio};
+
+    struct Run {
+        child: std::process::Child,
+        k: u32,
+        sentinel: std::path::PathBuf,
+        start: std::time::Instant,
+    }
+    let start = std::time::Instant::now();
+    let mut next = 0u32;
+    let mut running: Vec<Run> = Vec::new();
+    let mut found = None;
+    let mut tried = 0u32;
+    while found.is_none() {
+        let out_of_budget =
+            start.elapsed() >= CONC_REPLAY_NONDET_BUDGET || next >= CONC_REPLAY_NONDET_PLANS;
+        while !out_of_budget && running.len() < CONC_REPLAY_NONDET_JOBS {
+            let k = next;
+            next += 1;
+            let sentinel = dir.join(format!("saf_{tag}_{k}.sentinel"));
+            let _ = std::fs::remove_file(&sentinel);
+            let mut cmd = Command::new(harness);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .envs(envs_of(k))
+                .env("SAF_REPLAY_SENTINEL", &sentinel);
+            match harden_replay_spawn(&mut cmd).spawn() {
+                Ok(child) => running.push(Run {
+                    child,
+                    k,
+                    sentinel,
+                    start: std::time::Instant::now(),
+                }),
+                Err(_) => return (None, tried),
+            }
+        }
+        if running.is_empty() {
+            break;
+        }
+        let mut i = 0;
+        while i < running.len() {
+            let done = match running[i].child.try_wait() {
+                Ok(Some(_)) => true,
+                Ok(None) if running[i].start.elapsed() >= run_timeout => {
+                    kill_replay_group(&mut running[i].child);
+                    true
+                }
+                Ok(None) => false,
+                Err(_) => {
+                    kill_replay_group(&mut running[i].child);
+                    true
+                }
+            };
+            if done {
+                let r = running.swap_remove(i);
+                tried += 1;
+                if found.is_none() && r.sentinel.exists() {
+                    found = Some(r.k);
+                }
+                let _ = std::fs::remove_file(&r.sentinel);
+            } else {
+                i += 1;
+            }
+        }
+        if found.is_none() && !running.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    for mut r in running {
+        kill_replay_group(&mut r.child);
+        let _ = std::fs::remove_file(&r.sentinel);
+    }
+    if found.is_none() {
+        eprintln!(
+            "saf verify: {tag} search: no hit in {tried} runs ({:.0} s)",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    (found, tried)
+}
+
+/// Search (schedule, inputs) pairs for the nondet-aware replay harness
+/// ([`parallel_sentinel_search`] over [`conc_replay_nondet_plan`]).
+fn conc_replay_nondet_search(harness: &Path, dir: &Path) -> Option<(saf_svcomp::ReplayPlan, u32)> {
+    let envs = |k: u32| {
+        let (plan, ndseed) = conc_replay_nondet_plan(k);
+        vec![
+            ("SAF_REPLAY_POLICY", plan.policy_env().to_string()),
+            ("SAF_REPLAY_SEED", plan.seed_env().to_string()),
+            ("SAF_REPLAY_NDSEED", ndseed.to_string()),
+        ]
+    };
+    let (k, tried) = parallel_sentinel_search(harness, dir, "nd", CONC_REPLAY_RUN_TIMEOUT, &envs);
+    let (plan, nd) = conc_replay_nondet_plan(k?);
+    eprintln!(
+        "saf verify: nondet replay search hit plan {} nondet seed {nd} after {tried} runs",
+        plan.label()
+    );
+    Some((plan, nd))
+}
+
 /// Run the cooperative-scheduler replay harness once under one `(policy, seed)` plan.
 /// Returns `Ok(true)` iff the sentinel dropped (the property's violation event fired).
 /// Timeout / normal exit / crash all return `Ok(false)` — the sentinel is the sole
@@ -3584,6 +3835,7 @@ fn run_conc_replay_plan(
     harness: &Path,
     sentinel: &Path,
     plan: saf_svcomp::ReplayPlan,
+    ndseed: u32,
     timeout: std::time::Duration,
 ) -> anyhow::Result<bool> {
     use anyhow::Context;
@@ -3595,7 +3847,9 @@ fn run_conc_replay_plan(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .env("SAF_REPLAY_POLICY", plan.policy_env())
-        .env("SAF_REPLAY_SEED", plan.seed_env().to_string());
+        .env("SAF_REPLAY_SEED", plan.seed_env().to_string())
+        // Read only by the nondet-aware driver; the plain driver ignores it.
+        .env("SAF_REPLAY_NDSEED", ndseed.to_string());
     let mut child = harden_replay_spawn(&mut cmd)
         .spawn()
         .with_context(|| "spawning concurrency replay harness")?;
@@ -3638,9 +3892,6 @@ fn run_conc_replay_plan(
 // splitting it would obscure the control flow.
 #[allow(clippy::too_many_lines)]
 fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
-    use saf_svcomp::Property;
-    use std::process::{Command, Stdio};
-
     // Gate 0: there must be a reach_error site to reach.
     if saf_svcomp::reach_error_call_sites(ctx.module).is_empty() {
         return None;
@@ -3649,10 +3900,34 @@ fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     // Gate 1: the program must be amenable to the fine-grained replay model (reachable
     // spawn, `__VERIFIER_atomic` mid-body scheduling points, no mutex exclusion, no
     // nondet / condvars / … — see conc_replay_schedulable).
+    // The nondet-aware variant (lever `conc-replay-nondet`) takes the programs the plain
+    // gate rejects ONLY for calling scalar `__VERIFIER_nondet_*`; its driver supplies
+    // legal values of each function's type from a seeded generator. It is also the
+    // fallback when the plain plans miss: its search adds uniform-random schedules and a
+    // 64-bit schedule generator (the plain one cycles on ILP32), and a program with no
+    // nondet call simply never uses the driver's nondet definitions.
     let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
-    if !saf_svcomp::conc_replay_schedulable(ctx.module, &callgraph) {
-        return None;
+    if saf_svcomp::conc_replay_schedulable(ctx.module, &callgraph) {
+        if let Some(outcome) = conc_replay_confirm_false_with(ctx, false) {
+            return Some(outcome);
+        }
+        return conc_replay_confirm_false_with(ctx, true);
     }
+    if saf_svcomp::conc_replay_nondet_schedulable(ctx.module, &callgraph) {
+        return conc_replay_confirm_false_with(ctx, true);
+    }
+    None
+}
+
+/// The body of [`conc_replay_confirm_false`] once its gates chose a driver: `nondet`
+/// selects [`saf_svcomp::synthesize_conc_replay_driver_nondet`] and the parallel search.
+// NOTE: compile-once / replay-each-plan / re-confirm is one cohesive fail-closed unit;
+// splitting it would obscure the control flow.
+#[allow(clippy::too_many_lines)]
+fn conc_replay_confirm_false_with(ctx: &VerifyCtx, nondet: bool) -> Option<VerdictOutcome> {
+    use saf_svcomp::Property;
+    use std::process::{Command, Stdio};
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
 
     // Gate 2 (R7): abstain on OpenMP / relaxed-memory the SC replay cannot arbitrate
     // (symbol-level gates miss `#pragma omp` — the frontend drops it — so catch it here).
@@ -3667,12 +3942,13 @@ fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     let driver_src = dir.join("saf_replay_driver.c");
     let harness = dir.join("saf_replay_harness");
 
-    if std::fs::write(
-        &driver_src,
-        saf_svcomp::synthesize_conc_replay_driver(&escape_c_string(&sentinel)),
-    )
-    .is_err()
-    {
+    let sentinel_lit = escape_c_string(&sentinel);
+    let driver = if nondet {
+        saf_svcomp::synthesize_conc_replay_driver_nondet(&sentinel_lit)
+    } else {
+        saf_svcomp::synthesize_conc_replay_driver(&sentinel_lit)
+    };
+    if std::fs::write(&driver_src, driver).is_err() {
         return None;
     }
 
@@ -3724,13 +4000,26 @@ fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
 
     // Replay under each forced-interleaving plan; the first sentinel drop wins, then
     // re-confirm (R6) before emitting. A total wall-clock budget bounds per-task cost.
+    // Plain: the fixed plan list, inputs irrelevant. Nondet: the one (schedule, inputs)
+    // pair the parallel search nominates (none ⇒ abstain); the loop below runs it twice
+    // under the default sentinel (first hit + R6) exactly as for the plain driver.
+    let plans: Vec<(saf_svcomp::ReplayPlan, u32)> = if nondet {
+        conc_replay_nondet_search(&harness, dir)
+            .into_iter()
+            .collect()
+    } else {
+        saf_svcomp::replay_plans()
+            .into_iter()
+            .map(|p| (p, 0))
+            .collect()
+    };
     let budget_start = std::time::Instant::now();
-    for plan in saf_svcomp::replay_plans() {
+    for (plan, ndseed) in plans {
         if budget_start.elapsed() >= CONC_REPLAY_TOTAL_BUDGET {
             eprintln!("saf verify: concurrency replay budget exhausted -> unknown");
             break;
         }
-        match run_conc_replay_plan(&harness, &sentinel, plan, CONC_REPLAY_RUN_TIMEOUT) {
+        match run_conc_replay_plan(&harness, &sentinel, plan, ndseed, CONC_REPLAY_RUN_TIMEOUT) {
             Ok(true) => {}
             Ok(false) => continue,
             Err(e) => {
@@ -3743,7 +4032,7 @@ fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
         }
         // R6: require the identical deterministic reproduction on a second run.
         if !matches!(
-            run_conc_replay_plan(&harness, &sentinel, plan, CONC_REPLAY_RUN_TIMEOUT),
+            run_conc_replay_plan(&harness, &sentinel, plan, ndseed, CONC_REPLAY_RUN_TIMEOUT),
             Ok(true)
         ) {
             eprintln!(
@@ -3753,8 +4042,13 @@ fn conc_replay_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             continue;
         }
         eprintln!(
-            "saf verify: FALSE (concurrency forced-interleaving plan '{}' reached reach_error)",
-            plan.label()
+            "saf verify: FALSE (concurrency forced-interleaving plan '{}'{} reached reach_error)",
+            plan.label(),
+            if nondet {
+                format!(" nondet seed {ndseed}")
+            } else {
+                String::new()
+            }
         );
         let programfile = ctx.input.file_name().map_or_else(
             || ctx.input.display().to_string(),
@@ -3820,6 +4114,7 @@ fn run_conc_shim_plan(
     harness: &Path,
     sentinel: &Path,
     plan: saf_svcomp::ShimPlan,
+    ndseed: u32,
     timeout: std::time::Duration,
 ) -> anyhow::Result<bool> {
     use anyhow::Context;
@@ -3831,7 +4126,9 @@ fn run_conc_shim_plan(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .env("SAF_SHIM_P1", plan.p1_env())
-        .env("SAF_SHIM_P2", plan.p2_env());
+        .env("SAF_SHIM_P2", plan.p2_env())
+        // Read only by the nondet-aware shim driver; the plain driver ignores it.
+        .env("SAF_REPLAY_NDSEED", ndseed.to_string());
     let mut child = harden_replay_spawn(&mut cmd)
         .spawn()
         .with_context(|| "spawning concurrency shim harness")?;
@@ -3851,6 +4148,38 @@ fn run_conc_shim_plan(
         }
     }
     Ok(sentinel.exists())
+}
+
+/// The k-th (schedule, inputs) pair of the nondet-aware shim search: the bounded-preemption
+/// schedules (plus the preemption-free one) in turn, with input seed `k`.
+fn conc_shim_nondet_plan(k: u32, plans: &[saf_svcomp::ShimPlan]) -> (saf_svcomp::ShimPlan, u32) {
+    let i = k as usize % (plans.len() + 1);
+    let plan = plans
+        .get(i)
+        .copied()
+        .unwrap_or(saf_svcomp::ShimPlan { p1: -1, p2: -1 });
+    (plan, k)
+}
+
+/// Search (schedule, inputs) pairs for the nondet-aware shim harness
+/// ([`parallel_sentinel_search`] over [`conc_shim_nondet_plan`]).
+fn conc_shim_nondet_search(harness: &Path, dir: &Path) -> Option<(saf_svcomp::ShimPlan, u32)> {
+    let plans = saf_svcomp::shim_preemption_plans();
+    let envs = |k: u32| {
+        let (plan, ndseed) = conc_shim_nondet_plan(k, &plans);
+        vec![
+            ("SAF_SHIM_P1", plan.p1_env()),
+            ("SAF_SHIM_P2", plan.p2_env()),
+            ("SAF_REPLAY_NDSEED", ndseed.to_string()),
+        ]
+    };
+    let (k, tried) = parallel_sentinel_search(harness, dir, "shimnd", CONC_SHIM_RUN_TIMEOUT, &envs);
+    let (plan, nd) = conc_shim_nondet_plan(k?, &plans);
+    eprintln!(
+        "saf verify: nondet shim search hit schedule {} nondet seed {nd} after {tried} runs",
+        plan.label()
+    );
+    Some((plan, nd))
 }
 
 /// Mutex-aware bounded-preemption concurrency `unreach-call` FALSE confirmer (lever
@@ -3873,21 +4202,40 @@ fn run_conc_shim_plan(
 // splitting it would obscure the control flow.
 #[allow(clippy::too_many_lines)]
 fn conc_shim_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    conc_shim_confirm(ctx, false)
+}
+
+/// The shim confirmer for one property. `ovf == false`: `unreach-call` (the sentinel drops
+/// on `reach_error`). `ovf == true`: `no-overflow` — the harness is built with
+/// `-DSAF_SHIM_OVF` and non-trapping `-fsanitize=signed-integer-overflow` without the `UBSan`
+/// runtime, so the driver's `__ubsan_handle_*` entry points drop the sentinel (holding the
+/// operation's `line:column`) on the first signed overflow of the forced SC interleaving.
+// NOTE: one cohesive confirmer (gate, build, schedule search, R6, witness); splitting it
+// would scatter the shared harness/sentinel state across helpers.
+#[allow(clippy::too_many_lines)]
+fn conc_shim_confirm(ctx: &VerifyCtx, ovf: bool) -> Option<VerdictOutcome> {
     use saf_svcomp::Property;
     use std::process::{Command, Stdio};
 
     // Gate 0: there must be a reach_error site to reach.
-    if saf_svcomp::reach_error_call_sites(ctx.module).is_empty() {
+    if !ovf && saf_svcomp::reach_error_call_sites(ctx.module).is_empty() {
         return None;
     }
 
     // Gate 1: the program must be amenable to the mutex-aware bounded-preemption model
     // (reachable spawn, no nondet / condvars / …, no __VERIFIER_atomic, no non-default mutex
     // type — see conc_shim_schedulable).
+    // The nondet-aware variant (lever `conc-shim-nondet`) takes the programs the plain gate
+    // rejects ONLY for calling scalar `__VERIFIER_nondet_*`: its driver supplies legal values
+    // of each function's type from a seeded generator, searched in parallel with the schedules.
     let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
-    if !saf_svcomp::conc_shim_schedulable(ctx.module, &callgraph) {
+    let nondet = if saf_svcomp::conc_shim_schedulable(ctx.module, &callgraph) {
+        false
+    } else if saf_svcomp::conc_shim_nondet_schedulable(ctx.module, &callgraph) {
+        true
+    } else {
         return None;
-    }
+    };
 
     // Gate 2 (R7): abstain on OpenMP / relaxed-memory the SC replay cannot arbitrate
     // (symbol-level gates miss `#pragma omp` — the frontend drops it — so catch it here).
@@ -3902,12 +4250,12 @@ fn conc_shim_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     let driver_src = dir.join("saf_shim_driver.c");
     let harness = dir.join("saf_shim_harness");
 
-    if std::fs::write(
-        &driver_src,
-        saf_svcomp::synthesize_conc_shim_driver(&escape_c_string(&sentinel)),
-    )
-    .is_err()
-    {
+    let driver = if nondet {
+        saf_svcomp::synthesize_conc_shim_driver_nondet(&escape_c_string(&sentinel))
+    } else {
+        saf_svcomp::synthesize_conc_shim_driver(&escape_c_string(&sentinel))
+    };
+    if std::fs::write(&driver_src, driver).is_err() {
         return None;
     }
 
@@ -3925,8 +4273,17 @@ fn conc_shim_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
             "-O0",
             "-Wno-everything",
             "-fsanitize=signed-integer-overflow",
-            "-fsanitize-trap=signed-integer-overflow",
         ]);
+        if ovf {
+            // The driver defines the UBSan handlers (no runtime linked); see above.
+            cmd.args([
+                "-fno-sanitize-recover=signed-integer-overflow",
+                "-fno-sanitize-link-runtime",
+                "-DSAF_SHIM_OVF",
+            ]);
+        } else {
+            cmd.arg("-fsanitize-trap=signed-integer-overflow");
+        }
         if cov {
             cmd.args([
                 "-fsanitize-coverage=trace-pc-guard",
@@ -3974,13 +4331,24 @@ fn conc_shim_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
 
     // Replay under each bounded-preemption schedule; the first sentinel drop wins, then
     // re-confirm (R6) before emitting. A total wall-clock budget bounds per-task cost.
+    // Plain: the systematic schedule list, inputs irrelevant. Nondet: the one (schedule,
+    // inputs) pair the parallel search nominates (none ⇒ abstain); the loop below runs it
+    // twice under the default sentinel (first hit + R6) exactly as for the plain driver.
+    let plans: Vec<(saf_svcomp::ShimPlan, u32)> = if nondet {
+        conc_shim_nondet_search(&harness, dir).into_iter().collect()
+    } else {
+        saf_svcomp::shim_preemption_plans()
+            .into_iter()
+            .map(|p| (p, 0))
+            .collect()
+    };
     let budget_start = std::time::Instant::now();
-    for plan in saf_svcomp::shim_preemption_plans() {
+    for (plan, ndseed) in plans {
         if budget_start.elapsed() >= CONC_SHIM_TOTAL_BUDGET {
             eprintln!("saf verify: concurrency shim budget exhausted -> unknown");
             break;
         }
-        match run_conc_shim_plan(&harness, &sentinel, plan, CONC_SHIM_RUN_TIMEOUT) {
+        match run_conc_shim_plan(&harness, &sentinel, plan, ndseed, CONC_SHIM_RUN_TIMEOUT) {
             Ok(true) => {}
             Ok(false) => continue,
             Err(e) => {
@@ -3991,20 +4359,58 @@ fn conc_shim_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
                 continue;
             }
         }
-        // R6: require the identical deterministic reproduction on a second run.
+        let first_hit = std::fs::read_to_string(&sentinel).unwrap_or_default();
+        // R6: require the identical deterministic reproduction on a second run (for the
+        // overflow mode: the same overflowing operation).
         if !matches!(
-            run_conc_shim_plan(&harness, &sentinel, plan, CONC_SHIM_RUN_TIMEOUT),
+            run_conc_shim_plan(&harness, &sentinel, plan, ndseed, CONC_SHIM_RUN_TIMEOUT),
             Ok(true)
-        ) {
+        ) || std::fs::read_to_string(&sentinel).unwrap_or_default() != first_hit
+        {
             eprintln!(
                 "saf verify: concurrency shim schedule {} did not re-confirm deterministically -> continue",
                 plan.label()
             );
             continue;
         }
+        if ovf {
+            let Some(hit) = parse_shim_overflow_hit(&first_hit, ctx.input) else {
+                eprintln!("saf verify: concurrency shim overflow location unreadable -> continue");
+                continue;
+            };
+            eprintln!(
+                "saf verify: FALSE (concurrency bounded-preemption schedule '{}'{} overflowed at {}:{})",
+                plan.label(),
+                if nondet {
+                    format!(" nondet seed {ndseed}")
+                } else {
+                    String::new()
+                },
+                hit.line,
+                hit.column.unwrap_or(0)
+            );
+            let witness = build_witness(
+                ctx,
+                Some(saf_svcomp::lower_overflow_hit(&saf_svcomp::OverflowHit {
+                    column: full_expression_col(ctx, hit.line, hit.column).or(hit.column),
+                    ..hit.clone()
+                })),
+            );
+            return Some(VerdictOutcome {
+                verdict: saf_svcomp::overflow_verdict(),
+                witness,
+                graphml: None,
+                correctness: None,
+            });
+        }
         eprintln!(
-            "saf verify: FALSE (concurrency bounded-preemption schedule '{}' reached reach_error)",
-            plan.label()
+            "saf verify: FALSE (concurrency bounded-preemption schedule '{}'{} reached reach_error)",
+            plan.label(),
+            if nondet {
+                format!(" nondet seed {ndseed}")
+            } else {
+                String::new()
+            }
         );
         let programfile = ctx.input.file_name().map_or_else(
             || ctx.input.display().to_string(),
@@ -4044,8 +4450,36 @@ fn conc_shim_confirm_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
         });
     }
 
-    eprintln!("saf verify: no bounded-preemption schedule reached reach_error -> unknown");
+    eprintln!(
+        "saf verify: no bounded-preemption schedule reached {} -> unknown",
+        if ovf {
+            "a signed overflow"
+        } else {
+            "reach_error"
+        }
+    );
     None
+}
+
+/// Parse the overflow shim's sentinel (`line:column:file`, written by the driver's `UBSan`
+/// handler) into an [`saf_svcomp::OverflowHit`] on the task's input file.
+fn parse_shim_overflow_hit(text: &str, input: &Path) -> Option<saf_svcomp::OverflowHit> {
+    let mut parts = text.trim().splitn(3, ':');
+    let line: u32 = parts.next()?.parse().ok().filter(|&n| n > 0)?;
+    let col: u32 = parts.next()?.parse().ok()?;
+    // Only an overflow in the task's own source counts — never one in the driver/stub.
+    let file = Path::new(parts.next()?)
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
+    if file != input.file_name()?.to_string_lossy() {
+        return None;
+    }
+    Some(saf_svcomp::OverflowHit {
+        file,
+        line,
+        column: (col > 0).then_some(col),
+    })
 }
 
 /// Corpus size cap for the greybox feedback loop — bounds memory and keeps the
@@ -4780,12 +5214,52 @@ fn engine_false_candidate(
 /// [`engine_false_candidate`] on another ingestion of the task (the
 /// memory-safety recipe's module).
 fn engine_false_candidate_in(
-    _ctx: &VerifyCtx,
+    ctx: &VerifyCtx,
     module: &saf_core::air::AirModule,
     overflow: bool,
     opts: &saf_svcomp::CexOptions,
 ) -> Option<saf_svcomp::FalseCandidate> {
-    let found = saf_svcomp::find_counterexample_excluding(module, cex_budget(), overflow, opts)?;
+    let budget = if LATE_CEX.load(std::sync::atomic::Ordering::Relaxed) {
+        late_cex_budget(ctx)?
+    } else {
+        cex_budget()
+    };
+    let found = saf_svcomp::find_counterexample_excluding(module, budget, overflow, opts)?;
+    Some(candidate_from_counterexample(module, found, opts))
+}
+
+/// Set while a strategy's engine-counterexample stage runs a second time on
+/// what is left of the task budget ([`late_cex_budget`]): the first pass gets
+/// [`cex_budget`] per search, which a deep violation outlasts.
+static LATE_CEX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// One search's budget in the late pass: half of what is left (less
+/// [`LATE_CEX_MARGIN`]), so the searches after it still get time. `None` once
+/// that is under [`LATE_CEX_MIN`].
+fn late_cex_budget(ctx: &VerifyCtx) -> Option<std::time::Duration> {
+    let left = verify_time_left(ctx).saturating_sub(LATE_CEX_MARGIN) / 2;
+    (left >= LATE_CEX_MIN).then_some(left)
+}
+
+/// Run `stage` (an engine-counterexample stage) again in late mode
+/// ([`LATE_CEX`]) when the task has time left for it.
+fn late_cex_pass<T>(ctx: &VerifyCtx, stage: impl FnOnce() -> T) -> Option<T> {
+    if LATE_CEX.load(std::sync::atomic::Ordering::Relaxed) || late_cex_budget(ctx).is_none() {
+        return None;
+    }
+    eprintln!("saf verify: late engine counterexample pass");
+    LATE_CEX.store(true, std::sync::atomic::Ordering::Relaxed);
+    let out = stage();
+    LATE_CEX.store(false, std::sync::atomic::Ordering::Relaxed);
+    Some(out)
+}
+
+/// A replay candidate from an engine counterexample (logged as such).
+fn candidate_from_counterexample(
+    module: &saf_core::air::AirModule,
+    found: saf_svcomp::Counterexample,
+    opts: &saf_svcomp::CexOptions,
+) -> saf_svcomp::FalseCandidate {
     if opts.depth_first || opts.check_shl {
         eprintln!(
             "saf verify: (counterexample search: depth_first={} check_shl={})",
@@ -4804,7 +5278,7 @@ fn engine_false_candidate_in(
         let span = saf_svcomp::find_inst_span(module, found.error_inst);
         eprintln!("saf verify:   violation at {span:?}");
     }
-    Some(saf_svcomp::FalseCandidate {
+    saf_svcomp::FalseCandidate {
         reach_error_inst: found.error_inst,
         block_path: found.block_path,
         assignments: std::collections::BTreeMap::new(),
@@ -4817,7 +5291,7 @@ fn engine_false_candidate_in(
                 call_inst: Some(inst),
             })
             .collect(),
-    })
+    }
 }
 
 /// The `-Wl,--wrap=rand` definition the replay driver supplies when a
@@ -5602,7 +6076,7 @@ fn memsafety_engine_counterexample(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
                 continue;
             }
             eprintln!("saf verify: no engine memsafety counterexample -> unknown");
-            return None;
+            return late_cex_pass(ctx, || memsafety_engine_counterexample(ctx)).flatten();
         };
         match asan_replay_sequence(ctx, module, &candidate) {
             Ok(Some(hit)) => {
@@ -7527,6 +8001,15 @@ fn overflow_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         );
         return overflow_engine_counterexample(ctx);
     }
+    // Concurrent programs (the sequential UBSan sweep below abstains on them): the
+    // mutex-aware bounded-preemption shim in overflow mode. Every forced schedule is a
+    // real serialized SC interleaving, so a signed overflow it reaches is genuine.
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        if let Some(outcome) = conc_shim_confirm(ctx, true) {
+            return outcome;
+        }
+    }
     match ubsan_confirm(
         ctx.input,
         ctx.data_model,
@@ -7604,7 +8087,8 @@ fn overflow_engine_counterexample(ctx: &VerifyCtx) -> VerdictOutcome {
                 continue;
             }
             eprintln!("saf verify: no engine overflow counterexample -> unknown");
-            return unknown_outcome();
+            return late_cex_pass(ctx, || overflow_engine_counterexample(ctx))
+                .unwrap_or_else(unknown_outcome);
         };
         match ubsan_replay_sequence(
             ctx.input,
@@ -8303,13 +8787,30 @@ fn try_no_data_race_false(ctx: &VerifyCtx, source: &str) -> Option<VerdictOutcom
         return None;
     }
 
-    // Gate 3: the finder must PROPOSE at least one candidate racing pair. An
-    // empty result means the over-approximate lockset+MHP analysis proved the
-    // program race-free, so we abstain without paying for a TSan run.
+    // The lockset+MHP finder is informational only. It is a pre-filter, not a
+    // proof: it misses real races (pointer-aliased accesses, container_of, spin
+    // flags), so an empty result no longer skips TSan. TSan stays the sole arbiter,
+    // so running it on more programs cannot manufacture a race.
+    //
+    // EXCEPT under ILP32: TSan only runs LP64 (see `tsan_confirm`), and an LP64 run can
+    // race where the ILP32 program does not (`sizeof(long)`-sized loops, `long`
+    // wraparound — the `pthread-ilp32-twins` tasks). An ILP32 program whose own source is
+    // data-model sensitive therefore keeps the finder gate and the constant-only sweep;
+    // only a data-model-insensitive one gets the finder-free, random-nondet search.
     let candidates = saf_svcomp::find_race_candidates(ctx.module);
-    if candidates.is_empty() {
-        eprintln!("saf verify: lockset+MHP finder found no race candidate -> unknown");
-        return None;
+    let ilp32 = matches!(ctx.data_model, saf_svcomp::DataModel::ILP32);
+    let sensitive = if ilp32 {
+        data_model_sensitive_token(ctx.module, ctx.input, source)
+    } else {
+        None
+    };
+    if let Some(tok) = &sensitive {
+        if candidates.is_empty() {
+            eprintln!(
+                "saf verify: lockset+MHP finder found no race candidate and the ILP32 source is data-model sensitive ('{tok}') -> unknown"
+            );
+            return None;
+        }
     }
     eprintln!(
         "saf verify: finder proposed {} race candidate(s); attempting TSan confirmation",
@@ -8318,7 +8819,15 @@ fn try_no_data_race_false(ctx: &VerifyCtx, source: &str) -> Option<VerdictOutcom
 
     // Gate 4: TSan is the sole soundness arbiter (HB-based — only reports a race
     // it concretely observes).
-    match tsan_confirm(ctx.input, ctx.module, ctx.stub, ctx.tempdir, ctx.clang) {
+    match tsan_confirm(
+        ctx.input,
+        ctx.module,
+        ctx.stub,
+        ctx.tempdir,
+        ctx.clang,
+        ilp32,
+        sensitive.is_none(),
+    ) {
         Ok(Some(hit)) => {
             let programfile = ctx.input.file_name().map_or_else(
                 || ctx.input.display().to_string(),
@@ -8358,6 +8867,110 @@ fn try_no_data_race_false(ctx: &VerifyCtx, source: &str) -> Option<VerdictOutcom
             None
         }
     }
+}
+
+/// Tokens whose meaning differs between ILP32 and LP64 (type widths, sizes, model macros).
+const DATA_MODEL_TOKENS: &[&str] = &[
+    "sizeof",
+    "_Alignof",
+    "alignof",
+    "offsetof",
+    "long",
+    "size_t",
+    "ssize_t",
+    "ptrdiff_t",
+    "intptr_t",
+    "uintptr_t",
+    "off_t",
+    "time_t",
+    "clock_t",
+    "wint_t",
+    "LONG_MAX",
+    "LONG_MIN",
+    "ULONG_MAX",
+    "SIZE_MAX",
+    "SSIZE_MAX",
+    "PTRDIFF_MAX",
+    "INTPTR_MAX",
+    "UINTPTR_MAX",
+    "LONG_BIT",
+    "__WORDSIZE",
+    "__LP64__",
+    "_LP64",
+    "__ILP32__",
+    "__x86_64__",
+    "__i386__",
+];
+
+/// The first data-model-sensitive token (see [`DATA_MODEL_TOKENS`], plus any
+/// `__SIZEOF_*` macro) in the program's own source, or `None` if there is none.
+///
+/// A `.c` task is scanned whole (its headers are `#include`d, not inlined). A
+/// preprocessed `.i` task inlines its headers, so it is scanned from the first line of
+/// any function or global the module defines in that file (the user part follows the
+/// headers) to the end; a module with no such line in the file counts as sensitive.
+fn data_model_sensitive_token(
+    module: &saf_core::air::AirModule,
+    input: &Path,
+    source: &str,
+) -> Option<String> {
+    let start = if input.extension().is_some_and(|e| e == "c") {
+        1
+    } else {
+        let Some(base) = input.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            return Some("<unnamed input>".to_string());
+        };
+        let in_input = |sp: &saf_core::span::Span| {
+            module
+                .source_files
+                .iter()
+                .find(|f| f.id == sp.file_id)
+                .and_then(|f| Path::new(&f.path).file_name())
+                .is_some_and(|n| n.to_string_lossy() == base)
+        };
+        let mut lines = Vec::new();
+        for f in module.functions.iter().filter(|f| !f.is_declaration) {
+            lines.extend(
+                f.span
+                    .iter()
+                    .filter(|sp| in_input(sp))
+                    .map(|sp| sp.line_start),
+            );
+            for b in &f.blocks {
+                for i in &b.instructions {
+                    lines.extend(
+                        i.span
+                            .iter()
+                            .filter(|sp| in_input(sp))
+                            .map(|sp| sp.line_start),
+                    );
+                }
+            }
+        }
+        for g in &module.globals {
+            lines.extend(
+                g.span
+                    .iter()
+                    .filter(|sp| in_input(sp))
+                    .map(|sp| sp.line_start),
+            );
+        }
+        match lines.into_iter().filter(|&l| l > 0).min() {
+            Some(l) => l,
+            None => return Some("<no source region>".to_string()),
+        }
+    };
+    let region = source
+        .lines()
+        .skip(usize::try_from(start.saturating_sub(1)).unwrap_or(usize::MAX));
+    for line in region {
+        for word in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if DATA_MODEL_TOKENS.contains(&word) || word.starts_with("__SIZEOF_") {
+                return Some(word.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Source-level out-of-scope gate for the structural `no-data-race` **TRUE** proof.
@@ -8559,7 +9172,7 @@ fn custom_verifier_atomic_fns(source: &str) -> std::collections::BTreeSet<String
 /// identify the atomic functions by comparing the runtime frame address
 /// (`this_fn`) against each function's taken address — `extern void f();` is a
 /// signature-agnostic forward declaration, so no signature knowledge is needed.
-fn synthesize_tsan_driver(atomic_fns: &std::collections::BTreeSet<String>) -> String {
+fn synthesize_tsan_driver(atomic_fns: &std::collections::BTreeSet<String>, ilp32: bool) -> String {
     use std::fmt::Write as _;
 
     let mut s = String::new();
@@ -8567,14 +9180,53 @@ fn synthesize_tsan_driver(atomic_fns: &std::collections::BTreeSet<String>) -> St
     s.push_str("#define _GNU_SOURCE 1\n");
     s.push_str("#include <stddef.h>\n#include <stdlib.h>\n#include <pthread.h>\n");
     s.push_str("extern void _exit(int) __attribute__((noreturn));\n");
+    // An abort() (failed assume_abort_if_not) would otherwise pay ~130 ms in the
+    // core_pattern pipe helper, which ignores RLIMIT_CORE=0; must run after exec.
     s.push_str(
-        "static long __saf_c(void) { const char *e = getenv(\"SAF_NONDET_CONST\"); return e ? atol(e) : 0; }\n",
+        "#include <sys/prctl.h>\n\
+         __attribute__((constructor)) static void __saf_nodump(void) { prctl(PR_SET_DUMPABLE, 0, 0, 0, 0); }\n",
+    );
+    // Nondet values. Default: every call returns the constant `$SAF_NONDET_CONST`.
+    // With `$SAF_REPLAY_NDSEED` set, each call draws a fresh seeded pseudo-random
+    // value (half small in -4..4, half full-width; booleans biased by seed), which
+    // any value of the C type legally is. The per-call counter is a relaxed ATOMIC
+    // so concurrent nondet calls are not themselves a data race TSan could report.
+    s.push_str(
+        "static int __saf_ndmode = 0; static unsigned long long __saf_ndseed = 0;\n\
+         static unsigned long long __saf_ndctr = 0; static unsigned __saf_ndtp = 500;\n\
+         __attribute__((constructor)) static void __saf_ndinit(void) {\n\
+         \x20 const char *s = getenv(\"SAF_REPLAY_NDSEED\"); if (!s) return;\n\
+         \x20 static const unsigned b[5] = {500, 200, 800, 50, 950};\n\
+         \x20 __saf_ndmode = 1; __saf_ndseed = strtoull(s, 0, 10); __saf_ndtp = b[__saf_ndseed % 5]; }\n\
+         static unsigned long long __saf_nd(void) {\n\
+         \x20 unsigned long long z = __saf_ndseed * 0x9E3779B97F4A7C15ULL\n\
+         \x20   + __atomic_add_fetch(&__saf_ndctr, 1ULL, __ATOMIC_RELAXED) * 0x632BE59BD9B4E019ULL;\n\
+         \x20 z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL; z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;\n\
+         \x20 return z ^ (z >> 31); }\n\
+         static long __saf_c(void) {\n\
+         \x20 if (__saf_ndmode) { unsigned long long r = __saf_nd();\n\
+         \x20   return (r & 1ULL) ? (long)((r >> 8) % 9ULL) - 4 : (long)__saf_nd(); }\n\
+         \x20 const char *e = getenv(\"SAF_NONDET_CONST\"); return e ? atol(e) : 0; }\n",
     );
     for (fname, cty) in SCALAR_NONDET {
         let suffix = fname.trim_start_matches("__VERIFIER_nondet_");
+        if *cty == "_Bool" {
+            let _ = writeln!(
+                s,
+                "{cty} __VERIFIER_nondet_{suffix}(void) {{ return __saf_ndmode ? (_Bool)((__saf_nd() % 1000ULL) < __saf_ndtp) : ({cty})__saf_c(); }}"
+            );
+            continue;
+        }
+        // The harness is always LP64 (no 32-bit TSan runtime), but an ILP32 task's
+        // `long`-width nondet must stay within 32 bits to be a legal value of its type.
+        let narrow = match *cty {
+            "long" if ilp32 => "(int)",
+            "unsigned long" | "size_t" if ilp32 => "(unsigned int)",
+            _ => "",
+        };
         let _ = writeln!(
             s,
-            "{cty} __VERIFIER_nondet_{suffix}(void) {{ return ({cty})__saf_c(); }}"
+            "{cty} __VERIFIER_nondet_{suffix}(void) {{ return ({cty}){narrow}__saf_c(); }}"
         );
     }
     s.push_str("void* __VERIFIER_nondet_pointer(void) { return (void*)0; }\n");
@@ -8666,6 +9318,8 @@ fn tsan_confirm(
     stub: &Path,
     dir: &Path,
     clang: &str,
+    ilp32: bool,
+    nondet_search: bool,
 ) -> anyhow::Result<Option<saf_svcomp::RaceHit>> {
     use anyhow::Context;
     use std::process::{Command, Stdio};
@@ -8686,7 +9340,7 @@ fn tsan_confirm(
         &["-finstrument-functions"]
     };
 
-    std::fs::write(&driver_src, synthesize_tsan_driver(&atomic_fns))
+    std::fs::write(&driver_src, synthesize_tsan_driver(&atomic_fns, ilp32))
         .with_context(|| "writing TSan replay driver")?;
 
     let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
@@ -8785,8 +9439,80 @@ fn tsan_confirm(
             return Ok(Some(hit)); // first constant that reproduces a race wins
         }
     }
+
+    if !nondet_search {
+        return Ok(None);
+    }
+    tsan_nondet_search(&harness, &errpath, timeout)
+}
+
+/// The seeded random-nondet `TSan` runs of [`tsan_confirm`] (after its constant sweep).
+fn tsan_nondet_search(
+    harness: &Path,
+    errpath: &Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Option<saf_svcomp::RaceHit>> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+
+    // Seeded random nondet runs: each nondet call draws a fresh value (any value of
+    // its C type is a legal nondet choice), reaching paths a single repeated
+    // constant cannot — e.g. a nondet loop bound AND a nondet branch inside it.
+    // Each run is still a real execution judged by TSan alone.
+    let budget = std::time::Duration::from_secs(TSAN_ND_BUDGET_SECS);
+    let run_timeout = timeout.min(std::time::Duration::from_secs(TSAN_ND_RUN_TIMEOUT_SECS));
+    let started = std::time::Instant::now();
+    let mut runs = 0u32;
+    for seed in 1..=TSAN_ND_MAX_RUNS {
+        if started.elapsed() >= budget {
+            break;
+        }
+        runs += 1;
+        let errfile =
+            std::fs::File::create(errpath).with_context(|| "creating TSan stderr file")?;
+        let mut cmd = Command::new(harness);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(errfile))
+            .env("TSAN_OPTIONS", TSAN_OPTS)
+            .env("SAF_REPLAY_NDSEED", seed.to_string());
+        let mut child = harden_replay_spawn(&mut cmd)
+            .spawn()
+            .with_context(|| "spawning TSan harness")?;
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if start.elapsed() >= run_timeout {
+                        kill_replay_group(&mut child);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(e) => return Err(e).context("waiting on TSan harness"),
+            }
+        }
+        let report = std::fs::read_to_string(errpath).unwrap_or_default();
+        if let Some(hit) = saf_svcomp::parse_tsan_report(&report) {
+            eprintln!("saf verify: TSan nondet search hit at seed {seed} after {runs} runs");
+            return Ok(Some(hit));
+        }
+    }
+    eprintln!(
+        "saf verify: TSan nondet search: no race in {runs} runs ({} s)",
+        started.elapsed().as_secs()
+    );
     Ok(None)
 }
+
+/// Wall-clock budget (seconds) for the seeded random-nondet `TSan` runs that follow
+/// the constant sweep in [`tsan_confirm`].
+const TSAN_ND_BUDGET_SECS: u64 = 60;
+/// Per-run timeout (seconds) for one seeded random-nondet `TSan` run.
+const TSAN_ND_RUN_TIMEOUT_SECS: u64 = 5;
+/// Cap on the number of seeded random-nondet `TSan` runs.
+const TSAN_ND_MAX_RUNS: u32 = 2000;
 
 /// Confirm a `no-overflow` FALSE by `UBSan`-instrumented native execution (plan 199, R6).
 ///
@@ -11125,7 +11851,7 @@ void worker(void) { __VERIFIER_atomic_inc(&g); __VERIFIER_atomic_acquire(); }
         let mut fns = std::collections::BTreeSet::new();
         fns.insert("__VERIFIER_atomic_acquire".to_string());
         fns.insert("__VERIFIER_atomic_release".to_string());
-        let d = synthesize_tsan_driver(&fns);
+        let d = synthesize_tsan_driver(&fns, false);
         // Forward declares each atomic and takes its address into the table.
         assert!(d.contains("extern void __VERIFIER_atomic_acquire();"));
         assert!(d.contains("(void*)__VERIFIER_atomic_release"));
@@ -11135,16 +11861,78 @@ void worker(void) { __VERIFIER_atomic_inc(&g); __VERIFIER_atomic_acquire(); }
         assert!(d.contains("pthread_mutex_lock(&__saf_atomic)"));
         assert!(d.contains("no_instrument_function"));
         // Deterministic: identical inputs → identical bytes.
-        assert_eq!(d, synthesize_tsan_driver(&fns));
+        assert_eq!(d, synthesize_tsan_driver(&fns, false));
     }
 
     #[test]
     fn driver_omits_hooks_when_no_custom_atomics() {
-        let d = synthesize_tsan_driver(&std::collections::BTreeSet::new());
+        let d = synthesize_tsan_driver(&std::collections::BTreeSet::new(), false);
         // begin/end are still modelled, but no instrument-functions hooks are
         // emitted so the common case is unperturbed.
         assert!(d.contains("__VERIFIER_atomic_begin"));
         assert!(!d.contains("__cyg_profile_func_enter"));
+    }
+
+    #[test]
+    fn data_model_sensitivity_gate_catches_the_ilp32_twins() {
+        let m = saf_core::air::AirModule::new(saf_core::ids::ModuleId::new(1));
+        let c = Path::new("/b/header-words-ilp32.c");
+        let twin = "int words[4];\nvoid *f(void *a) {\n  for (unsigned long i = 0; i < sizeof(long) / sizeof(int); i++) words[i] = 0;\n  return 0;\n}\n";
+        assert_eq!(
+            data_model_sensitive_token(&m, c, twin).as_deref(),
+            Some("long")
+        );
+        assert_eq!(
+            data_model_sensitive_token(&m, c, "int x = __SIZEOF_POINTER__;").as_deref(),
+            Some("__SIZEOF_POINTER__")
+        );
+        // Whole-word matching: `longest`/`sizeofs` are ordinary identifiers.
+        let clean = "int longest, sizeofs;\nvoid *t(void *a) { longest++; return 0; }\n";
+        assert_eq!(data_model_sensitive_token(&m, c, clean), None);
+        // A preprocessed file whose module locates no definition in it is sensitive.
+        assert!(data_model_sensitive_token(&m, Path::new("/b/x.i"), clean).is_some());
+    }
+
+    #[test]
+    fn tsan_driver_narrows_long_nondets_for_ilp32() {
+        let d = synthesize_tsan_driver(&std::collections::BTreeSet::new(), true);
+        assert!(d.contains("long __VERIFIER_nondet_long(void) { return (long)(int)__saf_c(); }"));
+        assert!(d.contains("return (unsigned long)(unsigned int)__saf_c();"));
+        assert!(d.contains("return (size_t)(unsigned int)__saf_c();"));
+        let d64 = synthesize_tsan_driver(&std::collections::BTreeSet::new(), false);
+        assert!(d64.contains("long __VERIFIER_nondet_long(void) { return (long)__saf_c(); }"));
+    }
+
+    #[test]
+    fn shim_overflow_hit_is_parsed_only_in_the_input_file() {
+        let input = Path::new("/b/c/pthread-overflow/arg-local-reused.c");
+        let hit =
+            parse_shim_overflow_hit("52:11:/b/c/pthread-overflow/arg-local-reused.c\n", input)
+                .expect("hit in the input");
+        assert_eq!(hit.file, "arg-local-reused.c");
+        assert_eq!(hit.line, 52);
+        assert_eq!(hit.column, Some(11));
+        assert_eq!(
+            parse_shim_overflow_hit("7:0:arg-local-reused.c", input).and_then(|h| h.column),
+            None
+        );
+        // An overflow inside the generated driver or stub is not the program's.
+        assert!(parse_shim_overflow_hit("40:3:/tmp/x/saf_shim_driver.c", input).is_none());
+        assert!(parse_shim_overflow_hit("1", input).is_none());
+        assert!(parse_shim_overflow_hit("0:3:arg-local-reused.c", input).is_none());
+    }
+
+    #[test]
+    fn tsan_driver_has_race_free_seeded_nondet_mode() {
+        let d = synthesize_tsan_driver(&std::collections::BTreeSet::new(), false);
+        // Seeded random mode keyed on SAF_REPLAY_NDSEED, constant mode kept.
+        assert!(d.contains("getenv(\"SAF_REPLAY_NDSEED\")"), "{d}");
+        assert!(d.contains("getenv(\"SAF_NONDET_CONST\")"), "{d}");
+        // The shared per-call counter is atomic, so the driver itself never races.
+        assert!(d.contains("__atomic_add_fetch(&__saf_ndctr"), "{d}");
+        // Booleans are seed-biased; core dumps are disabled after exec.
+        assert!(d.contains("__saf_ndtp"), "{d}");
+        assert!(d.contains("prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)"), "{d}");
     }
 
     #[test]
