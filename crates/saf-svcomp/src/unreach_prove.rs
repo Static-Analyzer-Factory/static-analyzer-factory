@@ -3386,17 +3386,7 @@ impl<'a> Engine<'a> {
                 .get(n)
                 .copied()
                 .unwrap_or_else(|| model.eval(sym, true).and_then(|b| b.as_u64()).unwrap_or(0));
-            let unsigned = ["uint", "ulong", "ushort", "uchar", "ulonglong", "size_t"]
-                .iter()
-                .any(|u| name.ends_with(u));
-            let value: i64 = if *bits >= 64 || unsigned {
-                i64::from_ne_bytes(raw.to_ne_bytes())
-            } else if raw & (1u64 << (bits - 1)) != 0 {
-                i64::from_ne_bytes(raw.to_ne_bytes()) - (1i64 << bits)
-            } else {
-                i64::from_ne_bytes(raw.to_ne_bytes())
-            };
-            nondets.push((name.clone(), value, *inst));
+            nondets.push((name.clone(), read_value(name, *bits, raw), *inst));
         }
         nondets
     }
@@ -7588,6 +7578,31 @@ fn isqrt(n: i128) -> i64 {
     i64::try_from(r).unwrap_or(i64::MAX)
 }
 
+/// The C value a nondet read of `name` returns, from the `bits`-wide pattern
+/// `raw`: zero-extended for the unsigned functions and `_Bool` (whose 1-bit
+/// `true` is 1, not -1 — a `\result == -1` waypoint on a `_Bool` read makes a
+/// validator reject the witness), sign-extended otherwise.
+fn read_value(name: &str, bits: u32, raw: u64) -> i64 {
+    let unsigned = [
+        "uint",
+        "ulong",
+        "ushort",
+        "uchar",
+        "ulonglong",
+        "size_t",
+        "bool",
+    ]
+    .iter()
+    .any(|u| name.ends_with(u));
+    if bits >= 64 || unsigned || bits == 0 {
+        i64::from_ne_bytes(raw.to_ne_bytes())
+    } else if raw & (1u64 << (bits - 1)) != 0 {
+        i64::from_ne_bytes(raw.to_ne_bytes()) - (1i64 << bits)
+    } else {
+        i64::from_ne_bytes(raw.to_ne_bytes())
+    }
+}
+
 fn int_bv(value: i64, bits: u32) -> BV {
     if bits >= 64 {
         BV::from_i64(value, bits)
@@ -9445,6 +9460,19 @@ mod tests {
             .filter(|(_, b)| *b == lasso.block)
             .count();
         assert!(rounds >= 2, "{lasso:?}");
+    }
+
+    #[test]
+    fn nondet_read_values_are_extended_by_the_return_type() {
+        assert_eq!(read_value("__VERIFIER_nondet_bool", 1, 1), 1);
+        assert_eq!(read_value("__VERIFIER_nondet_bool", 8, 1), 1);
+        assert_eq!(read_value("__VERIFIER_nondet_char", 8, 0xff), -1);
+        assert_eq!(read_value("__VERIFIER_nondet_uchar", 8, 0xff), 255);
+        assert_eq!(read_value("__VERIFIER_nondet_int", 32, 0xffff_ffff), -1);
+        assert_eq!(
+            read_value("__VERIFIER_nondet_uint", 32, 0xffff_ffff),
+            4_294_967_295
+        );
     }
 
     #[test]

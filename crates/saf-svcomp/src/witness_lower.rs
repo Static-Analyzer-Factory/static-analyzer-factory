@@ -446,6 +446,12 @@ fn branching_for_path_step(
     {
         exit += 1;
     }
+    // A `?:` decision (`cond.true` / `cond.false`) is no branching statement:
+    // CPAchecker rejects the WHOLE witness on a branching waypoint at a ternary
+    // ("Ternary operators as branching"). Leaving it out only loosens the path.
+    if label_of(path[exit]).is_some_and(|l| l.starts_with("cond.")) {
+        return None;
+    }
     let taken = match clang_block_role(label_of(path[exit])) {
         Some(BlockRole::TrueSide) => true,
         Some(BlockRole::FalseSide) => false,
@@ -1341,6 +1347,62 @@ mod tests {
         assert_eq!(branchings[0].line, 9);
         assert_eq!(branchings[0].constraint.as_ref().unwrap().value, "true");
         assert_eq!(wps.last().unwrap().kind, WaypointKind::Target);
+    }
+
+    /// `x = c ? a : b; if (x) …`: the `?:` decision (clang's `cond.true` /
+    /// `cond.false`) is not a branching statement. CPAchecker rejects the whole
+    /// witness on a branching waypoint at a ternary ("Ternary operators as
+    /// branching"), so only the `if` gets one.
+    #[test]
+    fn ternary_decision_gets_no_branching_waypoint() {
+        let (f_id, err_id) = (FunctionId::new(1), FunctionId::new(2));
+        let (b0, c_true, c_false, c_end, if_then, if_end) = (
+            BlockId::new(10),
+            BlockId::new(11),
+            BlockId::new(12),
+            BlockId::new(13),
+            BlockId::new(14),
+            BlockId::new(15),
+        );
+        let jump = |iid: u128, target: BlockId| {
+            Instruction::new(InstId::new(iid), Operation::Br { target })
+        };
+        let reach_iid = InstId::new(33);
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.source_files.push(SourceFile::new(FileId::new(1), "t.c"));
+        m.functions.push(func(
+            f_id,
+            "main",
+            vec![
+                blk_named(b0, "entry", vec![cond_br(2, c_true, c_false, 5, 7)]),
+                blk_named(c_true, "cond.true", vec![jump(3, c_end)]),
+                blk_named(c_false, "cond.false", vec![jump(4, c_end)]),
+                blk_named(c_end, "cond.end", vec![cond_br(5, if_then, if_end, 6, 7)]),
+                blk_named(
+                    if_then,
+                    "if.then",
+                    vec![err_at(reach_iid, err_id, 7, 5), ret(6)],
+                ),
+                blk_named(if_end, "if.end", vec![ret(7)]),
+            ],
+            b0,
+        ));
+        m.functions.push(decl(err_id, "reach_error"));
+        m.functions
+            .push(decl(FunctionId::new(99), "__VERIFIER_nondet_int"));
+        let cand = FalseCandidate {
+            reach_error_inst: reach_iid,
+            block_path: vec![b0, c_true, c_end, if_then],
+            assignments: BTreeMap::new(),
+            nondet_sequence: vec![],
+        };
+        let wps = lower_candidate(&m, &cand, None).expect("lowered");
+        let lines: Vec<u32> = wps
+            .iter()
+            .filter(|w| w.kind == WaypointKind::Branching)
+            .map(|w| w.line)
+            .collect();
+        assert_eq!(lines, vec![6], "{wps:?}");
     }
 
     #[test]
