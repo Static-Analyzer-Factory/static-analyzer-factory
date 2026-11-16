@@ -128,6 +128,9 @@ pub fn termination_verdict() -> &'static str {
 /// reachable indirect call, or non-allowlisted reachable external.
 #[must_use]
 pub fn program_structurally_terminates(module: &AirModule) -> bool {
+    // A termination task has no undefined behaviour (CONVENTIONS.md): signed
+    // `nsw` arithmetic in loop guards is exact for the ranking synthesizer.
+    let _defined = crate::ranking::AssumeDefinedSignedArith::enter();
     // FAST PATH ONLY: skip promotion on a module with no entry point.
     // `universe::reachable_universe` below is the authoritative gate.
     if !module

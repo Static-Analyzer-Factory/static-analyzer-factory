@@ -102,11 +102,11 @@ pub use unreach_prove::{
     CexOptions, Counterexample, ExhaustiveProof, HeaderStates, KEEP_ALIVE, LIFETIME_END,
     LIFETIME_START, Lasso, PINNED_EXTERNS, STACK_RESTORE, STACK_SAVE, StateVar,
     find_counterexample, find_counterexample_excluding, find_counterexample_via_model,
-    find_nontermination, is_pinned_extern, module_has_failable_allocation,
-    prove_memcleanup_exhaustive, prove_memsafety_exhaustive, prove_no_overflow_exhaustive,
-    prove_no_overflow_exhaustive_shl, prove_no_overflow_exhaustive_with_states,
-    prove_no_overflow_exhaustive_with_states_shl, prove_termination_exhaustive,
-    prove_unreach_exhaustive, prove_unreach_exhaustive_with_states,
+    find_nontermination, find_nontermination_probes, find_nontermination_symbolic,
+    is_pinned_extern, module_has_failable_allocation, prove_memcleanup_exhaustive,
+    prove_memsafety_exhaustive, prove_no_overflow_exhaustive, prove_no_overflow_exhaustive_shl,
+    prove_no_overflow_exhaustive_with_states, prove_no_overflow_exhaustive_with_states_shl,
+    prove_termination_exhaustive, prove_unreach_exhaustive, prove_unreach_exhaustive_with_states,
 };
 pub use witness_lower::{
     call_close_paren_column, find_inst_span, full_expression_column, lower_candidate,

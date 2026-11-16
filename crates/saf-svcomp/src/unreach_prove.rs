@@ -1341,6 +1341,16 @@ pub struct Lasso {
 /// or no path has one. A CANDIDATE: the caller confirms it natively.
 #[must_use]
 pub fn find_nontermination(module: &AirModule, budget: Duration) -> Option<Lasso> {
+    let start = Instant::now();
+    find_nontermination_probes(module, budget)
+        .or_else(|| find_nontermination_symbolic(module, budget.saturating_sub(start.elapsed())))
+}
+
+/// The concrete-probe phase of [`find_nontermination`] alone: nondet reads
+/// return the values of each probe in [`nt_probes`] (cyclically), for at most a
+/// quarter of `budget` (capped at [`NT_PROBE_TOTAL`]). A CANDIDATE, as above.
+#[must_use]
+pub fn find_nontermination_probes(module: &AirModule, budget: Duration) -> Option<Lasso> {
     if has_global_ctors_dtors(module) {
         return None;
     }
@@ -1359,7 +1369,17 @@ pub fn find_nontermination(module: &AirModule, budget: Duration) -> Option<Lasso
             break; // no nondet read: every probe is the same execution
         }
     }
-    nonterm_run(module, budget.saturating_sub(start.elapsed()), None).0
+    None
+}
+
+/// The symbolic phase of [`find_nontermination`] alone (nondet reads are
+/// fresh symbols), on the whole `budget`. A CANDIDATE, as above.
+#[must_use]
+pub fn find_nontermination_symbolic(module: &AirModule, budget: Duration) -> Option<Lasso> {
+    if has_global_ctors_dtors(module) {
+        return None;
+    }
+    nonterm_run(module, budget, None).0
 }
 
 /// Total time and per-probe time of [`find_nontermination`]'s concrete probes.

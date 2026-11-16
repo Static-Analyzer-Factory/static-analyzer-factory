@@ -110,6 +110,44 @@ const Z3_TIMEOUT_MS: u32 = 2_000;
 const Z3_RLIMIT: u32 = 2_000_000;
 const Z3_SEED: u32 = 42;
 
+thread_local! {
+    /// Set while a `termination` task is analysed; see [`AssumeDefinedSignedArith`].
+    static SIGNED_ARITH_DEFINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scope in which in-loop signed `nsw` arithmetic is read as **exact** (its
+/// mathematical value) in comparison operands ([`exact_operand`]).
+///
+/// Only for `termination` tasks: sv-benchmarks CONVENTIONS.md ("Behavior") says a
+/// program whose property is not about undefined behaviour contains none, so an
+/// `add`/`sub`/`mul nsw` never overflows on any execution of the task and its
+/// machine value is its mathematical value. Unsigned and non-`nsw` arithmetic
+/// wraps by definition and stays inexact (`x - 5u > 10u` is not `x ≥ 16`). The
+/// same ranking code also gates the `no-overflow` confirmer, where overflow is the
+/// property itself, so the assumption is scoped, never global.
+#[must_use]
+pub struct AssumeDefinedSignedArith {
+    prev: bool,
+}
+
+impl AssumeDefinedSignedArith {
+    /// Enter the scope (restored on drop).
+    pub fn enter() -> Self {
+        let prev = SIGNED_ARITH_DEFINED.with(|c| c.replace(true));
+        Self { prev }
+    }
+}
+
+impl Drop for AssumeDefinedSignedArith {
+    fn drop(&mut self) {
+        SIGNED_ARITH_DEFINED.with(|c| c.set(self.prev));
+    }
+}
+
+fn signed_arith_defined() -> bool {
+    SIGNED_ARITH_DEFINED.with(std::cell::Cell::get)
+}
+
 /// Public entry point: does every natural loop in `func` admit a linear ranking
 /// function (⇒ the function's loops all terminate)?
 ///
@@ -560,6 +598,8 @@ struct Def {
     operands: Vec<ValueId>,
     in_loop: bool,
     result_type: Option<TypeId>,
+    /// The instruction carries LLVM's `nsw` flag.
+    nsw: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -784,6 +824,7 @@ fn index_defs(func: &AirFunction, body: &BTreeSet<BlockId>) -> BTreeMap<ValueId,
                         operands: inst.operands.clone(),
                         in_loop,
                         result_type: inst.result_type,
+                        nsw: inst.has_no_signed_wrap(),
                     },
                 );
             }
@@ -1024,8 +1065,11 @@ fn predicate_sign(kind: BinaryOp) -> Option<Sign> {
 ///   unsigned, through `sext` only when `s` is signed, and (with a path context)
 ///   through an in-body join phi to the value taken on the current path.
 ///
-/// In-loop `add`/`sub`/`mul` results are **never** exact: the machine wraps
+/// In-loop `add`/`sub`/`mul` results are **not** exact: the machine wraps
 /// modulo `2^w`, so `x - 5u > 10u` is not `x ≥ 16` (it also holds for `x < 5`).
+/// The one exception is a signed `nsw` operation read signed inside an
+/// [`AssumeDefinedSignedArith`] scope (a `termination` task, which has no
+/// undefined behaviour, so the operation never overflows).
 ///
 /// `equality` marks an `==`/`!=` operand: bit equality is reading-independent, so
 /// a leaf of [`Sign::Unknown`] reading is read as **signed** there. That is
@@ -1036,8 +1080,10 @@ fn predicate_sign(kind: BinaryOp) -> Option<Sign> {
 /// signed-reading fact.
 // NOTE: the arguments are the shared resolution context (defs, leaves, module,
 // sign view, optional path) threaded through a short recursion; bundling them
-// into a struct for this one helper would only add indirection.
-#[allow(clippy::too_many_arguments)]
+// into a struct for this one helper would only add indirection. The body is one
+// match over the operand's defining operation; splitting it would separate the
+// per-operation exactness rules that must be read together.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn exact_operand(
     v: ValueId,
     s: Sign,
@@ -1107,11 +1153,50 @@ fn exact_operand(
         // operand is a constant, in which case the machine result (computed
         // modulo `2^w`) is a known constant re-read under `s` (`-O0` recomputes
         // `uint32_max - 1` in the loop header as `sub 0xffffffff, 1`).
+        // In a `termination` task a signed `nsw` operation never overflows (see
+        // [`AssumeDefinedSignedArith`]), so under the signed reading it is the exact
+        // affine combination of exact operands (`mul` only by a constant).
         Operation::BinaryOp {
-            kind: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul,
-        } => fold_int_constant(v, defs, module, depth)
-            .and_then(|c| const_int_as(&c, s))
-            .map(Affine::constant),
+            kind: kind @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul),
+        } => {
+            if let Some(c) =
+                fold_int_constant(v, defs, module, depth).and_then(|c| const_int_as(&c, s))
+            {
+                return Some(Affine::constant(c));
+            }
+            if !(s == Sign::Signed && def.nsw && signed_arith_defined()) {
+                return None;
+            }
+            // Operands of signed arithmetic: a leaf of `Unknown` reading (one used
+            // only by `nsw` ops and `==`/`!=`, so it carries no type bound and no
+            // other ordered constraint) is read signed, as an equality operand is
+            // — one consistent reading of its symbol. A leaf read unsigned
+            // elsewhere stays non-exact.
+            let operand = |x: ValueId| {
+                exact_operand(
+                    x,
+                    s,
+                    true,
+                    defs,
+                    header_phis,
+                    module,
+                    signs,
+                    path,
+                    depth + 1,
+                )
+            };
+            let lhs = operand(*def.operands.first()?)?;
+            let rhs = operand(*def.operands.get(1)?)?;
+            match kind {
+                BinaryOp::Add => lhs.add(&rhs),
+                BinaryOp::Sub => lhs.sub(&rhs),
+                _ => match (lhs.as_constant(), rhs.as_constant()) {
+                    (Some(factor), _) => rhs.scale(factor),
+                    (_, Some(factor)) => lhs.scale(factor),
+                    _ => None,
+                },
+            }
+        }
         Operation::Phi { incoming } => {
             let Some(p) = path else {
                 return leaf(v);

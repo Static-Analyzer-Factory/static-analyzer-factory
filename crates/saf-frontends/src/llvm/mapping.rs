@@ -1302,13 +1302,21 @@ fn convert_instruction(
                         let asm_nonempty = asm_text.as_deref().is_none_or(|t| !t.trim().is_empty());
                         // Control flow inside the asm vanishes too: `1: jmp 1b`
                         // never returns, yet the AIR shows straight-line code.
-                        // Record every asm that carries instructions so
+                        // Record every asm that may carry control flow so
                         // whole-program provers (termination, unreachability)
                         // can abstain. An empty template (`asm("" ::: "memory")`,
-                        // a compiler barrier) executes nothing and stays silent.
+                        // a compiler barrier) executes nothing, and a
+                        // straight-line register-only template (`inb`, `outb`,
+                        // fences, Linux `BUG()`'s `ud2`) neither loops nor
+                        // jumps: both stay silent (their outputs have no AIR
+                        // definition, so every read of one is a fresh value).
                         // (`fidelity.dropped_instruction` is about lost MEMORY
                         // effects and stays reserved for the case below.)
-                        if asm_nonempty {
+                        if asm_nonempty
+                            && !asm_text
+                                .as_deref()
+                                .is_some_and(asm_template_is_straight_line)
+                        {
                             ctx.dropped_intrinsic_names.insert("inline-asm".to_string());
                         }
                         let has_ptr_arg = (0..num_operands - 1).any(|k| {
@@ -2108,6 +2116,106 @@ fn inline_asm_text(asm: inkwell::llvm_sys::prelude::LLVMValueRef) -> Option<Stri
         let bytes = std::slice::from_raw_parts(p.cast::<u8>(), len);
         Some(String::from_utf8_lossy(bytes).into_owned())
     }
+}
+
+/// Is an inline-asm template (LLVM IR form: `${0:b}` operands, `$$1` immediates)
+/// straight-line, register-only x86 code: no jump, call, return, loop, `rep`,
+/// trap-and-continue, raw bytes, or memory operand in the code it executes?
+///
+/// Accepted statements: numeric local labels (`1:` — harmless, since no jump can
+/// target them), a `lock` prefix, and one instruction from a fixed allowlist of
+/// mnemonics (optionally with a `b`/`w`/`l`/`q` size suffix) whose operands are
+/// all registers (`%al`), operand references (`$0`, `${1:w}`) or numeric
+/// immediates (`$$5`). `.pushsection <data>` … `.popsection` blocks emit data
+/// into another section and are skipped (Linux `BUG()`'s `__bug_table` entry);
+/// a pushed section whose name mentions `text` is rejected. `ud2` traps, so the
+/// real program stops where the AIR continues: the AIR only gains behaviours.
+/// A memory operand referenced through `$N` is an indirect (`*`) constraint and
+/// is flagged separately by the caller. Anything unrecognised ⇒ `false`.
+fn asm_template_is_straight_line(template: &str) -> bool {
+    const BASES: [&str; 47] = [
+        "in", "out", "nop", "pause", "ud2", "lfence", "mfence", "sfence", "cpuid", "rdtsc",
+        "rdtscp", "rdmsr", "wrmsr", "rdpmc", "cli", "sti", "clc", "stc", "cld", "mov", "movzb",
+        "movzw", "xchg", "bswap", "add", "sub", "adc", "sbb", "and", "or", "xor", "not", "neg",
+        "inc", "dec", "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bts", "btr", "btc", "cmp",
+        "test",
+    ];
+    let mnemonic_ok = |m: &str| {
+        BASES.iter().any(|b| {
+            m.strip_prefix(b)
+                .is_some_and(|rest| matches!(rest, "" | "b" | "w" | "l" | "q"))
+        })
+    };
+    let operand_ok = |o: &str| {
+        let o = o.trim();
+        if let Some(reg) = o.strip_prefix('%') {
+            return !reg.is_empty() && reg.bytes().all(|b| b.is_ascii_alphanumeric());
+        }
+        if let Some(imm) = o.strip_prefix("$$") {
+            let imm = imm.strip_prefix('-').unwrap_or(imm);
+            return !imm.is_empty() && imm.bytes().all(|b| b.is_ascii_hexdigit() || b == b'x');
+        }
+        if let Some(r) = o.strip_prefix("${") {
+            let Some(inner) = r.strip_suffix('}') else {
+                return false;
+            };
+            let (n, m) = inner.split_once(':').unwrap_or((inner, ""));
+            return !n.is_empty()
+                && n.bytes().all(|b| b.is_ascii_digit())
+                && m.bytes().all(|b| b.is_ascii_alphabetic());
+        }
+        o.strip_prefix('$')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let mut pushed = false;
+    for raw in template.split(['\n', ';']) {
+        let mut stmt = raw.trim();
+        if let Some(rest) = stmt.strip_prefix(".pushsection") {
+            let name = rest.trim().split([',', ' ', '\t']).next().unwrap_or("");
+            if pushed || name.is_empty() || name.contains("text") {
+                return false;
+            }
+            pushed = true;
+            continue;
+        }
+        if stmt == ".popsection" {
+            if !pushed {
+                return false;
+            }
+            pushed = false;
+            continue;
+        }
+        if pushed {
+            continue;
+        }
+        while let Some((label, rest)) = stmt.split_once(':') {
+            let label = label.trim();
+            if label.is_empty() || !label.bytes().all(|b| b.is_ascii_digit()) {
+                break;
+            }
+            stmt = rest.trim();
+        }
+        let mut words = stmt.splitn(2, char::is_whitespace);
+        let Some(mut mnemonic) = words.next().filter(|m| !m.is_empty()) else {
+            continue;
+        };
+        let mut operands = words.next().unwrap_or("").trim();
+        if mnemonic.eq_ignore_ascii_case("lock") {
+            let mut w = operands.splitn(2, char::is_whitespace);
+            let Some(m) = w.next().filter(|m| !m.is_empty()) else {
+                continue; // `lock;` — the prefix of the next statement
+            };
+            mnemonic = m;
+            operands = w.next().unwrap_or("").trim();
+        }
+        if !mnemonic_ok(&mnemonic.to_ascii_lowercase()) {
+            return false;
+        }
+        if !operands.is_empty() && !operands.split(',').all(operand_ok) {
+            return false;
+        }
+    }
+    !pushed
 }
 
 /// The constraint string of an inline-asm callee (`""` when unavailable).
@@ -3117,5 +3225,54 @@ mod gep_index_tests {
     #[test]
     fn runtime_index_is_dynamic_index() {
         assert_eq!(classify_gep_index(None), FieldStep::Index);
+    }
+}
+
+#[cfg(test)]
+mod inline_asm_tests {
+    use super::asm_template_is_straight_line as straight;
+
+    #[test]
+    fn port_io_fences_and_register_ops_are_straight_line() {
+        assert!(straight("inb ${1:w}, ${0:b}"));
+        assert!(straight("outb ${0:b}, ${1:w}"));
+        assert!(straight("outl $0, $1"));
+        assert!(straight("mfence"));
+        assert!(straight("movl $1,$0"));
+        assert!(straight("bt $2,$1\n\tsbb $0,$0"));
+        assert!(straight("xchgl $0, $1\n"));
+        assert!(straight("addl $$-1, %eax"));
+        assert!(straight("rdtsc"));
+    }
+
+    #[test]
+    fn linux_bug_and_smp_locks_templates_are_straight_line() {
+        assert!(straight(
+            "1:\tud2\n.pushsection __bug_table,\"a\"\n2:\t.long 1b - 2b, ${0:c} - 2b\n\t.word ${1:c}, 0\n\t.org 2b+${2:c}\n.popsection"
+        ));
+        assert!(straight(
+            ".pushsection .smp_locks,\"a\"\n.balign 4\n.long 671f - .\n.popsection\n671:\n\tlock; bts ${1},${0}"
+        ));
+    }
+
+    #[test]
+    fn control_flow_raw_bytes_and_memory_operands_are_not() {
+        assert!(!straight("1: jmp 1b"));
+        assert!(!straight("1:\n\tjmp 1b"));
+        assert!(!straight(".byte 0xeb, 0xfe"));
+        assert!(!straight("771:\n\tcall *${2:c};\n772:"));
+        assert!(!straight("rep; nop"));
+        assert!(!straight("hlt"));
+        assert!(!straight("int $$3"));
+        assert!(!straight("loop 1b"));
+        assert!(!straight("ret"));
+        assert!(!straight("movsb"));
+        assert!(!straight("movl %gs:${1:P},$0"));
+        assert!(!straight("movl (%rax), %eax"));
+        assert!(!straight("movl $$1, g"));
+        assert!(!straight("foo: nop"));
+        assert!(!straight(".pushsection .text\njmp 1f\n.popsection"));
+        assert!(!straight(".pushsection __bug_table\n.long 0"));
+        assert!(!straight("call __put_user_4"));
     }
 }

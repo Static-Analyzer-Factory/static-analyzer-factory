@@ -1265,6 +1265,21 @@ fn verify_termination_folded_constant_bound_is_true() {
     verify_termination("termination_true_folded_bound.c", "ILP32").stdout("true\n");
 }
 
+/// Signed `nsw` differences in loop guards are exact in a termination task
+/// (AliasDarteFeautrierGonnord-SAS2010-wise, proved by the submitted version).
+#[test]
+#[ignore]
+fn verify_termination_signed_guard_arithmetic_is_true() {
+    verify_termination("termination_true_signed_guard_arith.c", "LP64").stdout("true\n");
+}
+
+/// Straight-line port-I/O inline asm does not block the termination proof.
+#[test]
+#[ignore]
+fn verify_termination_port_io_asm_is_true() {
+    verify_termination("termination_true_port_io_asm.c", "LP64").stdout("true\n");
+}
+
 /// A loop guard `z <= INT_MAX - y` whose subtraction cannot wrap under the
 /// other stay condition `y > 0` bounds the counter => `true`.
 #[test]

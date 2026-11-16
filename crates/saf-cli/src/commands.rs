@@ -8794,24 +8794,32 @@ fn nontermination_false(ctx: &VerifyCtx, budget: std::time::Duration) -> Option<
     {
         return None;
     }
-    let Some(lasso) = saf_svcomp::find_nontermination(ctx.module, budget) else {
-        eprintln!(
-            "saf verify: non-termination search ({} s) found no recurring state",
-            budget.as_secs()
-        );
-        return None;
-    };
-    match nontermination_confirmed(ctx, &lasso) {
-        Ok(true) => {}
+    // Concrete probes first; whatever they find or fail to confirm, the symbolic
+    // search then runs on the WHOLE budget, so a probe can only add answers
+    // (a probe's cycle can fail natively where the symbolic one would not).
+    let confirmed = |lasso: saf_svcomp::Lasso| match nontermination_confirmed(ctx, &lasso) {
+        Ok(true) => Some(lasso),
         Ok(false) => {
-            eprintln!("saf verify: native run did not confirm the lasso -> unknown");
-            return None;
+            eprintln!("saf verify: native run did not confirm the lasso");
+            None
         }
         Err(e) => {
-            eprintln!("saf verify: native lasso confirmation failed: {e:#} -> unknown");
-            return None;
+            eprintln!("saf verify: native lasso confirmation failed: {e:#}");
+            None
         }
-    }
+    };
+    let lasso = saf_svcomp::find_nontermination_probes(ctx.module, budget)
+        .and_then(confirmed)
+        .or_else(|| {
+            let found = saf_svcomp::find_nontermination_symbolic(ctx.module, budget);
+            if found.is_none() {
+                eprintln!(
+                    "saf verify: non-termination search ({} s) found no recurring state",
+                    budget.as_secs()
+                );
+            }
+            found.and_then(confirmed)
+        })?;
     eprintln!(
         "saf verify: loop-header state recurs ({} nondet reads) and the native run keeps computing -> false(termination)",
         lasso.nondets.len()

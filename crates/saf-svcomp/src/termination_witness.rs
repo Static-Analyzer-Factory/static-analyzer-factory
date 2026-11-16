@@ -158,6 +158,8 @@ pub fn build_ranking_witness(
     source: &str,
     meta: &WitnessMeta,
 ) -> Option<InvariantSetWitness> {
+    // The same reading of signed arithmetic as the proof it witnesses.
+    let _defined = crate::ranking::AssumeDefinedSignedArith::enter();
     // Module-level OpenMP abstain (the AIR silently dropped any parallelism).
     if source_has_openmp(source) {
         return None;
@@ -229,6 +231,8 @@ pub fn build_termination_witness(
     source: &str,
     meta: &WitnessMeta,
 ) -> Option<InvariantSetWitness> {
+    // The same reading of signed arithmetic as the proof it witnesses.
+    let _defined = crate::ranking::AssumeDefinedSignedArith::enter();
     if source_has_openmp(source) {
         return None;
     }
