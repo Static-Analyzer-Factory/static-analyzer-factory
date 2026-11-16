@@ -1089,9 +1089,11 @@ fn check_integer_overflow_with_result(
 
 /// Verdict of the sound no-signed-overflow prover: `Proven` ONLY if every
 /// reachable signed `add`/`sub`/`mul` is provably in-bounds over the CONVERGED
-/// interval solution, each checked against ITS OWN result-type width; any
-/// TOP/bottom/absent operand, unmodeled overflow-capable op (`shl`/`sdiv`/`srem`),
-/// indirect call, missing width, or non-converged fixpoint ⇒ `Abstain`.
+/// interval solution, each checked against ITS OWN result-type width, and every
+/// reachable `abs`/`labs`/`llabs`/`imaxabs`/`llvm.abs` call provably excludes the
+/// minimum value of its width; any TOP/bottom/absent operand, unmodeled
+/// overflow-capable op (`shl`/`sdiv`/`srem`), indirect or unresolvable call,
+/// missing width, or non-converged fixpoint ⇒ `Abstain`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoOverflowProof {
     /// No reachable signed arithmetic op can overflow (sound, fail-closed).
@@ -1141,10 +1143,11 @@ pub fn prove_no_signed_overflow(module: &AirModule) -> NoOverflowProof {
 /// instruction with no abstract state is only safe to skip when it could not have
 /// carried an obligation in the first place. Mirrors the `match` in that function
 /// exactly — signed add/sub/mul are checked, shl/sdiv/srem are unmodelled
-/// fail-closed abstains, and an indirect call may reach un-analysed code. Keep the
-/// two in sync: an op that gains an obligation there must gain one here, or the
-/// gate silently stops covering it. (plans/213)
-fn carries_overflow_obligation(op: &Operation) -> bool {
+/// fail-closed abstains, an `abs`-family call overflows on the minimum value, and
+/// an indirect call may reach un-analysed code. Keep the two in sync: an op that
+/// gains an obligation there must gain one here, or the gate silently stops
+/// covering it. (plans/213)
+fn carries_overflow_obligation(module: &AirModule, op: &Operation) -> bool {
     match op {
         Operation::BinaryOp { kind } => matches!(
             kind,
@@ -1156,17 +1159,81 @@ fn carries_overflow_obligation(op: &Operation) -> bool {
                 | BinaryOp::SRem
         ),
         Operation::CallIndirect { .. } => true,
+        Operation::CallDirect { callee } => abs_callee(module, *callee) != AbsCallee::No,
         _ => false,
     }
 }
 
+/// Is a direct call's callee one of the integer absolute-value functions?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbsCallee {
+    /// Not an absolute-value function.
+    No,
+    /// `abs` / `labs` / `llabs` / `imaxabs`, or `llvm.abs.*`: `abs(MIN)` is
+    /// signed overflow (C11 7.22.6.1; for `llvm.abs` the `is_int_min_poison`
+    /// flag only decides poison vs. wrap — either way the C source overflowed).
+    Yes,
+    /// The callee cannot be resolved to a name; it may be any of the above.
+    Unknown,
+}
+
+/// Classify `callee` (see [`AbsCallee`]).
+fn abs_callee(module: &AirModule, callee: FunctionId) -> AbsCallee {
+    let func = module
+        .function(callee)
+        .or_else(|| module.functions.iter().find(|f| f.id == callee));
+    let Some(func) = func else {
+        return AbsCallee::Unknown;
+    };
+    let name = func.name.as_str();
+    if matches!(name, "abs" | "labs" | "llabs" | "imaxabs") || name.starts_with("llvm.abs.") {
+        AbsCallee::Yes
+    } else {
+        AbsCallee::No
+    }
+}
+
+/// Discharge the overflow obligation of an `abs`-family call: proven only when
+/// the argument provably excludes the minimum value of the call's integer width.
+///
+/// The width is the call's RESULT type (`abs`: `int`, `labs`: `long` — 32 bits
+/// on `ILP32` — `llabs`/`imaxabs`: 64, `llvm.abs.iN`: N), which is also the
+/// argument type. Never guessed: an unknown width fails closed.
+fn abs_call_in_bounds(
+    module: &AirModule,
+    inst: &Instruction,
+    state: &super::state::AbstractState,
+    constant_map: &BTreeMap<ValueId, Interval>,
+) -> Result<(), &'static str> {
+    use super::transfer::resolve_operand;
+    let Some(bits) = signed_result_bits(module, inst) else {
+        return Err("abs-no-width");
+    };
+    // `llvm.abs.iN(x, i1 is_int_min_poison)`: operand 0 is `x` either way.
+    let Some(&arg) = inst.operands.first() else {
+        return Err("abs-malformed");
+    };
+    let x = resolve_operand(arg, state, constant_map).wrap_to_width(bits);
+    if x.is_bottom() {
+        return Err("abs-bottom-operand");
+    }
+    if x.contains(signed_min(bits)) {
+        return Err("abs-may-overflow");
+    }
+    Ok(())
+}
+
 /// Prove no-overflow over a PRE-COMPUTED converged solution. See
 /// [`NoOverflowProof`] for the fail-closed contract. Proves the SIGNED-ARITHMETIC
-/// overflow property (add/sub/mul in-bounds; abstain on shl/sdiv/srem); integer
-/// conversions are not signed-arithmetic-overflow sites and are skipped.
+/// overflow property (add/sub/mul in-bounds; `abs`-family argument excludes the
+/// width's minimum; abstain on shl/sdiv/srem); integer conversions are not
+/// signed-arithmetic-overflow sites and are skipped.
 /// Property-level gates (OpenMP source text, reachable thread spawn) are the
 /// caller's responsibility — this reads the (sequential) absint solution only.
+// NOTE: one fail-closed walk over every obligation kind; splitting the match
+// would separate the obligation list from `carries_overflow_obligation`'s mirror.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn prove_no_signed_overflow_with_result(
     module: &AirModule,
     result: &AbstractInterpResult,
@@ -1217,7 +1284,7 @@ pub fn prove_no_signed_overflow_with_result(
                 // instruction that would have carried an obligation, and keep
                 // skipping the ones that never could (loads, stores, bitwise ops).
                 let Some(state) = result.state_at_inst(inst.id) else {
-                    if carries_overflow_obligation(&inst.op) {
+                    if carries_overflow_obligation(module, &inst.op) {
                         return NoOverflowProof::Abstain("unvisited-arith".to_string());
                     }
                     continue;
@@ -1231,8 +1298,14 @@ pub fn prove_no_signed_overflow_with_result(
                             let Some(bits) = signed_result_bits(module, inst) else {
                                 return NoOverflowProof::Abstain("no-result-width".to_string());
                             };
-                            let lhs = resolve_operand(inst.operands[0], state, &constant_map);
-                            let rhs = resolve_operand(inst.operands[1], state, &constant_map);
+                            // Re-encode the operands at the op's OWN width: a bound
+                            // held in another encoding (`0xFFFFFFFF` for `-1`) or
+                            // under a placeholder label would otherwise be judged
+                            // as a different number than the program holds.
+                            let lhs = resolve_operand(inst.operands[0], state, &constant_map)
+                                .wrap_to_width(bits);
+                            let rhs = resolve_operand(inst.operands[1], state, &constant_map)
+                                .wrap_to_width(bits);
                             if lhs.is_bottom() || rhs.is_bottom() || lhs.is_top() || rhs.is_top() {
                                 return NoOverflowProof::Abstain(
                                     "top-or-bottom-operand".to_string(),
@@ -1255,6 +1328,22 @@ pub fn prove_no_signed_overflow_with_result(
                     Operation::CallIndirect { .. } => {
                         return NoOverflowProof::Abstain("indirect-call".to_string());
                     }
+                    // `abs(INT_MIN)` overflows (Juliet `*_bad_abs`). The callee is
+                    // external, so no `sub` of its body is ever checked: the call
+                    // site itself carries the obligation.
+                    Operation::CallDirect { callee } => match abs_callee(module, *callee) {
+                        AbsCallee::No => {}
+                        AbsCallee::Unknown => {
+                            return NoOverflowProof::Abstain("unresolved-callee".to_string());
+                        }
+                        AbsCallee::Yes => {
+                            if let Err(reason) =
+                                abs_call_in_bounds(module, inst, state, &constant_map)
+                            {
+                                return NoOverflowProof::Abstain(reason.to_string());
+                            }
+                        }
+                    },
                     _ => {}
                 }
             }
@@ -1307,6 +1396,214 @@ mod nooverflow_prove_tests {
     fn shl_is_never_proven_by_arith_helper() {
         let a = Interval::new(0, 1, 32);
         assert!(!signed_arith_in_bounds(BinaryOp::Shl, &a, &a, 32));
+    }
+
+    // -------------------------------------------------------------------------
+    // Whole-prover tests on hand-built modules (confirmed wrong TRUEs o1/o2).
+    // -------------------------------------------------------------------------
+
+    use super::{NoOverflowProof, prove_no_signed_overflow};
+    use saf_core::air::{
+        AirBlock, AirFunction, AirModule, AirType, CastKind, Constant, Instruction, Operation,
+    };
+    use saf_core::ids::{BlockId, FunctionId, InstId, ModuleId, TypeId, ValueId};
+
+    fn i_ty(bits: u16) -> TypeId {
+        TypeId::derive(format!("integer:{bits}").as_bytes())
+    }
+
+    /// A module with external declarations `decls` and one defined `main` whose
+    /// single block runs `insts` and returns.
+    fn module_with(decls: &[&str], insts: Vec<Instruction>) -> AirModule {
+        let mut module = AirModule::new(ModuleId::derive(b"nooverflow-test"));
+        for bits in [1u16, 8, 32, 64] {
+            module.types.insert(i_ty(bits), AirType::Integer { bits });
+        }
+        for name in decls {
+            let mut decl = AirFunction::new(FunctionId::derive(name.as_bytes()), *name);
+            decl.is_declaration = true;
+            module.add_function(decl);
+        }
+        let entry = BlockId::derive(b"entry");
+        let mut block = AirBlock::new(entry);
+        block.instructions = insts;
+        block
+            .instructions
+            .push(Instruction::new(InstId::derive(b"ret"), Operation::Ret));
+        let mut main = AirFunction::new(FunctionId::derive(b"main"), "main");
+        main.blocks = vec![block];
+        main.entry_block = Some(entry);
+        module.add_function(main);
+        module
+    }
+
+    fn call(id: &str, callee: &str, args: Vec<ValueId>, dst: &str, bits: u16) -> Instruction {
+        let mut inst = Instruction::new(
+            InstId::derive(id.as_bytes()),
+            Operation::CallDirect {
+                callee: FunctionId::derive(callee.as_bytes()),
+            },
+        )
+        .with_operands(args)
+        .with_dst(ValueId::derive(dst.as_bytes()));
+        inst.result_type = Some(i_ty(bits));
+        inst
+    }
+
+    fn int_const(module: &mut AirModule, name: &str, value: i64, bits: u8) -> ValueId {
+        let id = ValueId::derive(name.as_bytes());
+        module.constants.insert(id, Constant::Int { value, bits });
+        id
+    }
+
+    /// o1: `unsigned u = (unsigned)nondet_longlong(); int x = (int)(u >> 1);
+    /// int y = x + x;` — `u = 0xFFFFFFFF` gives `x = INT_MAX`, so `x + x`
+    /// overflows. Must NOT be proven.
+    #[test]
+    fn o1_lshr_of_truncated_nondet_is_not_proven() {
+        let ll = ValueId::derive(b"ll");
+        let u = ValueId::derive(b"u");
+        let x = ValueId::derive(b"x");
+        let one = ValueId::derive(b"one32");
+        let mut trunc = Instruction::new(
+            InstId::derive(b"trunc"),
+            Operation::Cast {
+                kind: CastKind::Trunc,
+                target_bits: Some(32),
+            },
+        )
+        .with_operands(vec![ll])
+        .with_dst(u);
+        trunc.result_type = Some(i_ty(32));
+        let mut lshr = Instruction::new(
+            InstId::derive(b"lshr"),
+            Operation::BinaryOp {
+                kind: BinaryOp::LShr,
+            },
+        )
+        .with_operands(vec![u, one])
+        .with_dst(x);
+        lshr.result_type = Some(i_ty(32));
+        let mut add = Instruction::new(
+            InstId::derive(b"add"),
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+        )
+        .with_operands(vec![x, x])
+        .with_dst(ValueId::derive(b"y"));
+        add.result_type = Some(i_ty(32));
+        let mut module = module_with(
+            &["__VERIFIER_nondet_longlong"],
+            vec![
+                call("c", "__VERIFIER_nondet_longlong", vec![], "ll", 64),
+                trunc,
+                lshr,
+                add,
+            ],
+        );
+        int_const(&mut module, "one32", 1, 32);
+        assert!(matches!(
+            prove_no_signed_overflow(&module),
+            NoOverflowProof::Abstain(_)
+        ));
+    }
+
+    /// o2: `int x = nondet_int(); return abs(x) == 5;` — `abs(INT_MIN)`
+    /// overflows. Must NOT be proven, for every member of the family.
+    #[test]
+    fn o2_abs_of_nondet_is_not_proven() {
+        for (abs_name, bits) in [
+            ("abs", 32u16),
+            ("labs", 64),
+            ("llabs", 64),
+            ("imaxabs", 64),
+            ("llvm.abs.i32", 32),
+        ] {
+            let x = ValueId::derive(b"x");
+            let mut module = module_with(&["__VERIFIER_nondet_int", abs_name], vec![]);
+            let mut args = vec![x];
+            if abs_name.starts_with("llvm.abs") {
+                // `is_int_min_poison = false`: still an overflow in the C source.
+                args.push(int_const(&mut module, "false1", 0, 1));
+            }
+            let main = module
+                .functions
+                .iter_mut()
+                .find(|f| f.name == "main")
+                .expect("main exists");
+            let insts = &mut main.blocks[0].instructions;
+            insts.insert(0, call("a", abs_name, args, "r", bits));
+            insts.insert(0, call("c", "__VERIFIER_nondet_int", vec![], "x", bits));
+            assert_eq!(
+                prove_no_signed_overflow(&module),
+                NoOverflowProof::Abstain("abs-may-overflow".to_string()),
+                "{abs_name}"
+            );
+        }
+    }
+
+    /// GUARD: `abs` of a value that provably excludes `INT_MIN` stays provable.
+    #[test]
+    fn abs_of_safe_constant_is_proven() {
+        let mut module = module_with(&["abs"], vec![]);
+        let five = int_const(&mut module, "five32", 5, 32);
+        let main = module
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "main")
+            .expect("main exists");
+        main.blocks[0]
+            .instructions
+            .insert(0, call("a", "abs", vec![five], "r", 32));
+        assert_eq!(prove_no_signed_overflow(&module), NoOverflowProof::Proven);
+    }
+
+    /// `abs(INT_MIN)` with a constant argument is a definite overflow.
+    #[test]
+    fn abs_of_int_min_constant_is_not_proven() {
+        let mut module = module_with(&["abs"], vec![]);
+        let min = int_const(&mut module, "min32", i64::from(i32::MIN), 32);
+        let main = module
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "main")
+            .expect("main exists");
+        main.blocks[0]
+            .instructions
+            .insert(0, call("a", "abs", vec![min], "r", 32));
+        assert!(matches!(
+            prove_no_signed_overflow(&module),
+            NoOverflowProof::Abstain(_)
+        ));
+    }
+
+    /// An `undef` operand is any value, never 0: `undef + 1` may overflow.
+    #[test]
+    fn undef_operand_is_not_zero() {
+        let mut module = module_with(&[], vec![]);
+        let undef = ValueId::derive(b"undef32");
+        module.constants.insert(undef, Constant::Undef);
+        let one = int_const(&mut module, "one32", 1, 32);
+        let mut add = Instruction::new(
+            InstId::derive(b"add"),
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+        )
+        .with_operands(vec![undef, one])
+        .with_dst(ValueId::derive(b"y"));
+        add.result_type = Some(i_ty(32));
+        let main = module
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "main")
+            .expect("main exists");
+        main.blocks[0].instructions.insert(0, add);
+        assert!(matches!(
+            prove_no_signed_overflow(&module),
+            NoOverflowProof::Abstain(_)
+        ));
     }
 }
 

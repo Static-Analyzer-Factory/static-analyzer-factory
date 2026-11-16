@@ -144,6 +144,13 @@ pub struct ThreadConcurrencyGraph {
 
     /// Next thread ID to assign.
     next_id: u32,
+
+    /// Thread discovery dropped at least one call edge because the call chain
+    /// exceeded [`super::MtaConfig::max_context_depth`]. When set, the
+    /// discovered thread set may be INCOMPLETE (a spawn below the cap is never
+    /// seen, and a spawn site reached along a second, deeper path gets no second
+    /// context), so a sound client must not treat `threads` as exhaustive.
+    pub context_depth_limit_hit: bool,
 }
 
 impl ThreadConcurrencyGraph {

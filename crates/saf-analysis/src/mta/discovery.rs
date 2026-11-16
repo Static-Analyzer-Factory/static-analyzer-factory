@@ -249,6 +249,16 @@ impl<'a> ThreadDiscovery<'a> {
                                     inst.id,
                                 ));
 
+                                // A thread that (transitively) spawns its own
+                                // entry would otherwise create a fresh context
+                                // forever — every new thread id is unvisited.
+                                // Bound it by the same depth cap, and record the
+                                // truncation.
+                                if new_chain.len() > self.config.max_context_depth {
+                                    graph.context_depth_limit_hit = true;
+                                    continue;
+                                }
+
                                 // Add the new thread
                                 let new_thread = graph.add_thread(
                                     new_chain.clone(),
@@ -289,7 +299,12 @@ impl<'a> ThreadDiscovery<'a> {
                                     inst.id,
                                 ));
 
-                                // Limit context depth
+                                // Limit context depth. A dropped edge makes the
+                                // discovered thread set possibly incomplete; record
+                                // it so a sound client can abstain. (A callee with
+                                // no body — an external — cannot spawn through
+                                // this walk anyway, so only a defined callee
+                                // counts as a real loss.)
                                 if extended_chain.len() <= self.config.max_context_depth {
                                     let mut callee_funcs = BTreeSet::new();
                                     callee_funcs.insert((*callee, Some(inst.id)));
@@ -298,6 +313,12 @@ impl<'a> ThreadDiscovery<'a> {
                                         extended_chain,
                                         callee_funcs,
                                     ));
+                                } else if self
+                                    .module
+                                    .function(*callee)
+                                    .is_none_or(|f| !f.is_declaration)
+                                {
+                                    graph.context_depth_limit_hit = true;
                                 }
                             }
                         }

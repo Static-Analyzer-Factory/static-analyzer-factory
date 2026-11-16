@@ -440,9 +440,12 @@ fn mark_edge_executable(
 /// `prove_unreachable` then reads the pre-seeded ⊥ as a proof. Witness:
 /// `tests/programs/c/svcomp/unreach_false_wrapped_add.c`. (plans/213 M2)
 ///
-/// * Comparisons already produce a normal `i1` 0/1.
-/// * `And`/`Or`/`Xor` of two operands already normalised at width `b` stay within
-///   `b` — their `i128` sign-extensions agree bit for bit — so they need nothing.
+/// * Comparisons produce an `i1` as `0`/`1`.
+/// * `And`/`Or`/`Xor` would stay within `b` IF both operands were normalised at
+///   `b` — but an `i1` reaches them as `1` (a comparison result) or `-1` (a
+///   sign-extended IR constant), and `1 ^ -1 = -2` is non-zero where the real
+///   `true ^ true` is `false`: a `CondBr` on it marks the LIVE edge dead. Bitwise
+///   ops commute with reduction mod `2^b`, so wrapping them is exact.
 /// * `Add`/`Sub`/`Mul`/`SDiv`/`SRem` can leave the width and must be wrapped.
 ///
 /// Where the width is unknown no claim is justified, so the fold drops to
@@ -452,7 +455,14 @@ fn mark_edge_executable(
 fn normalize_binary_result(kind: BinaryOp, v: SccpValue, bits: Option<u8>) -> SccpValue {
     if !matches!(
         kind,
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::SDiv | BinaryOp::SRem
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::SDiv
+            | BinaryOp::SRem
+            | BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Xor
     ) {
         return v;
     }
@@ -694,9 +704,34 @@ fn evaluate_instruction(
     }
 }
 
+/// Is `kind` an integer comparison?
+fn is_icmp(kind: BinaryOp) -> bool {
+    matches!(
+        kind,
+        BinaryOp::ICmpEq
+            | BinaryOp::ICmpNe
+            | BinaryOp::ICmpSlt
+            | BinaryOp::ICmpSle
+            | BinaryOp::ICmpSgt
+            | BinaryOp::ICmpSge
+            | BinaryOp::ICmpUlt
+            | BinaryOp::ICmpUle
+            | BinaryOp::ICmpUgt
+            | BinaryOp::ICmpUge
+    )
+}
+
 /// Evaluate a binary operation when both operands may be constant.
 fn evaluate_binary(kind: BinaryOp, lhs: SccpValue, rhs: SccpValue) -> SccpValue {
     match (lhs, rhs) {
+        // `true` is `1` when a comparison produced it and `-1` when it is a
+        // sign-extended `i1` constant; `1` vs `-1` may be the SAME `i1` value, so
+        // no comparison of that pair can be folded.
+        (SccpValue::Constant(a), SccpValue::Constant(b))
+            if is_icmp(kind) && ((a == 1 && b == -1) || (a == -1 && b == 1)) =>
+        {
+            SccpValue::Bottom
+        }
         (SccpValue::Constant(a), SccpValue::Constant(b)) => {
             let result = match kind {
                 BinaryOp::Add => Some(a.wrapping_add(b)),
@@ -1147,6 +1182,44 @@ mod tests {
         assert_eq!(
             evaluate_cast(CastKind::SExt, SccpValue::Constant(-1), Some(32)),
             SccpValue::Constant(-1)
+        );
+    }
+
+    /// `xor i1 %cmp, true` with `%cmp` folded to `1` (comparison encoding) and
+    /// `true` the sign-extended constant `-1`: the real value is `false`. The
+    /// unwrapped fold gave `-2` (non-zero), so `CondBr` took the dead edge.
+    #[test]
+    fn xor_of_bool_encodings_is_normalised() {
+        let v = normalize_binary_result(
+            BinaryOp::Xor,
+            evaluate_binary(
+                BinaryOp::Xor,
+                SccpValue::Constant(1),
+                SccpValue::Constant(-1),
+            ),
+            Some(1),
+        );
+        assert_eq!(v, SccpValue::Constant(0));
+    }
+
+    /// `1` and `-1` may both be `i1 true`: never fold their comparison.
+    #[test]
+    fn compare_of_mixed_bool_encodings_is_not_folded() {
+        assert_eq!(
+            evaluate_binary(
+                BinaryOp::ICmpEq,
+                SccpValue::Constant(1),
+                SccpValue::Constant(-1)
+            ),
+            SccpValue::Bottom
+        );
+        assert_eq!(
+            evaluate_binary(
+                BinaryOp::ICmpEq,
+                SccpValue::Constant(3),
+                SccpValue::Constant(3)
+            ),
+            SccpValue::Constant(1)
         );
     }
 }

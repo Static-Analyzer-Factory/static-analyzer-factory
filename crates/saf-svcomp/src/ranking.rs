@@ -593,9 +593,17 @@ struct LoopModel {
 
 /// Build the affine [`LoopModel`], or `None` if any part is not exactly
 /// expressible (⇒ abstain).
+// NOTE: one cohesive model build (phis -> exact guards -> bounds -> stable
+// transitions); splitting it would scatter the shared sign and bound state.
+#[allow(clippy::too_many_lines)]
 fn build_loop_model(func: &AirFunction, module: &AirModule, li: &LoopInfo) -> Option<LoopModel> {
     let defs = index_defs(func, &li.body);
     let signs = infer_signs(func, module);
+    // This model adds bounds from `signs` as-is (no bit-pattern promotion).
+    let leaf_signs = LeafSigns {
+        signs: &signs,
+        promote_unless: None,
+    };
 
     // Header phis and their back-edge (latch) incoming value.
     let header_block = func.blocks.iter().find(|b| b.id == li.header)?;
@@ -624,6 +632,9 @@ fn build_loop_model(func: &AirFunction, module: &AirModule, li: &LoopInfo) -> Op
     // --- Guards (over-approximate; only necessary stay-conditions) -----------
     let mut region: Vec<Constraint> = Vec::new();
     let mut universe: BTreeSet<ValueId> = BTreeSet::new();
+    // Guards over in-loop arithmetic (`z <= INT_MAX - y`), admitted only once the
+    // rest of the region proves that arithmetic does not wrap (see below).
+    let mut deferred: Vec<WrappingGuard> = Vec::new();
     for &b in &li.body {
         // Only exit branches that *dominate the latch* impose a necessary
         // continuing condition (every iteration's path to the back-edge passes
@@ -631,13 +642,26 @@ fn build_loop_model(func: &AirFunction, module: &AirModule, li: &LoopInfo) -> Op
         if !dominates(b, li.latch, &li.idom) {
             continue;
         }
-        if let Some(cons) = guard_constraints_for_block(func, module, &defs, &header_phis, li, b) {
+        if let Some(cons) =
+            guard_constraints_for_block(func, module, &defs, &header_phis, &leaf_signs, li, b)
+        {
             for c in cons {
                 for k in c.coeffs.keys() {
                     universe.insert(*k);
                 }
                 region.push(c);
             }
+        } else if let Some(g) =
+            wrapping_guard_for_block(func, module, &defs, &header_phis, &leaf_signs, li, b)
+        {
+            // Its leaves join the universe now so they get their type bounds.
+            for c in &g.constraints {
+                universe.extend(c.coeffs.keys().copied());
+            }
+            for (form, _, _) in &g.obligations {
+                universe.extend(form.terms.keys().copied());
+            }
+            deferred.push(g);
         }
     }
 
@@ -648,7 +672,7 @@ fn build_loop_model(func: &AirFunction, module: &AirModule, li: &LoopInfo) -> Op
     let mut state: BTreeMap<ValueId, Affine> = BTreeMap::new();
     let mut next_forms: BTreeMap<ValueId, Affine> = BTreeMap::new();
     for (&phi, &nv) in &phi_next {
-        if let Some(a) = resolve_affine(nv, &defs, &header_phis, module, 0) {
+        if let Some(a) = resolve_affine(nv, &defs, &header_phis, module, &leaf_signs, 0) {
             for k in a.terms.keys() {
                 universe.insert(*k);
             }
@@ -688,6 +712,22 @@ fn build_loop_model(func: &AirFunction, module: &AirModule, li: &LoopInfo) -> Op
                 coeffs: BTreeMap::from([(sym, -1)]),
                 constant: hi,
             }); // hi - sym ≥ 0
+        }
+    }
+
+    // A deferred guard is the plain integer comparison of its affine operands
+    // exactly when none of its arithmetic wraps. Every continuing state
+    // satisfies the region built so far (each part is a necessary stay
+    // condition or a type fact), so when that region implies every
+    // intermediate result is in range, the continuing states also satisfy the
+    // integer comparison — the order the guards are evaluated in is irrelevant.
+    for g in deferred {
+        let no_wrap = g
+            .obligations
+            .iter()
+            .all(|(form, lo, hi)| next_never_overflows(form, *lo, *hi, &region, &universe));
+        if no_wrap {
+            region.extend(g.constraints);
         }
     }
 
@@ -752,13 +792,126 @@ fn index_defs(func: &AirFunction, body: &BTreeSet<BlockId>) -> BTreeMap<ValueId,
     defs
 }
 
+/// The signedness each leaf symbol of one model is **read under** — the same view
+/// whose type bounds the model adds to its regions.
+///
+/// A model symbol `z_v` stands for one fixed integer reading of the `w`-bit
+/// machine value `v`: the signed reading when `v` is [`Sign::Signed`], the
+/// unsigned one when [`Sign::Unsigned`]. Every region constraint that mentions
+/// `z_v` must use that same reading (see [`exact_operand`]), otherwise the region
+/// can exclude real continuing states (e.g. `x <u 3000000000` read with a
+/// sign-extended constant makes an unsigned `x` region empty ⇒ a vacuous ranking).
+///
+/// `promote_unless` mirrors [`promote_bitpattern_unsigned`]: a model that later
+/// promotes every sign-unknown leaf outside the given ineligible set to
+/// [`Sign::Unsigned`] passes that set here, so exactness is decided on the signs
+/// *as they will be* when the bounds are added.
+#[derive(Clone, Copy)]
+struct LeafSigns<'a> {
+    signs: &'a BTreeMap<ValueId, Sign>,
+    promote_unless: Option<&'a BTreeSet<ValueId>>,
+}
+
+impl LeafSigns<'_> {
+    /// The reading of leaf `v` (post-promotion when the model promotes).
+    fn get(&self, v: ValueId) -> Sign {
+        match self.signs.get(&v).copied() {
+            Some(s @ (Sign::Signed | Sign::Unsigned)) => s,
+            _ => match self.promote_unless {
+                Some(ineligible) if !ineligible.contains(&v) => Sign::Unsigned,
+                _ => Sign::Unknown,
+            },
+        }
+    }
+}
+
+/// Re-read integer constant `c` under signedness `s` at its own bit width:
+/// zero-extended for [`Sign::Unsigned`], sign-extended for [`Sign::Signed`].
+///
+/// The frontend stores `Constant::Int` sign-extended into an `i64`, so the raw
+/// `value` is only the *signed* reading: an unsigned comparison against
+/// `3000000000u` must see `3000000000`, not `-1294967296`. `ZeroInit` is `0` under
+/// either reading. `None` for any other constant, an unknown sign, or a width
+/// outside `1..=64` (fail closed ⇒ the comparison contributes no constraint).
+fn const_int_as(c: &Constant, s: Sign) -> Option<i128> {
+    let (value, bits) = match c {
+        Constant::Int { value, bits } => (*value, u32::from(*bits)),
+        Constant::ZeroInit => return (s != Sign::Unknown).then_some(0),
+        _ => return None,
+    };
+    if !(1..=64).contains(&bits) {
+        return None;
+    }
+    // The stored `i64` two's-complement bit pattern; its low `bits` bits are the
+    // machine constant.
+    let raw = value.cast_unsigned();
+    let mask: u64 = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let u = raw & mask;
+    match s {
+        Sign::Unsigned => Some(i128::from(u)),
+        Sign::Signed => {
+            let v = i128::from(u);
+            if u & (1u64 << (bits - 1)) != 0 {
+                Some(v - (1i128 << bits))
+            } else {
+                Some(v)
+            }
+        }
+        Sign::Unknown => None,
+    }
+}
+
+/// Resolve the operand of a `zext` (`want = Unsigned`) or `sext`
+/// (`want = Signed`) cast for a **transition** affine form.
+///
+/// `add`/`sub`/`mul` forms are exact modulo `2^w` (the overflow check then pins
+/// the phi's next value into its own range), but a width change breaks that
+/// congruence: `zext` of a value read *signed*, or `zext(x + 1)` where `x + 1`
+/// wraps at the narrow width, is not the affine form of its operand. So the cast
+/// is seen through only when its operand is a constant (re-read under `want` at
+/// its own width) or resolves to exactly one leaf symbol (coefficient `1`, no
+/// constant — bit-identical to that leaf) read under `want`; otherwise the cast
+/// result itself is an opaque leaf.
+fn resolve_cast_operand(
+    cast: ValueId,
+    inner: Option<Affine>,
+    operand: ValueId,
+    want: Sign,
+    module: &AirModule,
+    signs: &LeafSigns<'_>,
+) -> Affine {
+    if let Some(c) = module.constants.get(&operand) {
+        return const_int_as(c, want).map_or_else(|| Affine::symbol(cast), Affine::constant);
+    }
+    inner
+        .filter(|a| {
+            a.constant == 0
+                && a.terms.len() == 1
+                && a.terms
+                    .iter()
+                    .next()
+                    .is_some_and(|(&leaf, &k)| k == 1 && signs.get(leaf) == want)
+        })
+        .unwrap_or_else(|| Affine::symbol(cast))
+}
+
 /// Expand SSA value `v` into an affine form over leaf symbols (header phis and
 /// values not further expandable), or `None` if it is not affine.
+///
+/// The form is exact **modulo `2^w`** (same-width `add`/`sub`/`mul` by a
+/// constant); callers must pin it into the destination's range (see
+/// [`next_never_overflows`]) before treating it as the machine value. Width
+/// changes are handled by [`resolve_cast_operand`].
 fn resolve_affine(
     v: ValueId,
     defs: &BTreeMap<ValueId, Def>,
     header_phis: &BTreeSet<ValueId>,
     module: &AirModule,
+    signs: &LeafSigns<'_>,
     depth: u32,
 ) -> Option<Affine> {
     if depth > AFFINE_DEPTH_LIMIT {
@@ -780,12 +933,13 @@ fn resolve_affine(
     if !def.in_loop {
         return Some(Affine::symbol(v));
     }
+    let recur = |x: ValueId| resolve_affine(x, defs, header_phis, module, signs, depth + 1);
     match &def.op {
         Operation::BinaryOp {
             kind: kind @ (BinaryOp::Add | BinaryOp::Sub),
         } => {
-            let a = resolve_affine(*def.operands.first()?, defs, header_phis, module, depth + 1)?;
-            let b = resolve_affine(*def.operands.get(1)?, defs, header_phis, module, depth + 1)?;
+            let a = recur(*def.operands.first()?)?;
+            let b = recur(*def.operands.get(1)?)?;
             if matches!(kind, BinaryOp::Add) {
                 a.add(&b)
             } else {
@@ -795,8 +949,8 @@ fn resolve_affine(
         Operation::BinaryOp {
             kind: BinaryOp::Mul,
         } => {
-            let a = resolve_affine(*def.operands.first()?, defs, header_phis, module, depth + 1)?;
-            let b = resolve_affine(*def.operands.get(1)?, defs, header_phis, module, depth + 1)?;
+            let a = recur(*def.operands.first()?)?;
+            let b = recur(*def.operands.get(1)?)?;
             // Affine only if at least one factor is a constant.
             if let Some(k) = b.as_constant() {
                 a.scale(k)
@@ -806,30 +960,267 @@ fn resolve_affine(
                 None
             }
         }
-        // Value-preserving casts and copies pass the value through unchanged:
-        // `zext`/`sext` preserve the (unsigned/signed) integer value.
+        // `zext`/`sext` preserve the integer value only for an operand read under
+        // the matching signedness (see [`resolve_cast_operand`]).
         Operation::Cast {
-            kind: CastKind::ZExt | CastKind::SExt,
+            kind: kind @ (CastKind::ZExt | CastKind::SExt),
             ..
+        } => {
+            let op = *def.operands.first()?;
+            let want = if matches!(kind, CastKind::ZExt) {
+                Sign::Unsigned
+            } else {
+                Sign::Signed
+            };
+            Some(resolve_cast_operand(v, recur(op), op, want, module, signs))
         }
-        | Operation::Copy
-        | Operation::Freeze => {
-            resolve_affine(*def.operands.first()?, defs, header_phis, module, depth + 1)
-        }
+        // `xor x, -1` (`~x`) is `-x - 1` modulo `2^w`; any other `xor` is opaque.
+        Operation::BinaryOp {
+            kind: BinaryOp::Xor,
+        } => match not_operand(def, module) {
+            Some(x) => recur(x)?.scale(-1)?.add(&Affine::constant(-1)),
+            None => Some(Affine::symbol(v)),
+        },
+        // Copies pass the value through unchanged.
+        Operation::Copy | Operation::Freeze => recur(*def.operands.first()?),
         // Anything else (Load, Call, non-header Phi, Trunc, …) is opaque: treat as
         // a fresh free leaf symbol (sound — universally quantified downstream).
         _ => Some(Affine::symbol(v)),
     }
 }
 
+/// Path context for [`exact_operand`]: resolve an in-body join phi to its
+/// incoming value along the current path (as [`resolve_affine_path`] does).
+#[derive(Clone, Copy)]
+struct PathCtx<'a> {
+    block_of: &'a BTreeMap<ValueId, BlockId>,
+    path_pred: &'a BTreeMap<BlockId, BlockId>,
+}
+
+/// The signedness an ordered integer predicate reads its operands under, or
+/// `None` for `==`/`!=` (bit equality — reading-independent) and non-comparisons.
+fn predicate_sign(kind: BinaryOp) -> Option<Sign> {
+    match kind {
+        BinaryOp::ICmpSlt | BinaryOp::ICmpSle | BinaryOp::ICmpSgt | BinaryOp::ICmpSge => {
+            Some(Sign::Signed)
+        }
+        BinaryOp::ICmpUlt | BinaryOp::ICmpUle | BinaryOp::ICmpUgt | BinaryOp::ICmpUge => {
+            Some(Sign::Unsigned)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a **comparison operand** `v` to an affine form that is *exactly* its
+/// value under the reading `s`, or `None` (⇒ the comparison contributes no
+/// constraint — a sound weakening).
+///
+/// Exact operands are:
+/// - an integer constant, re-read under `s` at its own width ([`const_int_as`]);
+/// - a single leaf symbol (header phi, parameter, loop-invariant value, or opaque
+///   in-loop leaf) whose reading ([`LeafSigns::get`]) is `s` — so the region's type
+///   bounds and every other constraint on it agree on what the symbol means —
+///   optionally seen through `Copy`/`Freeze`, through `zext` only when `s` is
+///   unsigned, through `sext` only when `s` is signed, and (with a path context)
+///   through an in-body join phi to the value taken on the current path.
+///
+/// In-loop `add`/`sub`/`mul` results are **never** exact: the machine wraps
+/// modulo `2^w`, so `x - 5u > 10u` is not `x ≥ 16` (it also holds for `x < 5`).
+///
+/// `equality` marks an `==`/`!=` operand: bit equality is reading-independent, so
+/// a leaf of [`Sign::Unknown`] reading is read as **signed** there. That is
+/// consistent because an unknown-reading leaf never carries a type bound and never
+/// appears in an ordered constraint (those require a known reading), so every
+/// constraint that mentions it reads it signed; the only bound it can later earn
+/// is the sign-bit-clear box of [`inductive_nonneg_header_phis`], which is a
+/// signed-reading fact.
+// NOTE: the arguments are the shared resolution context (defs, leaves, module,
+// sign view, optional path) threaded through a short recursion; bundling them
+// into a struct for this one helper would only add indirection.
+#[allow(clippy::too_many_arguments)]
+fn exact_operand(
+    v: ValueId,
+    s: Sign,
+    equality: bool,
+    defs: &BTreeMap<ValueId, Def>,
+    header_phis: &BTreeSet<ValueId>,
+    module: &AirModule,
+    signs: &LeafSigns<'_>,
+    path: Option<PathCtx<'_>>,
+    depth: u32,
+) -> Option<Affine> {
+    if depth > AFFINE_DEPTH_LIMIT {
+        return None;
+    }
+    if let Some(c) = module.constants.get(&v) {
+        return const_int_as(c, s).map(Affine::constant);
+    }
+    let leaf = |x: ValueId| {
+        let mut reading = signs.get(x);
+        if equality && reading == Sign::Unknown {
+            reading = Sign::Signed;
+        }
+        (reading == s).then(|| Affine::symbol(x))
+    };
+    if header_phis.contains(&v) {
+        return leaf(v);
+    }
+    let Some(def) = defs.get(&v) else {
+        return leaf(v);
+    };
+    if !def.in_loop {
+        return leaf(v);
+    }
+    let recur = |x: ValueId, s2: Sign| {
+        exact_operand(
+            x,
+            s2,
+            equality,
+            defs,
+            header_phis,
+            module,
+            signs,
+            path,
+            depth + 1,
+        )
+    };
+    match &def.op {
+        Operation::Copy | Operation::Freeze => recur(*def.operands.first()?, s),
+        Operation::Cast {
+            kind: kind @ (CastKind::ZExt | CastKind::SExt),
+            ..
+        } => {
+            let through = if matches!(kind, CastKind::ZExt) {
+                Sign::Unsigned
+            } else {
+                Sign::Signed
+            };
+            let inner = if s == through {
+                def.operands.first().and_then(|&x| recur(x, s))
+            } else {
+                None
+            };
+            // Not seen through ⇒ the cast result is itself an opaque leaf.
+            inner.or_else(|| leaf(v))
+        }
+        // Wrapping in-loop arithmetic is not exact under any reading — unless every
+        // operand is a constant, in which case the machine result (computed
+        // modulo `2^w`) is a known constant re-read under `s` (`-O0` recomputes
+        // `uint32_max - 1` in the loop header as `sub 0xffffffff, 1`).
+        Operation::BinaryOp {
+            kind: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul,
+        } => fold_int_constant(v, defs, module, depth)
+            .and_then(|c| const_int_as(&c, s))
+            .map(Affine::constant),
+        Operation::Phi { incoming } => {
+            let Some(p) = path else {
+                return leaf(v);
+            };
+            let blk = p.block_of.get(&v)?;
+            let Some(pred) = p.path_pred.get(blk) else {
+                return leaf(v);
+            };
+            let val = incoming.iter().find(|(q, _)| q == pred).map(|(_, x)| *x)?;
+            recur(val, s)
+        }
+        _ => leaf(v),
+    }
+}
+
+/// Fold `v` to the integer constant the machine computes, or `None`.
+///
+/// `v` is an integer constant, or a same-width `add`/`sub`/`mul` (seen through
+/// `Copy`/`Freeze`) whose operands all fold. Arithmetic wraps modulo `2^w` exactly
+/// as the machine does; the result is returned as a sign-extended
+/// `Constant::Int` of width `w` (the frontend's storage convention), so
+/// [`const_int_as`] re-reads it under either signedness.
+fn fold_int_constant(
+    v: ValueId,
+    defs: &BTreeMap<ValueId, Def>,
+    module: &AirModule,
+    depth: u32,
+) -> Option<Constant> {
+    if depth > AFFINE_DEPTH_LIMIT {
+        return None;
+    }
+    if let Some(c @ Constant::Int { bits, .. }) = module.constants.get(&v) {
+        return (1..=64).contains(bits).then(|| c.clone());
+    }
+    let def = defs.get(&v)?;
+    let kind = match &def.op {
+        Operation::Copy | Operation::Freeze => {
+            return fold_int_constant(*def.operands.first()?, defs, module, depth + 1);
+        }
+        Operation::BinaryOp {
+            kind: kind @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul),
+        } => *kind,
+        _ => return None,
+    };
+    let [lhs, rhs] = def.operands.as_slice() else {
+        return None;
+    };
+    let (
+        Constant::Int {
+            value: lval,
+            bits: width,
+        },
+        Constant::Int {
+            value: rval,
+            bits: rwidth,
+        },
+    ) = (
+        fold_int_constant(*lhs, defs, module, depth + 1)?,
+        fold_int_constant(*rhs, defs, module, depth + 1)?,
+    )
+    else {
+        return None;
+    };
+    if width != rwidth {
+        return None;
+    }
+    let (first, second) = (lval.cast_unsigned(), rval.cast_unsigned());
+    let raw = match kind {
+        BinaryOp::Add => first.wrapping_add(second),
+        BinaryOp::Sub => first.wrapping_sub(second),
+        _ => first.wrapping_mul(second),
+    };
+    // Truncate to `w` bits, then sign-extend back into the `i64` storage.
+    let shift = 64 - u32::from(width);
+    let value = (raw << shift).cast_signed() >> shift;
+    Some(Constant::Int { value, bits: width })
+}
+
+/// Resolve both operands of integer comparison `kind` exactly (see
+/// [`exact_operand`]), or `None` when either is not exact under the predicate's
+/// reading. An ordered predicate fixes the reading (`s*` signed, `u*` unsigned);
+/// `==`/`!=` require every non-constant operand to share one reading, tried
+/// signed first, then unsigned.
+fn exact_comparison_operands(
+    kind: BinaryOp,
+    lo: ValueId,
+    ro: ValueId,
+    resolve: impl Fn(ValueId, Sign, bool) -> Option<Affine>,
+) -> Option<(Affine, Affine)> {
+    if let Some(s) = predicate_sign(kind) {
+        return Some((resolve(lo, s, false)?, resolve(ro, s, false)?));
+    }
+    if !matches!(kind, BinaryOp::ICmpEq | BinaryOp::ICmpNe) {
+        return None;
+    }
+    [Sign::Signed, Sign::Unsigned]
+        .into_iter()
+        .find_map(|s| Some((resolve(lo, s, true)?, resolve(ro, s, true)?)))
+}
+
 /// Extract the necessary stay-condition(s) imposed by block `b`'s exit branch,
 /// as region constraints `expr ≥ 0`. Returns `None` if `b` is not an
-/// affine-resolvable single-exit loop branch.
+/// exactly-resolvable single-exit loop branch ([`exact_comparison_operands`]).
 fn guard_constraints_for_block(
     func: &AirFunction,
     module: &AirModule,
     defs: &BTreeMap<ValueId, Def>,
     header_phis: &BTreeSet<ValueId>,
+    signs: &LeafSigns<'_>,
     li: &LoopInfo,
     b: BlockId,
 ) -> Option<Vec<Constraint>> {
@@ -856,17 +1247,307 @@ fn guard_constraints_for_block(
     let Operation::BinaryOp { kind } = &def.op else {
         return None;
     };
-    let lhs = resolve_affine(*def.operands.first()?, defs, header_phis, module, 0)?;
-    let rhs = resolve_affine(*def.operands.get(1)?, defs, header_phis, module, 0)?;
+    let (lhs, rhs) = exact_comparison_operands(
+        *kind,
+        *def.operands.first()?,
+        *def.operands.get(1)?,
+        |x, s, eq| exact_operand(x, s, eq, defs, header_phis, module, signs, None, 0),
+    )?;
     comparison_constraints(*kind, &lhs, &rhs, stay_when_true)
+}
+
+/// A loop-exit guard whose operands involve in-loop `add`/`sub`/`mul`: its
+/// region constraints as if no arithmetic wrapped, and the obligations under
+/// which that is the machine comparison — each intermediate result's affine
+/// form must lie in `[lo, hi]`, its type's range under the predicate's reading.
+struct WrappingGuard {
+    constraints: Vec<Constraint>,
+    obligations: Vec<(Affine, i128, i128)>,
+}
+
+/// The operand `x` of a bitwise complement `xor x, -1` (either operand order):
+/// the constant must be all ones at its own width (`true` for `i1`).
+fn not_operand(def: &Def, module: &AirModule) -> Option<ValueId> {
+    let [a, b] = def.operands.as_slice() else {
+        return None;
+    };
+    let all_ones = |v: &ValueId| {
+        module
+            .constants
+            .get(v)
+            .is_some_and(|c| const_int_as(c, Sign::Signed) == Some(-1))
+    };
+    if all_ones(b) {
+        Some(*a)
+    } else if all_ones(a) {
+        Some(*b)
+    } else {
+        None
+    }
+}
+
+/// An in-loop bitwise `and`/`or` result — an opaque leaf in the affine forms —
+/// with the affine forms of its two operands along one path. Each form is the
+/// operand's value modulo `2^w` (see [`resolve_affine_path`]).
+#[derive(Clone)]
+struct BitwiseLeaf {
+    leaf: ValueId,
+    is_and: bool,
+    ops: [Affine; 2],
+    /// Largest signed value of the operation's width, `2^(w-1) - 1`.
+    smax: i128,
+}
+
+/// Cap on the bitwise leaves related per path (a bound on the Z3 work).
+const MAX_BITWISE_LEAVES: usize = 8;
+
+/// Collect the in-loop `and`/`or` leaves reachable from `seeds` (the symbols of
+/// a path's guards and transitions), following the operands of each one.
+fn collect_bitwise_leaves(
+    seeds: &BTreeSet<ValueId>,
+    defs: &BTreeMap<ValueId, Def>,
+    module: &AirModule,
+    resolve: &dyn Fn(ValueId) -> Option<Affine>,
+) -> Vec<BitwiseLeaf> {
+    let mut out: Vec<BitwiseLeaf> = Vec::new();
+    let mut seen: BTreeSet<ValueId> = BTreeSet::new();
+    let mut work: Vec<ValueId> = seeds.iter().rev().copied().collect();
+    while let Some(sym) = work.pop() {
+        if out.len() >= MAX_BITWISE_LEAVES || !seen.insert(sym) {
+            continue;
+        }
+        let Some(def) = defs.get(&sym) else { continue };
+        if !def.in_loop {
+            continue;
+        }
+        let is_and = match &def.op {
+            Operation::BinaryOp {
+                kind: BinaryOp::And,
+            } => true,
+            Operation::BinaryOp { kind: BinaryOp::Or } => false,
+            _ => continue,
+        };
+        let Some(width) = def.result_type.and_then(|t| int_width(module, t)) else {
+            continue;
+        };
+        if !(2..=64).contains(&width) {
+            continue;
+        }
+        let [a, b] = def.operands.as_slice() else {
+            continue;
+        };
+        let (Some(fa), Some(fb)) = (resolve(*a), resolve(*b)) else {
+            continue;
+        };
+        work.extend(fa.terms.keys().rev().copied());
+        work.extend(fb.terms.keys().rev().copied());
+        out.push(BitwiseLeaf {
+            leaf: sym,
+            is_and,
+            ops: [fa, fb],
+            smax: (1i128 << (width - 1)) - 1,
+        });
+    }
+    out
+}
+
+/// Linear facts about bitwise leaf `b` that hold on every state of `region`.
+///
+/// An operand form that the region pins into `[0, 2^(w-1) - 1]` is the operand's
+/// exact signed value (the form is congruent modulo `2^w`), and that value is
+/// non-negative. Two's-complement facts, at width `w`:
+///
+/// - `x & y` with `x ≥ 0`: the sign bit is clear and the bits are a subset of
+///   `x`'s, so `0 ≤ x & y ≤ x` (likewise for `y`);
+/// - `x | y` with `x, y ≥ 0`: the sign bit is clear, the bits are a superset of
+///   each, and `x | y = x + y − (x & y)`, so `max(x, y) ≤ x | y ≤ x + y`.
+///
+/// Every fact implies the leaf is non-negative, where the signed and unsigned
+/// readings coincide, so it holds whatever reading the leaf symbol carries.
+fn bitwise_facts(
+    b: &BitwiseLeaf,
+    region: &[Constraint],
+    universe: &BTreeSet<ValueId>,
+) -> Vec<Constraint> {
+    let nonneg: Vec<bool> = b
+        .ops
+        .iter()
+        .map(|f| next_never_overflows(f, 0, b.smax, region, universe))
+        .collect();
+    let v = Affine::symbol(b.leaf);
+    let mut forms: Vec<Option<Affine>> = Vec::new();
+    if b.is_and {
+        for (f, &nn) in b.ops.iter().zip(&nonneg) {
+            if nn {
+                forms.push(Some(v.clone()));
+                forms.push(f.sub(&v));
+            }
+        }
+    } else if nonneg.iter().all(|&nn| nn) {
+        forms.push(v.sub(&b.ops[0]));
+        forms.push(v.sub(&b.ops[1]));
+        forms.push(b.ops[0].add(&b.ops[1]).and_then(|sum| sum.sub(&v)));
+    }
+    forms
+        .into_iter()
+        .flatten()
+        .map(|a| Constraint {
+            coeffs: a.terms,
+            constant: a.constant,
+        })
+        .collect()
+}
+
+/// Like [`guard_constraints_for_block`], for an ordered comparison whose
+/// operands are not exact only because of in-loop wrapping arithmetic (see
+/// [`wrapping_operand`]). `None` for anything else.
+fn wrapping_guard_for_block(
+    func: &AirFunction,
+    module: &AirModule,
+    defs: &BTreeMap<ValueId, Def>,
+    header_phis: &BTreeSet<ValueId>,
+    signs: &LeafSigns<'_>,
+    li: &LoopInfo,
+    b: BlockId,
+) -> Option<WrappingGuard> {
+    let block = func.blocks.iter().find(|bb| bb.id == b)?;
+    let term = block.terminator()?;
+    let Operation::CondBr {
+        then_target,
+        else_target,
+    } = &term.op
+    else {
+        return None;
+    };
+    let stay_when_true = match (li.body.contains(then_target), li.body.contains(else_target)) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => return None,
+    };
+    let def = defs.get(term.operands.first()?)?;
+    let Operation::BinaryOp { kind } = &def.op else {
+        return None;
+    };
+    // Ordered predicates only: they fix the reading of both operands.
+    let s = predicate_sign(*kind)?;
+    let mut obligations = Vec::new();
+    let lhs = wrapping_operand(
+        *def.operands.first()?,
+        s,
+        defs,
+        header_phis,
+        module,
+        signs,
+        None,
+        &mut obligations,
+        0,
+    )?;
+    let rhs = wrapping_operand(
+        *def.operands.get(1)?,
+        s,
+        defs,
+        header_phis,
+        module,
+        signs,
+        None,
+        &mut obligations,
+        0,
+    )?;
+    let constraints = comparison_constraints(*kind, &lhs, &rhs, stay_when_true)?;
+    Some(WrappingGuard {
+        constraints,
+        obligations,
+    })
+}
+
+/// The affine form of comparison operand `v` under reading `s`: exact
+/// ([`exact_operand`]) leaves and constants, combined through in-loop
+/// same-width `add`/`sub` and `mul` by a constant. Each such operation's
+/// result is recorded in `obligations` with the range of its type under `s`:
+/// when every recorded result lies in its range, no operation wrapped and the
+/// form is the operand's value under `s` (each operand is, by induction, and
+/// the in-range integer result has the same bits as the machine result).
+// NOTE: same shared resolution context as `exact_operand`, plus the
+// obligation sink.
+#[allow(clippy::too_many_arguments)]
+fn wrapping_operand(
+    v: ValueId,
+    s: Sign,
+    defs: &BTreeMap<ValueId, Def>,
+    header_phis: &BTreeSet<ValueId>,
+    module: &AirModule,
+    signs: &LeafSigns<'_>,
+    path: Option<PathCtx<'_>>,
+    obligations: &mut Vec<(Affine, i128, i128)>,
+    depth: u32,
+) -> Option<Affine> {
+    if depth > AFFINE_DEPTH_LIMIT {
+        return None;
+    }
+    if let Some(a) = exact_operand(v, s, false, defs, header_phis, module, signs, path, depth) {
+        return Some(a);
+    }
+    let def = defs.get(&v)?;
+    if !def.in_loop || header_phis.contains(&v) {
+        return None;
+    }
+    let Operation::BinaryOp {
+        kind: kind @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul),
+    } = &def.op
+    else {
+        return None;
+    };
+    let bits = int_width(module, def.result_type?)?;
+    if !(1..=64).contains(&bits) {
+        return None;
+    }
+    let (lo, hi) = match s {
+        Sign::Signed => (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1),
+        Sign::Unsigned => (0, (1i128 << bits) - 1),
+        Sign::Unknown => return None,
+    };
+    let [lhs, rhs] = def.operands.as_slice() else {
+        return None;
+    };
+    let mut operand = |x: ValueId| {
+        wrapping_operand(
+            x,
+            s,
+            defs,
+            header_phis,
+            module,
+            signs,
+            path,
+            obligations,
+            depth + 1,
+        )
+    };
+    let left = operand(*lhs)?;
+    let right = operand(*rhs)?;
+    let form = match kind {
+        BinaryOp::Add => left.add(&right)?,
+        BinaryOp::Sub => left.sub(&right)?,
+        _ => match (left.as_constant(), right.as_constant()) {
+            (_, Some(k)) => left.scale(k)?,
+            (Some(k), None) => right.scale(k)?,
+            (None, None) => return None,
+        },
+    };
+    obligations.push((form.clone(), lo, hi));
+    Some(form)
 }
 
 /// Turn an integer comparison (taken in the given polarity) into region
 /// constraints `expr ≥ 0`. Over the integers, strict `<` becomes `≥ 1`.
-/// Signed/unsigned share the same math form here: the constraint is a *necessary*
-/// condition on in-range continuing states either way, so it stays a sound
-/// superset guard. Non-order predicates that are not affine half-spaces (`!=`,
-/// and `==` under negation) are dropped.
+///
+/// The lowering is plain integer arithmetic, so it is a sound *necessary*
+/// condition **only** when `lhs`/`rhs` are the operands' exact values under the
+/// predicate's reading (signed for `s*`, unsigned for `u*`, one shared reading for
+/// `==`/`!=`) — callers must build them with [`exact_comparison_operands`]. An
+/// unsigned predicate over sign-extended constants or wrapping arithmetic would
+/// otherwise exclude real continuing states (or make the region empty ⇒ a vacuous
+/// ranking). Non-order predicates that are not affine half-spaces (`!=`, and `==`
+/// under negation) are dropped.
 fn comparison_constraints(
     kind: BinaryOp,
     lhs: &Affine,
@@ -1087,11 +1768,9 @@ fn def_result_nonneg(inst: &Instruction, module: &AirModule) -> bool {
 /// when it feeds — directly or through an affine derivation — either:
 ///
 /// - an **ordered** integer comparison (`<`/`<=`/`>`/`>=`, signed *or* unsigned):
-///   [`comparison_constraints`] lowers ordered predicates into affine half-spaces
-///   *without regard to signedness*, so the lowering is a sound necessary
-///   condition only under the integer bound matching how the machine actually
-///   reads the value; forcing an unsigned bound could wrongly prune a real signed
-///   half (a `< 0` branch) and unsoundly claim termination; or
+///   the leaf keeps the reading the program gives it (defense in depth on top of
+///   [`exact_operand`], which already drops any ordered comparison whose operand
+///   reading disagrees with the predicate); or
 /// - an **`nsw`** integer op (`add`/`sub`/`mul`/`shl`): a signed overflow there is
 ///   undefined behavior, so the operand must not be modelled as a defined
 ///   `mod 2^w` wraparound (a `sub nsw x, 1` from `INT_MIN` is UB, not a step to
@@ -1128,16 +1807,65 @@ fn bitpattern_ineligible_leaves(
                 continue;
             }
             for &op in inst.operands.iter().take(2) {
-                match resolve_affine(op, defs, header_phis, module, 0) {
-                    Some(aff) => out.extend(aff.terms.keys().copied()),
-                    None => {
-                        out.insert(op);
-                    }
-                }
+                collect_operand_leaves(op, defs, header_phis, module, 0, &mut out);
             }
         }
     }
     out
+}
+
+/// Insert into `out` the operand `v` and **every** value its affine expansion can
+/// stop at: through in-loop `add`/`sub`/`mul`, `zext`/`sext`, copies, and in-body
+/// join phis (all incoming values), stopping at header phis, out-of-loop values
+/// and opaque leaves. A deliberate over-approximation of the leaf sets
+/// [`resolve_affine`], [`resolve_affine_path`] and [`exact_operand`] can produce
+/// (they stop at different points depending on signedness and path), so
+/// [`bitpattern_ineligible_leaves`] stays conservative whichever one is used.
+fn collect_operand_leaves(
+    v: ValueId,
+    defs: &BTreeMap<ValueId, Def>,
+    header_phis: &BTreeSet<ValueId>,
+    module: &AirModule,
+    depth: u32,
+    out: &mut BTreeSet<ValueId>,
+) {
+    if module.constants.contains_key(&v) || !out.insert(v) {
+        return; // a constant, or already visited (also cuts phi cycles)
+    }
+    if depth > AFFINE_DEPTH_LIMIT || header_phis.contains(&v) {
+        return;
+    }
+    let Some(def) = defs.get(&v) else {
+        return;
+    };
+    if !def.in_loop {
+        return;
+    }
+    match &def.op {
+        // `xor` too: the resolvers expand `~x` to `-x-1` over the leaf `x`, so
+        // `while (x != 0) x = ~(~x + 1);` put `x` under the `add nsw` with a
+        // bit-pattern bound (wrong TRUE from a negative `x`: `~INT_MIN + 1`
+        // overflows). Any xor is followed — over-approximation only.
+        Operation::BinaryOp {
+            kind: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Xor,
+        }
+        | Operation::Cast {
+            kind: CastKind::ZExt | CastKind::SExt,
+            ..
+        }
+        | Operation::Copy
+        | Operation::Freeze => {
+            for &op in &def.operands {
+                collect_operand_leaves(op, defs, header_phis, module, depth + 1, out);
+            }
+        }
+        Operation::Phi { incoming } => {
+            for (_, x) in incoming {
+                collect_operand_leaves(*x, defs, header_phis, module, depth + 1, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Promote every leaf in `candidates` whose signedness is currently *unknown*
@@ -1208,11 +1936,8 @@ fn is_unsigned_nondet(name: &str) -> bool {
 /// treated as unsigned (only recall is lost, never soundness).
 fn arg_is_nonneg(arg: ValueId, caller: &AirFunction, module: &AirModule) -> bool {
     if let Some(c) = module.constants.get(&arg) {
-        return match c {
-            Constant::Int { value, .. } => *value >= 0,
-            Constant::ZeroInit => true,
-            _ => false,
-        };
+        // Non-negative = sign bit clear at the constant's own width.
+        return const_int_as(c, Sign::Signed).is_some_and(|k| k >= 0);
     }
     for block in &caller.blocks {
         for inst in &block.instructions {
@@ -1278,10 +2003,13 @@ fn arg_is_guarded_nonneg(
             }
         }
     }
-    let const_int = |x: ValueId| match module.constants.get(&x) {
-        Some(Constant::Int { value, .. }) => Some(i128::from(*value)),
-        Some(Constant::ZeroInit) => Some(0),
-        _ => None,
+    // The guard is a *signed* comparison, so its constant is read signed at its
+    // own width (`ZeroInit` ⇒ `0`).
+    let const_int = |x: ValueId| {
+        module
+            .constants
+            .get(&x)
+            .and_then(|c| const_int_as(c, Sign::Signed))
     };
     let cfg = Cfg::build(caller);
     let idom = compute_dominators(&cfg);
@@ -1405,10 +2133,13 @@ fn value_dominating_nonneg(
             }
         }
     }
-    let const_int = |x: ValueId| match module.constants.get(&x) {
-        Some(Constant::Int { value, .. }) => Some(i128::from(*value)),
-        Some(Constant::ZeroInit) => Some(0),
-        _ => None,
+    // The guard is a *signed* comparison, so its constant is read signed at its
+    // own width (`ZeroInit` ⇒ `0`).
+    let const_int = |x: ValueId| {
+        module
+            .constants
+            .get(&x)
+            .and_then(|c| const_int_as(c, Sign::Signed))
     };
     let cfg = Cfg::build(func);
     let idom = compute_dominators(&cfg);
@@ -1464,31 +2195,86 @@ fn value_dominating_nonneg(
     false
 }
 
-/// Is value `v` provably a **non-negative** integer on entry to a loop whose header
-/// is `header` — either an unconditionally non-negative *source*
-/// ([`arg_is_nonneg`]: constant, unsigned nondet, `zext`, or a non-negative
-/// arithmetic result) or gated by a *dominating signed guard* forcing `v >= 0` that
-/// reaches the header ([`value_dominating_nonneg`], e.g. an early `if (v < 0)
-/// return;` / `if (!(v >= 0))`)? Used to establish the **base case** of a header
-/// phi's `phi >= 0` loop invariant in [`inductive_nonneg_header_phis`]. Fails closed
-/// (only recall is affected).
+/// Is value `v` provably a **sign-bit-clear** integer (`0 ≤ v ≤ 2^(w−1)−1` under
+/// *both* readings) on entry to a loop whose header is `header` — either an
+/// unconditionally sign-bit-clear *source* ([`value_signbit_clear`]) or gated by a
+/// *dominating signed guard* forcing `v >= 0` that reaches the header
+/// ([`value_dominating_nonneg`], e.g. an early `if (v < 0) return;` /
+/// `if (!(v >= 0))`)? Used to establish the **base case** of a header phi's
+/// `0 ≤ phi ≤ 2^(w−1)−1` loop invariant in [`inductive_nonneg_header_phis`].
+///
+/// Deliberately stricter than [`arg_is_nonneg`]: an unsigned nondet (or an
+/// unsigned remainder by a non-constant divisor) is non-negative only under the
+/// *unsigned* reading — `3000000000u` has its sign bit set — so it cannot seed the
+/// sign-bit-clear box. Fails closed (only recall is affected).
 fn value_is_entry_nonneg(
     v: ValueId,
     func: &AirFunction,
     header: BlockId,
     module: &AirModule,
 ) -> bool {
-    arg_is_nonneg(v, func, module) || value_dominating_nonneg(v, func, header, module)
+    value_signbit_clear(v, func, module) || value_dominating_nonneg(v, func, header, module)
 }
 
-/// The header phis `p` for which `p >= 0` is a **sound inductive loop invariant**:
+/// The sign-bit-clear maximum `2^(w−1)−1` of an integer type of width
+/// `w ∈ 1..=64`, or `None` when the type is unknown / not such an integer.
+fn signbit_clear_max(type_id: Option<TypeId>, module: &AirModule) -> Option<i128> {
+    let w = i128::from(int_width(module, type_id?)?);
+    (1..=64).contains(&w).then(|| (1i128 << (w - 1)) - 1)
+}
+
+/// Is `v` (defined in `func`) unconditionally **sign-bit clear** — a constant whose
+/// signed reading is `≥ 0`, a `zext` (its top bit is a zero-extension bit), a
+/// logical right shift by a positive constant or a mask by a sign-bit-clear
+/// constant ([`def_result_nonneg`]), or an unsigned remainder by a constant whose
+/// signed reading is positive (result `< divisor ≤ 2^(w−1)−1`)? Fails closed.
+fn value_signbit_clear(v: ValueId, func: &AirFunction, module: &AirModule) -> bool {
+    if let Some(c) = module.constants.get(&v) {
+        return const_int_as(c, Sign::Signed).is_some_and(|k| k >= 0);
+    }
+    let Some(inst) = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .find(|i| i.dst == Some(v))
+    else {
+        return false;
+    };
+    match &inst.op {
+        Operation::Cast {
+            kind: CastKind::ZExt,
+            ..
+        } => true,
+        Operation::BinaryOp {
+            kind: BinaryOp::URem,
+        } => inst
+            .operands
+            .get(1)
+            .and_then(|d| module.constants.get(d))
+            .and_then(|c| const_int_as(c, Sign::Signed))
+            .is_some_and(|k| k > 0),
+        Operation::BinaryOp { .. } => def_result_nonneg(inst, module),
+        _ => false,
+    }
+}
+
+/// The header phis `p` for which `0 ≤ p ≤ hi(p)` is a **sound inductive loop
+/// invariant**, where `hi(p)` is the upper end of `p`'s type bound in `bound_of`,
+/// or the sign-bit-clear maximum `2^(w−1)−1` when `p` has no type bound:
 ///
 /// - **base case** — every *preheader* (non-latch) incoming value of `p` is provably
-///   non-negative ([`value_is_entry_nonneg`]); and
+///   sign-bit clear ([`value_is_entry_nonneg`]); and
 /// - **inductive step** — every split-expanded, type-bounded continuing branch
-///   *preserves* it: `region ∧ p ≥ 0 ⇒ next(p) ≥ 0` (a Farkas/Z3 check, mirroring
-///   [`assemble_branches`]'s split expansion and infeasible-cross-product pruning so
-///   the proof uses exactly the regions the ranking will).
+///   *preserves* it: `region ∧ 0 ≤ p ≤ hi ⇒ 0 ≤ next(p) ≤ hi` (a Z3 check,
+///   mirroring [`assemble_branches`]'s split expansion and infeasible-cross-product
+///   pruning so the proof uses exactly the regions the ranking will).
+///
+/// The upper half of the step matters: `next(p)` is an affine form exact only
+/// modulo `2^w`, so `next(p) ≥ 0` over the integers does not make the *machine*
+/// value non-negative (`p + 1` at `p = 2^(w−1)−1` wraps negative). Pinning the
+/// integer value into `[0, hi]` — inside the range of `p`'s own reading, and
+/// sign-bit clear (so both readings agree) when `p` has no type bound — makes it
+/// the machine value.
 ///
 /// Adding a proven `p ≥ 0` to the region is sound — it is a true fact about every
 /// continuing state, so the branch regions stay a *superset* of the real transition
@@ -1513,6 +2299,7 @@ fn inductive_nonneg_header_phis(
     header_phis: &BTreeSet<ValueId>,
     raws: &[RawBranch],
     base_bounds: &[Constraint],
+    bound_of: &BTreeMap<ValueId, (i128, i128)>,
     universe: &BTreeSet<ValueId>,
 ) -> BTreeSet<ValueId> {
     let mut out = BTreeSet::new();
@@ -1523,12 +2310,16 @@ fn inductive_nonneg_header_phis(
         // --- Base case: every preheader incoming value is provably non-negative. ---
         let mut has_preheader = false;
         let mut base_ok = true;
+        let mut hi: Option<i128> = bound_of.get(&p).map(|&(_, h)| h);
         for inst in &header_block.instructions {
             let Operation::Phi { incoming } = &inst.op else {
                 continue;
             };
             if inst.dst != Some(p) {
                 continue;
+            }
+            if hi.is_none() {
+                hi = signbit_clear_max(inst.result_type, module);
             }
             for (pred, v) in incoming {
                 if latch_set.contains(pred) {
@@ -1540,14 +2331,23 @@ fn inductive_nonneg_header_phis(
                 }
             }
         }
+        let Some(hi) = hi else {
+            continue; // no width ⇒ no box to prove (fail closed)
+        };
         if !has_preheader || !base_ok {
             continue;
         }
-        // --- Inductive step: `p >= 0` preserved by every split-expanded branch. ---
-        let hyp = Constraint {
-            coeffs: BTreeMap::from([(p, 1)]),
-            constant: 0,
-        };
+        // --- Inductive step: `0 <= p <= hi` preserved by every split-expanded branch.
+        let hyp = [
+            Constraint {
+                coeffs: BTreeMap::from([(p, 1)]),
+                constant: 0,
+            },
+            Constraint {
+                coeffs: BTreeMap::from([(p, -1)]),
+                constant: hi,
+            },
+        ];
         let mut preserved = true;
         'branches: for raw in raws {
             // Mirror `assemble_branches`: over the cap the splits are dropped (a
@@ -1562,7 +2362,7 @@ fn inductive_nonneg_header_phis(
                 let mut region = raw.guards.clone();
                 region.extend(base_bounds.iter().cloned());
                 region.extend(extra);
-                region.push(hyp.clone());
+                region.extend(hyp.iter().cloned());
                 // An infeasible sub-branch models no reachable state ⇒ vacuously
                 // preserved (this is where the negative half of `p`'s own `!=`-split
                 // drops out under `p >= 0`).
@@ -1582,10 +2382,24 @@ fn inductive_nonneg_header_phis(
                     preserved = false;
                     break 'branches;
                 };
-                let mut check = region;
+                let mut check = region.clone();
                 check.push(Constraint {
                     coeffs: neg.terms,
                     constant: neg.constant,
+                });
+                if !region_is_infeasible(&check, universe) {
+                    preserved = false;
+                    break 'branches;
+                }
+                // region ⇒ a <= hi, i.e. `region ∧ (a >= hi + 1)` is unsatisfiable.
+                let Some(over) = a.add(&Affine::constant(-hi - 1)) else {
+                    preserved = false;
+                    break 'branches;
+                };
+                let mut check = region;
+                check.push(Constraint {
+                    coeffs: over.terms,
+                    constant: over.constant,
                 });
                 if !region_is_infeasible(&check, universe) {
                     preserved = false;
@@ -2119,6 +2933,12 @@ struct RawBranch {
     /// [`assemble_branches`] forks the branch into the cartesian product of
     /// half-space choices, requiring the ranking to hold on every one.
     splits: Vec<[Constraint; 2]>,
+    /// Guards over in-loop arithmetic, admitted per sub-branch by
+    /// [`assemble_branches`] once its region proves the arithmetic never wraps.
+    deferred: Vec<WrappingGuard>,
+    /// In-loop `and`/`or` leaves of this path, related to their operands by
+    /// [`bitwise_facts`] once the sub-branch region is known.
+    bitwise: Vec<BitwiseLeaf>,
     raw_next: BTreeMap<ValueId, Option<Affine>>,
 }
 
@@ -2545,6 +3365,19 @@ fn build_recursion_model(
         return None;
     }
 
+    // The bit-pattern promotion applied after pass 1 (see the SOUNDNESS SENTINEL
+    // below) is decided up front, so pass 1 judges comparison exactness on the
+    // signs the bounds will actually use: every leaf a guard or transition
+    // mentions joins `universe` and is promoted iff `LeafSigns::get` says so.
+    let mut ineligible = bitpattern_ineligible_leaves(func, &defs, &header_phis, module);
+    if function_allocates_per_frame(func, module) {
+        ineligible.extend(param_ids.iter().copied());
+    }
+    let leaf_signs = LeafSigns {
+        signs: &signs,
+        promote_unless: Some(&ineligible),
+    };
+
     // --- Pass 1: one raw transition per (call site × entry→site path). ---------
     let mut raws: Vec<RawBranch> = Vec::new();
     let mut universe: BTreeSet<ValueId> = param_ids.clone();
@@ -2558,12 +3391,14 @@ fn build_recursion_model(
             let path_pred = path_pred_map(path);
             let mut guards: Vec<Constraint> = Vec::new();
             let mut splits: Vec<[Constraint; 2]> = Vec::new();
+            let mut deferred: Vec<WrappingGuard> = Vec::new();
             // Necessary stay-conditions of the branches entering the call block.
             for pair in path.windows(2) {
                 if let Some(block) = func.blocks.iter().find(|b| b.id == pair[0]) {
                     add_path_guards(
                         &mut guards,
                         &mut splits,
+                        &mut deferred,
                         &mut universe,
                         block,
                         pair[1],
@@ -2571,6 +3406,7 @@ fn build_recursion_model(
                         &block_of,
                         &header_phis,
                         module,
+                        &leaf_signs,
                         &path_pred,
                     );
                 }
@@ -2588,7 +3424,16 @@ fn build_recursion_model(
                     continue;
                 }
                 let a = args.get(p.index as usize).and_then(|&arg| {
-                    resolve_affine_path(arg, &defs, &block_of, &header_phis, module, &path_pred, 0)
+                    resolve_affine_path(
+                        arg,
+                        &defs,
+                        &block_of,
+                        &header_phis,
+                        module,
+                        &leaf_signs,
+                        &path_pred,
+                        0,
+                    )
                 });
                 if let Some(ref aff) = a {
                     universe.extend(aff.terms.keys().copied());
@@ -2598,6 +3443,8 @@ fn build_recursion_model(
             raws.push(RawBranch {
                 guards,
                 splits,
+                deferred,
+                bitwise: Vec::new(),
                 raw_next,
             });
             if raws.len() > MAX_PATHS {
@@ -2647,10 +3494,8 @@ fn build_recursion_model(
     // bit-pattern bound and still ranks, so this costs no arithmetic-recursion recall.
     // Excluding params can only turn a would-be `true` into `unknown` (sound:
     // abstaining is always sound for a verdict-only property).
-    let mut ineligible = bitpattern_ineligible_leaves(func, &defs, &header_phis, module);
-    if function_allocates_per_frame(func, module) {
-        ineligible.extend(param_ids.iter().copied());
-    }
+    // (`ineligible` — including the per-frame-allocation param exclusion — was
+    // computed before pass 1; see `leaf_signs`.)
     promote_bitpattern_unsigned(&mut signs, &universe, &ineligible);
 
     // Type bounds: parameters use their `AirParam` type; every other integer leaf
@@ -2914,6 +3759,25 @@ fn build_mutual_recursion_model(
         let block_of = index_block_of(f);
         // This member's own integer params are the affine leaves for resolution.
         let header_phis: BTreeSet<ValueId> = remap.keys().copied().collect();
+        // Leaf readings for this member: a remapped param is read under its SHARED
+        // position's sign (the only sign whose bounds the model adds for it); any
+        // other leaf under the member's own inference (it gets no bound, so a
+        // consistent reading is all exactness needs).
+        let mut member_signs = infer_signs(f, module);
+        for (local, shared) in remap {
+            match signs.get(shared) {
+                Some(&s) => {
+                    member_signs.insert(*local, s);
+                }
+                None => {
+                    member_signs.remove(local);
+                }
+            }
+        }
+        let leaf_signs = LeafSigns {
+            signs: &member_signs,
+            promote_unless: None,
+        };
         let entry = f.entry_block.unwrap_or(f.blocks.first()?.id);
 
         // Intra-SCC recursive call sites: a `CallDirect` to any SCC member.
@@ -2940,6 +3804,9 @@ fn build_mutual_recursion_model(
                         add_path_guards(
                             &mut guards_local,
                             &mut splits_local,
+                            // Deferred guards are not remapped across the SCC:
+                            // dropped (a sound weakening).
+                            &mut Vec::new(),
                             &mut local_universe,
                             block,
                             pair[1],
@@ -2947,6 +3814,7 @@ fn build_mutual_recursion_model(
                             &block_of,
                             &header_phis,
                             module,
+                            &leaf_signs,
                             &path_pred,
                         );
                     }
@@ -2970,6 +3838,7 @@ fn build_mutual_recursion_model(
                             &block_of,
                             &header_phis,
                             module,
+                            &leaf_signs,
                             &path_pred,
                             0,
                         )
@@ -2999,6 +3868,8 @@ fn build_mutual_recursion_model(
                 raws.push(RawBranch {
                     guards,
                     splits,
+                    deferred: Vec::new(),
+                    bitwise: Vec::new(),
                     raw_next,
                 });
                 if raws.len() > MAX_PATHS {
@@ -3130,6 +4001,16 @@ fn build_multipath_model_multi(
         return None;
     }
 
+    // The bit-pattern promotion below (`promote_bitpattern_unsigned`) is decided
+    // up front so that pass 1 judges comparison exactness on the signs the bounds
+    // will actually use (every leaf a guard or transition mentions joins
+    // `universe`, so it is promoted iff `LeafSigns::get` says so).
+    let ineligible = bitpattern_ineligible_leaves(func, &defs, &header_phis, module);
+    let leaf_signs = LeafSigns {
+        signs: &signs,
+        promote_unless: Some(&ineligible),
+    };
+
     // --- Pass 1: per-(latch × path) guards + raw affine transitions. -----------
     let mut raws: Vec<RawBranch> = Vec::new();
     let mut universe: BTreeSet<ValueId> = header_phis.clone();
@@ -3151,12 +4032,14 @@ fn build_multipath_model_multi(
             let path_pred = path_pred_map(path);
             let mut guards: Vec<Constraint> = Vec::new();
             let mut splits: Vec<[Constraint; 2]> = Vec::new();
+            let mut deferred: Vec<WrappingGuard> = Vec::new();
             // Necessary stay-conditions along the path's internal/exit branches …
             for pair in path.windows(2) {
                 if let Some(block) = func.blocks.iter().find(|b| b.id == pair[0]) {
                     add_path_guards(
                         &mut guards,
                         &mut splits,
+                        &mut deferred,
                         &mut universe,
                         block,
                         pair[1],
@@ -3164,6 +4047,7 @@ fn build_multipath_model_multi(
                         &block_of,
                         &header_phis,
                         module,
+                        &leaf_signs,
                         &path_pred,
                     );
                 }
@@ -3173,6 +4057,7 @@ fn build_multipath_model_multi(
             add_path_guards(
                 &mut guards,
                 &mut splits,
+                &mut deferred,
                 &mut universe,
                 latch_block,
                 header,
@@ -3180,6 +4065,7 @@ fn build_multipath_model_multi(
                 &block_of,
                 &header_phis,
                 module,
+                &leaf_signs,
                 &path_pred,
             );
 
@@ -3195,16 +4081,62 @@ fn build_multipath_model_multi(
                 // A phi lacking a back-edge value for this latch cannot be modelled;
                 // over-approximate it as an (unresolved) havoc below.
                 let a = phi_next.get(&phi).and_then(|&nv| {
-                    resolve_affine_path(nv, &defs, &block_of, &header_phis, module, &path_pred, 0)
+                    resolve_affine_path(
+                        nv,
+                        &defs,
+                        &block_of,
+                        &header_phis,
+                        module,
+                        &leaf_signs,
+                        &path_pred,
+                        0,
+                    )
                 });
                 if let Some(ref aff) = a {
                     universe.extend(aff.terms.keys().copied());
                 }
                 raw_next.insert(phi, a);
             }
+            // In-loop `and`/`or` leaves of this path's guards and transitions,
+            // with their operand forms along the same path.
+            let mut seeds: BTreeSet<ValueId> = BTreeSet::new();
+            for a in raw_next.values().flatten() {
+                seeds.extend(a.terms.keys().copied());
+            }
+            for c in guards.iter().chain(splits.iter().flatten()) {
+                seeds.extend(c.coeffs.keys().copied());
+            }
+            for g in &deferred {
+                for c in &g.constraints {
+                    seeds.extend(c.coeffs.keys().copied());
+                }
+                for (form, _, _) in &g.obligations {
+                    seeds.extend(form.terms.keys().copied());
+                }
+            }
+            let bitwise = collect_bitwise_leaves(&seeds, &defs, module, &|x| {
+                resolve_affine_path(
+                    x,
+                    &defs,
+                    &block_of,
+                    &header_phis,
+                    module,
+                    &leaf_signs,
+                    &path_pred,
+                    0,
+                )
+            });
+            for b in &bitwise {
+                universe.insert(b.leaf);
+                for f in &b.ops {
+                    universe.extend(f.terms.keys().copied());
+                }
+            }
             raws.push(RawBranch {
                 guards,
                 splits,
+                deferred,
+                bitwise,
                 raw_next,
             });
             if raws.len() > MAX_PATHS {
@@ -3243,7 +4175,7 @@ fn build_multipath_model_multi(
     // (`while (x != 0) x--` on an unsigned/`-fwrapv` `x`) ranks: the `!=` split's
     // negative half is pruned and `x − 1` stays in range. A signed `nsw` counter or
     // one feeding an ordered comparison stays `Unknown` ⇒ abstains, as it must.
-    let ineligible = bitpattern_ineligible_leaves(func, &defs, &header_phis, module);
+    // (`ineligible` was computed before pass 1 — see `leaf_signs`.)
     promote_bitpattern_unsigned(&mut signs, &universe, &ineligible);
 
     // Type bounds for every integer leaf with a known signedness/width — true facts
@@ -3282,6 +4214,7 @@ fn build_multipath_model_multi(
         &header_phis,
         &raws,
         &base_bounds,
+        &bound_of,
         &universe,
     );
     for &p in &nonneg_phis {
@@ -3300,14 +4233,9 @@ fn build_multipath_model_multi(
             // `x - 1`) as overflow-stable instead of demoting it to a havoc symbol
             // (which would erase the very decrease the ranking needs).
             None => {
-                if let Some(w) = defs
-                    .get(&p)
-                    .and_then(|d| d.result_type)
-                    .and_then(|t| int_width(module, t))
-                    .map(i128::from)
-                    .filter(|w| (1..=64).contains(w))
+                if let Some(hi) =
+                    signbit_clear_max(defs.get(&p).and_then(|d| d.result_type), module)
                 {
-                    let hi = (1i128 << (w - 1)) - 1;
                     bound_of.insert(p, (0, hi));
                     base_bounds.push(Constraint {
                         coeffs: BTreeMap::from([(p, -1)]),
@@ -3416,6 +4344,22 @@ fn assemble_branches(
             let mut check_region = raw.guards.clone();
             check_region.extend(base_bounds.iter().cloned());
             check_region.extend(extra);
+            // A deferred guard joins this sub-branch's region only when the
+            // region proves none of its arithmetic wraps (see
+            // `build_loop_model`): then it is the machine comparison.
+            for g in &raw.deferred {
+                if g.obligations.iter().all(|(form, lo, hi)| {
+                    next_never_overflows(form, *lo, *hi, &check_region, universe)
+                }) {
+                    check_region.extend(g.constraints.iter().cloned());
+                }
+            }
+            // Bitwise leaves gain their sign-conditional linear facts here, on
+            // the final sub-branch region (before overflow classification).
+            for b in &raw.bitwise {
+                let facts = bitwise_facts(b, &check_region, universe);
+                check_region.extend(facts);
+            }
 
             // A disjunctive `!=`-split can produce cross combinations whose region is
             // empty (e.g. `x ≥ 1` from one guard's half AND `x ≤ 0` from another's).
@@ -3668,6 +4612,7 @@ fn path_guard_is_unsat(guards: &[Constraint]) -> bool {
 fn add_path_guards(
     region: &mut Vec<Constraint>,
     splits: &mut Vec<[Constraint; 2]>,
+    deferred: &mut Vec<WrappingGuard>,
     universe: &mut BTreeSet<ValueId>,
     block: &saf_core::air::AirBlock,
     next_block: BlockId,
@@ -3675,6 +4620,7 @@ fn add_path_guards(
     block_of: &BTreeMap<ValueId, BlockId>,
     header_phis: &BTreeSet<ValueId>,
     module: &AirModule,
+    signs: &LeafSigns<'_>,
     path_pred: &BTreeMap<BlockId, BlockId>,
 ) {
     let Some(term) = block.terminator() else {
@@ -3700,6 +4646,7 @@ fn add_path_guards(
     resolve_bool_guard(
         region,
         splits,
+        deferred,
         universe,
         cond,
         taken_true,
@@ -3707,6 +4654,7 @@ fn add_path_guards(
         block_of,
         header_phis,
         module,
+        signs,
         path_pred,
         0,
     );
@@ -3746,6 +4694,7 @@ fn add_path_guards(
 fn resolve_bool_guard(
     region: &mut Vec<Constraint>,
     splits: &mut Vec<[Constraint; 2]>,
+    deferred: &mut Vec<WrappingGuard>,
     universe: &mut BTreeSet<ValueId>,
     cond: ValueId,
     want_true: bool,
@@ -3753,6 +4702,7 @@ fn resolve_bool_guard(
     block_of: &BTreeMap<ValueId, BlockId>,
     header_phis: &BTreeSet<ValueId>,
     module: &AirModule,
+    signs: &LeafSigns<'_>,
     path_pred: &BTreeMap<BlockId, BlockId>,
     depth: u32,
 ) {
@@ -3775,12 +4725,14 @@ fn resolve_bool_guard(
     };
     let recurse = |region: &mut Vec<Constraint>,
                    splits: &mut Vec<[Constraint; 2]>,
+                   deferred: &mut Vec<WrappingGuard>,
                    universe: &mut BTreeSet<ValueId>,
                    v: ValueId,
                    want: bool| {
         resolve_bool_guard(
             region,
             splits,
+            deferred,
             universe,
             v,
             want,
@@ -3788,6 +4740,7 @@ fn resolve_bool_guard(
             block_of,
             header_phis,
             module,
+            signs,
             path_pred,
             depth + 1,
         );
@@ -3798,10 +4751,50 @@ fn resolve_bool_guard(
             let (Some(&lo), Some(&ro)) = (def.operands.first(), def.operands.get(1)) else {
                 return;
             };
-            let (Some(lhs), Some(rhs)) = (
-                resolve_affine_path(lo, defs, block_of, header_phis, module, path_pred, 0),
-                resolve_affine_path(ro, defs, block_of, header_phis, module, path_pred, 0),
-            ) else {
+            // Only operands EXACT under the predicate's reading may contribute a
+            // constraint or a `!=` split (see `exact_operand`); anything else is
+            // dropped — a sound weakening.
+            let path = Some(PathCtx {
+                block_of,
+                path_pred,
+            });
+            let Some((lhs, rhs)) = exact_comparison_operands(*kind, lo, ro, |x, s, eq| {
+                exact_operand(x, s, eq, defs, header_phis, module, signs, path, 0)
+            }) else {
+                // Not exact only through in-loop arithmetic: defer the guard
+                // until the branch region proves that arithmetic never wraps.
+                if let Some(s) = predicate_sign(*kind) {
+                    let mut obligations = Vec::new();
+                    let mut operand = |x: ValueId| {
+                        wrapping_operand(
+                            x,
+                            s,
+                            defs,
+                            header_phis,
+                            module,
+                            signs,
+                            path,
+                            &mut obligations,
+                            0,
+                        )
+                    };
+                    if let (Some(lhs), Some(rhs)) = (operand(lo), operand(ro)) {
+                        if let Some(constraints) =
+                            comparison_constraints(*kind, &lhs, &rhs, want_true)
+                        {
+                            for c in &constraints {
+                                universe.extend(c.coeffs.keys().copied());
+                            }
+                            for (form, _, _) in &obligations {
+                                universe.extend(form.terms.keys().copied());
+                            }
+                            deferred.push(WrappingGuard {
+                                constraints,
+                                obligations,
+                            });
+                        }
+                    }
+                }
                 return;
             };
             if let Some(cons) = comparison_constraints(*kind, &lhs, &rhs, want_true) {
@@ -3829,7 +4822,7 @@ fn resolve_bool_guard(
                 return;
             };
             if let Some((_, val)) = incoming.iter().find(|(p, _)| p == pred) {
-                recurse(region, splits, universe, *val, want_true);
+                recurse(region, splits, deferred, universe, *val, want_true);
             }
         }
         // Logical `and` taken true ⇒ both conjuncts true; logical `or` taken false
@@ -3838,12 +4831,12 @@ fn resolve_bool_guard(
             kind: BinaryOp::And,
         } if want_true => {
             for &op in def.operands.iter().take(2) {
-                recurse(region, splits, universe, op, true);
+                recurse(region, splits, deferred, universe, op, true);
             }
         }
         Operation::BinaryOp { kind: BinaryOp::Or } if !want_true => {
             for &op in def.operands.iter().take(2) {
-                recurse(region, splits, universe, op, false);
+                recurse(region, splits, deferred, universe, op, false);
             }
         }
         // `xor v, 1` is `!v` on an `i1`; recurse on `v` with flipped polarity.
@@ -3862,26 +4855,28 @@ fn resolve_bool_guard(
                 // `xor v, true` ⇒ negate `v`; `xor v, false` ⇒ passthrough.
                 (Some(bit), _) => {
                     if let Some(v) = b {
-                        recurse(region, splits, universe, v, want_true ^ bit);
+                        recurse(region, splits, deferred, universe, v, want_true ^ bit);
                     }
                 }
                 (_, Some(bit)) => {
                     if let Some(v) = a {
-                        recurse(region, splits, universe, v, want_true ^ bit);
+                        recurse(region, splits, deferred, universe, v, want_true ^ bit);
                     }
                 }
                 _ => {}
             }
         }
         // Value-preserving carriers of an `i1`: recurse on the source unchanged.
+        // A `trunc` is not one: it keeps the low bit (`trunc 2 to i1` is false,
+        // and `instcombine` lowers `if (x & 1)` to one), so it gives no guard.
         Operation::Copy
         | Operation::Freeze
         | Operation::Cast {
-            kind: CastKind::ZExt | CastKind::SExt | CastKind::Trunc,
+            kind: CastKind::ZExt | CastKind::SExt,
             ..
         } => {
             if let Some(&src) = def.operands.first() {
-                recurse(region, splits, universe, src, want_true);
+                recurse(region, splits, deferred, universe, src, want_true);
             }
         }
         _ => {}
@@ -3917,6 +4912,7 @@ fn resolve_affine_path(
     block_of: &BTreeMap<ValueId, BlockId>,
     header_phis: &BTreeSet<ValueId>,
     module: &AirModule,
+    signs: &LeafSigns<'_>,
     path_pred: &BTreeMap<BlockId, BlockId>,
     depth: u32,
 ) -> Option<Affine> {
@@ -3936,7 +4932,16 @@ fn resolve_affine_path(
         return Some(Affine::symbol(v));
     }
     let recur = |x: ValueId| {
-        resolve_affine_path(x, defs, block_of, header_phis, module, path_pred, depth + 1)
+        resolve_affine_path(
+            x,
+            defs,
+            block_of,
+            header_phis,
+            module,
+            signs,
+            path_pred,
+            depth + 1,
+        )
     };
     match &def.op {
         Operation::BinaryOp {
@@ -3963,12 +4968,28 @@ fn resolve_affine_path(
                 None
             }
         }
+        // `zext`/`sext` preserve the integer value only for an operand read under
+        // the matching signedness (see [`resolve_cast_operand`]).
         Operation::Cast {
-            kind: CastKind::ZExt | CastKind::SExt,
+            kind: kind @ (CastKind::ZExt | CastKind::SExt),
             ..
+        } => {
+            let op = *def.operands.first()?;
+            let want = if matches!(kind, CastKind::ZExt) {
+                Sign::Unsigned
+            } else {
+                Sign::Signed
+            };
+            Some(resolve_cast_operand(v, recur(op), op, want, module, signs))
         }
-        | Operation::Copy
-        | Operation::Freeze => recur(*def.operands.first()?),
+        Operation::Copy | Operation::Freeze => recur(*def.operands.first()?),
+        // `xor x, -1` (`~x`) is `-x - 1` modulo `2^w`; any other `xor` is opaque.
+        Operation::BinaryOp {
+            kind: BinaryOp::Xor,
+        } => match not_operand(def, module) {
+            Some(x) => recur(x)?.scale(-1)?.add(&Affine::constant(-1)),
+            None => Some(Affine::symbol(v)),
+        },
         // A non-header phi resolves along the current path to its incoming value
         // from the path predecessor of the phi's own block.
         Operation::Phi { incoming } => {
@@ -8353,5 +9374,461 @@ mod tests {
         assert!(branch_can_follow(&model, 0, 0)); // A → A (diverging self-loop).
         assert!(!branch_can_follow(&model, 0, 1)); // A (x≥6→x+2) can't reach B (x≤4).
         assert!(greedy_lex_rank(&model).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Guard / transition exactness (wrap-around soundness fixes)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn const_int_as_rereads_by_width_and_sign() {
+        // `3000000000u` is stored sign-extended as an i32 constant.
+        let big = Constant::Int {
+            value: i64::from(3_000_000_000u32.cast_signed()),
+            bits: 32,
+        };
+        assert_eq!(const_int_as(&big, Sign::Unsigned), Some(3_000_000_000));
+        assert_eq!(const_int_as(&big, Sign::Signed), Some(-1_294_967_296));
+        assert_eq!(const_int_as(&big, Sign::Unknown), None);
+        let neg_one = Constant::Int { value: -1, bits: 8 };
+        assert_eq!(const_int_as(&neg_one, Sign::Unsigned), Some(255));
+        assert_eq!(const_int_as(&neg_one, Sign::Signed), Some(-1));
+        let max64 = Constant::Int {
+            value: -1,
+            bits: 64,
+        };
+        assert_eq!(
+            const_int_as(&max64, Sign::Unsigned),
+            Some(i128::from(u64::MAX))
+        );
+        let five = Constant::Int { value: 5, bits: 32 };
+        assert_eq!(const_int_as(&five, Sign::Signed), Some(5));
+        assert_eq!(const_int_as(&five, Sign::Unsigned), Some(5));
+        assert_eq!(const_int_as(&Constant::ZeroInit, Sign::Unsigned), Some(0));
+    }
+
+    /// `3000000000u` as the sign-extended `i32` constant the frontend stores.
+    fn u32_3e9() -> i64 {
+        i64::from(3_000_000_000u32.cast_signed())
+    }
+
+    #[test]
+    fn unsigned_large_const_identity_loop_abstains() {
+        // f1b: `unsigned x; while (x < 3000000000u) x = x;` (the `+ 0` update is the
+        // identity). Non-terminating for every `x < 3e9`. Before the fix the
+        // sign-extended constant made the guard `x ≤ -1294967297`, which with
+        // `x ∈ [0, 2^32−1]` is an EMPTY region ⇒ a vacuous ranking ⇒ wrong TRUE.
+        let m = counter_loop(BinaryOp::ICmpUlt, Bound::Const(u32_3e9()), 0);
+        assert!(!ranked(&m));
+    }
+
+    #[test]
+    fn unsigned_large_const_mul_identity_loop_abstains() {
+        // f1: `unsigned x = 0; while (x < 3000000000u) x = x * 1u;`
+        let mut m = counter_loop(BinaryOp::ICmpUlt, Bound::Const(u32_3e9()), 1);
+        for inst in m.functions[0]
+            .blocks
+            .iter_mut()
+            .flat_map(|b| b.instructions.iter_mut())
+        {
+            if inst.id == iid("add") {
+                inst.op = Operation::BinaryOp {
+                    kind: BinaryOp::Mul,
+                };
+            }
+        }
+        assert!(!ranked(&m));
+    }
+
+    #[test]
+    fn unsigned_large_const_increment_is_ranked() {
+        // `unsigned x = 0; while (x < 3000000000u) x++;` — terminates; with the
+        // constant read zero-extended `f = 2999999999 − x` ranks (the fix re-reads
+        // the constant rather than merely dropping the guard).
+        let m = counter_loop(BinaryOp::ICmpUlt, Bound::Const(u32_3e9()), 1);
+        assert!(ranked(&m));
+    }
+
+    /// `x = nondet(); while (x + k >u 10 && x <(s|u) hi) { if (x == z) x = r; else
+    /// x = x - 1; }` — the in-loop `x + k` wraps, so `x + k >u 10` is NOT `x ≥ 11 − k`.
+    ///
+    /// - unsigned (f2): `while (x - 5u > 10u && x < 4000u) { if (x == 0u) x = 4u;
+    ///   else x--; }` — cycles `0 → 4 → 3 → 2 → 1 → 0` (all satisfy `x − 5u > 10u`).
+    /// - signed (f2s): `while ((unsigned)(x + 5) > 10u && x < 100) { if (x == -6)
+    ///   x = 50; else x--; }` — diverges downward from any `x < -6`.
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+    fn wrapped_guard_loop(signed: bool) -> AirModule {
+        let i32t = tid("i32");
+        let i1t = tid("i1");
+        let (k, hi, z, r) = if signed {
+            (5, 100, -6, 50)
+        } else {
+            (-5, 4000, 0, 4)
+        };
+        let mut constants = BTreeMap::new();
+        let (kv, ten, hiv, zv, rv, negone) = (
+            vid("k"),
+            vid("ten"),
+            vid("hi"),
+            vid("z"),
+            vid("r"),
+            vid("negone"),
+        );
+        for (v, c) in [
+            (kv, k),
+            (ten, 10),
+            (hiv, hi),
+            (zv, z),
+            (rv, r),
+            (negone, -1),
+        ] {
+            constants.insert(v, Constant::Int { value: c, bits: 32 });
+        }
+        let (b0, h, ch2, body, then_b, else_b, l, e) = (
+            bid("entry"),
+            bid("header"),
+            bid("check2"),
+            bid("body"),
+            bid("then"),
+            bid("else"),
+            bid("latch"),
+            bid("exit"),
+        );
+        let (n, x, sx, c1, c2, c3, xm, xn) = (
+            vid("n"),
+            vid("x"),
+            vid("sx"),
+            vid("c1"),
+            vid("c2"),
+            vid("c3"),
+            vid("xm"),
+            vid("xn"),
+        );
+
+        let mut entry = AirBlock::new(b0);
+        entry.instructions.push(ndcall(
+            "n_call",
+            if signed {
+                "__VERIFIER_nondet_int"
+            } else {
+                "__VERIFIER_nondet_uint"
+            },
+            n,
+            i32t,
+        ));
+        entry
+            .instructions
+            .push(term("br_entry", Operation::Br { target: h }, vec![]));
+
+        let mut header = AirBlock::new(h);
+        header.instructions.push(vinst(
+            "phi_x",
+            Operation::Phi {
+                incoming: vec![(b0, n), (l, xn)],
+            },
+            x,
+            vec![],
+            i32t,
+        ));
+        header.instructions.push(vinst(
+            "add_k",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            sx,
+            vec![x, kv],
+            i32t,
+        ));
+        header.instructions.push(vinst(
+            "cmp1",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpUgt,
+            },
+            c1,
+            vec![sx, ten],
+            i1t,
+        ));
+        header.instructions.push(term(
+            "condbr1",
+            Operation::CondBr {
+                then_target: ch2,
+                else_target: e,
+            },
+            vec![c1],
+        ));
+
+        let mut check2 = AirBlock::new(ch2);
+        check2.instructions.push(vinst(
+            "cmp2",
+            Operation::BinaryOp {
+                kind: if signed {
+                    BinaryOp::ICmpSlt
+                } else {
+                    BinaryOp::ICmpUlt
+                },
+            },
+            c2,
+            vec![x, hiv],
+            i1t,
+        ));
+        check2.instructions.push(term(
+            "condbr2",
+            Operation::CondBr {
+                then_target: body,
+                else_target: e,
+            },
+            vec![c2],
+        ));
+
+        let mut bodyb = AirBlock::new(body);
+        bodyb.instructions.push(vinst(
+            "cmp3",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpEq,
+            },
+            c3,
+            vec![x, zv],
+            i1t,
+        ));
+        bodyb.instructions.push(term(
+            "condbr3",
+            Operation::CondBr {
+                then_target: then_b,
+                else_target: else_b,
+            },
+            vec![c3],
+        ));
+
+        let mut thenb = AirBlock::new(then_b);
+        thenb
+            .instructions
+            .push(term("br_then", Operation::Br { target: l }, vec![]));
+
+        let mut elseb = AirBlock::new(else_b);
+        let dec = vinst(
+            "dec",
+            Operation::BinaryOp {
+                kind: BinaryOp::Add,
+            },
+            xm,
+            vec![x, negone],
+            i32t,
+        );
+        elseb.instructions.push(if signed {
+            dec.with_no_signed_wrap()
+        } else {
+            dec
+        });
+        elseb
+            .instructions
+            .push(term("br_else", Operation::Br { target: l }, vec![]));
+
+        let mut latch = AirBlock::new(l);
+        latch.instructions.push(vinst(
+            "phi_xn",
+            Operation::Phi {
+                incoming: vec![(then_b, rv), (else_b, xm)],
+            },
+            xn,
+            vec![],
+            i32t,
+        ));
+        latch
+            .instructions
+            .push(term("br_latch", Operation::Br { target: h }, vec![]));
+
+        let mut exit = AirBlock::new(e);
+        exit.instructions.push(term("ret", Operation::Ret, vec![x]));
+
+        module_of(
+            main_func(
+                vec![entry, header, check2, bodyb, thenb, elseb, latch, exit],
+                b0,
+            ),
+            constants,
+        )
+    }
+
+    #[test]
+    fn unsigned_wrapping_sub_guard_abstains() {
+        // f2: the old lowering read `x - 5u > 10u` as `x ≥ 16`, which made the
+        // `x == 0` branch infeasible and ranked the rest by `f = x` ⇒ wrong TRUE.
+        assert!(!ranked(&wrapped_guard_loop(false)));
+    }
+
+    #[test]
+    fn signed_cast_wrapping_add_guard_abstains() {
+        // f2s: `(unsigned)(x + 5) > 10u` was read as `x ≥ 6`, pruning the `x == -6`
+        // branch and every negative `x` ⇒ wrong TRUE.
+        assert!(!ranked(&wrapped_guard_loop(true)));
+    }
+
+    /// `X = 10; while (X > 0 && (int)c < X) X = ext(c);` with `c` a fresh signed
+    /// `i8` nondet each iteration. With `ext = sext` the new `X` is `c < X` ⇒
+    /// terminates (`f = X`). With `ext = zext` (through a `freeze`, so `c` itself
+    /// keeps its signed reading) `c = -1` gives `X = 255` forever ⇒ NON-terminating;
+    /// passing the `zext` through as the identity on the signed `c` ranked it.
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+    fn ext_transition_loop(zext: bool) -> AirModule {
+        let i32t = tid("i32");
+        let i8t = tid("i8");
+        let i1t = tid("i1");
+        let mut constants = BTreeMap::new();
+        let (ten, zero) = (vid("ten"), vid("zero"));
+        constants.insert(
+            ten,
+            Constant::Int {
+                value: 10,
+                bits: 32,
+            },
+        );
+        constants.insert(zero, Constant::Int { value: 0, bits: 32 });
+        let (b0, h, ch, l, e) = (
+            bid("entry"),
+            bid("header"),
+            bid("check"),
+            bid("latch"),
+            bid("exit"),
+        );
+        let (xv, c1, c8, s, c2, fr, xn) = (
+            vid("X"),
+            vid("c1"),
+            vid("c8"),
+            vid("s"),
+            vid("c2"),
+            vid("fr"),
+            vid("xn"),
+        );
+        let cast = |kind| Operation::Cast {
+            kind,
+            target_bits: Some(32),
+        };
+
+        let mut entry = AirBlock::new(b0);
+        entry
+            .instructions
+            .push(term("br_entry", Operation::Br { target: h }, vec![]));
+
+        let mut header = AirBlock::new(h);
+        header.instructions.push(vinst(
+            "phi_x",
+            Operation::Phi {
+                incoming: vec![(b0, ten), (l, xn)],
+            },
+            xv,
+            vec![],
+            i32t,
+        ));
+        header.instructions.push(vinst(
+            "cmp1",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSgt,
+            },
+            c1,
+            vec![xv, zero],
+            i1t,
+        ));
+        header.instructions.push(term(
+            "condbr1",
+            Operation::CondBr {
+                then_target: ch,
+                else_target: e,
+            },
+            vec![c1],
+        ));
+
+        let mut check = AirBlock::new(ch);
+        check
+            .instructions
+            .push(ndcall("c_call", "__VERIFIER_nondet_char", c8, i8t));
+        check
+            .instructions
+            .push(vinst("sext", cast(CastKind::SExt), s, vec![c8], i32t));
+        check.instructions.push(vinst(
+            "cmp2",
+            Operation::BinaryOp {
+                kind: BinaryOp::ICmpSlt,
+            },
+            c2,
+            vec![s, xv],
+            i1t,
+        ));
+        check.instructions.push(term(
+            "condbr2",
+            Operation::CondBr {
+                then_target: l,
+                else_target: e,
+            },
+            vec![c2],
+        ));
+
+        let mut latch = AirBlock::new(l);
+        if zext {
+            latch
+                .instructions
+                .push(vinst("freeze", Operation::Freeze, fr, vec![c8], i8t));
+            latch
+                .instructions
+                .push(vinst("zext", cast(CastKind::ZExt), xn, vec![fr], i32t));
+        } else {
+            latch
+                .instructions
+                .push(vinst("sext2", cast(CastKind::SExt), xn, vec![c8], i32t));
+        }
+        latch
+            .instructions
+            .push(term("br_latch", Operation::Br { target: h }, vec![]));
+
+        let mut exit = AirBlock::new(e);
+        exit.instructions
+            .push(term("ret", Operation::Ret, vec![xv]));
+
+        let mut m = module_of(
+            main_func(vec![entry, header, check, latch, exit], b0),
+            constants,
+        );
+        m.types.insert(i8t, AirType::Integer { bits: 8 });
+        m
+    }
+
+    #[test]
+    fn sext_of_signed_leaf_transition_is_ranked() {
+        assert!(ranked(&ext_transition_loop(false)));
+    }
+
+    #[test]
+    fn zext_of_signed_leaf_transition_abstains() {
+        assert!(!ranked(&ext_transition_loop(true)));
+    }
+
+    #[test]
+    fn unsigned_nondet_entry_does_not_seed_signbit_box() {
+        // `unsigned u = nondet_uint(); int x = u; while (x != 0) x--;` with a signed
+        // (`nsw`) decrement. `u ≥ 2^31` makes `x` negative, so the inductive
+        // `0 ≤ x ≤ 2^31−1` box must NOT be seeded by the unsigned source (it used to
+        // be, via `arg_is_nonneg`, which then ranked `f = x`).
+        let mut m = guarded_ne_loop(-1, 0, false, false);
+        let uint = FunctionId(make_id("func", b"__VERIFIER_nondet_uint"));
+        for inst in m.functions[0]
+            .blocks
+            .iter_mut()
+            .flat_map(|b| b.instructions.iter_mut())
+        {
+            if inst.id == iid("n_call") {
+                inst.op = Operation::CallDirect { callee: uint };
+            }
+        }
+        m.functions.push(AirFunction {
+            id: uint,
+            name: "__VERIFIER_nondet_uint".to_string(),
+            params: Vec::new(),
+            blocks: Vec::new(),
+            entry_block: None,
+            is_declaration: true,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        });
+        assert!(!ranked(&m));
     }
 }

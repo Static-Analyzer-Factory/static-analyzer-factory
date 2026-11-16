@@ -52,7 +52,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use saf_core::air::{
-    AirModule, AirType, BinaryOp, CastKind, Constant, GEP_BYTES_KEY, Instruction, Layout, Operation,
+    AirFunction, AirModule, AirType, BinaryOp, CastKind, Constant, GEP_BYTES_KEY, Instruction,
+    Layout, Operation,
 };
 use saf_core::ids::{BlockId, FunctionId, InstId, ValueId};
 use z3::SatResult;
@@ -117,7 +118,13 @@ const NOOP_EXTERNS: &[&str] = &[
     "kmem_cache_free",
     "devm_kfree",
 ];
-// NOT `sprintf`: it writes its destination buffer (an unknown extern havocs it).
+/// Externs that write no program memory and return: output only. The
+/// `printf` family writes through a `%n` conversion, so their format must be
+/// a constant string without one (see [`Engine::pure_extern_writes`], every
+/// goal); a `FILE *` that is a modelled object is havocked. NOT `sprintf`,
+/// `snprintf`, `sscanf`, `scanf`, `strcpy`, `time`, …: they write through
+/// their pointer arguments and stay unknown externs (which havoc every
+/// pointee, every global and every object an extern was given before).
 const PURE_EXTERNS: &[&str] = &["printf", "puts", "putchar", "fflush", "fprintf"];
 /// Externs whose integer result the counterexample search pins and the replay
 /// driver hands back through `--wrap` (plan 222 §2n): the string conversions,
@@ -478,6 +485,10 @@ struct State {
     /// Every heap object allocated on this path, with its byte size when
     /// that is a constant (a fresh base per allocation, never reused).
     heap_objs: BTreeMap<ValueId, Option<u64>>,
+    /// Objects whose address some unknown extern was given on this path: it
+    /// may have kept the pointer, so every later unknown extern may write
+    /// them too (each such call havocs them all). Merging keeps the union.
+    extern_known: BTreeSet<ValueId>,
     /// Byte size of each executed variable-length stack object (by base).
     vla_sizes: BTreeMap<ValueId, (BV, Vars)>,
     /// `stacksave` snapshots: the stack objects that existed at each save.
@@ -557,8 +568,9 @@ type FrameKey = (
 
 /// A concrete loop-header state: everything the continuation can read. The
 /// structure (program point, call stack, which values / cells exist) and the
-/// contents (`vals`: frames' saved values, then `values`, then `memory`, in
-/// that order) are kept apart so one enumeration patches only the contents.
+/// contents (`vals`: frames' saved values, then `values`, then `memory`, then
+/// the variable-length and heap block sizes, in that order) are kept apart so
+/// one enumeration patches only the contents.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ConcreteKey {
     func: FunctionId,
@@ -570,6 +582,21 @@ struct ConcreteKey {
     escaped: Vec<ValueId>,
     dead: Vec<ValueId>,
     stack: Vec<(usize, ValueId)>,
+    /// The object bookkeeping, restricted to the objects (and `stacksave`
+    /// tokens) the state still references (see [`referenced_objects`]): an
+    /// object no pointer reaches any more cannot influence the continuation,
+    /// and keeping fresh per-iteration objects out lets a loop that
+    /// allocates converge. The variable-length sizes and heap block sizes
+    /// are content slots in `vals` (after `memory`), in `vla_ids` /
+    /// `heap_ids` order.
+    zeroed: Vec<ValueId>,
+    heap_objs: Vec<(ValueId, Option<u64>)>,
+    extern_known: Vec<ValueId>,
+    seen_alloca: Vec<ValueId>,
+    versioned: Vec<(ValueId, ValueId)>,
+    stack_saves: Vec<(u32, Vec<ValueId>)>,
+    vla_ids: Vec<ValueId>,
+    heap_ids: Vec<(ValueId, u8)>,
     vals: Vec<CVal>,
 }
 
@@ -983,6 +1010,13 @@ struct Engine<'a> {
     /// Non-termination search ([`find_nontermination`]): counterexample-mode
     /// exploration that looks for a loop-header state recurring on one path.
     nonterm: bool,
+    /// `no-overflow` goal reachability, computed on first use. See
+    /// [`Engine::goal_free`].
+    goal_reach: GoalReachCache,
+    /// Some path was dropped as goal-free: the header state sets miss the
+    /// states only that path reached (a loop in `f` entered from a pruned
+    /// call context), so [`Engine::header_states`] exports none.
+    goal_pruned: bool,
     /// Non-termination probe ([`find_nontermination`]): every scalar integer
     /// nondet read returns the next value of this cycle instead of a fresh
     /// symbol, so a loop whose header state never becomes concrete under
@@ -1659,6 +1693,83 @@ fn has_global_ctors_dtors(module: &AirModule) -> bool {
         .any(|g| g.name == "llvm.global_ctors" || g.name == "llvm.global_dtors")
 }
 
+/// The callers of every direct call to `fid` in the module (one entry per
+/// call site, from any function).
+fn direct_callers(module: &AirModule, fid: FunctionId) -> Vec<FunctionId> {
+    let mut out = Vec::new();
+    for f in &module.functions {
+        for b in &f.blocks {
+            for i in &b.instructions {
+                if matches!(i.op, Operation::CallDirect { callee } if callee == fid) {
+                    out.push(f.id);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Is `fid` used as a value anywhere (an instruction operand, a module
+/// constant, a global's initialiser)? A function used as a value is the
+/// operand whose id is the function's own (see `Engine::val`), so it can be
+/// called indirectly from anywhere.
+fn function_address_taken(module: &AirModule, fid: FunctionId) -> bool {
+    fn mentions(c: &Constant, raw: u128) -> bool {
+        match c {
+            Constant::GlobalRef(v) => v.raw() == raw,
+            Constant::GlobalElem { base, .. } => base.raw() == raw,
+            Constant::Aggregate { elements } => elements.iter().any(|e| mentions(e, raw)),
+            _ => false,
+        }
+    }
+    let raw = fid.raw();
+    let in_code = module.functions.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| i.operands.iter().any(|o| o.raw() == raw))
+        })
+    });
+    in_code
+        || module.constants.values().any(|c| mentions(c, raw))
+        || module
+            .globals
+            .iter()
+            .any(|g| g.init.as_ref().is_some_and(|c| mentions(c, raw)))
+}
+
+/// Why the k-induction loop's function `fid` may be entered other than once
+/// per path, fresh, from `main` (or, for `fid == main`, other than as the
+/// program's entry): `None` when it cannot. The induction cases count header
+/// visits per path, keyed by block and never reset on call or return, so a
+/// second activation would start with the count already above `k` — the base
+/// case would cut it unchecked and the step case would run from a vacuous
+/// candidate set (wrong TRUE, 2026-11-13). Required: `main` has no direct
+/// caller and its address is never taken; `fid`'s only direct call site is in
+/// `main` (which is loop-free when `fid != main`, so it runs at most once) and
+/// its address is never taken. Recursion through `fid` would need a second
+/// call site or a call of `main`, so it is excluded too.
+fn loop_function_entry_problem(
+    module: &AirModule,
+    fid: FunctionId,
+    main: FunctionId,
+) -> Option<String> {
+    if !direct_callers(module, main).is_empty() || function_address_taken(module, main) {
+        return Some("main-is-called".to_string());
+    }
+    if fid == main {
+        return None;
+    }
+    let callers = direct_callers(module, fid);
+    if callers.len() != 1 || callers.first() != Some(&main) {
+        return Some(format!("loop-function-has-{}-call-sites", callers.len()));
+    }
+    if function_address_taken(module, fid) {
+        return Some("loop-function-address-taken".to_string());
+    }
+    None
+}
+
 fn prove_exhaustive_opts(
     module: &AirModule,
     budget: Duration,
@@ -2042,6 +2153,8 @@ impl<'a> Engine<'a> {
             memcleanup: false,
             live_out: std::cell::RefCell::new(BTreeMap::new()),
             nonterm: false,
+            goal_reach: GoalReachCache::Unknown,
+            goal_pruned: false,
             nt_probe: None,
             nt_probe_reads: 0,
             capture_model: false,
@@ -2340,6 +2453,7 @@ impl<'a> Engine<'a> {
             escaped: BTreeSet::new(),
             zeroed: BTreeSet::new(),
             heap_objs: BTreeMap::new(),
+            extern_known: BTreeSet::new(),
             vla_sizes: BTreeMap::new(),
             stack_saves: BTreeMap::new(),
             constraints: Vec::new(),
@@ -2393,6 +2507,11 @@ impl<'a> Engine<'a> {
         };
         let own = natural_loops(main);
         if own.len() == 1 {
+            // The visit counts of the induction cases assume the loop is
+            // entered fresh, once per path: `main` must never be re-entered.
+            if let Some(why) = loop_function_entry_problem(module, main.id, main.id) {
+                return Err(why);
+            }
             let (header, body) = own.into_iter().next().ok_or("no-loop")?;
             return Ok(LoopInfo {
                 func: main.id,
@@ -2426,6 +2545,14 @@ impl<'a> Engine<'a> {
             return Err(format!("main-calls-{}-looping-callees", looping.len()));
         }
         let (callee, cb, cidx, cdst) = looping[0];
+        // The loop's function must be entered exactly once per path, fresh, at
+        // this call site: the per-path visit counts are keyed by block and never
+        // reset on call/return, so an earlier activation (through a loop-free
+        // wrapper, recursion or an indirect call) left the header's count above
+        // `k` and made both induction cases vacuous (wrong TRUE, 2026-11-13).
+        if let Some(why) = loop_function_entry_problem(module, callee, main.id) {
+            return Err(why);
+        }
         let f = module.function(callee).ok_or("no-loop")?;
         let loops = natural_loops(f);
         if loops.len() != 1 {
@@ -2512,6 +2639,7 @@ impl<'a> Engine<'a> {
             escaped: BTreeSet::new(),
             zeroed: BTreeSet::new(),
             heap_objs: BTreeMap::new(),
+            extern_known: BTreeSet::new(),
             vla_sizes: BTreeMap::new(),
             stack_saves: BTreeMap::new(),
             constraints: Vec::new(),
@@ -2578,7 +2706,22 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
+            // An alloca whose address is used other than as the pointer of a
+            // load or store may have been handed to an unknown extern before
+            // the loop (which may have kept it): extern-known in an arbitrary
+            // header state.
+            let address_used = |d: ValueId| {
+                f.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
+                    i.operands.iter().enumerate().any(|(n, o)| {
+                        *o == d
+                            && !matches!((&i.op, n), (Operation::Load, 0) | (Operation::Store, 1))
+                    })
+                })
+            };
             for (d, v) in binds {
+                if matches!(v, Val::Ptr(Some(_))) && address_used(d) {
+                    st.extern_known.insert(d);
+                }
                 st.values.insert(d, v);
             }
         }
@@ -2811,6 +2954,13 @@ impl<'a> Engine<'a> {
         let r = self.run(init);
         self.kcapture_at = None;
         r?;
+        // Initiation that captured no header state prunes nothing: every
+        // candidate (a contradictory set among them) would survive and the
+        // step case would assume it, vacuously. No invariant then.
+        if self.kcaptured.is_empty() {
+            trace(|| "houdini: initiation captured no header state, no invariant".to_string());
+            return Ok(Vec::new());
+        }
         self.kprune(&mut cands)?;
         // Consecution, to a fixpoint. Only a round that drops nothing proves
         // the set inductive: a set still shrinking when the rounds run out is
@@ -2967,7 +3117,12 @@ impl<'a> Engine<'a> {
                         // only) makes every later access through it abstain.
                         // Not merging only costs states; each side is explored
                         // on its own.
-                        if self.goal == Goal::MemSafety && !ms_merge_compatible(&state, &other) {
+                        // Every goal: differing call stacks (saved recursive
+                        // bindings) are never merged.
+                        if !frames_mergeable(&state, &other)
+                            || (self.goal == Goal::MemSafety
+                                && !ms_merge_compatible(&state, &other))
+                        {
                             let k = self.order_key(&other);
                             worklist.push(k, other);
                             continue;
@@ -3161,6 +3316,7 @@ impl<'a> Engine<'a> {
         a.versioned.extend(b.versioned);
         a.zeroed = a.zeroed.intersection(&b.zeroed).copied().collect();
         a.heap_objs.extend(b.heap_objs);
+        a.extern_known.extend(b.extern_known);
         for (k, v) in b.vla_sizes {
             match a.vla_sizes.get(&k) {
                 Some(x) if x.0 != v.0 => {
@@ -3217,7 +3373,7 @@ impl<'a> Engine<'a> {
     /// fixpoint gave up on, and everything when the total cap was hit, are left
     /// out (their sets would be incomplete).
     fn header_states(&self) -> Vec<HeaderStates> {
-        if !self.fixpoint || self.seen_header.len() >= FIXPOINT_TOTAL_CAP {
+        if !self.fixpoint || self.goal_pruned || self.seen_header.len() >= FIXPOINT_TOTAL_CAP {
             return Vec::new();
         }
         let mut by_header: BTreeMap<(FunctionId, BlockId), Vec<HeaderState>> = BTreeMap::new();
@@ -3589,6 +3745,50 @@ impl<'a> Engine<'a> {
     }
 
     /// Counters appended to a budget abstain, for the probes.
+    /// Can no `no-overflow` check ([`Goal::SignedOverflow`]: an `nsw`
+    /// add/sub/mul, `sdiv`/`srem`, `shl`, an `abs`-family call) execute on any
+    /// continuation of `st` at the entry of its block? The continuation is the
+    /// rest of the current function from this block, then the rest of every
+    /// caller from just after its call. A path whose continuation has none
+    /// cannot reach a violation, so it ends here as safe.
+    ///
+    /// Only proofs of `no-overflow` prune: never the termination engine (a
+    /// path must really end), the non-termination search or a counterexample
+    /// search. Modules with control-transferring externals (callbacks,
+    /// threads, `setjmp`/`longjmp`, exit handlers, signals) are not pruned.
+    fn goal_free(&mut self, st: &State) -> bool {
+        if self.goal != Goal::SignedOverflow
+            || self.termination
+            || self.nonterm
+            || self.cex_mode
+            || debug_flag("noprunegoal")
+        {
+            return false;
+        }
+        if matches!(self.goal_reach, GoalReachCache::Unknown) {
+            self.goal_reach = overflow_goal_reach(self.module)
+                .map_or(GoalReachCache::Disabled, |r| {
+                    GoalReachCache::Ready(Rc::new(r))
+                });
+        }
+        let GoalReachCache::Ready(reach) = &self.goal_reach else {
+            return false;
+        };
+        let reach = Rc::clone(reach);
+        if reach.from_entry.contains(&(st.func, st.block)) {
+            return false;
+        }
+        st.frames.iter().all(|fr| {
+            let key = (fr.func, fr.ret_block);
+            reach.last.get(&key).is_none_or(|&last| last <= fr.ret_idx)
+                && reach.succs.get(&key).is_some_and(|succs| {
+                    succs
+                        .iter()
+                        .all(|b| !reach.from_entry.contains(&(fr.func, *b)))
+                })
+        })
+    }
+
     fn stats(&self) -> String {
         format!(
             "({}:steps={},solver={},states={},restarts={},simplify={}ms,check={}ms,merge={}ms/{}n/pc{}ms,mc={},fa={})",
@@ -3665,6 +3865,13 @@ impl<'a> Engine<'a> {
             // set then), and counting that entry twice made the induction cases
             // stop an iteration early — a vacuous, WRONG proof (2026-10-09).
             if st.idx == 0 && !st.parked {
+                // No overflow check can execute on any continuation of this
+                // path: it is safe as it stands (see `goal_free`).
+                if self.goal_free(&st) {
+                    trace(|| format!("goal-free continuation at block={:?}", st.block));
+                    self.goal_pruned = true;
+                    return Ok(());
+                }
                 st.restarted = false;
                 if self.cex_mode {
                     st.path.push((st.func, st.block));
@@ -4203,8 +4410,22 @@ impl<'a> Engine<'a> {
                     if overflow_excluded_by_bounds(inst, *kind, &a, &b) {
                         trace(|| format!("overflow excluded by bounds: {kind:?} at {:?}", inst.id));
                     } else if let Some(ovf) = overflow_condition(inst, *kind, &a, &b) {
-                        trace(|| format!("overflow check: {kind:?} at {:?}", inst.id));
-                        self.check_violation(st, Some((&ovf, &vars)), inst.id)?;
+                        if self.termination_assumes_defined(*kind) {
+                            // A `termination` task has no undefined behaviour
+                            // (sv-benchmarks CONVENTIONS.md, "Behavior"): an
+                            // execution with a signed overflow here does not
+                            // exist, like one cut by `__VERIFIER_assume(0)`.
+                            trace(|| format!("overflow excluded (defined): {:?}", inst.id));
+                            let safe = ovf.not();
+                            if !self.branch_feasible(st, &safe, &vars)? {
+                                st.dead_end = true;
+                                return Ok(Flow::Halt);
+                            }
+                            st.constraints.push((safe, vars.clone()));
+                        } else {
+                            trace(|| format!("overflow check: {kind:?} at {:?}", inst.id));
+                            self.check_violation(st, Some((&ovf, &vars)), inst.id)?;
+                        }
                     }
                 }
                 let v = self.binop(st, *kind, &a, &b, &vars)?;
@@ -4747,6 +4968,29 @@ impl<'a> Engine<'a> {
                     {
                         trace(|| format!("indirect call resolved to {base:?}"));
                         self.call(st, inst, FunctionId::new(base.raw()), args)
+                    }
+                    // A call through a pointer into a heap block (the LDV
+                    // `__symbol_get` model returns `ldv_malloc(0)`): there is
+                    // no code there. The memory-safety counterexample search
+                    // reports it (the replay jumps into heap memory and `ASan`
+                    // confirms the `SEGV`); the path ends either way.
+                    Some((base, _))
+                        if self.cex_mode
+                            && self.goal == Goal::MemSafety
+                            && st.heap.contains_key(&base) =>
+                    {
+                        self.ms_violation(st, inst.id, "ms-call-heap-pointer".to_string())?;
+                        st.dead_end = true;
+                        Ok(Flow::Halt)
+                    }
+                    // Any other unresolved callee: the memory-safety
+                    // counterexample search drops this path and explores the
+                    // rest (every candidate is replay-gated, so a dropped path
+                    // only loses candidates). Everything else abstains.
+                    _ if self.cex_mode && self.goal == Goal::MemSafety => {
+                        trace(|| "unresolved indirect call: path dropped".to_string());
+                        st.dead_end = true;
+                        Ok(Flow::Halt)
                     }
                     _ => Err("call-indirect".to_string()),
                 }
@@ -5310,29 +5554,76 @@ impl<'a> Engine<'a> {
             {
                 continue;
             }
-            let text = match self.ptr(st, arg)? {
-                Some(cell) => match (cell_offset(&cell), self.globals.get(&cell.0)) {
-                    (Some(off), Some((Some(Constant::String { value }), true)))
-                        if self
-                            .layouts
-                            .get(&cell.0)
-                            .is_some_and(|l| u64::from(off) < l.size()) =>
-                    {
-                        Some(
-                            value
-                                .get(usize::try_from(off).unwrap_or(usize::MAX)..)
-                                .unwrap_or(""),
-                        )
-                    }
-                    _ => None,
-                },
-                None => None,
-            };
-            let Some(text) = text else {
+            let Some(text) = self.const_c_string(st, arg)? else {
                 return Err(format!("ms-extern-{name}-pointer-arg"));
             };
-            if format_at == Some(i) && format_writes(text) {
+            if format_at == Some(i) && format_writes(&text) {
                 return Err(format!("ms-extern-{name}-percent-n"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The C string `arg` points at when it points into a constant string
+    /// global at an offset inside the object (the text from there on);
+    /// `None` for any other pointer or value.
+    fn const_c_string(&mut self, st: &mut State, arg: ValueId) -> Res<Option<String>> {
+        let Some(cell) = self.ptr(st, arg)? else {
+            return Ok(None);
+        };
+        Ok(match (cell_offset(&cell), self.globals.get(&cell.0)) {
+            (Some(off), Some((Some(Constant::String { value }), true)))
+                if self
+                    .layouts
+                    .get(&cell.0)
+                    .is_some_and(|l| u64::from(off) < l.size()) =>
+            {
+                Some(
+                    value
+                        .get(usize::try_from(off).unwrap_or(usize::MAX)..)
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            }
+            _ => None,
+        })
+    }
+
+    /// [`PURE_EXTERNS`] write no program memory — except a `printf`-family
+    /// `%n` conversion, which stores through its argument, and the libc
+    /// stream object a `FILE *` names. Every goal (the memory-safety checks
+    /// of [`Engine::ms_pure_extern_args`] come on top): a format must be a
+    /// constant string without `%n` (a non-constant format may hold one),
+    /// else abstain; a stream that is a modelled object (never a real
+    /// `FILE`, whose pointer is opaque) is havocked like an unknown extern's
+    /// pointee.
+    fn pure_extern_writes(&mut self, st: &mut State, name: &str, args: &[ValueId]) -> Res<()> {
+        let format_at = match name {
+            "printf" => Some(0),
+            "fprintf" => Some(1),
+            _ => None,
+        };
+        if let Some(at) = format_at {
+            let &fmt = args.get(at).ok_or_else(|| format!("extern-{name}-arity"))?;
+            match self.const_c_string(st, fmt)? {
+                Some(text) if !format_writes(&text) => {}
+                Some(_) => return Err(format!("extern-{name}-percent-n")),
+                None => return Err(format!("extern-{name}-nonconstant-format")),
+            }
+        }
+        let stream = STREAM_ARG.iter().find(|(n, _)| *n == name).map(|(_, i)| *i);
+        if let Some(&s) = stream.and_then(|i| args.get(i)) {
+            if !matches!(self.module.constants.get(&s), Some(Constant::Null)) {
+                match self.val(st, s, self.width.get(&s).copied()) {
+                    Ok(Val::Ptr(Some((base, _)))) if base != NULL_BASE => {
+                        st.memory.retain(|k, _| k.0 != base);
+                        st.escaped.insert(base);
+                    }
+                    Ok(_) => {}
+                    // An `undef` stream points at no object of the program.
+                    Err(e) if e == "undefined-value" => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(())
@@ -5848,6 +6139,9 @@ impl<'a> Engine<'a> {
             }
         }
         if !defined && PURE_EXTERNS.contains(&name) {
+            if !self.cex_mode {
+                self.pure_extern_writes(st, name, args)?;
+            }
             if self.goal == Goal::MemSafety && !self.cex_mode {
                 self.ms_pure_extern_args(st, name, args)?;
             }
@@ -5894,6 +6188,27 @@ impl<'a> Engine<'a> {
         let recursive = st.func == callee || st.frames.iter().any(|fr| fr.func == callee);
         if recursive && self.has_alloca.contains(&callee) {
             return Err("recursion-with-alloca".to_string());
+        }
+        // k-induction (and Houdini) count the loop header's visits per path,
+        // assuming its function is entered once, fresh, from the call site
+        // `find_induction_loop` chose. `loop_function_entry_problem` rules out
+        // every other entry statically; this re-checks it on the path so that
+        // a missed route abstains instead of starting a vacuous count.
+        if let Some(lp) = self.kloop.as_ref() {
+            if callee == lp.func {
+                let fresh = match lp.call_site {
+                    Some((cb, cidx, _)) => {
+                        st.frames.is_empty()
+                            && st.block == cb
+                            && st.idx == cidx
+                            && st.visits.get(&lp.header).copied().unwrap_or(0) == 0
+                    }
+                    None => false,
+                };
+                if !fresh {
+                    return Err("kloop-function-reentered".to_string());
+                }
+            }
         }
         // Bind arguments, then transfer control to the callee's entry block.
         // Extra arguments are ignored (a defined variadic function reads them
@@ -6096,6 +6411,21 @@ impl<'a> Engine<'a> {
     /// `-fsanitize=shift-base` emitted no check there): an unsigned shift is
     /// defined for every operand. Without the location table, or without a
     /// location on the instruction, the shift counts as signed (checked).
+    /// The `termination` TRUE prover ([`prove_termination_exhaustive`]) drops
+    /// the executions where this signed operation overflows instead of
+    /// abstaining: termination tasks are free of undefined behaviour. Only
+    /// `nsw` add/sub/mul and `sdiv`/`srem` (signed by construction); a `shl`
+    /// may have had an unsigned operand, whose wrap is defined, so it stays a
+    /// check. Never in the non-termination search (it excludes UB on its own)
+    /// or counterexample mode, and `SAF_UNREACH_DEBUG=termub` turns it off.
+    fn termination_assumes_defined(&self, kind: BinaryOp) -> bool {
+        self.termination
+            && !self.nonterm
+            && !self.cex_mode
+            && kind != BinaryOp::Shl
+            && !debug_flag("termub")
+    }
+
     fn shl_is_unsigned(&self, inst: &Instruction) -> bool {
         let (Some(set), Some(span)) = (&self.signed_shl_locs, inst.span.as_ref()) else {
             return false;
@@ -6104,6 +6434,9 @@ impl<'a> Engine<'a> {
             .is_some_and(|(_, line, col)| !set.contains(&(line, col)))
     }
 
+    // NOTE: one extern-call transfer (argument checks, havoc of every reachable
+    // object, fresh result); splitting would duplicate the escape bookkeeping.
+    #[allow(clippy::too_many_lines)]
     fn call_unknown_extern(
         &mut self,
         st: &mut State,
@@ -6182,7 +6515,17 @@ impl<'a> Engine<'a> {
         }
         trace(|| format!("fresh: unknown extern {name} havocs globals + pointee args"));
         let globals: Vec<ValueId> = self.globals.keys().copied().collect();
-        for base in globals.into_iter().chain(pointee) {
+        // An object whose address an earlier unknown extern was given may be
+        // written now too (the library may have kept the pointer). The
+        // counterexample search is replay-gated and keeps the narrower model.
+        let known: Vec<ValueId> = if self.cex_mode {
+            Vec::new()
+        } else {
+            st.extern_known.iter().copied().collect()
+        };
+        st.extern_known
+            .extend(pointee.iter().copied().filter(|b| *b != NULL_BASE));
+        for base in globals.into_iter().chain(pointee).chain(known) {
             st.memory.retain(|k, _| k.0 != base);
             st.escaped.insert(base);
         }
@@ -6827,7 +7170,7 @@ type MergeKey = (
     FunctionId,
     BlockId,
     usize,
-    Vec<(FunctionId, BlockId, usize)>,
+    Vec<(FunctionId, BlockId, usize, Option<ValueId>, Vec<ValueId>)>,
     u32,
     bool,
 );
@@ -6835,6 +7178,9 @@ type MergeKey = (
 /// The footprint of a parked state (see `header_fixpoint`): its concrete key
 /// with every symbolic bitvector slot left as a placeholder, plus those slots'
 /// terms. A bitvector counts as concrete when it simplifies to a numeral.
+// NOTE: the key must list every piece of state in one place, or two states
+// that differ only in an omitted piece are deduplicated (a wrong proof).
+#[allow(clippy::too_many_lines)]
 fn footprint(st: &State) -> (ConcreteKey, Vec<(usize, BV)>) {
     let mut vals: Vec<CVal> = Vec::new();
     let mut syms: Vec<(usize, BV)> = Vec::new();
@@ -6874,6 +7220,34 @@ fn footprint(st: &State) -> (ConcreteKey, Vec<(usize, BV)>) {
     for v in st.memory.values() {
         push(Some(v), &mut vals, &mut syms);
     }
+    let (live, tokens) = referenced_objects(st);
+    let mut vla_ids = Vec::new();
+    for (base, (size, vars)) in &st.vla_sizes {
+        if live.contains(base) {
+            vla_ids.push(*base);
+            push(
+                Some(&Val::Bv(size.clone(), vars.clone())),
+                &mut vals,
+                &mut syms,
+            );
+        }
+    }
+    let mut heap_ids = Vec::new();
+    for (base, obj) in &st.heap {
+        if live.contains(base) {
+            let status = match obj.status {
+                HeapStatus::Live => 0,
+                HeapStatus::Freed => 1,
+                HeapStatus::Maybe => 2,
+            };
+            heap_ids.push((*base, status));
+            let size = obj
+                .size
+                .as_ref()
+                .map(|(size, vars)| Val::Bv(size.clone(), vars.clone()));
+            push(size.as_ref(), &mut vals, &mut syms);
+        }
+    }
     (
         ConcreteKey {
             func: st.func,
@@ -6885,10 +7259,79 @@ fn footprint(st: &State) -> (ConcreteKey, Vec<(usize, BV)>) {
             escaped: st.escaped.iter().copied().collect(),
             dead: st.dead.iter().copied().collect(),
             stack: st.stack.clone(),
+            zeroed: st
+                .zeroed
+                .iter()
+                .filter(|b| live.contains(*b))
+                .copied()
+                .collect(),
+            heap_objs: st
+                .heap_objs
+                .iter()
+                .filter(|(b, _)| live.contains(*b))
+                .map(|(b, size)| (*b, *size))
+                .collect(),
+            extern_known: st
+                .extern_known
+                .iter()
+                .filter(|b| live.contains(*b))
+                .copied()
+                .collect(),
+            seen_alloca: st.seen_alloca.iter().copied().collect(),
+            versioned: st
+                .versioned
+                .iter()
+                .filter(|(b, _)| live.contains(*b))
+                .map(|(b, d)| (*b, *d))
+                .collect(),
+            stack_saves: st
+                .stack_saves
+                .iter()
+                .filter(|(k, _)| tokens.contains(*k))
+                .map(|(k, objs)| (*k, objs.iter().copied().collect()))
+                .collect(),
+            vla_ids,
+            heap_ids,
             vals,
         },
         syms,
     )
+}
+
+/// The objects a state can still reach — the base of every pointer held in
+/// an SSA value, a memory cell or a saved binding, every object with a
+/// modelled cell, and the objects of the escaped, dead, stack and
+/// extern-known sets — and the `stacksave` tokens it still holds. The rest of
+/// the object bookkeeping (sizes, zeroing, versions) describes objects no
+/// pointer reaches: the continuation cannot observe it.
+fn referenced_objects(st: &State) -> (BTreeSet<ValueId>, BTreeSet<u32>) {
+    let mut bases: BTreeSet<ValueId> = BTreeSet::new();
+    let mut tokens: BTreeSet<u32> = BTreeSet::new();
+    let mut note = |v: &Val, bases: &mut BTreeSet<ValueId>| {
+        if let Val::Ptr(Some((base, path))) = v {
+            bases.insert(*base);
+            if *base == STACK_TOKEN_BASE {
+                tokens.extend(path.first().copied());
+            }
+        }
+    };
+    for v in st.values.values() {
+        note(v, &mut bases);
+    }
+    for (cell, v) in &st.memory {
+        bases.insert(cell.0);
+        note(v, &mut bases);
+    }
+    for f in &st.frames {
+        for v in f.saved.iter().filter_map(|(_, v)| v.as_ref()) {
+            note(v, &mut bases);
+        }
+    }
+    bases.extend(st.escaped.iter().copied());
+    bases.extend(st.dead.iter().copied());
+    bases.extend(st.stack.iter().map(|(_, b)| *b));
+    bases.extend(st.extern_known.iter().copied());
+    (bases, tokens)
 }
 
 /// The constraint-free state at `st`'s program point whose contents are the
@@ -6916,6 +7359,18 @@ fn restart_state(st: &State, key: &ConcreteKey) -> State {
     for v in out.memory.values_mut() {
         if let Some(c) = next(&mut slots) {
             *v = c;
+        }
+    }
+    for base in &key.vla_ids {
+        if let (Some(Val::Bv(c, vars)), Some(size)) =
+            (next(&mut slots), out.vla_sizes.get_mut(base))
+        {
+            *size = (c, vars);
+        }
+    }
+    for (base, _) in &key.heap_ids {
+        if let (Some(Val::Bv(c, vars)), Some(obj)) = (next(&mut slots), out.heap.get_mut(base)) {
+            obj.size = Some((c, vars));
         }
     }
     out.constraints.clear();
@@ -6957,14 +7412,58 @@ fn ms_merge_compatible(a: &State, b: &State) -> bool {
     values && cells && heap
 }
 
+/// Do two states have the same call stack — every frame's return point (call
+/// site and result value) and every saved binding of an outer recursive
+/// activation identical? [`Engine::merge`]
+/// keeps the first state's frames as they are, so only such states may merge
+/// (the saved values come back on return and would otherwise silently take
+/// one side's values on both paths).
+fn frames_mergeable(a: &State, b: &State) -> bool {
+    let same_val = |x: Option<&Val>, y: Option<&Val>| match (x, y) {
+        (None, None) => true,
+        (Some(Val::Bv(p, _)), Some(Val::Bv(q, _))) => p.get_size() == q.get_size() && p == q,
+        (Some(Val::Ptr(p)), Some(Val::Ptr(q))) => p == q,
+        _ => false,
+    };
+    a.frames.len() == b.frames.len()
+        && a.frames.iter().zip(&b.frames).all(|(fa, fb)| {
+            fa.func == fb.func
+                && fa.ret_block == fb.ret_block
+                && fa.ret_idx == fb.ret_idx
+                // `ret_prev` is not compared: the caller resumes after the call
+                // (index ≥ 1), and only the phis at index 0 read `prev`. Two
+                // paths that reached the same call site from different
+                // predecessors (ECA's input-validation chain) must still merge.
+                && fa.ret_dst == fb.ret_dst
+                && fa.saved.len() == fb.saved.len()
+                && fa
+                    .saved
+                    .iter()
+                    .zip(&fb.saved)
+                    .all(|((va, xa), (vb, xb))| va == vb && same_val(xa.as_ref(), xb.as_ref()))
+        })
+}
+
 fn merge_key(st: &State) -> MergeKey {
     (
         st.func,
         st.block,
         st.idx,
+        // The whole call stack, saved bindings included (their ids here, their
+        // values in `frames_mergeable`): `merge` keeps one side's frames, so
+        // two states whose outer recursive activations differ must never be
+        // merged (wrong TRUE, 2026-11-13).
         st.frames
             .iter()
-            .map(|f| (f.func, f.ret_block, f.ret_idx))
+            .map(|f| {
+                (
+                    f.func,
+                    f.ret_block,
+                    f.ret_idx,
+                    f.ret_dst,
+                    f.saved.iter().map(|(v, _)| *v).collect(),
+                )
+            })
             .collect(),
         st.visits.get(&st.block).copied().unwrap_or(0),
         st.restarted,
@@ -7059,6 +7558,184 @@ enum Flow {
     AllocSplit,
     Return(Option<Val>),
     Halt,
+}
+
+/// Where a [`Goal::SignedOverflow`] check may still execute (see
+/// [`Engine::goal_free`]).
+struct GoalReach {
+    /// Blocks from whose entry a check may be reached (in the block, through a
+    /// call, or in a successor).
+    from_entry: BTreeSet<(FunctionId, BlockId)>,
+    /// Index of the last instruction of each block that is or calls a check.
+    last: BTreeMap<(FunctionId, BlockId), usize>,
+    /// CFG successors of each block.
+    succs: BTreeMap<(FunctionId, BlockId), BTreeSet<BlockId>>,
+}
+
+/// Externals that call back into the program or transfer control non-locally:
+/// a module that declares one is never pruned.
+const CONTROL_EXTERNS: &[&str] = &[
+    "qsort",
+    "qsort_r",
+    "bsearch",
+    "pthread_create",
+    "thrd_create",
+    "atexit",
+    "at_quick_exit",
+    "on_exit",
+    "__cxa_atexit",
+    "signal",
+    "sigaction",
+    "pthread_once",
+    "call_once",
+    "tsearch",
+    "twalk",
+    "tfind",
+    "tdelete",
+    "lfind",
+    "lsearch",
+    "ftw",
+    "nftw",
+    "scandir",
+    "setjmp",
+    "_setjmp",
+    "sigsetjmp",
+    "__sigsetjmp",
+    "longjmp",
+    "_longjmp",
+    "siglongjmp",
+    "__longjmp_chk",
+    "makecontext",
+    "swapcontext",
+    "setcontext",
+    "fork",
+    "vfork",
+];
+
+/// [`Engine::goal_reach`]: not computed yet, disabled for the module, or ready.
+enum GoalReachCache {
+    Unknown,
+    Disabled,
+    Ready(Rc<GoalReach>),
+}
+
+/// [`GoalReach`] for `module`, or `None` when it must not be pruned.
+///
+/// A check instruction is any `nsw` `add`/`sub`/`mul`, `sdiv`, `srem` or `shl`
+/// (the operations `overflow_condition` can flag) and any call of an external
+/// whose name contains `abs` (the `iabs` builtin family). Every indirect call,
+/// every call of an unknown function and every call of a defined function
+/// that may reach a check (a call-graph fixpoint) counts as one too.
+// NOTE: one table build (check instructions -> call-graph fixpoint -> per-block
+// backward closure); splitting it would only pass the shared maps around.
+#[allow(clippy::too_many_lines)]
+fn overflow_goal_reach(module: &AirModule) -> Option<GoalReach> {
+    let by_id: BTreeMap<FunctionId, &AirFunction> =
+        module.functions.iter().map(|f| (f.id, f)).collect();
+    if module
+        .functions
+        .iter()
+        .any(|f| f.is_declaration && CONTROL_EXTERNS.contains(&f.name.as_str()))
+    {
+        return None;
+    }
+    let local_check = |inst: &Instruction| match &inst.op {
+        Operation::BinaryOp { kind } => match kind {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => inst.has_no_signed_wrap(),
+            BinaryOp::SDiv | BinaryOp::SRem | BinaryOp::Shl => true,
+            _ => false,
+        },
+        Operation::CallIndirect { .. } => true,
+        Operation::CallDirect { callee } => match by_id.get(callee) {
+            Some(f) if !f.is_declaration => false,
+            Some(f) => f.name.contains("abs"),
+            None => true,
+        },
+        _ => false,
+    };
+    let calls_defined = |inst: &Instruction| match &inst.op {
+        Operation::CallDirect { callee } => by_id
+            .get(callee)
+            .filter(|f| !f.is_declaration)
+            .map(|f| f.id),
+        _ => None,
+    };
+    let defined: Vec<&AirFunction> = module
+        .functions
+        .iter()
+        .filter(|f| !f.is_declaration)
+        .collect();
+    // Functions that may execute a check (directly or through a callee).
+    let mut func_check: BTreeSet<FunctionId> = defined
+        .iter()
+        .filter(|f| {
+            f.blocks
+                .iter()
+                .any(|b| b.instructions.iter().any(local_check))
+        })
+        .map(|f| f.id)
+        .collect();
+    loop {
+        let before = func_check.len();
+        for f in &defined {
+            if func_check.contains(&f.id) {
+                continue;
+            }
+            let calls = f.blocks.iter().any(|b| {
+                b.instructions
+                    .iter()
+                    .any(|i| calls_defined(i).is_some_and(|c| func_check.contains(&c)))
+            });
+            if calls {
+                func_check.insert(f.id);
+            }
+        }
+        if func_check.len() == before {
+            break;
+        }
+    }
+    let is_check = |inst: &Instruction| {
+        local_check(inst) || calls_defined(inst).is_some_and(|c| func_check.contains(&c))
+    };
+    let mut reach = GoalReach {
+        from_entry: BTreeSet::new(),
+        last: BTreeMap::new(),
+        succs: BTreeMap::new(),
+    };
+    for f in &defined {
+        let cfg = saf_analysis::cfg::Cfg::build(f);
+        for b in &f.blocks {
+            if let Some(i) = b.instructions.iter().rposition(is_check) {
+                reach.last.insert((f.id, b.id), i);
+                reach.from_entry.insert((f.id, b.id));
+            }
+            reach.succs.insert(
+                (f.id, b.id),
+                cfg.successors.get(&b.id).cloned().unwrap_or_default(),
+            );
+        }
+        // Backward closure: a block reaches a check if a successor does.
+        loop {
+            let before = reach.from_entry.len();
+            for b in &f.blocks {
+                let key = (f.id, b.id);
+                if reach.from_entry.contains(&key) {
+                    continue;
+                }
+                if reach
+                    .succs
+                    .get(&key)
+                    .is_some_and(|ss| ss.iter().any(|t| reach.from_entry.contains(&(f.id, *t))))
+                {
+                    reach.from_entry.insert(key);
+                }
+            }
+            if reach.from_entry.len() == before {
+                break;
+            }
+        }
+    }
+    Some(reach)
 }
 
 /// The condition under which `a <kind> b` is a signed overflow (see
@@ -9288,6 +9965,44 @@ mod tests {
         assert!(find_counterexample_excluding(&kmalloc, budget, false, &opts).is_none());
     }
 
+    /// `void (*f)(void) = malloc(4); f();` (the LDV `__symbol_get` model): the
+    /// memory-safety counterexample search reports the call through a heap
+    /// pointer at the call; the `reach_error` search never does.
+    #[test]
+    fn call_through_heap_pointer_is_a_memsafety_counterexample() {
+        use saf_core::air::HeapAllocKind;
+        let mut b = B::new();
+        let e = b.bid();
+        let size = b.konst(4);
+        let (i_p, p) = b.inst(
+            Operation::HeapAlloc {
+                kind: HeapAllocKind::Malloc,
+            },
+            vec![size],
+            Some(PTR),
+        );
+        let (i_call, _) = b.inst(
+            Operation::CallIndirect {
+                expected_signature: None,
+            },
+            vec![p.unwrap()],
+            None,
+        );
+        let call_id = i_call.id;
+        let (i_r, _) = b.inst(Operation::Ret, vec![], None);
+        b.func("main", vec![], vec![blk(e, vec![i_p, i_call, i_r])]);
+        let m = b.m;
+        let budget = Duration::from_secs(10);
+        let opts = CexOptions {
+            memsafety: true,
+            ..CexOptions::default()
+        };
+        let cex = find_counterexample_excluding(&m, budget, false, &opts)
+            .expect("the call through the heap pointer is reported");
+        assert_eq!(cex.error_inst, call_id);
+        assert!(find_counterexample_excluding(&m, budget, false, &CexOptions::default()).is_none());
+    }
+
     /// `int *p = malloc(4);` (NULL-checked) `if (*p == 3) reach_error();` —
     /// indeterminate contents: the load is fresh and the error feasible, never a
     /// proof.
@@ -11323,5 +12038,452 @@ mod tests {
             prove(&b.m),
             ExhaustiveProof::Abstain("error-feasible".into())
         );
+    }
+
+    /// `void f(int n) { int i = 0; while (i < n) i++; }` — the counting loop
+    /// k-induction picks up when `main` calls `f`.
+    fn counting_loop_function(b: &mut B) -> FunctionId {
+        let (e, hdr, body, exit) = (b.bid(), b.bid(), b.bid(), b.bid());
+        let n = AirParam {
+            id: ValueId::new(b.id()),
+            name: Some("n".into()),
+            index: 0,
+            param_type: Some(I32),
+        };
+        let (zero, one) = (b.konst(0), b.konst(1));
+        let (i_j, _) = b.inst(Operation::Br { target: hdr }, vec![], None);
+        let (mut i_phi, i) = b.inst(Operation::Phi { incoming: vec![] }, vec![], Some(I32));
+        let (i_lt, lt) = fbin(b, BinaryOp::ICmpSlt, i.unwrap(), n.id, I1);
+        let (i_br, _) = b.inst(
+            Operation::CondBr {
+                then_target: body,
+                else_target: exit,
+            },
+            vec![lt],
+            None,
+        );
+        let (i_inc, i1) = fbin(b, BinaryOp::Add, i.unwrap(), one, I32);
+        i_phi.op = Operation::Phi {
+            incoming: vec![(e, zero), (body, i1)],
+        };
+        let (i_back, _) = b.inst(Operation::Br { target: hdr }, vec![], None);
+        let (i_ret, _) = b.inst(Operation::Ret, vec![], None);
+        b.func(
+            "f",
+            vec![n],
+            vec![
+                blk(e, vec![i_j]),
+                blk(hdr, vec![i_phi, i_lt, i_br]),
+                blk(body, vec![i_inc, i_back]),
+                blk(exit, vec![i_ret]),
+            ],
+        )
+    }
+
+    /// Regression (wrong TRUE, 2026-11-13): `void g(void) { f(0); }
+    /// int main(void) { g(); f(1); reach_error(); }` — the loop function also
+    /// runs through the loop-free wrapper `g`, so on the direct call its header
+    /// count already exceeds `k`: the base case cut the path before
+    /// `reach_error` and the step case ran from a vacuous Houdini set. The
+    /// loop must not be chosen for k-induction, and the error is reached.
+    #[test]
+    fn induction_loop_function_with_a_second_caller_is_not_used() {
+        let mut b = B::new();
+        let err = b.decl("reach_error");
+        let f = counting_loop_function(&mut b);
+        let (zero, one) = (b.konst(0), b.konst(1));
+        let ge = b.bid();
+        let (i_gc, _) = b.inst(Operation::CallDirect { callee: f }, vec![zero], None);
+        let (i_gr, _) = b.inst(Operation::Ret, vec![], None);
+        let g = b.func("g", vec![], vec![blk(ge, vec![i_gc, i_gr])]);
+        let me = b.bid();
+        let (i_g, _) = b.inst(Operation::CallDirect { callee: g }, vec![], None);
+        let (i_f, _) = b.inst(Operation::CallDirect { callee: f }, vec![one], None);
+        let (i_err, _) = b.inst(Operation::CallDirect { callee: err }, vec![], None);
+        let (i_ret, _) = b.inst(Operation::Ret, vec![], None);
+        b.func("main", vec![], vec![blk(me, vec![i_g, i_f, i_err, i_ret])]);
+        let main =
+            b.m.functions
+                .iter()
+                .find(|f| f.name == "main")
+                .expect("main");
+        let why = Engine::find_induction_loop(&b.m, main)
+            .err()
+            .unwrap_or_default();
+        assert!(why.contains("call-sites"), "{why:?}");
+        let r = prove(&b.m);
+        assert!(
+            matches!(&r, ExhaustiveProof::Abstain(why) if why.contains("error-feasible")),
+            "{r:?}"
+        );
+    }
+
+    /// The loop function's address taken (an indirect route into it), or
+    /// `main` called, rules the loop out of k-induction; a single direct call
+    /// from `main` keeps it.
+    #[test]
+    fn induction_loop_function_entry_must_be_unique() {
+        let build = |taken: bool| {
+            let mut b = B::new();
+            let f = counting_loop_function(&mut b);
+            let one = b.konst(1);
+            let me = b.bid();
+            let (i_f, _) = b.inst(Operation::CallDirect { callee: f }, vec![one], None);
+            let mut insts = vec![i_f];
+            if taken {
+                let use_fn = b.decl("register");
+                let addr = ValueId::new(f.raw());
+                let (i_u, _) = b.inst(Operation::CallDirect { callee: use_fn }, vec![addr], None);
+                insts.push(i_u);
+            }
+            let (i_ret, _) = b.inst(Operation::Ret, vec![], None);
+            insts.push(i_ret);
+            let main = b.func("main", vec![], vec![blk(me, insts)]);
+            (b.m, f, main)
+        };
+        let (m, f, main) = build(false);
+        assert_eq!(loop_function_entry_problem(&m, f, main), None);
+        let main_fn = m.function(main).expect("main");
+        assert!(Engine::find_induction_loop(&m, main_fn).is_ok());
+        let (m, f, main) = build(true);
+        assert_eq!(
+            loop_function_entry_problem(&m, f, main),
+            Some("loop-function-address-taken".to_string())
+        );
+    }
+
+    /// Regression (wrong TRUE, 2026-11-13): two states at the same point whose
+    /// outer recursive activations saved different bindings must never merge —
+    /// `merge` keeps one side's frames, and the other side's saved value would
+    /// come back as the first's on return.
+    #[test]
+    fn states_with_different_saved_frames_are_not_merged() {
+        let mut b = B::new();
+        let e = b.bid();
+        let (i_ret, _) = b.inst(Operation::Ret, vec![], None);
+        let main = b.func("main", vec![], vec![blk(e, vec![i_ret])]);
+        let m = b.m;
+        let mut engine = Engine::new(&m, Duration::from_secs(5));
+        let main_fn = m.function(main).expect("main");
+        let base = engine.initial_state(main_fn, e);
+        let x = ValueId::new(4242);
+        let with_saved = |v: i64| {
+            let mut st = base.clone();
+            st.frames.push(Frame {
+                func: main,
+                ret_block: e,
+                ret_idx: 0,
+                ret_prev: None,
+                ret_dst: None,
+                saved: vec![(x, Some(Val::Bv(int_bv(v, 32), no_vars())))],
+            });
+            st
+        };
+        let (five, seven, five_again) = (with_saved(5), with_saved(7), with_saved(5));
+        // Same call stack shape: the order and merge keys alone cannot tell
+        // them apart, the saved values do.
+        assert!(merge_key(&five) == merge_key(&seven));
+        assert!(!frames_mergeable(&five, &seven));
+        assert!(frames_mergeable(&five, &five_again));
+        // The caller's predecessor block is dead after the return (the caller
+        // resumes past its phis): it never blocks a merge (ECA input chains).
+        let mut other_pred = five_again.clone();
+        if let Some(f) = other_pred.frames.last_mut() {
+            f.ret_prev = Some(e);
+        }
+        assert!(frames_mergeable(&five, &other_pred));
+    }
+
+    /// Regression (wrong TRUE, 2026-11-13), end to end:
+    /// `int f(int d, int x) { if (d == 0) { return nondet() ? 1 : 0; }
+    /// int y = f(d - 1, 0); if (x == 7 && y) reach_error(); return 0; }
+    /// int main() { int x = nondet(); if (x != 5 && x != 7) return 0; f(1, x); }`
+    /// — the inner activation's join merged the `x == 5` and `x == 7` paths and
+    /// kept one saved `x`.
+    #[test]
+    fn recursion_keeps_each_paths_saved_bindings() {
+        let mut b = B::new();
+        let err = b.decl("reach_error");
+        let nd = b.decl("__VERIFIER_nondet_int");
+        let (fe, base, t1, e1, join, rec, bad, ok) = (
+            b.bid(),
+            b.bid(),
+            b.bid(),
+            b.bid(),
+            b.bid(),
+            b.bid(),
+            b.bid(),
+            b.bid(),
+        );
+        let d = AirParam {
+            id: ValueId::new(b.id()),
+            name: Some("d".into()),
+            index: 0,
+            param_type: Some(I32),
+        };
+        let x = AirParam {
+            id: ValueId::new(b.id()),
+            name: Some("x".into()),
+            index: 1,
+            param_type: Some(I32),
+        };
+        let fid = FunctionId::new(b.id());
+        let (zero, one, five, seven) = (b.konst(0), b.konst(1), b.konst(5), b.konst(7));
+        let (i_d0, d0) = fbin(&mut b, BinaryOp::ICmpEq, d.id, zero, I1);
+        let (i_b0, _) = b.inst(
+            Operation::CondBr {
+                then_target: base,
+                else_target: rec,
+            },
+            vec![d0],
+            None,
+        );
+        let (i_nd, r) = b.inst(Operation::CallDirect { callee: nd }, vec![], Some(I32));
+        let (i_rne, rne) = fbin(&mut b, BinaryOp::ICmpNe, r.unwrap(), zero, I1);
+        let (i_rb, _) = b.inst(
+            Operation::CondBr {
+                then_target: t1,
+                else_target: e1,
+            },
+            vec![rne],
+            None,
+        );
+        let (i_t1, _) = b.inst(Operation::Br { target: join }, vec![], None);
+        let (i_e1, _) = b.inst(Operation::Br { target: join }, vec![], None);
+        let (i_phi, rv) = b.inst(
+            Operation::Phi {
+                incoming: vec![(t1, one), (e1, zero)],
+            },
+            vec![],
+            Some(I32),
+        );
+        let (i_jr, _) = b.inst(Operation::Ret, vec![rv.unwrap()], None);
+        let (i_dm, dm) = fbin(&mut b, BinaryOp::Sub, d.id, one, I32);
+        let (i_rec, y) = b.inst(
+            Operation::CallDirect { callee: fid },
+            vec![dm, zero],
+            Some(I32),
+        );
+        let (i_x7, x7) = fbin(&mut b, BinaryOp::ICmpEq, x.id, seven, I1);
+        let (i_yne, yne) = fbin(&mut b, BinaryOp::ICmpNe, y.unwrap(), zero, I1);
+        let (i_and, both) = fbin(&mut b, BinaryOp::And, x7, yne, I1);
+        let (i_rb2, _) = b.inst(
+            Operation::CondBr {
+                then_target: bad,
+                else_target: ok,
+            },
+            vec![both],
+            None,
+        );
+        let (i_err, _) = b.inst(Operation::CallDirect { callee: err }, vec![], None);
+        let (i_br0, _) = b.inst(Operation::Ret, vec![zero], None);
+        let (i_ok, _) = b.inst(Operation::Ret, vec![zero], None);
+        let blocks = vec![
+            blk(fe, vec![i_d0, i_b0]),
+            blk(base, vec![i_nd, i_rne, i_rb]),
+            blk(t1, vec![i_t1]),
+            blk(e1, vec![i_e1]),
+            blk(join, vec![i_phi, i_jr]),
+            blk(rec, vec![i_dm, i_rec, i_x7, i_yne, i_and, i_rb2]),
+            blk(bad, vec![i_err, i_br0]),
+            blk(ok, vec![i_ok]),
+        ];
+        b.m.functions.push(AirFunction {
+            id: fid,
+            name: "f".into(),
+            params: vec![d, x],
+            blocks,
+            entry_block: Some(fe),
+            is_declaration: false,
+            span: None,
+            symbol: None,
+            block_index: BTreeMap::new(),
+        });
+        let (me, early, cont) = (b.bid(), b.bid(), b.bid());
+        let (i_x, mx) = b.inst(Operation::CallDirect { callee: nd }, vec![], Some(I32));
+        let (i_n5, n5) = fbin(&mut b, BinaryOp::ICmpNe, mx.unwrap(), five, I1);
+        let (i_n7, n7) = fbin(&mut b, BinaryOp::ICmpNe, mx.unwrap(), seven, I1);
+        let (i_nn, nn) = fbin(&mut b, BinaryOp::And, n5, n7, I1);
+        let (i_mb, _) = b.inst(
+            Operation::CondBr {
+                then_target: early,
+                else_target: cont,
+            },
+            vec![nn],
+            None,
+        );
+        let (i_er, _) = b.inst(Operation::Ret, vec![zero], None);
+        let (i_call, _) = b.inst(
+            Operation::CallDirect { callee: fid },
+            vec![one, mx.unwrap()],
+            Some(I32),
+        );
+        let (i_cr, _) = b.inst(Operation::Ret, vec![zero], None);
+        b.func(
+            "main",
+            vec![],
+            vec![
+                blk(me, vec![i_x, i_n5, i_n7, i_nn, i_mb]),
+                blk(early, vec![i_er]),
+                blk(cont, vec![i_call, i_cr]),
+            ],
+        );
+        let r = prove(&b.m);
+        assert!(
+            matches!(&r, ExhaustiveProof::Abstain(why) if why.contains("error-feasible")),
+            "{r:?}"
+        );
+    }
+
+    /// `int x = 0; printf(fmt, &x); if (x == 2) reach_error();` with a
+    /// constant format string `fmt`.
+    fn printf_program(fmt: &str) -> AirModule {
+        let mut b = B::new();
+        let err = b.decl("reach_error");
+        let printf = b.decl("printf");
+        let s = ValueId::new(b.id());
+        let mut g = saf_core::air::AirGlobal::new(s, saf_core::ids::ObjId::new(b.id()), ".str");
+        g.init = Some(Constant::String { value: fmt.into() });
+        g.is_constant = true;
+        g.layout = Some(saf_core::air::Layout::Array {
+            count: fmt.len() as u64 + 1,
+            stride: 1,
+            element: Box::new(saf_core::air::Layout::Scalar { size: 1 }),
+        });
+        b.m.globals.push(g);
+        let (e, bb_then, bb_end) = (b.bid(), b.bid(), b.bid());
+        let (zero, two) = (b.konst(0), b.konst(2));
+        let (i_a, px) = b.inst(
+            Operation::Alloca {
+                size_bytes: Some(4),
+            },
+            vec![],
+            Some(I32),
+        );
+        let (i_st, _) = b.inst(Operation::Store, vec![zero, px.unwrap()], None);
+        let (i_pf, _) = b.inst(
+            Operation::CallDirect { callee: printf },
+            vec![s, px.unwrap()],
+            Some(I32),
+        );
+        let (i_ld, xv) = b.inst(Operation::Load, vec![px.unwrap()], Some(I32));
+        let (i_eq, c) = fbin(&mut b, BinaryOp::ICmpEq, xv.unwrap(), two, I1);
+        let (i_br, _) = b.inst(
+            Operation::CondBr {
+                then_target: bb_then,
+                else_target: bb_end,
+            },
+            vec![c],
+            None,
+        );
+        let (i_err, _) = b.inst(Operation::CallDirect { callee: err }, vec![], None);
+        let (i_r1, _) = b.inst(Operation::Ret, vec![], None);
+        let (i_r2, _) = b.inst(Operation::Ret, vec![], None);
+        b.func(
+            "main",
+            vec![],
+            vec![
+                blk(e, vec![i_a, i_st, i_pf, i_ld, i_eq, i_br]),
+                blk(bb_then, vec![i_err, i_r1]),
+                blk(bb_end, vec![i_r2]),
+            ],
+        );
+        b.m
+    }
+
+    /// Regression (wrong TRUE, 2026-11-13): `printf("ab%n", &x)` writes 2 to
+    /// `x` under every goal, not only memory safety: the proof abstains. A
+    /// format without `%n` writes nothing (still proven).
+    #[test]
+    fn printf_percent_n_abstains_under_every_goal() {
+        let r = prove(&printf_program("ab%n"));
+        assert!(
+            matches!(&r, ExhaustiveProof::Abstain(why) if why.contains("percent-n")),
+            "{r:?}"
+        );
+        assert_eq!(prove(&printf_program("ab")), ExhaustiveProof::Proven);
+    }
+
+    /// `int x; keep(&x); x = 0; poke(); if (x != 0) reach_error();` — `keep`
+    /// may have kept the pointer, so `poke` may write `x`: never a proof.
+    #[test]
+    fn extern_known_objects_are_havocked_by_later_externs() {
+        let mut b = B::new();
+        let err = b.decl("reach_error");
+        let keep = b.decl("keep");
+        let poke = b.decl("poke");
+        let (e, bb_then, bb_end) = (b.bid(), b.bid(), b.bid());
+        let zero = b.konst(0);
+        let (i_a, px) = b.inst(
+            Operation::Alloca {
+                size_bytes: Some(4),
+            },
+            vec![],
+            Some(I32),
+        );
+        let (i_k, _) = b.inst(
+            Operation::CallDirect { callee: keep },
+            vec![px.unwrap()],
+            None,
+        );
+        let (i_st, _) = b.inst(Operation::Store, vec![zero, px.unwrap()], None);
+        let (i_p, _) = b.inst(Operation::CallDirect { callee: poke }, vec![], None);
+        let (i_ld, xv) = b.inst(Operation::Load, vec![px.unwrap()], Some(I32));
+        let (i_ne, c) = fbin(&mut b, BinaryOp::ICmpNe, xv.unwrap(), zero, I1);
+        let (i_br, _) = b.inst(
+            Operation::CondBr {
+                then_target: bb_then,
+                else_target: bb_end,
+            },
+            vec![c],
+            None,
+        );
+        let (i_err, _) = b.inst(Operation::CallDirect { callee: err }, vec![], None);
+        let (i_r1, _) = b.inst(Operation::Ret, vec![], None);
+        let (i_r2, _) = b.inst(Operation::Ret, vec![], None);
+        b.func(
+            "main",
+            vec![],
+            vec![
+                blk(e, vec![i_a, i_k, i_st, i_p, i_ld, i_ne, i_br]),
+                blk(bb_then, vec![i_err, i_r1]),
+                blk(bb_end, vec![i_r2]),
+            ],
+        );
+        assert_eq!(
+            prove(&b.m),
+            ExhaustiveProof::Abstain("error-feasible".into())
+        );
+    }
+
+    /// The header fixpoint's key distinguishes states that differ only in
+    /// object bookkeeping the continuation reads (a zero-allocated object
+    /// reads 0, an indeterminate one any value), and ignores the bookkeeping
+    /// of objects nothing references any more.
+    #[test]
+    fn fixpoint_key_covers_object_bookkeeping() {
+        let mut b = B::new();
+        let e = b.bid();
+        let (i_ret, _) = b.inst(Operation::Ret, vec![], None);
+        let main = b.func("main", vec![], vec![blk(e, vec![i_ret])]);
+        let m = b.m;
+        let mut engine = Engine::new(&m, Duration::from_secs(5));
+        let main_fn = m.function(main).expect("main");
+        let mut plain = engine.initial_state(main_fn, e);
+        let (obj, p) = (ValueId::new(u128::MAX - 7), ValueId::new(4243));
+        plain.values.insert(p, Val::Ptr(Some((obj, Vec::new()))));
+        plain.heap_objs.insert(obj, Some(4));
+        let mut zeroed = plain.clone();
+        zeroed.zeroed.insert(obj);
+        assert!(footprint(&plain).0 != footprint(&zeroed).0);
+        let mut known = plain.clone();
+        known.extern_known.insert(obj);
+        assert!(footprint(&plain).0 != footprint(&known).0);
+        // Nothing points at `obj` any more: its bookkeeping is unobservable.
+        let mut gone = zeroed.clone();
+        gone.values.remove(&p);
+        let mut gone_plain = plain.clone();
+        gone_plain.values.remove(&p);
+        assert!(footprint(&gone).0 == footprint(&gone_plain).0);
     }
 }

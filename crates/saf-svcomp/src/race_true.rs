@@ -34,9 +34,11 @@
 //!    mutexes become the same value. We therefore admit a lock into the
 //!    must-lockset **only** when its pointer resolves — via a def-chain walk over
 //!    casts and no-op GEPs — to a *standalone global* mutex: a global that is
-//!    NEVER the base of an indexing GEP and is NOT initialized by ≥2
-//!    `pthread_mutex_init` sites (either would prove it holds several distinct
-//!    mutexes the frontend has conflated). A parameter, `phi`/`select`, loaded
+//!    NEVER the base of an indexing GEP, is NOT initialized by ≥2
+//!    `pthread_mutex_init` sites, is NOT a target of a collapsed constant
+//!    sub-address (`AirModule::collapsed_globals`), and whose byte layout holds at
+//!    most one `pthread_mutex_t` (any of these would mean it holds several
+//!    distinct mutexes the frontend has conflated). A parameter, `phi`/`select`, loaded
 //!    pointer, or indexed sub-object all drop the lock (fail-closed). Symmetrically,
 //!    `unlock(p)` drops the lock `p` resolves to, or — when `p` is ambiguous —
 //!    clears the whole set (a possibly-mismatched unlock soundly voids protection).
@@ -53,6 +55,8 @@
 //! To keep the direct call graph *complete* (so the analysis sees every access and
 //! every lock), we abstain on any reachable **indirect call**, any reachable
 //! external not on a small **race-inert** allowlist, any unresolved thread entry,
+//! a truncated (non-converged) points-to solve, an MTA thread discovery that hit
+//! its context-depth cap, any instruction the frontend dropped,
 //! and any threading feature we do not model (only `pthread_mutex_lock/unlock` and
 //! the `__VERIFIER_atomic_begin/end` section delimiters are modeled — trylock /
 //! cond / rwlock / spin / sem / barrier / C11-atomics / whole-function
@@ -128,6 +132,10 @@ fn is_lock_release(name: &str) -> bool {
 /// Cost gate: abstain rather than run the O(n²) pairwise conflict scan on a huge
 /// access set (large CIL drivers), which could time a sibling task out.
 const MAX_ACCESSES: usize = 3000;
+
+/// MTA thread-discovery context-depth cap for the TRUE provers (`race_true`,
+/// `memsafe`). Hitting it makes both abstain, so it trades only cost for recall.
+pub(crate) const MTA_MAX_CONTEXT_DEPTH: usize = 64;
 
 /// The exact SV-COMP verdict string for a proven `no-data-race` TRUE — a bare
 /// `true` (BenchExec `RESULT_TRUE_PROP`), consistent with [`crate::termination`].
@@ -319,15 +327,52 @@ fn libc_call_accesses(
     let mut out = Vec::with_capacity(inst.operands.len());
     match model {
         LibcModel::ReadAll | LibcModel::ReadAllFormat { .. } => {
-            out.extend(inst.operands.iter().map(|p| (*p, false)));
+            out.extend(
+                inst.operands
+                    .iter()
+                    .filter(|p| !is_provably_non_pointer(**p, defs, module))
+                    .map(|p| (*p, false)),
+            );
         }
         LibcModel::WriteDst { .. } => {
             for (i, p) in inst.operands.iter().enumerate() {
-                out.push((*p, i == 0));
+                // The written destination is always kept, whatever its type.
+                if i == 0 || !is_provably_non_pointer(*p, defs, module) {
+                    out.push((*p, i == 0));
+                }
             }
         }
     }
     Ok(out)
+}
+
+/// Is `v` provably NOT an address — an inline scalar or null constant, or the result of
+/// an instruction whose result type is an integer or float? Such an operand of a
+/// modeled libc call (`printf("%d", x)`) is passed by value and dereferences
+/// nothing, so it is not an access. Its points-to set is absent or empty, which
+/// [`may_overlap`] must read as "may touch anything" for a real pointer; dropping
+/// it here keeps that conservative rule from abstaining on every printed integer.
+/// Anything else — a pointer, an untyped value, a parameter, a global or a
+/// `GlobalRef` — is kept (fail-closed).
+fn is_provably_non_pointer(v: ValueId, defs: &DefMap<'_>, module: &AirModule) -> bool {
+    if let Some(c) = module.constants.get(&v) {
+        return matches!(
+            c,
+            Constant::Int { .. }
+                | Constant::BigInt { .. }
+                | Constant::Float { .. }
+                | Constant::Null
+        );
+    }
+    defs.get(&v)
+        .and_then(|inst| inst.result_type)
+        .and_then(|t| module.types.get(&t))
+        .is_some_and(|t| {
+            matches!(
+                t,
+                saf_core::air::AirType::Integer { .. } | saf_core::air::AirType::Float { .. }
+            )
+        })
 }
 
 /// Resolve a pointer value to the **string literal** it addresses, forwarding
@@ -504,6 +549,27 @@ pub fn undefined_userfn_names(module: &AirModule) -> BTreeSet<String> {
         .collect()
 }
 
+/// Did ingestion drop something that could hide an access from the scan?
+///
+/// Mirrors `unreach_prover_blocked_by_dropped` in the CLI: an instruction of an
+/// unknown opcode is (nothing marks where it was), and so is every lossy intrinsic
+/// skip except `llvm.stackrestore*`, which only ends object lifetimes (a race needs
+/// two accesses, and ending a lifetime is neither). Every inline-asm entry
+/// (`inline-asm-memory`: an asm that may write memory) blocks — an access the
+/// scan never sees cannot be paired.
+///
+/// `atomicrmw`/`cmpxchg` do NOT block (as in the concurrent no-overflow gate):
+/// the frontend lowers each to a visible `Load` + `Store` of the same pointer,
+/// imprecise only in the stored VALUE, which this prover never reads. The scan
+/// sees the access and treats it as a plain write, which can only add conflicts.
+fn race_blocked_by_dropped(module: &AirModule) -> bool {
+    module.dropped_unknown_opcode
+        || module.dropped_intrinsics.iter().any(|n| {
+            n.starts_with("inline-asm")
+                || !(n.starts_with("llvm.stackrestore") || n == "atomicrmw" || n == "cmpxchg")
+        })
+}
+
 /// Core of [`program_is_race_free`]: `Ok(())` = provably race-free, `Err(reason)` =
 /// abstain (the reason string is for diagnostics only, never affects the verdict).
 #[allow(clippy::too_many_lines)]
@@ -520,12 +586,23 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
     {
         return Err("no-defined-main".into());
     }
+    // INGESTION FIDELITY. The access scan reasons "no unprotected conflicting
+    // access appears in the AIR", which is evidence only if the AIR shows every
+    // access: a dropped instruction of an unmodeled opcode, a lossy intrinsic
+    // (`llvm.va_*`, `llvm.experimental.*`) or an effectful inline asm is an
+    // access the scan never sees.
+    if race_blocked_by_dropped(module) {
+        return Err("ingest-dropped-instruction".into());
+    }
 
     let cg = CallGraph::build(module);
 
     // Points-to (Andersen, over-approximate) + MTA thread/concurrency model. MTA's
     // thread-entry discovery is PTA-driven, so it is a SOUND *superset* of the real
     // entry functions — we never miss a thread body (only possibly over-analyze).
+    // That holds only for a CONVERGED solve: a truncated one under-approximates
+    // every points-to set (missed thread entries, missed overlaps) — checked below,
+    // once a spawn is known to be reachable.
     let pta = {
         let mut ctx = PtaContext::new(PtaConfig::default());
         let raw = ctx.analyze(module);
@@ -535,6 +612,11 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
     let mta_config = MtaConfig {
         thread_create_funcs: SPAWN_FUNCTIONS.iter().map(|s| (*s).to_string()).collect(),
         thread_join_funcs: JOIN_FUNCTIONS.iter().map(|s| (*s).to_string()).collect(),
+        // Discovery is bounded by its (thread, function, call site) visited set,
+        // not by this cap; the cap only truncates, and a truncated discovery now
+        // abstains (`context_depth_limit_hit`). The default 10 is shallower than
+        // many drivers' call depth, so raise it to keep those provable.
+        max_context_depth: MTA_MAX_CONTEXT_DEPTH,
         ..MtaConfig::default()
     };
     let mta = MtaAnalysis::with_pta(
@@ -582,6 +664,19 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
     // indirect call that could hide one — ⇒ genuinely sequential ⇒ no data race.
     if !has_reachable_spawn {
         return Ok(());
+    }
+    // Concurrent from here on, so the PTA and MTA results are load-bearing.
+    // A truncated points-to solve under-approximates every set.
+    if pta.diagnostics().iteration_limit_hit {
+        return Err("pta-iteration-limit-hit".into());
+    }
+    // MTA's discovery walk stops at `max_context_depth`; past it, a spawn is never
+    // seen and a spawn site reached along a second path gets no second context
+    // (so a twice-running thread looks single-instance). Its thread set is then
+    // not exhaustive — abstain. (Neither matters above: with no spawn reachable
+    // from `main`, no thread is ever created, whatever MTA found.)
+    if mta.thread_graph.context_depth_limit_hit {
+        return Err("mta-context-depth-limit-hit".into());
     }
     // A spawn is reachable but MTA modeled ≤1 thread — do not trust a sequential
     // conclusion, abstain.
@@ -655,7 +750,18 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
     // recurrent thread never gets join credit. Join credit propagates
     // interprocedurally (`main` → `module_exit()` → `pthread_join`) via a monotone
     // must-joined-on-entry fixpoint mirroring [`compute_entry_locks`].
-    let (thread_handles, ambiguous_handles) = build_thread_handles(module, threads, &res.defs);
+    let (thread_handles, mut ambiguous_handles) = build_thread_handles(module, threads, &res.defs);
+    // A handle variable joins the thread whose id it HOLDS at the join, which is
+    // the creating thread's only while nothing else writes it. Deny join credit
+    // to any handle whose address is used for anything but loads and its single
+    // `pthread_create` (a second store, an escape into memory or a call, an
+    // indexing GEP, a global initializer naming it, a collapsed sub-address).
+    ambiguous_handles.extend(handles_with_foreign_uses(
+        module,
+        threads,
+        &thread_handles,
+        &res.defs,
+    ));
     let joined_entry = compute_joined_entry(module, &main_tree, &roots, &res.defs);
     let joined_in_by_func: BTreeMap<FunctionId, BTreeMap<BlockId, BTreeSet<ValueId>>> = main_tree
         .iter()
@@ -775,7 +881,13 @@ fn race_free_classify(module: &AirModule) -> Result<(), String> {
     // SOUND over-approximation: a thread is single-instance only when its entry is
     // unshared AND its spawn site provably executes at most once (in an
     // invoked-at-most-once main-tree function, not inside a CFG loop).
-    let invoked_once = compute_invoked_at_most_once(module, main_id, &main_tree);
+    let thread_entries: BTreeSet<FunctionId> = threads
+        .values()
+        .filter(|t| t.creation_site.is_some())
+        .map(|t| t.entry_function)
+        .collect();
+    let invoked_once =
+        compute_invoked_at_most_once(module, main_id, &reachable_fids, &thread_entries);
     let recurrent = recurrent_thread_ids(module, &mta, &invoked_once);
     if std::env::var_os("SAF_RACE_TRUE_DEBUG").is_some() {
         debug_accesses(&accesses, &pta);
@@ -865,14 +977,24 @@ fn debug_accesses(accesses: &[Access], pta: &PtaResult) {
 /// `i == 4` (a wrong TRUE in the SV-COMP 2027 training run). No step-wise comparison
 /// of such paths is sound, so object identity decides. A pointee the factory cannot
 /// resolve may overlap anything.
+///
+/// An access whose pointer has NO points-to entry, or an EMPTY one, may overlap
+/// anything too. `PtaResult::may_alias` reads an empty set as "never assigned, so
+/// aliases nothing", which is false for a dereferenced pointer: the solver does not
+/// link a `pthread_create` argument to the thread's parameter, so `*(int *)arg` in
+/// a thread body has an empty set while it writes `main`'s object. Checked FIRST,
+/// before `may_alias` can answer `No` for it.
 fn may_overlap(pta: &PtaResult, p: ValueId, q: ValueId) -> bool {
-    if pta.may_alias(p, q).may_alias_conservative() {
-        return true;
-    }
     let points_to = pta.points_to_map();
     let (Some(ps), Some(qs)) = (points_to.get(&p), points_to.get(&q)) else {
         return true;
     };
+    if ps.is_empty() || qs.is_empty() {
+        return true;
+    }
+    if pta.may_alias(p, q).may_alias_conservative() {
+        return true;
+    }
     ps.iter().any(|&lp| {
         qs.iter()
             .any(|&lq| match (pta.location(lp), pta.location(lq)) {
@@ -1044,7 +1166,14 @@ struct LockResolver<'a> {
     ///   accessed via a preserved GEP), OR
     /// - it is the base of ≥2 distinct `pthread_mutex_init` call sites (a *struct*
     ///   of several mutexes whose field GEPs the frontend dropped entirely — the
-    ///   only surviving evidence of multiplicity is the repeated init).
+    ///   only surviving evidence of multiplicity is the repeated init), OR
+    /// - the frontend collapsed a constant sub-object address onto it
+    ///   ([`AirModule::collapsed_globals`]: `&arr[1].m` became `@arr`, so it and
+    ///   `&arr[0].m` are the same AIR value) — every global when the collapse
+    ///   could not be attributed (`None`), OR
+    /// - its byte layout could hold MORE than one `pthread_mutex_t`, or is unknown
+    ///   (see [`global_mutex_capacity`]): an array of mutex-bearing structs or a
+    ///   struct with two mutex fields is several locks behind one base address.
     ambiguous_globals: BTreeSet<ObjId>,
     /// Net **acquire** summary per user function: the concrete locks it provably
     /// holds on EVERY return path and never releases (a `lock()`-style wrapper).
@@ -1115,11 +1244,64 @@ impl<'a> LockResolver<'a> {
                 ambiguous_globals.insert(obj);
             }
         }
+        let mutex_size = pthread_mutex_size(module.target_pointer_width);
+        for g in &module.globals {
+            let collapsed = module
+                .collapsed_globals
+                .as_ref()
+                .is_none_or(|c| c.contains(&g.id));
+            let multi_mutex = match (mutex_size, g.layout.as_ref()) {
+                (Some(m), Some(layout)) => global_mutex_capacity(layout, m) > 1,
+                _ => true,
+            };
+            if collapsed || multi_mutex {
+                ambiguous_globals.insert(g.obj);
+            }
+        }
         Self {
             defs,
             ambiguous_globals,
             acquire_summaries: BTreeMap::new(),
             entry_locks: BTreeMap::new(),
+        }
+    }
+}
+
+/// `sizeof(pthread_mutex_t)` (glibc, x86) for a target with `ptr_width`-byte
+/// pointers: 24 on `ILP32`, 40 on `LP64`. `None` for any other width (⇒ no
+/// global is admitted as a lock identity).
+fn pthread_mutex_size(ptr_width: u32) -> Option<u64> {
+    match ptr_width {
+        4 => Some(24),
+        8 => Some(40),
+        _ => None,
+    }
+}
+
+/// An upper bound on how many distinct `pthread_mutex_t` objects (of `mutex_size`
+/// bytes) the object laid out as `layout` can contain at distinct addresses.
+///
+/// A struct of exactly `mutex_size` bytes counts as ONE (it is the mutex, or a
+/// wrapper around exactly one); a larger struct sums its fields; an array
+/// multiplies its element's count; a scalar counts one iff it is at least mutex
+/// size. Byte blobs (`char buf[80]`) count zero — a second mutex inside one needs
+/// a non-base address, which only an indexing GEP or a collapsed constant
+/// expression can produce, and both already disqualify the global.
+fn global_mutex_capacity(layout: &saf_core::air::Layout, mutex_size: u64) -> u64 {
+    use saf_core::air::Layout;
+    match layout {
+        Layout::Scalar { size } => u64::from(*size >= mutex_size),
+        Layout::Struct { size, fields } => {
+            if *size == mutex_size {
+                1
+            } else {
+                fields.iter().fold(0u64, |acc, f| {
+                    acc.saturating_add(global_mutex_capacity(&f.layout, mutex_size))
+                })
+            }
+        }
+        Layout::Array { count, element, .. } => {
+            count.saturating_mul(global_mutex_capacity(element, mutex_size))
         }
     }
 }
@@ -1377,6 +1559,147 @@ fn build_thread_handles(
         .filter_map(|(k, c)| (c >= 2).then_some(k))
         .collect();
     (handles, ambiguous)
+}
+
+/// Handle keys whose join credit must be withdrawn because the handle object may
+/// hold something other than the id its single `pthread_create` stored.
+///
+/// [`resolve_join_key`] keys a join on the handle VARIABLE (`pthread_join(t)` ⇒
+/// "the object `t`"), while the thread joined is the one whose id `t` holds at the
+/// join. Those coincide only while nothing but the creating `pthread_create`
+/// writes `t`. So a key keeps its credit only when EVERY use of its address — any
+/// operand that is the object itself, a `GlobalRef`/`GlobalElem` to it, or a
+/// cast/copy/no-op GEP of one — is either
+///
+/// - the address operand of a `Load` (a read), or
+/// - operand 0 of one of the key's own creation-site spawn calls,
+///
+/// (casts, copies and no-op GEPs merely forward the address; their results are
+/// themselves checked). Anything else disqualifies it: a `Store` to it (`t1 = t2`)
+/// or of its address, passing it to any other call (a helper or an external may
+/// write through it, and a spawn's `arg` hands it to the new thread), an indexing
+/// GEP, a `phi`/`select`, a `memcpy`/`memset`, a global initializer naming it, or —
+/// for a global — a collapsed constant sub-address onto it
+/// ([`AirModule::collapsed_globals`]; every global when that is `None`). This is a
+/// syntactic escape check, so it needs no points-to answer.
+fn handles_with_foreign_uses(
+    module: &AirModule,
+    threads: &BTreeMap<ThreadId, saf_analysis::mta::ThreadContext>,
+    handles: &BTreeMap<u32, ValueId>,
+    defs: &DefMap<'_>,
+) -> BTreeSet<ValueId> {
+    // key → the creation-site instructions allowed to take its address.
+    let mut sites: BTreeMap<ValueId, BTreeSet<InstId>> = BTreeMap::new();
+    for (tid, tctx) in threads {
+        if let (Some(key), Some(site)) = (handles.get(&tid.0), tctx.creation_site) {
+            sites.entry(*key).or_default().insert(site);
+        }
+    }
+    let keys: BTreeSet<ValueId> = sites.keys().copied().collect();
+    let mut bad: BTreeSet<ValueId> = BTreeSet::new();
+    if keys.is_empty() {
+        return bad;
+    }
+
+    // Collapsed constant sub-addresses of a global handle.
+    for g in &module.globals {
+        if keys.contains(&g.id)
+            && module
+                .collapsed_globals
+                .as_ref()
+                .is_none_or(|c| c.contains(&g.id))
+        {
+            bad.insert(g.id);
+        }
+        // A global initializer storing the handle's address (`pthread_t *p = &t;`).
+        if let Some(init) = &g.init {
+            constant_refs_keys(init, &keys, &mut bad);
+        }
+    }
+
+    for func in &module.functions {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                for (i, &op) in inst.operands.iter().enumerate() {
+                    let Some(key) = handle_alias_of(op, &keys, defs, module) else {
+                        continue;
+                    };
+                    let allowed = match &inst.op {
+                        Operation::Load
+                        | Operation::Cast { .. }
+                        | Operation::Copy
+                        | Operation::Freeze => i == 0,
+                        Operation::Gep { field_path } => {
+                            i == 0 && !gep_has_indexing(field_path, inst.operands.len())
+                        }
+                        Operation::CallDirect { .. } => {
+                            i == 0 && sites.get(&key).is_some_and(|ss| ss.contains(&inst.id))
+                        }
+                        _ => false,
+                    };
+                    if !allowed {
+                        bad.insert(key);
+                    }
+                }
+            }
+        }
+    }
+    bad
+}
+
+/// The handle key in `keys` that the address `v` names — the key itself, a
+/// `GlobalRef`/`GlobalElem` constant to it, or a cast/copy/no-op GEP chain ending
+/// at one — or `None`.
+fn handle_alias_of(
+    v: ValueId,
+    keys: &BTreeSet<ValueId>,
+    defs: &DefMap<'_>,
+    module: &AirModule,
+) -> Option<ValueId> {
+    let mut cur = v;
+    for _ in 0..64 {
+        if keys.contains(&cur) {
+            return Some(cur);
+        }
+        match module.constants.get(&cur) {
+            Some(Constant::GlobalRef(t)) => return keys.contains(t).then_some(*t),
+            Some(Constant::GlobalElem { base, .. }) => {
+                return keys.contains(base).then_some(*base);
+            }
+            Some(_) => return None,
+            None => {}
+        }
+        let inst = defs.get(&cur)?;
+        match &inst.op {
+            Operation::Cast { .. } | Operation::Copy | Operation::Freeze => {
+                cur = inst.operands.first().copied()?;
+            }
+            Operation::Gep { field_path } if !gep_has_indexing(field_path, inst.operands.len()) => {
+                cur = inst.operands.first().copied()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Record in `out` every key of `keys` that the constant `c` takes the address of
+/// (`GlobalRef`/`GlobalElem`, at any aggregate depth).
+fn constant_refs_keys(c: &Constant, keys: &BTreeSet<ValueId>, out: &mut BTreeSet<ValueId>) {
+    match c {
+        Constant::GlobalRef(t) if keys.contains(t) => {
+            out.insert(*t);
+        }
+        Constant::GlobalElem { base, .. } if keys.contains(base) => {
+            out.insert(*base);
+        }
+        Constant::Aggregate { elements } => {
+            for e in elements {
+                constant_refs_keys(e, keys, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Must-join dataflow over `main`: the handle keys provably `pthread_join`-ed on
@@ -1777,60 +2100,76 @@ fn build_global_prespawn(
     out
 }
 
-/// Main-tree functions that provably execute **at most once** per program run.
-/// `main` qualifies; a non-`main` function `F` qualifies iff it has exactly ONE
-/// direct call site within the main tree, that site is in an at-most-once caller,
-/// and the site's block is not inside a CFG cycle (a loop would call `F` many
-/// times). Greatest fixpoint (start all true, retract violators — recursion, in a
-/// call cycle, is retracted because its self/back-edge site sits in a cycle or its
-/// caller is itself retracted).
+/// Functions that provably execute **at most once** per program run, counting
+/// EVERY thread's calls — not just `main`'s. `main` qualifies iff nothing calls it
+/// and it is not a thread entry; any other function `F` qualifies iff it is not a
+/// thread entry (a spawn runs it with no call site to count) and it has exactly
+/// ONE direct call site among all `reachable` functions (main's tree and every
+/// thread body), that site is in an at-most-once caller, and the site's block is
+/// not inside a CFG cycle (a loop would call `F` many times). Greatest fixpoint
+/// (start all true, retract violators — recursion, in a call cycle, is retracted
+/// because its self/back-edge site sits in a cycle or its caller is itself
+/// retracted).
+///
+/// Counting only `main`'s call tree is unsound: a helper `main` calls once and a
+/// thread body calls once runs twice, so a `pthread_create` inside it spawns two
+/// instances of the same thread.
 ///
 /// Soundness: if `F` is at-most-once then any `pthread_create` directly in `F` (not
 /// in a CFG loop within `F`) fires at most once — so the spawned thread has a
 /// single instance. Used only to *grant* single-instance status; failing the test
-/// keeps the conservative recurrent (self-racing) treatment.
+/// keeps the conservative recurrent (self-racing) treatment. There is no indirect
+/// call in the universe (the caller abstains on one), so direct call sites plus
+/// spawns are every way a function is entered.
 fn compute_invoked_at_most_once(
     module: &AirModule,
     main_id: FunctionId,
-    main_tree: &BTreeSet<FunctionId>,
+    reachable: &BTreeSet<FunctionId>,
+    thread_entries: &BTreeSet<FunctionId>,
 ) -> BTreeSet<FunctionId> {
-    // Cost gate: on an oversized main tree, grant single-instance to no thread
+    // Cost gate: on an oversized universe, grant single-instance to no thread
     // (∅) — SOUND (every thread then treated as recurrent/self-racing, the
     // conservative default), bounding the fixpoint's worst case.
-    if main_tree.len() > MAX_INTERPROC_FUNCS {
+    if reachable.len() > MAX_INTERPROC_FUNCS {
         return BTreeSet::new();
     }
 
     // Per-function CFG (to test whether a call site's block is in a cycle).
     let mut cfgs: BTreeMap<FunctionId, Cfg> = BTreeMap::new();
     for func in &module.functions {
-        if !func.is_declaration && main_tree.contains(&func.id) {
+        if !func.is_declaration && reachable.contains(&func.id) {
             cfgs.insert(func.id, Cfg::build(func));
         }
     }
-    // Direct call sites within the main tree, indexed by callee: callee →
+    // Direct call sites from ANY reachable function, indexed by callee: callee →
     // [(caller, block-of-site)].
     let mut sites_by_callee: BTreeMap<FunctionId, Vec<(FunctionId, BlockId)>> = BTreeMap::new();
     for func in &module.functions {
-        if func.is_declaration || !main_tree.contains(&func.id) {
+        if func.is_declaration || !reachable.contains(&func.id) {
             continue;
         }
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let Operation::CallDirect { callee } = &inst.op {
-                    if main_tree.contains(callee) {
-                        sites_by_callee
-                            .entry(*callee)
-                            .or_default()
-                            .push((func.id, block.id));
-                    }
+                    sites_by_callee
+                        .entry(*callee)
+                        .or_default()
+                        .push((func.id, block.id));
                 }
             }
         }
     }
 
-    let mut once: BTreeSet<FunctionId> = cfgs.keys().copied().collect();
-    once.insert(main_id);
+    let mut once: BTreeSet<FunctionId> = cfgs
+        .keys()
+        .copied()
+        .filter(|f| !thread_entries.contains(f))
+        .collect();
+    // `main` runs once from the program start — unless something also calls it
+    // or spawns it.
+    if sites_by_callee.contains_key(&main_id) || thread_entries.contains(&main_id) {
+        once.remove(&main_id);
+    }
     loop {
         let mut changed = false;
         let snapshot: Vec<FunctionId> = once.iter().copied().collect();
@@ -1999,7 +2338,8 @@ fn lock_identity(p: ValueId, res: &LockResolver<'_>, module: &AirModule) -> Opti
 }
 
 /// The object id `obj` iff it is a valid standalone-mutex lock base — i.e. NOT in
-/// [`LockResolver::ambiguous_globals`] (not GEP-indexed and not multiply-init'd).
+/// [`LockResolver::ambiguous_globals`] (not GEP-indexed, not multiply-init'd, not
+/// a collapse target, and laid out to hold at most one mutex).
 /// Admitting an aggregate global whose distinct embedded mutexes the frontend has
 /// collapsed onto one base would conflate them into a bogus common lock.
 fn standalone_mutex_obj(res: &LockResolver<'_>, obj: ObjId) -> Option<LockId> {
@@ -2919,7 +3259,8 @@ mod tests {
         let m = module(vec![main.clone(), helper.clone()]);
         let main_tree: BTreeSet<FunctionId> =
             [func_id("main"), func_id("helper")].into_iter().collect();
-        let once = compute_invoked_at_most_once(&m, func_id("main"), &main_tree);
+        let no_entries = BTreeSet::new();
+        let once = compute_invoked_at_most_once(&m, func_id("main"), &main_tree, &no_entries);
         assert!(once.contains(&func_id("main")));
         assert!(once.contains(&func_id("helper")));
 
@@ -2940,7 +3281,7 @@ mod tests {
         );
         let main2 = defined("main", vec![call_a, call_b]);
         let m2 = module(vec![main2, helper]);
-        let once2 = compute_invoked_at_most_once(&m2, func_id("main"), &main_tree);
+        let once2 = compute_invoked_at_most_once(&m2, func_id("main"), &main_tree, &no_entries);
         assert!(once2.contains(&func_id("main")));
         assert!(
             !once2.contains(&func_id("helper")),
@@ -2986,6 +3327,309 @@ mod tests {
         assert!(
             sink_joins.contains(&hbase),
             "join of h must be visible at the later sink call site"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Soundness regressions (2026-11 audit: r1/r2 wrong TRUEs, B1–B5)
+    // -------------------------------------------------------------------------
+
+    fn global(id: u128, obj: u128, name: &str, layout: Option<saf_core::air::Layout>) -> AirGlobal {
+        AirGlobal {
+            id: ValueId::new(id),
+            obj: ObjId::new(obj),
+            name: name.to_string(),
+            init: None,
+            is_constant: false,
+            span: None,
+            value_type: None,
+            layout,
+        }
+    }
+
+    fn call(id: &str, callee: &str, operands: Vec<ValueId>) -> Instruction {
+        inst(
+            id,
+            Operation::CallDirect {
+                callee: func_id(callee),
+            },
+            operands,
+        )
+    }
+
+    /// `pthread_mutex_t` on LP64: a 40-byte struct.
+    fn mutex_layout() -> saf_core::air::Layout {
+        saf_core::air::Layout::Struct {
+            size: 40,
+            fields: vec![saf_core::air::LayoutField {
+                offset: 0,
+                layout: saf_core::air::Layout::Array {
+                    count: 10,
+                    stride: 4,
+                    element: Box::new(saf_core::air::Layout::Scalar { size: 4 }),
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn may_overlap_treats_empty_points_to_as_anything() {
+        let mut factory = saf_analysis::LocationFactory::new(saf_analysis::FieldSensitivity::None);
+        let lx = factory.get_or_create(ObjId::new(0x10), saf_analysis::FieldPath::empty());
+        let ly = factory.get_or_create(ObjId::new(0x11), saf_analysis::FieldPath::empty());
+        let (px, py, pe) = (ValueId::new(1), ValueId::new(2), ValueId::new(3));
+        let mut pts = saf_analysis::PointsToMap::new();
+        pts.insert(px, [lx].into_iter().collect());
+        pts.insert(py, [ly].into_iter().collect());
+        pts.insert(pe, BTreeSet::new());
+        let pta = PtaResult::new(
+            pts,
+            Arc::new(factory),
+            saf_analysis::PtaDiagnostics::default(),
+        );
+        // Distinct objects stay disjoint.
+        assert!(!may_overlap(&pta, px, py));
+        // An empty set (e.g. `*(int *)arg` in a thread body) may touch anything —
+        // including itself and an untracked pointer.
+        assert!(may_overlap(&pta, px, pe));
+        assert!(may_overlap(&pta, pe, py));
+        assert!(may_overlap(&pta, pe, pe));
+        assert!(may_overlap(&pta, px, ValueId::new(0x99)));
+    }
+
+    #[test]
+    fn non_pointer_libc_operands_are_not_accesses() {
+        let mut m = module(vec![]);
+        let k = ValueId::new(0x700);
+        m.constants.insert(k, Constant::Int { value: 5, bits: 32 });
+        let defs: DefMap = BTreeMap::new();
+        assert!(is_provably_non_pointer(k, &defs, &m));
+        // An untyped SSA value is kept (fail-closed).
+        assert!(!is_provably_non_pointer(ValueId::new(0x701), &defs, &m));
+    }
+
+    #[test]
+    fn lock_identity_rejects_collapsed_and_multi_mutex_globals() {
+        // r2: `struct P { pthread_mutex_t m; int v; } arr[2]` — `&arr[1].m`
+        // collapsed onto `@arr` — must never be a lock identity.
+        let elem = saf_core::air::Layout::Struct {
+            size: 48,
+            fields: vec![
+                saf_core::air::LayoutField {
+                    offset: 0,
+                    layout: mutex_layout(),
+                },
+                saf_core::air::LayoutField {
+                    offset: 40,
+                    layout: saf_core::air::Layout::Scalar { size: 4 },
+                },
+            ],
+        };
+        let arr_layout = saf_core::air::Layout::Array {
+            count: 2,
+            stride: 48,
+            element: Box::new(elem.clone()),
+        };
+        assert_eq!(global_mutex_capacity(&arr_layout, 40), 2);
+        assert_eq!(global_mutex_capacity(&elem, 40), 1);
+        assert_eq!(global_mutex_capacity(&mutex_layout(), 40), 1);
+
+        let mut m = module(vec![]);
+        m.globals
+            .push(global(0x800, 0x810, "arr", Some(arr_layout)));
+        m.globals
+            .push(global(0x801, 0x811, "m", Some(mutex_layout())));
+        m.globals.push(global(0x802, 0x812, "s", Some(elem)));
+        m.globals.push(global(0x803, 0x813, "nolayout", None));
+        m.globals
+            .push(global(0x804, 0x814, "collapsed", Some(mutex_layout())));
+        m.collapsed_globals = Some([ValueId::new(0x804)].into_iter().collect());
+        let res = LockResolver::build(&m);
+        assert_eq!(lock_identity(ValueId::new(0x800), &res, &m), None, "array");
+        assert_eq!(
+            lock_identity(ValueId::new(0x801), &res, &m),
+            Some(ObjId::new(0x811)),
+            "a standalone mutex is a lock identity"
+        );
+        assert_eq!(
+            lock_identity(ValueId::new(0x802), &res, &m),
+            Some(ObjId::new(0x812)),
+            "a struct holding ONE mutex is"
+        );
+        assert_eq!(
+            lock_identity(ValueId::new(0x803), &res, &m),
+            None,
+            "no layout"
+        );
+        assert_eq!(
+            lock_identity(ValueId::new(0x804), &res, &m),
+            None,
+            "collapsed"
+        );
+
+        // Unattributed collapse (`None`): every global is opaque.
+        m.collapsed_globals = None;
+        let res = LockResolver::build(&m);
+        assert_eq!(lock_identity(ValueId::new(0x801), &res, &m), None);
+    }
+
+    #[test]
+    fn handle_written_twice_loses_join_credit() {
+        // main: alloca t; create(&t, f); [store v -> t]; load t; join
+        let vt = ValueId::new(0x900);
+        let vv = ValueId::new(0x901);
+        let fn_f = ValueId::new(func_id("f").raw());
+        let build = |extra_store: bool| {
+            let mut insts = vec![
+                inst_d("a", Operation::Alloca { size_bytes: None }, vec![], vt),
+                call(
+                    "cr",
+                    "pthread_create",
+                    vec![vt, ValueId::new(0), fn_f, ValueId::new(0)],
+                ),
+            ];
+            if extra_store {
+                insts.push(inst("st", Operation::Store, vec![ValueId::new(0x902), vt]));
+            }
+            insts.push(inst_d("l", Operation::Load, vec![vt], vv));
+            insts.push(call("j", "pthread_join", vec![vv, ValueId::new(0)]));
+            module(vec![
+                defined("main", insts),
+                defined("f", vec![]),
+                declared("pthread_create"),
+                declared("pthread_join"),
+            ])
+        };
+        let mut threads: BTreeMap<ThreadId, saf_analysis::mta::ThreadContext> = BTreeMap::new();
+        threads.insert(
+            ThreadId::MAIN,
+            saf_analysis::mta::ThreadContext::main(func_id("main"), "main".to_string()),
+        );
+        let mut t1 = saf_analysis::mta::ThreadContext::main(func_id("f"), "f".to_string());
+        t1.creation_site = Some(inst_id("cr"));
+        threads.insert(ThreadId(1), t1);
+
+        let clean = build(false);
+        let defs = LockResolver::build(&clean).defs;
+        let (handles, _) = build_thread_handles(&clean, &threads, &defs);
+        assert_eq!(handles.get(&1), Some(&vt));
+        assert!(handles_with_foreign_uses(&clean, &threads, &handles, &defs).is_empty());
+
+        let dirty = build(true);
+        let defs = LockResolver::build(&dirty).defs;
+        let (handles, _) = build_thread_handles(&dirty, &threads, &defs);
+        assert!(handles_with_foreign_uses(&dirty, &threads, &handles, &defs).contains(&vt));
+    }
+
+    #[test]
+    fn invoked_at_most_once_counts_thread_call_sites() {
+        // main calls `spawner` once, and so does the thread body `worker`: it runs
+        // twice, so a spawn inside it is NOT single-instance.
+        let main = defined("main", vec![call("c1", "spawner", vec![])]);
+        let worker = defined("worker", vec![call("c2", "spawner", vec![])]);
+        let spawner = defined("spawner", vec![]);
+        let m = module(vec![main, worker, spawner]);
+        let reachable: BTreeSet<FunctionId> =
+            [func_id("main"), func_id("worker"), func_id("spawner")]
+                .into_iter()
+                .collect();
+        let entries: BTreeSet<FunctionId> = [func_id("worker")].into_iter().collect();
+        let once = compute_invoked_at_most_once(&m, func_id("main"), &reachable, &entries);
+        assert!(once.contains(&func_id("main")));
+        assert!(
+            !once.contains(&func_id("spawner")),
+            "called from main AND a thread"
+        );
+        assert!(
+            !once.contains(&func_id("worker")),
+            "a thread entry is never once"
+        );
+    }
+
+    #[test]
+    fn dropped_instructions_block_the_prover() {
+        let mut m = module(vec![defined("main", Vec::new())]);
+        assert!(!race_blocked_by_dropped(&m));
+        m.dropped_intrinsics
+            .insert("llvm.stackrestore.p0".to_string());
+        m.dropped_intrinsics.insert("atomicrmw".to_string());
+        assert!(!race_blocked_by_dropped(&m));
+        assert!(program_is_race_free(&m));
+        m.dropped_intrinsics.insert("inline-asm-memory".to_string());
+        assert!(race_blocked_by_dropped(&m));
+        assert!(!program_is_race_free(&m));
+        let mut m2 = module(vec![defined("main", Vec::new())]);
+        m2.dropped_unknown_opcode = true;
+        assert!(!program_is_race_free(&m2));
+    }
+
+    /// r1 and its race-free twin, end to end. r1: the thread writes through a
+    /// pointer it loaded from `gp`, which holds its `arg` (`&x`); PTA does not link
+    /// `arg` to `&x`, so the pointer's set is empty — it must still conflict with
+    /// `main`'s unprotected `x = 2`. The twin writes a separate global directly.
+    #[test]
+    fn thread_write_through_arg_pointer_is_a_conflict() {
+        let x = ValueId::new(0xa00);
+        let gp = ValueId::new(0xa01);
+        let y = ValueId::new(0xa02);
+        let t = ValueId::new(0xa03);
+        let tv = ValueId::new(0xa04);
+        let arg = ValueId::new(0xa05);
+        let loaded = ValueId::new(0xa06);
+        let fn_f = ValueId::new(func_id("f").raw());
+        let build = |r1: bool| {
+            let main = defined(
+                "main",
+                vec![
+                    inst_d("ma", Operation::Alloca { size_bytes: None }, vec![], t),
+                    call(
+                        "mc",
+                        "pthread_create",
+                        vec![t, ValueId::new(0xa10), fn_f, x],
+                    ),
+                    inst("ms", Operation::Store, vec![ValueId::new(0xa11), x]),
+                    inst_d("ml", Operation::Load, vec![t], tv),
+                    call("mj", "pthread_join", vec![tv, ValueId::new(0xa10)]),
+                ],
+            );
+            let body = if r1 {
+                vec![
+                    inst("fs", Operation::Store, vec![arg, gp]),
+                    inst_d("fl", Operation::Load, vec![gp], loaded),
+                    inst("fw", Operation::Store, vec![ValueId::new(0xa12), loaded]),
+                ]
+            } else {
+                vec![inst("fw", Operation::Store, vec![ValueId::new(0xa12), y])]
+            };
+            let mut f = defined("f", body);
+            f.params.push(saf_core::air::AirParam {
+                id: arg,
+                name: None,
+                index: 0,
+                param_type: None,
+            });
+            let mut m = module(vec![
+                main,
+                f,
+                declared("pthread_create"),
+                declared("pthread_join"),
+            ]);
+            m.globals.push(global(0xa00, 0xb00, "x", None));
+            m.globals.push(global(0xa01, 0xb01, "gp", None));
+            m.globals.push(global(0xa02, 0xb02, "y", None));
+            m.constants.insert(ValueId::new(0xa10), Constant::Null);
+            m.constants
+                .insert(ValueId::new(0xa11), Constant::Int { value: 2, bits: 32 });
+            m.constants
+                .insert(ValueId::new(0xa12), Constant::Int { value: 1, bits: 32 });
+            m.collapsed_globals = Some(BTreeSet::new());
+            m
+        };
+        assert_eq!(race_free_classify(&build(false)), Ok(()), "control proves");
+        assert_eq!(
+            race_free_classify(&build(true)),
+            Err("conflicting-pair-no-common-lock".to_string()),
+            "r1 must abstain"
         );
     }
 }

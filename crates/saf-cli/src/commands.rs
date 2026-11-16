@@ -2291,10 +2291,54 @@ struct VerifyCtx<'a> {
 /// A per-property `propose -> concrete-confirm -> witness` pipeline.
 type StrategyFn = fn(&VerifyCtx) -> VerdictOutcome;
 
+/// `SAF_AUDIT_TRUE_ONLY=1` (soundness audit knob): run only the TRUE arms of
+/// each property and answer `unknown` wherever they abstain. It can only turn
+/// a verdict into `unknown`, so it never adds a verdict; the audit runs every
+/// expected-FALSE task this way, where any `true` is a wrong TRUE.
+fn audit_true_only() -> bool {
+    std::env::var("SAF_AUDIT_TRUE_ONLY").is_ok_and(|v| v == "1")
+}
+
+/// The TRUE arms of `property`, exactly as the strategies call them, with
+/// every FALSE stage left out (see [`audit_true_only`]).
+fn true_arms_only(property: saf_svcomp::Property) -> Option<StrategyFn> {
+    match property {
+        saf_svcomp::Property::UnreachCall => {
+            Some(|ctx| try_unreach_true(ctx).unwrap_or_else(unknown_outcome))
+        }
+        saf_svcomp::Property::NoOverflow => {
+            Some(|ctx| try_overflow_true(ctx).unwrap_or_else(unknown_outcome))
+        }
+        saf_svcomp::Property::ValidMemsafety => {
+            Some(|ctx| memsafety_true_or_unknown(ctx, "saf verify: audit (TRUE arms only)"))
+        }
+        // The termination and race strategies return before their FALSE stages
+        // under the audit knob.
+        saf_svcomp::Property::Termination => Some(termination_strategy),
+        saf_svcomp::Property::NoDataRace => Some(no_data_race_strategy),
+        saf_svcomp::Property::ValidMemcleanup => Some(|ctx| {
+            if try_heap_engine_true(ctx, true) {
+                VerdictOutcome {
+                    verdict: "true".to_string(),
+                    witness: None,
+                    graphml: None,
+                    correctness: None,
+                }
+            } else {
+                unknown_outcome()
+            }
+        }),
+        _ => None,
+    }
+}
+
 /// The verdict-dispatch table (plan 194 extensibility spine). Today only
 /// `unreach-call` is wired; memsafety/overflow/… add an arm here, each with its
 /// own concrete confirmer, reusing the shared orchestration and witness emitter.
 fn strategy_for(property: saf_svcomp::Property) -> Option<StrategyFn> {
+    if audit_true_only() {
+        return true_arms_only(property);
+    }
     match property {
         saf_svcomp::Property::UnreachCall => Some(unreach_strategy),
         saf_svcomp::Property::ValidMemsafety => Some(memsafety_strategy),
@@ -2326,15 +2370,27 @@ fn run_verdict_under_budget(
     budget: std::time::Duration,
 ) -> VerdictOutcome {
     let (tx, rx) = std::sync::mpsc::channel();
-    let _worker = std::thread::spawn(move || {
-        let _ = tx.send(run_verdict(
-            &input,
-            data_model,
-            property,
-            specification,
-            budget,
-        ));
-    });
+    // A 512 MiB stack (reserved, committed only when touched): the prover's
+    // terms grow with every unrolled iteration (a `termination` path keeps one
+    // no-overflow constraint per signed operation), and the recursion over them
+    // in Z3 overflowed the default 2 MiB stack (Ex07.c, 2026-11-15) — an abort
+    // that also cut the full non-termination search after the prover.
+    let spawned = std::thread::Builder::new()
+        .name("saf-verify".into())
+        .stack_size(512 << 20)
+        .spawn(move || {
+            let _ = tx.send(run_verdict(
+                &input,
+                data_model,
+                property,
+                specification,
+                budget,
+            ));
+        });
+    if spawned.is_err() {
+        eprintln!("saf verify: could not start the analysis thread -> unknown");
+        return unknown_outcome();
+    }
     rx.recv_timeout(budget).unwrap_or_else(|_| {
         eprintln!(
             "saf verify: analysis exceeded {}s budget (or worker failed) -> unknown",
@@ -6070,7 +6126,14 @@ fn memsafety_true_or_unknown(ctx: &VerifyCtx, why_no_false: &str) -> VerdictOutc
         eprintln!("{why_no_false}; Anchored-Object: IR re-read failed -> unknown");
         return unknown_outcome();
     };
-    match saf_svcomp::memsafe::prove_memsafe(ctx.module, ctx.fidelity, &escaping) {
+    // The task's data model fixes the `pthread_*` handle sizes the prover checks
+    // admitted externals against; a module laid out for another width abstains.
+    match saf_svcomp::memsafe::prove_memsafe_for_data_model(
+        ctx.module,
+        ctx.fidelity,
+        &escaping,
+        ctx.data_model,
+    ) {
         saf_svcomp::memsafe::MemSafeProof::Proven => {
             eprintln!("{why_no_false}; Anchored-Object proof succeeded -> true");
             VerdictOutcome {
@@ -6103,7 +6166,9 @@ fn memsafety_true_or_engine_false(ctx: &VerifyCtx, why_no_false: &str) -> Verdic
     if out.verdict != "unknown" {
         return out;
     }
-    memsafety_engine_counterexample(ctx).unwrap_or(out)
+    memsafety_engine_counterexample(ctx)
+        .or_else(|| memtrack_engine_counterexample(ctx))
+        .unwrap_or(out)
 }
 
 /// `valid-memsafety` FALSE from the engine (plan 222 §2w): the memory-safety
@@ -6225,6 +6290,170 @@ fn memsafety_cex_search(
     MemsafetyCexSearch::Exhausted
 }
 
+/// `fopen` in the memory-safety counterexample replays (linked with
+/// `-Wl,--wrap=fopen`): a file the task does not provide (`./gpac_12.hex`)
+/// is unknown to the program, so opening it may succeed — when the real open
+/// fails, the stream is `/dev/null` instead, and the pinned `fgetc`/`getc`
+/// reads supply the contents the counterexample chose.
+const FOPEN_FALLBACK: &str = "#include <stdio.h>\n\
+     extern FILE *__real_fopen(const char *, const char *);\n\
+     FILE *__wrap_fopen(const char *p, const char *m) { FILE *f = __real_fopen(p, m); \
+     if (!f) f = __real_fopen(\"/dev/null\", (m && (m[0] == 'w' || m[0] == 'a')) ? \"w\" : \"r\"); return f; }\n";
+
+/// `valid-memtrack` FALSE from the engine: the memcleanup goal's
+/// counterexample search finds a feasible termination with a heap block still
+/// allocated, and the program is replayed natively on the counterexample's
+/// inputs with `LeakSanitizer` ([`lsan_replay_sequence`]). Only a leak
+/// `LeakSanitizer` reports at normal exit, allocated from the task's own
+/// source, confirms it — the same evidence as [`asan_confirm`]'s leak pass,
+/// on the inputs of a path the engine found instead of all-zero nondets. A
+/// candidate that does not reproduce is excluded and the search runs again.
+/// Verdict-only: a `valid-memtrack` witness is not required in 2027.
+fn memtrack_engine_counterexample(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+    let source = std::fs::read_to_string(ctx.input).ok()?;
+    if saf_svcomp::source_has_openmp(&source) {
+        return None;
+    }
+    let callgraph = saf_analysis::callgraph::CallGraph::build(ctx.module);
+    if saf_svcomp::fast_paths::reachable_spawns_threads(ctx.module, &callgraph) {
+        return None;
+    }
+    let recipe = compile_to_ir_memsafety(ctx.input, ctx.data_model, ctx.stub, ctx.tempdir, false)
+        .ok()
+        .flatten();
+    let module = recipe.as_ref().unwrap_or(ctx.module);
+    let mut opts = saf_svcomp::CexOptions {
+        memsafety: true,
+        memcleanup: true,
+        ..saf_svcomp::CexOptions::default()
+    };
+    for attempt in 0..=cex_retries() {
+        let Some(candidate) = engine_false_candidate_in(ctx, module, false, &opts) else {
+            if opts.skip.is_empty() && !opts.depth_first {
+                opts.depth_first = true;
+                continue;
+            }
+            eprintln!("saf verify: no engine memtrack counterexample -> unknown");
+            return None;
+        };
+        match lsan_replay_sequence(ctx, &candidate) {
+            Ok(Some(hit)) => {
+                eprintln!(
+                    "saf verify: engine counterexample leak confirmed by LeakSanitizer (line {}) -> false(valid-memtrack)",
+                    hit.line
+                );
+                return Some(VerdictOutcome {
+                    verdict: saf_svcomp::memsafety_verdict(hit.subproperty),
+                    witness: None,
+                    graphml: None,
+                    correctness: None,
+                });
+            }
+            Ok(None) => eprintln!(
+                "saf verify: engine memtrack counterexample did not replay (attempt {})",
+                attempt + 1
+            ),
+            Err(e) => {
+                eprintln!("saf verify: memtrack counterexample replay errored: {e:#} -> unknown");
+                return None;
+            }
+        }
+        opts.skip.insert(candidate.reach_error_inst);
+    }
+    None
+}
+
+/// Replay an engine counterexample's inputs (pinned nondet reads, no sinks)
+/// under `LeakSanitizer`, `main` wrapped to scrub its dead stack after it
+/// returns ([`LSAN_SCRUB_MAIN`]): the first leak [`saf_svcomp::parse_lsan_report`]
+/// accepts. A run that ends in an `ASan` error, an abort, a false assumption
+/// (`_exit`) or a time-out reports no leak.
+fn lsan_replay_sequence(
+    ctx: &VerifyCtx,
+    candidate: &saf_svcomp::FalseCandidate,
+) -> anyhow::Result<Option<saf_svcomp::AsanHit>> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+    let dir = ctx.tempdir;
+    let driver_src = dir.join("saf_mtcex_driver.c");
+    let harness = dir.join("saf_mtcex_harness");
+    let errpath = dir.join("saf_mtcex_stderr.txt");
+    let mut driver = synthesize_input_defs(candidate);
+    driver.push_str(&rand_wrapper(candidate));
+    driver.push_str(LSAN_SCRUB_MAIN);
+    driver.push_str(FOPEN_FALLBACK);
+    std::fs::write(&driver_src, driver)
+        .with_context(|| "writing memtrack counterexample driver")?;
+    let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
+    let build = |neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(ctx.clang);
+        cmd.args([
+            "-O0",
+            "-g",
+            "-fsanitize=address",
+            "-fno-sanitize-recover=address",
+            "-Wno-everything",
+            "-Wl,--wrap=main",
+            "-Wl,--wrap=fopen",
+        ])
+        .args(replay_wrap_flags())
+        .args(ctx.data_model.clang_flags())
+        .arg("-include")
+        .arg(ctx.stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include").arg(n);
+        }
+        cmd.arg("-I")
+            .arg(srcdir)
+            .arg(ctx.input)
+            .arg(&driver_src)
+            .arg("-lm")
+            .arg("-o")
+            .arg(&harness)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    if !link_replay_harness(&build, &driver_src, dir, "memtrack counterexample replay")? {
+        return Ok(None);
+    }
+    let errfile = std::fs::File::create(&errpath).with_context(|| "creating LSan stderr file")?;
+    let mut cmd = Command::new(&harness);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(errfile))
+        .env("ASAN_OPTIONS", ASAN_OPTS_LEAKS)
+        .env("SAF_SCRUB_STACK", "1");
+    let mut child = harden_replay_spawn(&mut cmd)
+        .spawn()
+        .with_context(|| "spawning memtrack counterexample harness")?;
+    let timeout = memsafety_replay_timeout();
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    kill_replay_group(&mut child);
+                    return Ok(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e).context("waiting on memtrack counterexample harness"),
+        }
+    }
+    let report = std::fs::read_to_string(&errpath).unwrap_or_default();
+    if std::env::var_os("SAF_CEX_DEBUG").is_some() {
+        eprintln!("saf verify: memtrack cex harness stderr:\n{report}");
+    }
+    let task_file = ctx
+        .input
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Ok(saf_svcomp::parse_lsan_report(&report, &task_file))
+}
+
 /// Replay an engine counterexample's inputs under `AddressSanitizer` (the driver
 /// of [`ubsan_replay_sequence`], compiled with `-fsanitize=address`); the trap
 /// is parsed by [`saf_svcomp::parse_asan_report`] (own-code faults with a
@@ -6244,6 +6473,7 @@ fn asan_replay_sequence(
     let mut driver = synthesize_driver(candidate, &sentinel);
     driver.push_str(&rand_wrapper(candidate));
     driver.push_str(&alloc_fail_wrapper(&candidate.alloc_fails));
+    driver.push_str(FOPEN_FALLBACK);
     std::fs::write(&driver_src, driver)
         .with_context(|| "writing memsafety counterexample driver")?;
     let srcdir = ctx.input.parent().unwrap_or_else(|| Path::new("."));
@@ -6257,6 +6487,7 @@ fn asan_replay_sequence(
             "-Wno-everything",
         ])
         .args(replay_wrap_flags())
+        .arg("-Wl,--wrap=fopen")
         .args(alloc_fail_wrap_flags(&candidate.alloc_fails))
         .args(ctx.data_model.clang_flags())
         .arg("-include")
@@ -7163,6 +7394,16 @@ fn asan_confirm(
     Ok(None)
 }
 
+/// The `main` wrapper of the leak-pass harnesses (linked with
+/// `-Wl,--wrap=main`): with `$SAF_SCRUB_STACK` set, the 64 KiB of stack below
+/// `main`'s frame are zeroed once `main` has returned, before the exit-time
+/// leak check (see [`asan_confirm`]'s pass 4).
+const LSAN_SCRUB_MAIN: &str = "#include <stdlib.h>\n\
+     #include <string.h>\n\
+     extern int __real_main(int, char **, char **);\n\
+     __attribute__((noinline)) static void __saf_scrub(void) { volatile char b[1 << 16]; memset((char *)b, 0, sizeof b); }\n\
+     int __wrap_main(int c, char **v, char **e) { int r = __real_main(c, v, e); if (getenv(\"SAF_SCRUB_STACK\")) __saf_scrub(); return r; }\n";
+
 /// The leak pass's harness: the `ASan` replay build of [`asan_confirm`] (driver
 /// [`synthesize_asan_driver`], `rand`/`srand` wrapped) with `main` wrapped too,
 /// so that with `$SAF_SCRUB_STACK` set the 64 KiB of stack below `main`'s frame
@@ -7180,12 +7421,7 @@ fn lsan_scrub_harness(
     let driver_src = dir.join("saf_lsan_driver.c");
     let harness = dir.join("saf_lsan_harness");
     let mut driver = synthesize_asan_driver();
-    driver.push_str(
-        "#include <string.h>\n\
-         extern int __real_main(int, char **, char **);\n\
-         __attribute__((noinline)) static void __saf_scrub(void) { volatile char b[1 << 16]; memset((char *)b, 0, sizeof b); }\n\
-         int __wrap_main(int c, char **v, char **e) { int r = __real_main(c, v, e); if (getenv(\"SAF_SCRUB_STACK\")) __saf_scrub(); return r; }\n",
-    );
+    driver.push_str(LSAN_SCRUB_MAIN);
     std::fs::write(&driver_src, driver).with_context(|| "writing LSan driver")?;
     let srcdir = input.parent().unwrap_or_else(|| Path::new("."));
     let build = |neutralizer: Option<&Path>| {
@@ -8183,8 +8419,13 @@ fn signed_shift_locations(
         saf_svcomp::DataModel::ILP32 => "-m32",
         saf_svcomp::DataModel::LP64 => "-m64",
     };
-    let status = Command::new(clang)
-        .args([
+    // Same two-pass assert-macro fallback as `compile_to_ir_with`: a program
+    // that defines its own `__VERIFIER_assert` function only compiles once the
+    // stub's macro is `#undef`ed (an extra `-include` shifts no line of the
+    // input, so the locations still match the engine's module).
+    let compile = |neutralizer: Option<&Path>| {
+        let mut cmd = Command::new(clang);
+        cmd.args([
             "-S",
             "-emit-llvm",
             "-O0",
@@ -8196,16 +8437,29 @@ fn signed_shift_locations(
             m,
         ])
         .arg("-include")
-        .arg(stub)
-        .arg(input)
-        .arg("-o")
-        .arg(&out)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
+        .arg(stub);
+        if let Some(n) = neutralizer {
+            cmd.arg("-include")
+                .arg(n)
+                .arg("-D__CLANG_MAX_ALIGN_T_DEFINED=1")
+                .arg("-D__DEFINED_max_align_t=1");
+        }
+        if let Some(srcdir) = input.parent() {
+            cmd.arg("-I").arg(srcdir);
+        }
+        cmd.arg(input)
+            .arg("-o")
+            .arg(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if !compile(None) {
+        let neutralizer = write_assert_neutralizer(dir.path()).ok()?;
+        if !compile(Some(&neutralizer)) {
+            return None;
+        }
     }
     let text = std::fs::read_to_string(&out).ok()?;
     // `!dbg !N` of every shift check call.
@@ -8417,6 +8671,11 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     // Path 1: the shared mem2reg-only module (current behavior, preserved as a
     // floor so this arm never regresses an already-emitted `true`).
     let mut proven = saf_svcomp::program_structurally_terminates(ctx.module);
+    // The module whose loops the proof ranked: the witness renders its ranking
+    // functions from the same module (the mem2reg module cannot rank the
+    // memory-backed loops the promoted one proves, and would fall back to a
+    // guard hint).
+    let mut proof_module: Option<saf_core::air::AirModule> = None;
 
     // Path 2 (additive): re-ingest with a richer promotion pipeline that exposes
     // memory-backed loop induction variables (the `alloca()`-library-call families)
@@ -8425,10 +8684,27 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     // the second ingestion falls through to Path 1's verdict.
     if !proven {
         match compile_to_ir_termination(ctx.input, ctx.data_model, ctx.stub, ctx.tempdir) {
-            Ok(promoted) => proven = saf_svcomp::program_structurally_terminates(&promoted),
+            Ok(promoted) => {
+                proven = saf_svcomp::program_structurally_terminates(&promoted);
+                if proven {
+                    proof_module = Some(promoted);
+                }
+            }
             Err(e) => eprintln!(
                 "saf verify: termination promotion re-ingest failed: {e:#} -> using mem2reg module"
             ),
+        }
+    }
+
+    // A short non-termination search first: a lasso the engine finds in seconds
+    // should not wait for the exhaustive TRUE prover's budget to run out. The
+    // FALSE answer is gated exactly as below (concrete recurrence + native run).
+    if !proven && !audit_true_only() {
+        if let Some(outcome) = nontermination_false(
+            ctx,
+            NONTERM_EARLY_BUDGET.min(unreach_prove_budget(ctx.budget)),
+        ) {
+            return outcome;
         }
     }
 
@@ -8452,9 +8728,13 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     }
 
     if !proven {
+        if audit_true_only() {
+            return unknown_outcome();
+        }
         // Neither TRUE arm proved termination: look for a non-terminating
         // execution (TRUE verdicts are untouched by this arm).
-        return nontermination_false(ctx).unwrap_or_else(unknown_outcome);
+        return nontermination_false(ctx, unreach_prove_budget(ctx.budget))
+            .unwrap_or_else(unknown_outcome);
     }
     {
         // SV-COMP 2027 requires a 2.1-or-higher correctness witness for every
@@ -8476,7 +8756,12 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         // as one transition invariant), or a symbol with no C name.
         let correctness = std::fs::read_to_string(ctx.input)
             .ok()
-            .and_then(|src| saf_svcomp::build_termination_witness(ctx.module, &src, ctx.meta))
+            .and_then(|src| {
+                proof_module
+                    .as_ref()
+                    .and_then(|m| saf_svcomp::build_termination_witness(m, &src, ctx.meta))
+                    .or_else(|| saf_svcomp::build_termination_witness(ctx.module, &src, ctx.meta))
+            })
             .unwrap_or_else(|| saf_svcomp::InvariantSetWitness::empty_2_1(ctx.meta));
         VerdictOutcome {
             verdict: saf_svcomp::termination_verdict().to_string(),
@@ -8487,6 +8772,10 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
     }
 }
 
+/// Budget of the early non-termination search that runs before the exhaustive
+/// termination prover (the full search runs after it, on the prover's budget).
+const NONTERM_EARLY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `false(termination)`: the engine's non-termination search
 /// ([`saf_svcomp::find_nontermination`]) finds a loop-header state that recurs
 /// on one feasible, defined path, and a native run of the program on that
@@ -8494,7 +8783,7 @@ fn termination_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
 /// its time is up. Same gates as the engine's TRUE arm (OpenMP, threads,
 /// dropped instructions). The witness is the format-2.1 lasso; without one
 /// (no placeable loop head) the verdict still stands.
-fn nontermination_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
+fn nontermination_false(ctx: &VerifyCtx, budget: std::time::Duration) -> Option<VerdictOutcome> {
     let source = std::fs::read_to_string(ctx.input).ok()?;
     if saf_svcomp::source_has_openmp(&source) {
         return None;
@@ -8505,9 +8794,11 @@ fn nontermination_false(ctx: &VerifyCtx) -> Option<VerdictOutcome> {
     {
         return None;
     }
-    let Some(lasso) = saf_svcomp::find_nontermination(ctx.module, unreach_prove_budget(ctx.budget))
-    else {
-        eprintln!("saf verify: non-termination search found no recurring state -> unknown");
+    let Some(lasso) = saf_svcomp::find_nontermination(ctx.module, budget) else {
+        eprintln!(
+            "saf verify: non-termination search ({} s) found no recurring state",
+            budget.as_secs()
+        );
         return None;
     };
     match nontermination_confirmed(ctx, &lasso) {
@@ -8874,12 +9165,24 @@ const TSAN_OPTS: &str = "halt_on_error=1:abort_on_error=0:exitcode=66";
 /// conflicting access pair can exist — a wrong TRUE (−32) cannot arise from an
 /// over-approximate finding.
 fn no_data_race_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
-    let source = std::fs::read_to_string(ctx.input).unwrap_or_default();
+    // An unreadable or non-UTF-8 source cannot be screened for the out-of-scope
+    // features below — an empty string would pass every text gate — so the TRUE
+    // prover is skipped outright; the FALSE pipeline still runs (it is
+    // replay-confirmed, and sees the same empty text it always did).
+    let source_read = std::fs::read_to_string(ctx.input);
+    let source_screened = match &source_read {
+        Ok(text) => race_true_out_of_scope(text).is_none(),
+        Err(e) => {
+            eprintln!("saf verify: no-data-race source unreadable ({e}); TRUE prover skipped");
+            false
+        }
+    };
+    let source = source_read.unwrap_or_default();
 
     // TRUE prover first (cheap-gated). Gate on the same out-of-scope source
     // features (OpenMP / relaxed-memory) plus inline asm, since those can hide
     // concurrency or memory effects the AIR-level proof would not see (a wrong TRUE).
-    if race_true_out_of_scope(&source).is_none() {
+    if source_screened {
         if saf_svcomp::program_is_race_free(ctx.module) {
             eprintln!("saf verify: no-data-race structurally proven race-free -> true");
             return race_true_outcome();
@@ -8906,6 +9209,9 @@ fn no_data_race_strategy(ctx: &VerifyCtx) -> VerdictOutcome {
         }
     }
 
+    if audit_true_only() {
+        return unknown_outcome();
+    }
     // FALSE pipeline (concrete TSan confirmation).
     if let Some(outcome) = try_no_data_race_false(ctx, &source) {
         return outcome;
@@ -9382,7 +9688,7 @@ fn contains_effectful_inline_asm(source: &str) -> bool {
 /// races; atomic↔plain still races). Only genuinely-unarbitratable features stay
 /// out of scope.
 fn tsan_out_of_scope(source: &str) -> Option<&'static str> {
-    if source.contains("#pragma omp") {
+    if source_mentions_openmp(source) {
         return Some("OpenMP");
     }
     if source.contains("memory_order_relaxed")
@@ -9394,6 +9700,68 @@ fn tsan_out_of_scope(source: &str) -> Option<&'static str> {
         return Some("relaxed-memory atomics");
     }
     None
+}
+
+/// Does `source` contain an `OpenMP` directive in any spelling the preprocessor
+/// accepts? Fail-closed (a false positive only abstains):
+///
+/// - `#` then optional horizontal whitespace (or backslash-newline continuations),
+///   `pragma`, at least one whitespace, `omp` — `#pragma omp`, `# pragma  omp`,
+///   `#\tpragma\tomp`;
+/// - `_Pragma` (or MSVC `__pragma`) whose parenthesised operand mentions `omp`
+///   anywhere — `_Pragma("omp parallel for")`;
+/// - [`saf_svcomp::source_has_openmp`]'s line test, for parity with the other
+///   strategies.
+fn source_mentions_openmp(source: &str) -> bool {
+    if saf_svcomp::source_has_openmp(source) {
+        return true;
+    }
+    let b = source.as_bytes();
+    // Skip spaces, tabs, form feeds, vertical tabs and `\`-newline continuations.
+    let skip_ws = |mut i: usize| -> usize {
+        loop {
+            match b.get(i) {
+                Some(b' ' | b'\t' | 0x0b | 0x0c | b'\r') => i += 1,
+                Some(b'\\') if matches!(b.get(i + 1), Some(b'\n')) => i += 2,
+                Some(b'\\') if b.get(i + 1) == Some(&b'\r') && b.get(i + 2) == Some(&b'\n') => {
+                    i += 3;
+                }
+                _ => return i,
+            }
+        }
+    };
+    for (pos, &c) in b.iter().enumerate() {
+        if c != b'#' {
+            continue;
+        }
+        let i = skip_ws(pos + 1);
+        if !b[i.min(b.len())..].starts_with(b"pragma") {
+            continue;
+        }
+        let after = i + "pragma".len();
+        let j = skip_ws(after);
+        if j > after && b[j.min(b.len())..].starts_with(b"omp") {
+            return true;
+        }
+    }
+    for needle in ["_Pragma", "__pragma"] {
+        let mut from = 0;
+        while let Some(off) = source[from..].find(needle) {
+            let start = from + off + needle.len();
+            // The operand, up to the closing paren (or a bounded window).
+            let tail = &source[start..];
+            let end = tail.find(')').unwrap_or(tail.len()).min(512);
+            let end = (0..=end)
+                .rev()
+                .find(|&k| tail.is_char_boundary(k))
+                .unwrap_or(0);
+            if tail[..end].contains("omp") {
+                return true;
+            }
+            from = start;
+        }
+    }
+    false
 }
 
 /// Collect the full identifiers of every custom whole-function atomic the source
@@ -12017,6 +12385,28 @@ void worker(void) { __VERIFIER_atomic_inc(&g); __VERIFIER_atomic_acquire(); }
             tsan_out_of_scope("atomic_load_explicit(&x, memory_order_acquire)"),
             Some("relaxed-memory atomics")
         );
+    }
+
+    #[test]
+    fn openmp_detection_is_spelling_robust() {
+        for src in [
+            "#pragma omp parallel",
+            "  #  pragma   omp parallel for",
+            "#\tpragma\tomp critical",
+            "# pragma \\\n omp atomic",
+            "_Pragma(\"omp parallel\")",
+            "#define P _Pragma ( \"omp for\" )",
+        ] {
+            assert!(source_mentions_openmp(src), "{src:?}");
+            assert_eq!(tsan_out_of_scope(src), Some("OpenMP"), "{src:?}");
+        }
+        for src in [
+            "int main(void){return 0;}",
+            "#pragma once",
+            "_Pragma(\"GCC diagnostic\")",
+        ] {
+            assert!(!source_mentions_openmp(src), "{src:?}");
+        }
     }
 
     #[test]

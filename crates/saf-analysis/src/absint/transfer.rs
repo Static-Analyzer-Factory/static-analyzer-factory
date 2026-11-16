@@ -100,24 +100,33 @@ pub fn build_constant_map(module: &AirModule) -> BTreeMap<ValueId, Interval> {
     // Convert AIR constants to intervals
     for (value_id, constant) in &module.constants {
         let interval = match constant {
+            // `i1` is canonically `{0, 1}` in this domain (what `icmp` produces);
+            // the frontend sign-extends constants, so `true` arrives as `-1`.
+            Constant::Int { value, bits: 1 } => Interval::singleton(i128::from(*value != 0), 1),
             Constant::Int { value, bits } => Interval::singleton(i128::from(*value), *bits),
             Constant::BigInt { value, bits } => {
                 // Parse the string as i128
                 if let Ok(v) = value.parse::<i128>() {
-                    Interval::singleton(v, *bits)
+                    Interval::singleton(v, *bits).wrap_to_width(*bits)
                 } else {
                     Interval::make_top(*bits)
                 }
             }
-            Constant::Float { .. } => {
+            Constant::Undef | Constant::Float { .. } => {
+                // `undef`/`poison` is ANY value of its type (an uninitialised
+                // local after `mem2reg` reaches a phi as `undef`). Reading it as
+                // 0 is an under-approximation: `int x; return x + 1;` would be
+                // judged `[1, 1]`. Absent from the map = ⊤ for every consumer
+                // (`resolve_operand`, phi resolution).
+                //
                 // Floats are not handled by interval domain — storing them
                 // as truncated integers would produce incorrect results for
                 // float comparisons (FCmpOeq). Float→integer conversion is
                 // handled at FPToSI/FPToUI cast sites in the transfer function.
                 continue;
             }
-            Constant::Null | Constant::Undef | Constant::ZeroInit => {
-                // Null/undef/zero treated as 0 (pointer value)
+            Constant::Null | Constant::ZeroInit => {
+                // Null/zero treated as 0 (pointer value)
                 Interval::singleton(0, DEFAULT_BITS)
             }
             Constant::String { .. }
@@ -254,11 +263,56 @@ pub fn private_allocas(func: &saf_core::air::AirFunction, module: &AirModule) ->
 /// Panics if a singleton GEP target set is empty after a `len() == 1` check (should
 /// never happen), or if `ctx.return_intervals` is `Some` but `ctx.pta` is `None`
 /// (invariant: summaries implies PTA).
+pub fn transfer_instruction_with_context(
+    inst: &Instruction,
+    state: &mut AbstractState,
+    constant_map: &BTreeMap<ValueId, Interval>,
+    module: &AirModule,
+    ctx: &TransferContext<'_>,
+) {
+    transfer_instruction_raw(inst, state, constant_map, module, ctx);
+
+    // WIDTH NORMALISATION (soundness). `Interval` carries no signedness tag, and
+    // several producers label a value with a width that is not its type's (loads,
+    // calls and parameters are `⊤(i64)` whatever their type) or hold it in an
+    // unsigned encoding (a spec interval `[0, 2^32-1]` for a `u32`). The signed
+    // reasoning downstream — `join`'s range clamp, signed refiners, the
+    // no-overflow sentinel — is only sound on the SIGNED encoding at the value's
+    // OWN width; read off that, `0xFFFFFFFF` is `4294967295` where the program
+    // has `-1`, and a reachable `x < 0` edge is declared dead. So every integer
+    // result is wrapped (modularly, which is exact) to its result type's width.
+    let Some(dst) = inst.dst else {
+        return;
+    };
+    let Some(bits) = int_type_bits(module, inst.result_type) else {
+        return;
+    };
+    if state.is_unreachable() {
+        return;
+    }
+    if let Some(val) = state.get_opt(dst) {
+        let normalized = val.wrap_to_width(bits);
+        if &normalized != val {
+            state.set(dst, normalized);
+        }
+    }
+}
+
+/// Bit-width of an integer type, or `None` for a non-integer / unknown type.
+pub(crate) fn int_type_bits(module: &AirModule, ty: Option<TypeId>) -> Option<u8> {
+    match module.types.get(&ty?)? {
+        AirType::Integer { bits } => u8::try_from(*bits).ok().filter(|b| *b > 0),
+        _ => None,
+    }
+}
+
+/// The transfer function proper, before [`transfer_instruction_with_context`]
+/// normalises the produced value to its type's width.
 // NOTE: Transfer function covers all instruction types with context-dependent
 // behavior (Store, Memcpy, Load, Call, GEP, etc.). Splitting by instruction
 // type would fragment the shared PTA/summary dispatch logic.
 #[allow(clippy::too_many_lines)]
-pub fn transfer_instruction_with_context(
+fn transfer_instruction_raw(
     inst: &Instruction,
     state: &mut AbstractState,
     constant_map: &BTreeMap<ValueId, Interval>,
@@ -848,57 +902,8 @@ pub fn transfer_instruction_with_context(
             if inst.operands.len() >= 2 {
                 let lhs = resolve_operand(inst.operands[0], state, constant_map);
                 let rhs = resolve_operand(inst.operands[1], state, constant_map);
-
-                let result = match kind {
-                    BinaryOp::Add => lhs.add(&rhs),
-                    BinaryOp::Sub => lhs.sub(&rhs),
-                    BinaryOp::Mul => lhs.mul(&rhs),
-                    BinaryOp::SDiv => lhs.sdiv(&rhs),
-                    BinaryOp::UDiv => lhs.udiv(&rhs),
-                    BinaryOp::SRem => lhs.srem(&rhs),
-                    BinaryOp::URem => lhs.urem(&rhs),
-                    BinaryOp::Shl => lhs.shl(&rhs),
-                    BinaryOp::LShr => lhs.lshr(&rhs),
-                    BinaryOp::AShr => lhs.ashr(&rhs),
-                    BinaryOp::And => lhs.bitand(&rhs),
-                    BinaryOp::Or => lhs.bitor(&rhs),
-                    BinaryOp::Xor => lhs.bitxor(&rhs),
-
-                    // Comparisons produce i1 (boolean) intervals
-                    BinaryOp::ICmpSlt => lhs.icmp_slt(&rhs),
-                    BinaryOp::ICmpSle => lhs.icmp_sle(&rhs),
-                    BinaryOp::ICmpSgt => lhs.icmp_sgt(&rhs),
-                    BinaryOp::ICmpSge => lhs.icmp_sge(&rhs),
-                    BinaryOp::ICmpEq => lhs.icmp_eq(&rhs),
-                    BinaryOp::ICmpNe => lhs.icmp_ne(&rhs),
-                    BinaryOp::ICmpUlt => lhs.icmp_ult(&rhs),
-                    BinaryOp::ICmpUle => lhs.icmp_ule(&rhs),
-                    BinaryOp::ICmpUgt => lhs.icmp_ugt(&rhs),
-                    BinaryOp::ICmpUge => lhs.icmp_uge(&rhs),
-
-                    // Float operations -> top (we don't track floats)
-                    BinaryOp::FAdd
-                    | BinaryOp::FSub
-                    | BinaryOp::FMul
-                    | BinaryOp::FDiv
-                    | BinaryOp::FRem
-                    | BinaryOp::FCmpOeq
-                    | BinaryOp::FCmpOne
-                    | BinaryOp::FCmpOgt
-                    | BinaryOp::FCmpOge
-                    | BinaryOp::FCmpOlt
-                    | BinaryOp::FCmpOle
-                    | BinaryOp::FCmpUeq
-                    | BinaryOp::FCmpUne
-                    | BinaryOp::FCmpUgt
-                    | BinaryOp::FCmpUge
-                    | BinaryOp::FCmpUlt
-                    | BinaryOp::FCmpUle
-                    | BinaryOp::FCmpOrd
-                    | BinaryOp::FCmpUno
-                    | BinaryOp::FCmpTrue
-                    | BinaryOp::FCmpFalse => Interval::make_top(DEFAULT_BITS),
-                };
+                let width = int_type_bits(module, inst.result_type);
+                let result = transfer_binary(*kind, &lhs, &rhs, width);
                 state.set(dst, result);
             }
         }
@@ -925,6 +930,10 @@ pub fn transfer_instruction_with_context(
                         // `br i1 %cond` provable after `%cond = trunc i8 %v to i1`.
                         if bits == 1 && val.lo() >= 0 && val.hi() <= 1 {
                             Interval::new(val.lo(), val.hi(), 1)
+                        } else if target_bits.is_none() {
+                            // Unknown target width: a guessed width could keep
+                            // bits the truncation drops.
+                            Interval::make_top(DEFAULT_BITS)
                         } else {
                             val.trunc(bits)
                         }
@@ -1022,6 +1031,121 @@ pub fn transfer_instruction_with_context(
         | Operation::Switch { .. }
         | Operation::Ret
         | Operation::Unreachable => {}
+    }
+}
+
+/// Is `kind` an integer comparison (`icmp`)?
+fn is_int_compare(kind: BinaryOp) -> bool {
+    matches!(
+        kind,
+        BinaryOp::ICmpSlt
+            | BinaryOp::ICmpSle
+            | BinaryOp::ICmpSgt
+            | BinaryOp::ICmpSge
+            | BinaryOp::ICmpEq
+            | BinaryOp::ICmpNe
+            | BinaryOp::ICmpUlt
+            | BinaryOp::ICmpUle
+            | BinaryOp::ICmpUgt
+            | BinaryOp::ICmpUge
+    )
+}
+
+/// Is `kind` a SIGNED integer comparison?
+fn is_signed_compare(kind: BinaryOp) -> bool {
+    matches!(
+        kind,
+        BinaryOp::ICmpSlt | BinaryOp::ICmpSle | BinaryOp::ICmpSgt | BinaryOp::ICmpSge
+    )
+}
+
+/// Bring the two operands of an integer comparison into one encoding.
+///
+/// Returns `None` when the comparison cannot be judged on intervals at all: a
+/// SIGNED comparison of `i1` values, whose canonical `{0, 1}` encoding orders
+/// `true` above `false` where the signed `i1` order puts it below.
+///
+/// `i1` is identified by either operand carrying width 1 (both operands of an
+/// `icmp` share one type): its values arrive as `{0, 1}` from comparisons and as
+/// `-1` from sign-extended IR constants, so both are canonicalised to `{0, 1}`.
+/// Same-width operands are wrapped to that width so an unsigned-encoded bound
+/// cannot be compared as a signed one.
+fn compare_operands(
+    kind: BinaryOp,
+    lhs: &Interval,
+    rhs: &Interval,
+) -> Option<(Interval, Interval)> {
+    if lhs.bits() == 1 || rhs.bits() == 1 {
+        if is_signed_compare(kind) {
+            return None;
+        }
+        return Some((lhs.wrap_to_width(1), rhs.wrap_to_width(1)));
+    }
+    if lhs.bits() == rhs.bits() {
+        return Some((lhs.wrap_to_width(lhs.bits()), rhs.wrap_to_width(rhs.bits())));
+    }
+    Some((lhs.clone(), rhs.clone()))
+}
+
+/// Interval transfer of one integer/float binary operation.
+///
+/// `width` is the result type's bit-width (`None` when unknown). With a width,
+/// the operands are first wrapped to it — the operation's semantics are defined
+/// on `width`-bit patterns, and an operand interval may carry another label
+/// (`⊤(i64)` from a load) or an unsigned encoding. Without one, the operations
+/// whose result depends on the width (unsigned division/remainder, logical
+/// shift right, shift left) are `⊤`: a guessed width is how a `u32` above
+/// `INT_MAX` was once read as a small non-negative number.
+fn transfer_binary(kind: BinaryOp, lhs: &Interval, rhs: &Interval, width: Option<u8>) -> Interval {
+    if is_int_compare(kind) {
+        let Some((lhs, rhs)) = compare_operands(kind, lhs, rhs) else {
+            return Interval::new(0, 1, 1);
+        };
+        return match kind {
+            BinaryOp::ICmpSlt => lhs.icmp_slt(&rhs),
+            BinaryOp::ICmpSle => lhs.icmp_sle(&rhs),
+            BinaryOp::ICmpSgt => lhs.icmp_sgt(&rhs),
+            BinaryOp::ICmpSge => lhs.icmp_sge(&rhs),
+            BinaryOp::ICmpEq => lhs.icmp_eq(&rhs),
+            BinaryOp::ICmpNe => lhs.icmp_ne(&rhs),
+            BinaryOp::ICmpUlt => lhs.icmp_ult(&rhs),
+            BinaryOp::ICmpUle => lhs.icmp_ule(&rhs),
+            BinaryOp::ICmpUgt => lhs.icmp_ugt(&rhs),
+            _ => lhs.icmp_uge(&rhs),
+        };
+    }
+    let width_sensitive = matches!(
+        kind,
+        BinaryOp::UDiv | BinaryOp::URem | BinaryOp::Shl | BinaryOp::LShr
+    );
+    if width.is_none() && width_sensitive {
+        return Interval::make_top(DEFAULT_BITS);
+    }
+    let (lhs, rhs) = match width {
+        Some(w) => (lhs.wrap_to_width(w), rhs.wrap_to_width(w)),
+        None => (lhs.clone(), rhs.clone()),
+    };
+    let result = match kind {
+        BinaryOp::Add => lhs.add(&rhs),
+        BinaryOp::Sub => lhs.sub(&rhs),
+        BinaryOp::Mul => lhs.mul(&rhs),
+        BinaryOp::SDiv => lhs.sdiv(&rhs),
+        BinaryOp::SRem => lhs.srem(&rhs),
+        BinaryOp::AShr => lhs.ashr(&rhs),
+        BinaryOp::And => lhs.bitand(&rhs),
+        BinaryOp::Or => lhs.bitor(&rhs),
+        BinaryOp::Xor => lhs.bitxor(&rhs),
+        BinaryOp::UDiv => lhs.udiv(&rhs),
+        BinaryOp::URem => lhs.urem(&rhs),
+        BinaryOp::Shl => lhs.shl(&rhs),
+        BinaryOp::LShr => lhs.lshr(&rhs),
+        // Float operations -> top (we don't track floats); comparisons were
+        // handled above.
+        _ => Interval::make_top(DEFAULT_BITS),
+    };
+    match width {
+        Some(w) => result.wrap_to_width(w),
+        None => result,
     }
 }
 
@@ -1568,6 +1692,14 @@ pub fn refine_branch_condition(
     let rhs_id = cond_inst.operands[1];
     let lhs = resolve_operand(lhs_id, state, constant_map);
     let rhs = resolve_operand(rhs_id, state, constant_map);
+    if !is_int_compare(*kind) {
+        return refined;
+    }
+    // One encoding for both operands (`i1` canonicalised, same-width operands
+    // wrapped); a signed `i1` comparison is not refined at all.
+    let Some((lhs, rhs)) = compare_operands(*kind, &lhs, &rhs) else {
+        return refined;
+    };
 
     // Compute refined intervals for both operands.
     let (lhs_refined, rhs_refined) = match (kind, take_true) {
@@ -1948,8 +2080,12 @@ pub fn seed_global_aggregate_constants(
                         state.store_loc(*loc_id, Interval::singleton(v, *bits));
                     }
                 }
-                Constant::Null | Constant::Undef | Constant::ZeroInit => {
+                Constant::Null | Constant::ZeroInit => {
                     state.store_loc(*loc_id, Interval::singleton(0, DEFAULT_BITS));
+                }
+                // An `undef` element may hold any value: explicit ⊤, never 0.
+                Constant::Undef => {
+                    state.store_loc(*loc_id, Interval::make_top(DEFAULT_BITS));
                 }
                 // Nested aggregates, strings, floats, GlobalRef — not directly useful
                 // for interval tracking. Pointer-valued elements ({&a, &b}) are
@@ -2845,5 +2981,112 @@ mod tests {
         assert!(is_pure_function_with_specs("llvm.dbg.value", None));
         assert!(is_pure_function_with_specs("llvm.sin.f64", None));
         assert!(!is_pure_function_with_specs("unknown_func", None));
+    }
+
+    // =========================================================================
+    // Width / encoding soundness
+    // =========================================================================
+
+    fn module_with_int_types() -> (AirModule, TypeId, TypeId) {
+        let mut module = empty_module();
+        let i32_ty = TypeId::derive(b"integer:32");
+        let i64_ty = TypeId::derive(b"integer:64");
+        module.types.insert(i32_ty, AirType::Integer { bits: 32 });
+        module.types.insert(i64_ty, AirType::Integer { bits: 64 });
+        (module, i32_ty, i64_ty)
+    }
+
+    /// `undef` is any value: it must be absent from the constant map (= ⊤),
+    /// never the singleton 0.
+    #[test]
+    fn undef_constant_is_top_not_zero() {
+        let mut module = empty_module();
+        module
+            .constants
+            .insert(vid(7), saf_core::air::Constant::Undef);
+        let map = build_constant_map(&module);
+        assert!(!map.contains_key(&vid(7)));
+        let state = AbstractState::new();
+        assert!(resolve_operand(vid(7), &state, &map).is_top());
+    }
+
+    /// The IR constant `i1 true` is sign-extended (`-1`); the domain's `i1`
+    /// encoding is `{0, 1}`.
+    #[test]
+    fn bool_true_constant_is_one() {
+        let mut module = empty_module();
+        module
+            .constants
+            .insert(vid(7), saf_core::air::Constant::Int { value: -1, bits: 1 });
+        let map = build_constant_map(&module);
+        assert_eq!(map.get(&vid(7)), Some(&Interval::singleton(1, 1)));
+    }
+
+    /// o1 through the transfer: an `i32` `lshr` whose operand is a placeholder
+    /// `⊤(i64)` (a loaded / returned value) reaches `INT_MAX`.
+    #[test]
+    fn transfer_lshr_uses_result_type_width() {
+        let (module, i32_ty, _) = module_with_int_types();
+        let mut state = AbstractState::new();
+        state.set(vid(1), Interval::make_top(64));
+        state.set(vid(2), Interval::singleton(1, 32));
+        let mut inst = make_binop_inst(100, BinaryOp::LShr, 1, 2, 3);
+        inst.result_type = Some(i32_ty);
+        transfer_instruction(&inst, &mut state, &BTreeMap::new(), &module);
+        let r = state.get(vid(3), 32);
+        assert_eq!(r, Interval::new(0, i128::from(i32::MAX), 32));
+    }
+
+    /// Without a result width, a width-sensitive op cannot be judged.
+    #[test]
+    fn transfer_lshr_without_width_is_top() {
+        let mut state = AbstractState::new();
+        state.set(vid(1), Interval::new(-4, -2, 32));
+        state.set(vid(2), Interval::singleton(1, 32));
+        let inst = make_binop_inst(100, BinaryOp::LShr, 1, 2, 3);
+        transfer_instruction(&inst, &mut state, &BTreeMap::new(), &empty_module());
+        assert!(state.get(vid(3), 64).is_top());
+    }
+
+    /// Every integer result is re-encoded at its type width: an `i32` add of
+    /// `INT_MAX + 1` (wrapping `add`, no `nsw`) is `INT_MIN`, not `2^31`.
+    #[test]
+    fn transfer_result_is_wrapped_to_type_width() {
+        let (module, i32_ty, _) = module_with_int_types();
+        let mut state = AbstractState::new();
+        state.set(vid(1), Interval::singleton(i128::from(i32::MAX), 64));
+        state.set(vid(2), Interval::singleton(1, 64));
+        let mut inst = make_binop_inst(100, BinaryOp::Add, 1, 2, 3);
+        inst.result_type = Some(i32_ty);
+        transfer_instruction(&inst, &mut state, &BTreeMap::new(), &module);
+        let r = state.get(vid(3), 32);
+        assert!(r.hi() <= i128::from(i32::MAX), "signed encoding at i32");
+        assert!(r.contains(i128::from(i32::MIN)));
+    }
+
+    /// `icmp eq i1 %c, true` where `%c = [1,1]` (a comparison result) and `true`
+    /// is the sign-extended `-1`: the TRUE edge is reachable.
+    #[test]
+    fn branch_refinement_bool_eq_mixed_encodings_is_feasible() {
+        let mut state = AbstractState::new();
+        state.set(vid(1), Interval::singleton(1, 1));
+        state.set(vid(2), Interval::singleton(-1, 1));
+        let cond_inst = make_binop_inst(100, BinaryOp::ICmpEq, 1, 2, 3);
+        let refined = refine_branch_condition(&cond_inst, &state, &BTreeMap::new(), true);
+        assert!(!refined.is_unreachable());
+        let other = refine_branch_condition(&cond_inst, &state, &BTreeMap::new(), false);
+        assert!(other.is_unreachable(), "true != true is infeasible");
+    }
+
+    /// An unsigned-encoded bound (`0xFFFFFFFF` held as a large positive) must not
+    /// make `x < 0` look infeasible: at `i32` it is `-1`.
+    #[test]
+    fn branch_refinement_wraps_unsigned_encoded_operand() {
+        let mut state = AbstractState::new();
+        state.set(vid(1), Interval::new(0, i128::from(u32::MAX), 32));
+        state.set(vid(2), Interval::singleton(0, 32));
+        let cond_inst = make_binop_inst(100, BinaryOp::ICmpSlt, 1, 2, 3);
+        let refined = refine_branch_condition(&cond_inst, &state, &BTreeMap::new(), true);
+        assert!(!refined.is_unreachable());
     }
 }

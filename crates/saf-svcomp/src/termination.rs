@@ -18,7 +18,11 @@
 //!   (CLAUDE.md redline #8), and lets R7 avoid pointer analysis entirely;
 //! - **(E)** every reachable *external* callee is **known-terminating**
 //!   ([`is_known_returning_external`]); any non-allowlisted reachable external
-//!   forces abstain (an opaque external may loop / block / not return).
+//!   forces abstain (an opaque external may loop / block / not return);
+//! - **(F)** the frontend dropped nothing that could hide control flow — no
+//!   unknown opcode and no recorded dropped intrinsic / inline asm other than
+//!   `llvm.stackrestore*` (an inline-asm `1: jmp 1b` loops forever while the AIR
+//!   shows straight-line code).
 //!
 //! Finite call depth (A) × finite intra-procedural paths (L) × terminating
 //! externals (E) ⇒ only finite executions ⇒ the program always terminates. A
@@ -134,6 +138,16 @@ pub fn program_structurally_terminates(module: &AirModule) -> bool {
         return false;
     }
 
+    // (F) INGESTION FIDELITY. The proof reads "every loop/recursion in the AIR is
+    // ranked", which is evidence only if the AIR shows all of the program's control
+    // flow. The frontend drops what it cannot model — an inline-asm `1: jmp 1b` is
+    // an infinite loop that leaves straight-line AIR behind — and records it in
+    // `dropped_intrinsics` / `dropped_unknown_opcode`. Abstain on any such drop
+    // except the ones known to carry no control flow.
+    if module_dropped_control_relevant(module) {
+        return false;
+    }
+
     // Scalar-alloca → SSA promotion (a self-contained `mem2reg`) exposes
     // `-O0`-spilled loop counters and recursion parameters as affine SSA state to
     // the ranking synthesizer below. It is semantics-preserving and preserves the
@@ -239,6 +253,20 @@ pub fn program_structurally_terminates(module: &AirModule) -> bool {
             || crate::ranking::recursion_is_ranked(f, module, &cfg);
         loops_ok && recursion_ok
     })
+}
+
+/// Did the frontend drop anything that could hide control flow (a loop, a jump, a
+/// non-returning call)? Mirrors `unreach_prover_blocked_by_dropped` in `saf-cli`:
+/// an unknown opcode always counts, and every recorded dropped intrinsic / inline
+/// asm counts except `llvm.stackrestore*`, which only rewinds the stack pointer.
+/// (Pure-metadata skips such as `llvm.lifetime.*` / `llvm.dbg.*` are never
+/// recorded in `dropped_intrinsics`.) Erring towards `true` costs only recall.
+fn module_dropped_control_relevant(module: &AirModule) -> bool {
+    module.dropped_unknown_opcode
+        || module
+            .dropped_intrinsics
+            .iter()
+            .any(|n| !n.starts_with("llvm.stackrestore"))
 }
 
 /// Classify the reachable call graph's SCCs for termination.
@@ -543,6 +571,36 @@ mod tests {
         assert!(program_structurally_terminates(&module(vec![defined(
             "main"
         )])));
+    }
+
+    #[test]
+    fn dropped_inline_asm_abstains() {
+        // int main(){ __asm__ volatile("1: jmp 1b"); return 0; } — the frontend drops
+        // the asm (recording "inline-asm"), leaving a straight-line `main` that would
+        // otherwise be judged terminating. A wrong TRUE before the (F) gate.
+        let mut m = module(vec![defined("main")]);
+        m.dropped_intrinsics.insert("inline-asm".to_string());
+        assert!(!program_structurally_terminates(&m));
+
+        let mut m = module(vec![defined("main")]);
+        m.dropped_intrinsics.insert("inline-asm-memory".to_string());
+        assert!(!program_structurally_terminates(&m));
+    }
+
+    #[test]
+    fn dropped_unknown_opcode_abstains() {
+        let mut m = module(vec![defined("main")]);
+        m.dropped_unknown_opcode = true;
+        assert!(!program_structurally_terminates(&m));
+    }
+
+    #[test]
+    fn dropped_stackrestore_still_terminates() {
+        // `llvm.stackrestore` only rewinds the stack pointer — no control flow.
+        let mut m = module(vec![defined("main")]);
+        m.dropped_intrinsics
+            .insert("llvm.stackrestore.p0".to_string());
+        assert!(program_structurally_terminates(&m));
     }
 
     #[test]

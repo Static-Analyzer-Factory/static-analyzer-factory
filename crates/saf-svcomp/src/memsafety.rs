@@ -36,6 +36,10 @@ pub struct AsanHit {
     pub line: u32,
     /// 1-based column, if ASan reported one.
     pub column: Option<u32>,
+    /// A `SEGV` from a call into a non-executable address (a function pointer to
+    /// heap memory). The frame-pointer unwinder then skips the calling function,
+    /// so `line`/`column` name its caller's call site, not the faulting call.
+    pub wild_jump: bool,
 }
 
 /// Map an AddressSanitizer error-class phrase (the text after
@@ -91,6 +95,7 @@ pub fn parse_asan_report(stderr: &str) -> Option<AsanHit> {
     // ambiguous bad-free and abstained — never guess a sub-property (a wrong one is
     // −16). Non-SEGV free violations (`double-free`) map via R2 and are unaffected.
     let is_segv = class_line.starts_with("SEGV");
+    let wild_jump = is_segv && stderr[start..].contains("PC is at a non-executable region");
     // An access to a dead stack object (its scope or its function has ended) is
     // no output-helper artifact: the helper's rejection below exists for the
     // string over-read of a buffer without its terminator, which these classes
@@ -126,6 +131,7 @@ pub fn parse_asan_report(stderr: &str) -> Option<AsanHit> {
                 file: basename(&path),
                 line: line_no,
                 column: col,
+                wild_jump,
             });
         }
     }
@@ -166,6 +172,7 @@ pub fn parse_lsan_report(stderr: &str, task_file: &str) -> Option<AsanHit> {
                     file: basename(&path),
                     line: line_no,
                     column: col,
+                    wild_jump: false,
                 });
             }
         }
@@ -601,6 +608,26 @@ AddressSanitizer:DEADLYSIGNAL
     }
 
     #[test]
+    fn wild_jump_segv_is_flagged() {
+        let report = "==73==ERROR: AddressSanitizer: SEGV on unknown address 0x7bfb290e0010 (pc 0x7bfb290e0010 bp 0x7ffe0ecc8c20 sp 0x7ffe0ecc8b08 T0)
+==73==The signal is caused by a READ memory access.
+==73==Hint: PC is at a non-executable region. Maybe a wild jump?
+    #0 0x7bfb290e0010  (<unknown module>)
+    #1 0x5590a0b93d8b in main /w/drv.i:7064:7
+    #2 0x7fdb29dd128a in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x2a28a)
+";
+        let hit = parse_asan_report(report).expect("hit");
+        assert_eq!(hit.subproperty, "valid-deref");
+        assert_eq!(hit.line, 7064);
+        assert!(hit.wild_jump);
+        let plain = report.replace(
+            "Hint: PC is at a non-executable region. Maybe a wild jump?",
+            "",
+        );
+        assert!(!parse_asan_report(&plain).expect("hit").wild_jump);
+    }
+
+    #[test]
     fn verdict_string_is_the_subproperty() {
         assert_eq!(memsafety_verdict("valid-deref"), "false(valid-deref)");
         assert_eq!(memsafety_verdict("valid-free"), "false(valid-free)");
@@ -613,6 +640,7 @@ AddressSanitizer:DEADLYSIGNAL
             file: "oob.c".to_string(),
             line: 5,
             column: Some(12),
+            wild_jump: false,
         };
         let wps = lower_memsafety_hit(&hit);
         assert_eq!(wps.len(), 1);

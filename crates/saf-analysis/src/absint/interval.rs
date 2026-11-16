@@ -18,6 +18,9 @@ pub fn signed_min(bits: u8) -> i128 {
     if bits == 0 {
         return 0;
     }
+    if bits >= 128 {
+        return i128::MIN; // `-(1 << 127)` overflows
+    }
     -(1i128 << (bits - 1))
 }
 
@@ -27,19 +30,10 @@ pub fn signed_max(bits: u8) -> i128 {
     if bits == 0 {
         return 0;
     }
-    (1i128 << (bits - 1)) - 1
-}
-
-/// Maximum value for an unsigned integer of the given bit-width.
-#[must_use]
-pub fn unsigned_max(bits: u8) -> i128 {
-    if bits == 0 {
-        return 0;
-    }
     if bits >= 128 {
-        return i128::MAX; // clamp for safety
+        return i128::MAX;
     }
-    (1i128 << bits) - 1
+    (1i128 << (bits - 1)) - 1
 }
 
 /// A closed interval `[lo, hi]` over fixed-width integers.
@@ -209,6 +203,117 @@ impl Interval {
         !self.bottom && self.lo == 0 && self.hi == 0
     }
 
+    // =========================================================================
+    // Encoding normalisation
+    //
+    // `Interval` carries no signedness tag. The domain's canonical encoding of a
+    // `w`-bit value (w >= 2) is its SIGNED value in `[signed_min(w),
+    // signed_max(w)]`; `i1` is canonically `{0, 1}` (what `icmp` produces). An
+    // interval may still arrive in another encoding — an unsigned bound such as
+    // `0xFFFFFFFF`, or a width label that is not the value's type width — and the
+    // signed reasoning (`join`'s range clamp, the signed refiners, the
+    // no-overflow sentinel) is unsound on those. `wrap_to_width` restores the
+    // canonical encoding EXACTLY (modular arithmetic), never by clamping.
+    // =========================================================================
+
+    /// Truth-value view of an `i1` interval: `(may_be_false, may_be_true)`.
+    ///
+    /// `i1` values reach the domain as `{0, 1}` (comparison results) and as `-1`
+    /// (sign-extended IR constants), so a boolean is read by zero / non-zero,
+    /// never by its raw bounds.
+    fn truth(&self) -> (bool, bool) {
+        if self.bottom {
+            return (false, false);
+        }
+        (self.contains(0), self.lo != 0 || self.hi != 0)
+    }
+
+    /// Canonical `i1`-encoded interval (`{0, 1}` subset) with the given truth values,
+    /// labelled `bits` (callers pass 1, or a target width for `zext`).
+    fn from_truth(may_false: bool, may_true: bool, bits: u8) -> Self {
+        match (may_false, may_true) {
+            (false, false) => Self::make_bottom(bits),
+            (true, false) => Self::singleton(0, bits),
+            (false, true) => Self::singleton(1, bits),
+            (true, true) => Self::new(0, 1, bits),
+        }
+    }
+
+    /// Re-encode this interval as `bits`-bit values in the canonical encoding.
+    ///
+    /// Every bound `v` stands for the bit pattern `v mod 2^bits`; the result is
+    /// the tightest interval over those patterns' SIGNED values (`{0, 1}` truth
+    /// encoding for `bits == 1`). Exact when the patterns form one contiguous
+    /// signed run, otherwise `⊤` — never smaller than the set it represents, so
+    /// it is always sound to apply. Widths outside `1..127` are relabelled only.
+    #[must_use]
+    pub fn wrap_to_width(&self, bits: u8) -> Self {
+        if self.bottom {
+            return Self::make_bottom(bits);
+        }
+        if bits == 1 {
+            let (may_false, may_true) = self.truth();
+            return Self::from_truth(may_false, may_true, 1);
+        }
+        // `1 << 127` does not fit `i128`; such widths are never wrapped.
+        if bits == 0 || bits >= 127 {
+            return Self::new(self.lo, self.hi, bits);
+        }
+        let min = signed_min(bits);
+        let max = signed_max(bits);
+        if self.lo >= min && self.hi <= max {
+            return Self::new(self.lo, self.hi, bits);
+        }
+        let modulus = 1i128 << bits;
+        // `span + 1` values: covering a whole period means every pattern.
+        let covers_all = self
+            .hi
+            .checked_sub(self.lo)
+            .is_none_or(|span| span >= modulus - 1);
+        if covers_all {
+            return Self::make_top(bits);
+        }
+        let wrap = |v: i128| {
+            let r = v.rem_euclid(modulus);
+            if r > max { r - modulus } else { r }
+        };
+        let (lo, hi) = (wrap(self.lo), wrap(self.hi));
+        // Fewer than `2^bits` consecutive values map to one contiguous run iff
+        // the run does not cross the `max -> min` seam, i.e. iff `lo <= hi`.
+        if lo <= hi {
+            Self::new(lo, hi, bits)
+        } else {
+            Self::make_top(bits)
+        }
+    }
+
+    /// The values read as UNSIGNED `self.bits`-bit integers, as `(lo, hi)` within
+    /// `[0, 2^bits - 1]`. A run that holds both negative and non-negative signed
+    /// values covers both ends of the unsigned range, so it reads as the full
+    /// range. `None` for bottom or a width the `i128` encoding cannot hold.
+    fn unsigned_bounds(&self) -> Option<(i128, i128)> {
+        if self.bottom || self.bits == 0 || self.bits >= 127 {
+            return None;
+        }
+        let w = self.wrap_to_width(self.bits);
+        if w.bottom {
+            return None;
+        }
+        let modulus = 1i128 << self.bits;
+        Some(if w.lo >= 0 {
+            (w.lo, w.hi)
+        } else if w.hi < 0 {
+            (w.lo + modulus, w.hi + modulus)
+        } else {
+            (0, modulus - 1)
+        })
+    }
+
+    /// Canonical interval for the unsigned `bits`-bit range `[lo, hi]`.
+    fn from_unsigned_bounds(lo: i128, hi: i128, bits: u8) -> Self {
+        Self::new(lo, hi, bits).wrap_to_width(bits)
+    }
+
     /// Widening with threshold set.
     ///
     /// Instead of jumping to ±∞ when bounds grow, uses the nearest
@@ -222,12 +327,21 @@ impl Interval {
         if other.bottom {
             return self.clone();
         }
+        // `i1` has three raw values; joining terminates without widening, and
+        // the signed bound `max = 0` would drop `true` (= 1).
+        if self.bits == 1 {
+            return self.join(other);
+        }
+        // Range bounds below are only meaningful on the canonical encoding.
+        let this = self.wrap_to_width(self.bits);
+        let other = other.wrap_to_width(self.bits);
+        let (this, other) = (&this, &other);
 
         let min_bound = signed_min(self.bits);
         let max_bound = signed_max(self.bits);
 
-        // Lower bound: if other.lo < self.lo, find largest threshold <= other.lo
-        let new_lo = if other.lo < self.lo {
+        // Lower bound: if other.lo < this.lo, find largest threshold <= other.lo
+        let new_lo = if other.lo < this.lo {
             thresholds
                 .range(..=other.lo)
                 .next_back()
@@ -235,11 +349,11 @@ impl Interval {
                 .unwrap_or(min_bound)
                 .max(min_bound)
         } else {
-            self.lo
+            this.lo
         };
 
-        // Upper bound: if other.hi > self.hi, find smallest threshold >= other.hi
-        let new_hi = if other.hi > self.hi {
+        // Upper bound: if other.hi > this.hi, find smallest threshold >= other.hi
+        let new_hi = if other.hi > this.hi {
             thresholds
                 .range(other.hi..)
                 .next()
@@ -247,7 +361,7 @@ impl Interval {
                 .unwrap_or(max_bound)
                 .min(max_bound)
         } else {
-            self.hi
+            this.hi
         };
 
         Self::new(new_lo, new_hi, self.bits)
@@ -368,28 +482,29 @@ impl Interval {
         self.clamp_or_top(lo, hi)
     }
 
-    /// Unsigned division: treats both operands as unsigned.
+    /// Unsigned division at width `self.bits` (both operands read as UNSIGNED).
+    ///
+    /// A negative bound is a `bits`-bit pattern above the signed maximum
+    /// (`-1` is `0xFFFFFFFF` at 32 bits), so the operands are read through
+    /// [`Self::unsigned_bounds`] — reading `hi.max(0)` instead once bounded
+    /// `0xFFFFFFFF / 2` by `0`. The caller must label `self` with the
+    /// operation's type width.
     #[must_use]
     pub fn udiv(&self, other: &Self) -> Self {
         if self.bottom || other.bottom {
             return Self::make_bottom(self.bits);
         }
+        let (Some((a_lo, a_hi)), Some((d_lo, d_hi))) = (
+            self.unsigned_bounds(),
+            other.wrap_to_width(self.bits).unsigned_bounds(),
+        ) else {
+            return Self::make_top(self.bits);
+        };
         // Division by zero → top
-        if other.lo <= 0 && other.hi >= 0 {
+        if d_lo == 0 {
             return Self::make_top(self.bits);
         }
-        // For unsigned, assume non-negative
-        let lo = if other.hi != 0 {
-            self.lo.max(0) / other.hi.max(1)
-        } else {
-            0
-        };
-        let hi = if other.lo > 0 {
-            self.hi.max(0) / other.lo
-        } else {
-            unsigned_max(self.bits)
-        };
-        self.clamp_or_top(lo, hi)
+        Self::from_unsigned_bounds(a_lo / d_hi, a_hi / d_lo, self.bits)
     }
 
     /// Signed remainder.
@@ -417,144 +532,184 @@ impl Interval {
         Self::new(lo, hi, self.bits)
     }
 
-    /// Unsigned remainder.
+    /// Unsigned remainder at width `self.bits` (both operands read as UNSIGNED).
+    ///
+    /// The divisor bound is its unsigned value, not `|divisor|`: `x %u -2` at 32
+    /// bits divides by `0xFFFFFFFE`, so the remainder reaches `0xFFFFFFFD`.
     #[must_use]
-    #[allow(clippy::cast_possible_wrap)] // max_divisor fits in i128 after range validation
     pub fn urem(&self, other: &Self) -> Self {
         if self.bottom || other.bottom {
             return Self::make_bottom(self.bits);
         }
-        if other.lo <= 0 && other.hi >= 0 {
+        let (Some((a_lo, a_hi)), Some((d_lo, d_hi))) = (
+            self.unsigned_bounds(),
+            other.wrap_to_width(self.bits).unsigned_bounds(),
+        ) else {
+            return Self::make_top(self.bits);
+        };
+        if d_lo == 0 {
             return Self::make_top(self.bits);
         }
-        // Conservative: 0 <= result < |divisor|
-        let max_divisor = cmp::max(other.lo.unsigned_abs(), other.hi.unsigned_abs());
-        Self::new(0, max_divisor as i128 - 1, self.bits)
+        if a_hi < d_lo {
+            // Every dividend is below every divisor: the remainder is the dividend.
+            return Self::from_unsigned_bounds(a_lo, a_hi, self.bits);
+        }
+        Self::from_unsigned_bounds(0, a_hi.min(d_hi - 1), self.bits)
     }
 
-    /// Left shift: `[a, b] << [c, d]`.
+    /// Left shift: `[a, b] << [c, d]` at width `self.bits`.
     ///
-    /// When both operands are non-negative, the result is bounded by
-    /// `unsigned_max(bits)` instead of `signed_max(bits)`. This avoids
-    /// spurious TOP from expressions like `[0, RAND_MAX] << 30` where the
-    /// shifted value exceeds the signed range but is still valid as an
-    /// unsigned value within the bit-width.
+    /// The result is re-encoded with [`Self::wrap_to_width`]: bits shifted past
+    /// the width are discarded, so `[0, 1] << 31` at 32 bits is `{0, INT_MIN}`,
+    /// not `[0, 2^31]`. (An earlier version kept non-negative results up to
+    /// `unsigned_max(bits)`; that unsigned encoding made `x < 0` look infeasible
+    /// for a value that IS negative, and `join` then clamped the large values
+    /// away.)
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // shift validated to [0, bits)
     pub fn shl(&self, shift: &Self) -> Self {
         if self.bottom || shift.bottom {
             return Self::make_bottom(self.bits);
         }
+        // Corner products below need `|v| << s` to fit in `i128`.
+        if self.bits == 0 || self.bits > 64 {
+            return Self::make_top(self.bits);
+        }
+        let this = self.wrap_to_width(self.bits);
+        let shift = shift.wrap_to_width(self.bits);
         let bits = i128::from(self.bits);
-        // Shift amount must be in [0, bits)
+        // Shift amount must be in [0, bits); `i1` shift amounts are `{0, 1}`.
         if shift.lo < 0 || shift.hi >= bits {
             return Self::make_top(self.bits);
         }
+        // INVARIANT: 0 <= shift < bits <= 64, |value| <= 2^63, so no product
+        // exceeds 2^126.
         let lo_shift = shift.lo as u32;
         let hi_shift = shift.hi as u32;
         let products = [
-            self.lo.checked_shl(lo_shift).unwrap_or(0),
-            self.lo.checked_shl(hi_shift).unwrap_or(0),
-            self.hi.checked_shl(lo_shift).unwrap_or(0),
-            self.hi.checked_shl(hi_shift).unwrap_or(0),
+            this.lo << lo_shift,
+            this.lo << hi_shift,
+            this.hi << lo_shift,
+            this.hi << hi_shift,
         ];
         let lo = products.iter().copied().min().unwrap_or(0);
         let hi = products.iter().copied().max().unwrap_or(0);
-
-        // When both operands are non-negative, use unsigned range to avoid
-        // spurious TOP from signed overflow (e.g., [0, RAND_MAX] << 30).
-        if self.lo >= 0 && shift.lo >= 0 {
-            let umax = unsigned_max(self.bits);
-            return Self::new(lo.max(0), hi.min(umax), self.bits);
-        }
-
-        self.clamp_or_top(lo, hi)
+        Self::new(lo, hi, self.bits).wrap_to_width(self.bits)
     }
 
-    /// Logical shift right (unsigned).
+    /// Logical shift right at width `self.bits` (value read as UNSIGNED).
+    ///
+    /// A negative bound is a pattern with the top bit set, i.e. an unsigned value
+    /// above the signed maximum: `0xFFFFFFFF >> 1` is `INT_MAX`. Reading it as
+    /// `max(hi, 0)` once bounded that by `2^30 - 1` and let `x + x` be proven
+    /// overflow-free. The caller must label `self` with the operation's width.
     #[must_use]
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_possible_wrap
-    )] // shift validated to [0, bits), unsigned to signed cast deliberate
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // shift validated to [0, bits)
     pub fn lshr(&self, shift: &Self) -> Self {
         if self.bottom || shift.bottom {
             return Self::make_bottom(self.bits);
         }
-        let bits = i128::from(self.bits);
-        if shift.lo < 0 || shift.hi >= bits {
+        let (Some((a_lo, a_hi)), Some((s_lo, s_hi))) = (
+            self.unsigned_bounds(),
+            shift.wrap_to_width(self.bits).unsigned_bounds(),
+        ) else {
+            return Self::make_top(self.bits);
+        };
+        // A shift amount >= the width is poison.
+        if s_hi >= i128::from(self.bits) {
             return Self::make_top(self.bits);
         }
-        // For logical shift right, treat as unsigned
-        // Conservative: result is in [0, max >> min_shift]
-        let min_shift = shift.lo as u32;
-        let hi = (self.hi.max(0) as u128 >> min_shift) as i128;
-        Self::new(0, hi, self.bits)
+        // INVARIANT: 0 <= s_lo <= s_hi < bits < 127.
+        let lo = a_lo >> (s_hi as u32);
+        let hi = a_hi >> (s_lo as u32);
+        Self::from_unsigned_bounds(lo, hi, self.bits)
     }
 
-    /// Arithmetic shift right (signed).
+    /// Arithmetic shift right (signed) at width `self.bits`.
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // shift validated to [0, bits)
     pub fn ashr(&self, shift: &Self) -> Self {
         if self.bottom || shift.bottom {
             return Self::make_bottom(self.bits);
         }
+        let this = self.wrap_to_width(self.bits);
+        let shift = shift.wrap_to_width(self.bits);
         let bits = i128::from(self.bits);
-        if shift.lo < 0 || shift.hi >= bits {
+        if this.bottom || shift.lo < 0 || shift.hi >= bits || bits >= 128 {
             return Self::make_top(self.bits);
         }
         let lo_shift = shift.lo as u32;
         let hi_shift = shift.hi as u32;
         let results = [
-            self.lo >> lo_shift,
-            self.lo >> hi_shift,
-            self.hi >> lo_shift,
-            self.hi >> hi_shift,
+            this.lo >> lo_shift,
+            this.lo >> hi_shift,
+            this.hi >> lo_shift,
+            this.hi >> hi_shift,
         ];
         let lo = results.iter().copied().min().unwrap_or(0);
         let hi = results.iter().copied().max().unwrap_or(0);
         Self::new(lo, hi, self.bits)
     }
 
-    /// Bitwise AND (conservative).
+    /// Bitwise AND (conservative) at width `self.bits`.
     #[must_use]
     pub fn bitand(&self, other: &Self) -> Self {
         if self.bottom || other.bottom {
             return Self::make_bottom(self.bits);
         }
-        // Conservative: if both non-negative, result in [0, min(hi, other.hi)]
-        if self.lo >= 0 && other.lo >= 0 {
-            let hi = cmp::min(self.hi, other.hi);
-            return Self::new(0, hi, self.bits);
+        if self.bits == 1 {
+            let ((fa, ta), (fb, tb)) = (self.truth(), other.truth());
+            return Self::from_truth(fa || fb, ta && tb, 1);
         }
-        Self::make_top(self.bits)
+        let a = self.wrap_to_width(self.bits);
+        let b = other.wrap_to_width(self.bits);
+        // A non-negative operand has its sign bit clear, and so does the result,
+        // which is also at most that operand.
+        match (a.lo >= 0, b.lo >= 0) {
+            (true, true) => Self::new(0, cmp::min(a.hi, b.hi), self.bits),
+            (true, false) => Self::new(0, a.hi, self.bits),
+            (false, true) => Self::new(0, b.hi, self.bits),
+            (false, false) => Self::make_top(self.bits),
+        }
     }
 
-    /// Bitwise OR (conservative).
+    /// Bitwise OR (conservative) at width `self.bits`.
     #[must_use]
     pub fn bitor(&self, other: &Self) -> Self {
         if self.bottom || other.bottom {
             return Self::make_bottom(self.bits);
         }
-        // Conservative: top for general case
-        if self.lo >= 0 && other.lo >= 0 {
-            // Both non-negative: upper bound approximation
-            let hi = unsigned_max(self.bits).min(self.hi + other.hi);
-            return Self::new(0, hi, self.bits);
+        if self.bits == 1 {
+            let ((fa, ta), (fb, tb)) = (self.truth(), other.truth());
+            return Self::from_truth(fa && fb, ta || tb, 1);
+        }
+        let a = self.wrap_to_width(self.bits);
+        let b = other.wrap_to_width(self.bits);
+        // Both non-negative: the sign bit stays clear and `a | b <= a + b`, so
+        // the result is within the SIGNED range (never `unsigned_max`, which
+        // would put a negative pattern in the unsigned encoding).
+        if a.lo >= 0 && b.lo >= 0 {
+            let hi = signed_max(self.bits).min(a.hi.saturating_add(b.hi));
+            return Self::new(cmp::max(a.lo, b.lo), hi, self.bits);
         }
         Self::make_top(self.bits)
     }
 
-    /// Bitwise XOR (conservative).
+    /// Bitwise XOR (conservative) at width `self.bits`.
     #[must_use]
     pub fn bitxor(&self, other: &Self) -> Self {
         if self.bottom || other.bottom {
             return Self::make_bottom(self.bits);
         }
-        // Conservative approximation
-        if self.lo >= 0 && other.lo >= 0 {
-            let hi = unsigned_max(self.bits).min(self.hi + other.hi);
+        if self.bits == 1 {
+            let ((fa, ta), (fb, tb)) = (self.truth(), other.truth());
+            return Self::from_truth((fa && fb) || (ta && tb), (ta && fb) || (fa && tb), 1);
+        }
+        let a = self.wrap_to_width(self.bits);
+        let b = other.wrap_to_width(self.bits);
+        // Both non-negative: sign bit stays clear and `a ^ b <= a + b`.
+        if a.lo >= 0 && b.lo >= 0 {
+            let hi = signed_max(self.bits).min(a.hi.saturating_add(b.hi));
             return Self::new(0, hi, self.bits);
         }
         Self::make_top(self.bits)
@@ -565,71 +720,82 @@ impl Interval {
     // =========================================================================
 
     /// Zero-extend to a larger bit-width.
+    ///
+    /// `Operation::Cast` carries only the TARGET width, so the source width is
+    /// `self.bits` — trusted only when it is below the target (a `zext` always
+    /// widens; a label `>= target` is a placeholder such as `⊤(i64)` for a
+    /// loaded `i32`) and below 64. With an untrusted label, a non-negative value keeps its
+    /// value and anything else is bounded only by `[0, signed_max(target)]`
+    /// (the source is narrower than the target, so its unsigned range is).
     #[must_use]
     pub fn zext(&self, target_bits: u8) -> Self {
         if self.bottom {
             return Self::make_bottom(target_bits);
         }
-        // Zero-extend: reinterpret the source value as unsigned at the
-        // source bit width, then extend. For example, i8 -1 → u8 255.
-        if self.bits > 0 && self.bits < 128 {
-            let mask = if self.bits >= 64 {
-                i128::MAX // avoid overflow for large bit widths
-            } else {
-                (1i128 << self.bits) - 1
-            };
-            let lo = self.lo & mask;
-            let hi = self.hi & mask;
-            // If the range spans the sign boundary (lo > hi after masking),
-            // the result covers [0, mask] — return top at target bits.
-            if lo > hi {
-                return Self::new(0, mask, target_bits);
-            }
-            Self::new(lo, hi, target_bits)
-        } else {
-            let lo = self.lo.max(0);
-            let hi = self.hi.max(0);
-            Self::new(lo, hi, target_bits)
+        if self.bits == 1 {
+            let (may_false, may_true) = self.truth();
+            return Self::from_truth(may_false, may_true, target_bits);
         }
+        let cap = signed_max(target_bits);
+        // 64 is also the placeholder label of an untyped value (`⊤(i64)` for a
+        // parameter, or an `i32` refined from it), so it is never trusted as
+        // the source width: reading `-1` as `2^64 - 1` where the source is `i32`
+        // would miss the real `2^32 - 1`. Labels below 64 are exact.
+        if self.bits < target_bits && self.bits < 64 {
+            if let Some((lo, hi)) = self.unsigned_bounds() {
+                return Self::new(lo, hi, target_bits).wrap_to_width(target_bits);
+            }
+        }
+        if self.lo >= 0 && self.lo <= cap {
+            return Self::new(self.lo, self.hi.min(cap), target_bits);
+        }
+        Self::new(0, cap, target_bits)
     }
 
     /// Sign-extend to a larger bit-width.
+    ///
+    /// A value in the canonical (signed) encoding keeps its value. An `i1`
+    /// extends `true` to `-1`; a source label below the target is first wrapped
+    /// to it so an unsigned-encoded bound becomes the negative value it is.
     #[must_use]
     pub fn sext(&self, target_bits: u8) -> Self {
         if self.bottom {
             return Self::make_bottom(target_bits);
         }
-        // Sign-extend preserves the value in the larger range
-        Self::new(self.lo, self.hi, target_bits)
+        if self.bits == 1 {
+            let (may_false, may_true) = self.truth();
+            return match (may_false, may_true) {
+                (false, false) => Self::make_bottom(target_bits),
+                (true, false) => Self::singleton(0, target_bits),
+                (false, true) => Self::singleton(-1, target_bits),
+                (true, true) => Self::new(-1, 0, target_bits),
+            };
+        }
+        let src = if self.bits < target_bits {
+            self.wrap_to_width(self.bits)
+        } else {
+            self.clone()
+        };
+        Self::new(src.lo, src.hi, target_bits).wrap_to_width(target_bits)
     }
 
-    /// Truncate to a smaller bit-width (conservative).
+    /// Truncate to a smaller bit-width: the low `target_bits` bits, read as a
+    /// signed value of that width (exact via [`Self::wrap_to_width`]).
     #[must_use]
     pub fn trunc(&self, target_bits: u8) -> Self {
-        if self.bottom {
-            return Self::make_bottom(target_bits);
+        // To `i1` the result is the LOW BIT, not the zero/non-zero reading that
+        // `wrap_to_width(1)` gives an already-boolean value: `trunc 2 to i1` is
+        // 0. Exact for a singleton or a `{0, 1}` subset, else both truth values.
+        if target_bits == 1 && self.bits != 1 && !self.bottom {
+            if self.lo == self.hi {
+                return Self::singleton(self.lo.rem_euclid(2), 1);
+            }
+            if self.lo >= 0 && self.hi <= 1 {
+                return Self::new(self.lo, self.hi, 1);
+            }
+            return Self::new(0, 1, 1);
         }
-        let target_min = signed_min(target_bits);
-        let target_max = signed_max(target_bits);
-        // If the interval fits in the target range, truncation is exact
-        if self.lo >= target_min && self.hi <= target_max {
-            return Self::new(self.lo, self.hi, target_bits);
-        }
-        // Singleton: compute the concrete wrapped value
-        if self.lo == self.hi {
-            let mask = (1i128 << target_bits) - 1;
-            let truncated = self.lo & mask;
-            // Sign-extend from target_bits to i128
-            let sign_bit = 1i128 << (target_bits - 1);
-            let signed_val = if truncated & sign_bit != 0 {
-                truncated | !mask // sign-extend
-            } else {
-                truncated
-            };
-            return Self::singleton(signed_val, target_bits);
-        }
-        // Otherwise conservative: full target range
-        Self::make_top(target_bits)
+        self.wrap_to_width(target_bits)
     }
 
     // =========================================================================
@@ -933,6 +1099,11 @@ impl AbstractDomain for Interval {
         if other.bottom {
             return false; // non-⊥ ⋢ ⊥
         }
+        if self.bits == 1 && other.bits == 1 {
+            // Booleans compare by truth value (`true` may be `1` or `-1`).
+            let ((fa, ta), (fb, tb)) = (self.truth(), other.truth());
+            return (!fa || fb) && (!ta || tb);
+        }
         self.lo >= other.lo && self.hi <= other.hi
     }
 
@@ -943,32 +1114,36 @@ impl AbstractDomain for Interval {
         if other.bottom {
             return self.clone();
         }
-        let lo = cmp::min(self.lo, other.lo);
-        let hi = cmp::max(self.hi, other.hi);
-        // Clamp to self.bits range to prevent bit-width mismatch corruption.
-        // When joining intervals with different bit widths (e.g. [0,0](i32)
-        // with TOP(i64) from resolve_operand fallback), the raw min/max can
-        // produce bounds outside the representable range, creating intervals
-        // like [-2^63, 2^63-1](i32) that is_top() doesn't recognize.
-        let min_bound = signed_min(self.bits);
-        let max_bound = signed_max(self.bits);
-        if lo <= min_bound && hi >= max_bound {
-            Self::make_top(self.bits)
-        } else {
-            Self::new(
-                lo.clamp(min_bound, max_bound),
-                hi.clamp(min_bound, max_bound),
-                self.bits,
-            )
+        if self.bits == 1 {
+            // Truth-value join. The signed `i1` range is `[-1, 0]`, so the old
+            // range clamp turned `[0,0] ⊔ [1,1]` into `[0,0]` and dropped `true`.
+            let ((fa, ta), (fb, tb)) = (self.truth(), other.truth());
+            return Self::from_truth(fa || fb, ta || tb, 1);
         }
+        // Re-encode both sides at `self.bits` first (e.g. `[0,0](i32)` with
+        // `⊤(i64)` from the `resolve_operand` fallback becomes `⊤(i32)`). This
+        // used to CLAMP out-of-range bounds instead, which is unsound: an
+        // unsigned-encoded `0xFFFFFFFF` clamped to `INT_MAX` loses the `-1` the
+        // program holds. Wrapping is exact.
+        let a = self.wrap_to_width(self.bits);
+        let b = other.wrap_to_width(self.bits);
+        let lo = cmp::min(a.lo, b.lo);
+        let hi = cmp::max(a.hi, b.hi);
+        Self::new(lo, hi, self.bits)
     }
 
     fn meet(&self, other: &Self) -> Self {
         if self.bottom || other.bottom {
             return Self::make_bottom(self.bits);
         }
-        let lo = cmp::max(self.lo, other.lo);
-        let hi = cmp::min(self.hi, other.hi);
+        if self.bits == 1 {
+            let ((fa, ta), (fb, tb)) = (self.truth(), other.truth());
+            return Self::from_truth(fa && fb, ta && tb, 1);
+        }
+        let a = self.wrap_to_width(self.bits);
+        let b = other.wrap_to_width(self.bits);
+        let lo = cmp::max(a.lo, b.lo);
+        let hi = cmp::min(a.hi, b.hi);
         if lo > hi {
             Self::make_bottom(self.bits)
         } else {
@@ -983,20 +1158,27 @@ impl AbstractDomain for Interval {
         if other.bottom {
             return self.clone();
         }
+        // `i1` is finite: join terminates, and the signed bound `max = 0` would
+        // drop `true` (= 1).
+        if self.bits == 1 {
+            return self.join(other);
+        }
+        let this = self.wrap_to_width(self.bits);
+        let other = other.wrap_to_width(self.bits);
 
         let min_bound = signed_min(self.bits);
         let max_bound = signed_max(self.bits);
 
         // Standard widening: jump to ±∞ when bounds grow
-        let lo = if other.lo < self.lo {
+        let lo = if other.lo < this.lo {
             min_bound
         } else {
-            self.lo
+            this.lo
         };
-        let hi = if other.hi > self.hi {
+        let hi = if other.hi > this.hi {
             max_bound
         } else {
-            self.hi
+            this.hi
         };
 
         Self::new(lo, hi, self.bits)
@@ -1009,12 +1191,18 @@ impl AbstractDomain for Interval {
         if other.bottom {
             return Self::make_bottom(self.bits);
         }
+        if self.bits == 1 {
+            return self.meet(other);
+        }
+        let this = self.wrap_to_width(self.bits);
+        let other = other.wrap_to_width(self.bits);
+        let (this, other) = (&this, &other);
 
         // Singleton specialization: if `other` is a singleton contained
         // within `self`, narrow directly to the singleton. This helps
         // post-loop assertions like `assert(i == 5)` where the loop
         // exit produces the exact bound value.
-        if other.is_singleton() && other.lo >= self.lo && other.hi <= self.hi {
+        if other.is_singleton() && other.lo >= this.lo && other.hi <= this.hi {
             return other.clone();
         }
 
@@ -1027,15 +1215,15 @@ impl AbstractDomain for Interval {
         // [0, 100] instead of [0, MAX]), preventing further tightening. This
         // generalized version is still monotonically decreasing (we only
         // shrink the interval) so the narrowing sequence converges.
-        let lo = if self.lo == min_bound || other.lo > self.lo {
+        let lo = if this.lo == min_bound || other.lo > this.lo {
             other.lo
         } else {
-            self.lo
+            this.lo
         };
-        let hi = if self.hi == max_bound || other.hi < self.hi {
+        let hi = if this.hi == max_bound || other.hi < this.hi {
             other.hi
         } else {
-            self.hi
+            this.hi
         };
 
         if lo > hi {
@@ -1891,19 +2079,26 @@ mod tests {
     // Bitwise shift improvement tests
     // =========================================================================
 
+    /// CORRECTED (soundness): `[0, 2^31-1] << 30` at 32 bits wraps — `1 << 31` is
+    /// `INT_MIN` — so the result must contain negative values. The old answer
+    /// `[0, unsigned_max(32)]` held them in an unsigned encoding the signed
+    /// refiners misread (`x < 0` became infeasible).
     #[test]
-    fn shl_non_negative_avoids_top() {
-        // [0, 2^31-1] << 30 should NOT be TOP — should be [0, unsigned_max(32)]
+    fn shl_non_negative_overflowing_width_is_top() {
         let a = Interval::new(0, i128::from(i32::MAX), 32);
         let shift = Interval::singleton(30, 32);
         let result = a.shl(&shift);
-        assert!(
-            !result.is_top(),
-            "shl of non-negative values should not return TOP"
-        );
-        assert_eq!(result.lo, 0);
-        // Upper bound should be at most unsigned_max(32)
-        assert!(result.hi <= unsigned_max(32));
+        assert!(result.contains(i128::from(i32::MIN)));
+        assert!(result.hi <= signed_max(32), "canonical (signed) encoding");
+    }
+
+    /// `[0, 1] << 31` at 32 bits is `{0, INT_MIN}`: never above `INT_MAX`.
+    #[test]
+    fn shl_into_sign_bit_is_negative() {
+        let a = Interval::new(0, 1, 32);
+        let result = a.shl(&Interval::singleton(31, 32));
+        assert!(result.contains(i128::from(i32::MIN)));
+        assert!(result.hi <= signed_max(32));
     }
 
     #[test]
@@ -1943,5 +2138,228 @@ mod tests {
         // With negative input, clamp_or_top is used — may be TOP and that's OK
         // Just verify it doesn't panic
         assert_eq!(result.bits, 32);
+    }
+
+    // =========================================================================
+    // Unsigned / encoding soundness (no-overflow wrong-TRUE o1 and its family)
+    // =========================================================================
+
+    /// o1: `unsigned u = (unsigned)nondet_longlong(); int x = (int)(u >> 1);`
+    /// `u` is the full 32-bit range — `⊤(i32)` in the signed encoding — so `x`
+    /// reaches `INT_MAX` and `x + x` overflows. The old `lshr` read `max(hi, 0)`
+    /// and answered `[0, 2^30 - 1]`.
+    #[test]
+    fn lshr_of_full_unsigned_range_reaches_int_max() {
+        let u = Interval::make_top(64).trunc(32);
+        let x = u.lshr(&Interval::singleton(1, 32));
+        assert_eq!(x.lo(), 0);
+        assert_eq!(x.hi(), i128::from(i32::MAX));
+        let (_, sum_hi) = x.add_unwrapped(&x);
+        assert!(sum_hi > signed_max(32), "x + x must be seen to overflow");
+    }
+
+    /// A negative-only interval is a run of large unsigned values.
+    #[test]
+    fn lshr_of_negative_value_is_large_unsigned() {
+        // -2 at 32 bits is 0xFFFFFFFE; >> 1 is 0x7FFFFFFF.
+        let x = Interval::singleton(-2, 32).lshr(&Interval::singleton(1, 32));
+        assert_eq!(x, Interval::singleton(i128::from(i32::MAX), 32));
+    }
+
+    #[test]
+    fn lshr_by_zero_keeps_negative_values() {
+        let x = Interval::new(-5, -1, 32).lshr(&Interval::singleton(0, 32));
+        assert_eq!(x, Interval::new(-5, -1, 32));
+    }
+
+    #[test]
+    fn lshr_non_constant_shift_of_mixed_sign_is_sound() {
+        let x = Interval::new(-1, 1, 32).lshr(&Interval::new(0, 3, 32));
+        // 0xFFFFFFFF >> 0 is -1 again, >> 1 is INT_MAX.
+        assert!(x.contains(-1));
+        assert!(x.contains(i128::from(i32::MAX)));
+    }
+
+    #[test]
+    fn lshr_shift_out_of_width_is_top() {
+        let x = Interval::new(0, 10, 32).lshr(&Interval::singleton(32, 32));
+        assert!(x.is_top());
+    }
+
+    #[test]
+    fn udiv_of_negative_dividend_is_large() {
+        // 0xFFFFFFFF /u 2 = 0x7FFFFFFF. The old code said 0.
+        let q = Interval::singleton(-1, 32).udiv(&Interval::singleton(2, 32));
+        assert_eq!(q, Interval::singleton(i128::from(i32::MAX), 32));
+    }
+
+    #[test]
+    fn udiv_of_mixed_sign_dividend_covers_int_max() {
+        let q = Interval::new(-1, 10, 32).udiv(&Interval::singleton(2, 32));
+        assert!(q.contains(i128::from(i32::MAX)));
+        assert!(q.contains(0));
+    }
+
+    #[test]
+    fn udiv_by_negative_divisor_is_small() {
+        // x /u 0xFFFFFFFE is 0 or 1.
+        let q = Interval::new(0, 100, 32).udiv(&Interval::singleton(-2, 32));
+        assert!(q.contains(0));
+        assert!(q.leq(&Interval::new(0, 1, 32)));
+    }
+
+    #[test]
+    fn urem_by_negative_divisor_keeps_large_remainder() {
+        // 0xFFFFFFFD %u 0xFFFFFFFE = 0xFFFFFFFD (= -3). The old `|divisor|` read
+        // bounded the remainder by 1.
+        let r = Interval::singleton(-3, 32).urem(&Interval::singleton(-2, 32));
+        assert!(r.contains(-3));
+    }
+
+    #[test]
+    fn urem_of_negative_dividend_by_small_divisor() {
+        let r = Interval::new(-10, -1, 32).urem(&Interval::singleton(8, 32));
+        assert_eq!(r, Interval::new(0, 7, 32));
+    }
+
+    #[test]
+    fn urem_dividend_below_divisor_is_identity() {
+        let r = Interval::new(2, 5, 32).urem(&Interval::singleton(8, 32));
+        assert_eq!(r, Interval::new(2, 5, 32));
+    }
+
+    #[test]
+    fn trunc_to_i1_keeps_the_low_bit() {
+        assert_eq!(
+            Interval::singleton(2, 32).trunc(1),
+            Interval::singleton(0, 1)
+        );
+        assert_eq!(
+            Interval::singleton(3, 32).trunc(1),
+            Interval::singleton(1, 1)
+        );
+        assert_eq!(
+            Interval::singleton(-1, 32).trunc(1),
+            Interval::singleton(1, 1)
+        );
+        assert_eq!(Interval::new(1, 2, 32).trunc(1), Interval::new(0, 1, 1));
+        assert_eq!(Interval::new(0, 1, 32).trunc(1), Interval::new(0, 1, 1));
+    }
+
+    #[test]
+    fn wrap_to_width_unsigned_encoding_becomes_negative() {
+        let w = Interval::singleton(i128::from(u32::MAX), 32).wrap_to_width(32);
+        assert_eq!(w, Interval::singleton(-1, 32));
+        let straddle = Interval::new(0, 1i128 << 31, 32).wrap_to_width(32);
+        assert!(straddle.is_top());
+        let high = Interval::new(1i128 << 31, (1i128 << 32) - 1, 32).wrap_to_width(32);
+        assert_eq!(high, Interval::new(i128::from(i32::MIN), -1, 32));
+    }
+
+    #[test]
+    fn wrap_to_width_full_period_is_top() {
+        assert!(Interval::new(0, 255, 8).wrap_to_width(8).is_top());
+        assert_eq!(
+            Interval::new(256, 260, 8).wrap_to_width(8),
+            Interval::new(0, 4, 8)
+        );
+    }
+
+    #[test]
+    fn join_wraps_instead_of_clamping() {
+        // 0xFFFFFFFF held unsigned must join as -1, not be clamped to INT_MAX.
+        let a = Interval::singleton(0, 32);
+        let b = Interval::singleton(i128::from(u32::MAX), 32);
+        let j = a.join(&b);
+        assert!(j.contains(-1));
+        assert!(j.contains(0));
+    }
+
+    /// `[0,0] ⊔ [1,1]` on `i1` used to clamp to `[0,0]` (signed `i1` max is 0),
+    /// dropping `true` — e.g. the phi of `c = a && b`.
+    #[test]
+    fn bool_join_keeps_true() {
+        let f = Interval::singleton(0, 1);
+        let t = Interval::singleton(1, 1);
+        let j = f.join(&t);
+        assert!(j.contains(0) && j.contains(1));
+        let w = f.widen(&t);
+        assert!(w.contains(0) && w.contains(1));
+        // `-1` is the sign-extended IR constant `true`.
+        let n = Interval::singleton(-1, 1);
+        assert!(f.join(&n).contains(1));
+        assert!(t.leq(&n) && n.leq(&t));
+    }
+
+    #[test]
+    fn bool_narrow_does_not_drop_true() {
+        let both = Interval::new(0, 1, 1);
+        let n = both.narrow(&Interval::new(-1, 0, 1));
+        assert!(n.contains(1), "[-1, 0] at i1 is {{true, false}}");
+    }
+
+    #[test]
+    fn bitor_never_produces_unsigned_encoding() {
+        let a = Interval::new(0, 1i128 << 30, 32);
+        let r = a.bitor(&a);
+        assert!(r.hi() <= signed_max(32));
+        // i1 or: {false} | {true} = {true}.
+        let t = Interval::singleton(0, 1).bitor(&Interval::singleton(1, 1));
+        assert_eq!(t, Interval::singleton(1, 1));
+        let x = Interval::singleton(1, 1).bitxor(&Interval::singleton(-1, 1));
+        assert_eq!(x, Interval::singleton(0, 1), "true ^ true = false");
+    }
+
+    #[test]
+    fn bitand_with_non_negative_mask() {
+        let r = Interval::make_top(32).bitand(&Interval::singleton(255, 32));
+        assert_eq!(r, Interval::new(0, 255, 32));
+    }
+
+    #[test]
+    fn zext_negative_uses_source_width() {
+        // zext i8 -1 to i32 = 255.
+        assert_eq!(
+            Interval::singleton(-1, 8).zext(32),
+            Interval::singleton(255, 32)
+        );
+        // zext i32 [-1, 0] to i64 = {0, 0xFFFFFFFF}.
+        let z = Interval::new(-1, 0, 32).zext(64);
+        assert!(z.contains(i128::from(u32::MAX)) && z.contains(0));
+    }
+
+    /// The label is a placeholder (`⊤(i64)` for a loaded `i32`): never mask by
+    /// it. The old code produced `[0, i128::MAX]` tagged with the target.
+    #[test]
+    fn zext_with_untrusted_label_stays_in_target_range() {
+        let z = Interval::new(-5, 3, 64).zext(64);
+        assert!(z.lo() >= 0 && z.hi() <= signed_max(64));
+        assert!(z.contains(3));
+    }
+
+    #[test]
+    fn bool_casts_use_truth_values() {
+        assert_eq!(
+            Interval::singleton(-1, 1).zext(32),
+            Interval::singleton(1, 32)
+        );
+        assert_eq!(
+            Interval::singleton(1, 1).sext(32),
+            Interval::singleton(-1, 32)
+        );
+        let s = Interval::new(0, 1, 1).sext(32);
+        assert!(s.contains(-1) && s.contains(0));
+    }
+
+    #[test]
+    fn trunc_wraps_exactly() {
+        assert_eq!(
+            Interval::singleton(255, 32).trunc(8),
+            Interval::singleton(-1, 8)
+        );
+        assert_eq!(
+            Interval::new(256, 300, 32).trunc(8),
+            Interval::new(0, 44, 8)
+        );
     }
 }

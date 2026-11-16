@@ -203,6 +203,8 @@ pub fn lower_memsafety_candidate(
     let src_lines: Option<Vec<&str>> = source.map(|s| s.lines().collect());
     let src_lines = src_lines.as_deref();
     let mut waypoints = Vec::new();
+    let mut sites = BTreeSet::new();
+    let mut revisits = false;
     for nc in &cand.nondet_sequence {
         if !pins_result(&nc.func_name) {
             continue;
@@ -211,10 +213,32 @@ pub fn lower_memsafety_candidate(
             continue;
         };
         if let Some(wp) = function_return_waypoint(module, id, &nc.func_name, nc.value, src_lines) {
+            revisits |= !sites.insert((wp.line, wp.column));
             waypoints.push(wp);
         }
     }
-    waypoints.extend(crate::memsafety::lower_memsafety_hit(hit));
+    // Validators reject a witness that revisits a read site (a read in a loop,
+    // an allocator model called twice): CPAchecker refutes it, ESBMC reports
+    // TRUE. The target alone was confirmed for 15 of 21 such witnesses, against
+    // 13 with each site's first read and 8 with every read (2026-11-13).
+    if revisits {
+        waypoints.clear();
+    }
+    // A wild-jump SEGV's ASan location is one frame too high (the unwinder skips
+    // the function that made the call); the engine's faulting call is exact.
+    let corrected = hit
+        .wild_jump
+        .then(|| find_inst_span(module, cand.reach_error_inst))
+        .flatten()
+        .map(|(file, line, column)| crate::memsafety::AsanHit {
+            file,
+            line,
+            column: Some(column),
+            ..hit.clone()
+        });
+    waypoints.extend(crate::memsafety::lower_memsafety_hit(
+        corrected.as_ref().unwrap_or(hit),
+    ));
     waypoints
 }
 
@@ -1505,6 +1529,82 @@ mod tests {
             value,
             call_inst: Some(InstId::new(call_inst)),
         }
+    }
+
+    #[test]
+    fn memsafety_witness_constrains_each_read_site_once_and_fixes_a_wild_jump_target() {
+        // main: x = nondet(); (in a loop) ... the faulting call is inst 33 at 7:5.
+        let (main_id, err_id, nd_id) = (FunctionId::new(1), FunctionId::new(2), FunctionId::new(3));
+        let bb0 = BlockId::new(10);
+        let call_iid = InstId::new(33);
+        let nd_iid = 50u128;
+        let mut m = AirModule::new(ModuleId::new(1));
+        m.source_files.push(SourceFile::new(FileId::new(1), "t.c"));
+        m.functions.push(func(
+            main_id,
+            "main",
+            vec![blk(
+                bb0,
+                vec![
+                    nondet_at(nd_iid, nd_id, 5, 11),
+                    err_at(call_iid, err_id, 7, 5),
+                    ret(4),
+                ],
+            )],
+            bb0,
+        ));
+        m.functions.push(decl(err_id, "g"));
+        m.functions.push(decl(nd_id, "__VERIFIER_nondet_int"));
+        let cand = FalseCandidate {
+            reach_error_inst: call_iid,
+            alloc_fails: Vec::new(),
+            block_path: vec![bb0],
+            assignments: BTreeMap::new(),
+            nondet_sequence: vec![
+                nc("__VERIFIER_nondet_int", 68, nd_iid),
+                nc("__VERIFIER_nondet_int", 0, nd_iid),
+            ],
+        };
+        const SRC: &str = "int main(void) {\n  int x;\n  int y;\n  x = 0;\n  int x = __VERIFIER_nondet_int();\n  if (x == 42) {\n    g();\n  }\n}\n";
+        let hit = crate::memsafety::AsanHit {
+            subproperty: "valid-deref",
+            file: "t.c".to_string(),
+            line: 2,
+            column: Some(3),
+            wild_jump: true,
+        };
+        let wps = lower_memsafety_candidate(&m, &cand, &hit, Some(SRC));
+        assert_eq!(
+            wps.len(),
+            1,
+            "a revisited read site leaves the target alone"
+        );
+        assert_eq!(wps[0].kind, WaypointKind::Target);
+        assert_eq!(
+            (wps[0].line, wps[0].column),
+            (7, Some(5)),
+            "engine call, not ASan frame"
+        );
+
+        let once = FalseCandidate {
+            nondet_sequence: vec![nc("__VERIFIER_nondet_int", 68, nd_iid)],
+            ..cand
+        };
+        let plain = crate::memsafety::AsanHit {
+            wild_jump: false,
+            ..hit
+        };
+        let wps = lower_memsafety_candidate(&m, &once, &plain, Some(SRC));
+        assert_eq!(wps.len(), 2, "one function_return + target");
+        assert_eq!(
+            wps[0].constraint.as_ref().map(|c| c.value.as_str()),
+            Some("\\result == 68")
+        );
+        assert_eq!(
+            (wps[1].line, wps[1].column),
+            (2, Some(3)),
+            "ASan location kept"
+        );
     }
 
     #[test]

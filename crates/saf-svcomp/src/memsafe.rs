@@ -328,23 +328,60 @@ fn value_width(module: &AirModule, defs: &BTreeMap<ValueId, TypeId>, v: ValueId)
 /// the pointer that held it, which forwards a value through the dead object
 /// and erases the dangling dereference (`{ int y; p = &y; } *p = 1;` becomes
 /// no access at all).
+///
+/// The target's pointer width — which fixes the sizes of the `pthread_*` handle
+/// objects an admitted external writes (see [`handle_accesses`]) — is read from
+/// `module.target_pointer_width` (the module's own data layout). Prefer
+/// [`prove_memsafe_for_data_model`], which also checks that width against the
+/// task's declared data model.
 #[must_use]
 pub fn prove_memsafe(
     module: &AirModule,
     fidelity: IngestFidelity,
     escaping_locals: &BTreeSet<(String, String)>,
 ) -> MemSafeProof {
-    match memsafe_classify(module, fidelity, escaping_locals) {
+    match memsafe_classify(
+        module,
+        fidelity,
+        escaping_locals,
+        module.target_pointer_width,
+    ) {
         Ok(()) => MemSafeProof::Proven,
         Err(reason) => MemSafeProof::Abstain(reason),
     }
 }
 
+/// [`prove_memsafe`] for a task of the given `data_model`: abstains unless the
+/// module's data layout has that model's pointer width (4 for `ILP32`, 8 for
+/// `LP64`). A module compiled for — or defaulted to — another width would size
+/// every handle object for the wrong ABI, and an over-sized handle check is the
+/// wrong-proof direction.
+#[must_use]
+pub fn prove_memsafe_for_data_model(
+    module: &AirModule,
+    fidelity: IngestFidelity,
+    escaping_locals: &BTreeSet<(String, String)>,
+    data_model: crate::DataModel,
+) -> MemSafeProof {
+    let width = match data_model {
+        crate::DataModel::ILP32 => 4,
+        crate::DataModel::LP64 => 8,
+    };
+    if module.target_pointer_width != width {
+        return MemSafeProof::Abstain("data-model-pointer-width-mismatch".into());
+    }
+    prove_memsafe(module, fidelity, escaping_locals)
+}
+
 /// Core of [`prove_memsafe`]. `Ok(())` = proven, `Err(reason)` = abstain.
+// NOTE: one linear sequence of gates and obligations; splitting it would only
+// scatter the order in which they must run.
+#[allow(clippy::too_many_lines)]
 fn memsafe_classify(
     module: &AirModule,
     fidelity: IngestFidelity,
     escaping_locals: &BTreeSet<(String, String)>,
+    ptr_width: u32,
 ) -> Result<(), String> {
     // (F) INGESTION FIDELITY, first and cheapest. Every obligation below reasons
     //     "the AIR shows no unsafe access", which is evidence only if the AIR is a
@@ -389,7 +426,7 @@ fn memsafe_classify(
     // Measured over the corpus: 96.6% of tasks are rejected before this point by
     // the fidelity/entry gates and obligation 1, and only ~2.5% reach the PTA arm.
     let uni = if crate::fast_paths::reachable_spawns_threads(module, &cg) {
-        let roots = discover_thread_entries(module, &cg);
+        let roots = discover_thread_entries(module, &cg)?;
         // A spawn IS reachable, so a thread body WILL run. If discovery came back
         // empty, `ThreadRoots::Also({})` degenerates to main's tree — and unlike
         // `ThreadRoots::MainOnly`, `universe`'s check 0 does not catch that,
@@ -437,10 +474,10 @@ fn memsafe_classify(
     // Function ADDRESSES, as `mapping.rs` derives them when a function is used as
     // a value. Kept apart from `globals` on purpose: a function address is a legal
     // argument to a thread spawn but is never a legal data pointer.
-    let fn_addrs: BTreeSet<ValueId> = module
+    let fn_addrs: BTreeMap<ValueId, FunctionId> = module
         .functions
         .iter()
-        .map(|f| ValueId::new(f.id.raw()))
+        .map(|f| (ValueId::new(f.id.raw()), f.id))
         .collect();
     // Stack slots, each mapped to its EXACT object size when the frontend could
     // compute one. See `check_access` for what a stack anchor is and is not
@@ -454,7 +491,56 @@ fn memsafe_classify(
         .filter(|i| matches!(i.op, Operation::Alloca { .. }))
         .filter_map(|i| Some((i.dst?, alloca_exact_size(i))))
         .collect();
+    // Object sizes for the HANDLE check of an admitted external (see
+    // `check_external_call`): the data-layout allocation size, which — unlike the
+    // dereference bound above — may count pointers, floats and structs, because it
+    // comes from the module's own data layout rather than a width-blind type walk.
+    // `sizeof(T)` IS the allocation size, so a handle object of at least the
+    // callee's handle size holds the whole write.
+    let handle_sizes: BTreeMap<ValueId, Option<u64>> = module
+        .globals
+        .iter()
+        .map(|g| {
+            let size = g
+                .layout
+                .as_ref()
+                .map(saf_core::air::Layout::size)
+                .or_else(|| {
+                    g.value_type
+                        .and_then(|ty| module.types.get(&ty))
+                        .and_then(|ty| exact_size_of(ty, &module.types))
+                });
+            (g.id, size)
+        })
+        .chain(
+            module
+                .functions
+                .iter()
+                .filter(|f| !f.is_declaration && uni.reachable.contains(&f.id))
+                .flat_map(|f| f.blocks.iter())
+                .flat_map(|b| b.instructions.iter())
+                .filter(|i| matches!(i.op, Operation::Alloca { .. }))
+                .filter_map(|i| {
+                    let size = i
+                        .extensions
+                        .get(saf_core::air::ALLOCA_LAYOUT_SIZE_KEY)
+                        .and_then(serde_json::Value::as_u64)
+                        .or_else(|| alloca_exact_size(i));
+                    Some((i.dst?, size))
+                }),
+        )
+        .collect();
     let defs = result_types(module, &uni.reachable);
+    let scan = Scan {
+        module,
+        globals: &globals,
+        fn_addrs: &fn_addrs,
+        stack_slots: &stack_slots,
+        handle_sizes: &handle_sizes,
+        defs: &defs,
+        reachable: &uni.reachable,
+        ptr_width,
+    };
 
     for func in &module.functions {
         if func.is_declaration || !uni.reachable.contains(&func.id) {
@@ -462,12 +548,32 @@ fn memsafe_classify(
         }
         for block in &func.blocks {
             for inst in &block.instructions {
-                check_instruction(module, &globals, &fn_addrs, &stack_slots, &defs, inst)?;
+                check_instruction(&scan, inst)?;
             }
         }
     }
 
     Ok(())
+}
+
+/// Everything the per-instruction obligations read, built once per proof.
+struct Scan<'a> {
+    module: &'a AirModule,
+    /// Globals → EXACT width-independent size (the dereference bound).
+    globals: &'a BTreeMap<ValueId, Option<u64>>,
+    /// Function addresses (as `mapping.rs` derives them) → the function.
+    fn_addrs: &'a BTreeMap<ValueId, FunctionId>,
+    /// Reachable stack slots → EXACT size (the dereference bound).
+    stack_slots: &'a BTreeMap<ValueId, Option<u64>>,
+    /// Globals and reachable stack slots → data-layout allocation size (the
+    /// handle bound for an admitted external).
+    handle_sizes: &'a BTreeMap<ValueId, Option<u64>>,
+    /// Result type of every reachable instruction.
+    defs: &'a BTreeMap<ValueId, TypeId>,
+    /// The reachable universe.
+    reachable: &'a BTreeSet<FunctionId>,
+    /// Target pointer width in bytes (fixes the `pthread_*` handle sizes).
+    ptr_width: u32,
 }
 
 /// `ValueId` -> the `TypeId` of the instruction that defined it, over the
@@ -492,14 +598,9 @@ fn result_types(module: &AirModule, reachable: &BTreeSet<FunctionId>) -> BTreeMa
 }
 
 /// Obligations 1, 3 and 4, per instruction.
-fn check_instruction(
-    module: &AirModule,
-    globals: &BTreeMap<ValueId, Option<u64>>,
-    fn_addrs: &BTreeSet<ValueId>,
-    stack_slots: &BTreeMap<ValueId, Option<u64>>,
-    defs: &BTreeMap<ValueId, TypeId>,
-    inst: &saf_core::air::Instruction,
-) -> Result<(), String> {
+fn check_instruction(scan: &Scan<'_>, inst: &saf_core::air::Instruction) -> Result<(), String> {
+    let module = scan.module;
+    let (globals, stack_slots, defs) = (scan.globals, scan.stack_slots, scan.defs);
     match &inst.op {
         // --- Obligation 1: nothing is ever HEAP-allocated ----------------------
         // `malloc`/`calloc`/`realloc`/`free` are rejected at the policy; this is
@@ -548,9 +649,7 @@ fn check_instruction(
         // rejects this already; repeated here so the reason is attributed to the
         // instruction rather than to the whole function.
         Operation::CallIndirect { .. } => Err("indirect-call".into()),
-        Operation::CallDirect { callee } => {
-            check_external_call(module, globals, fn_addrs, stack_slots, defs, *callee, inst)
-        }
+        Operation::CallDirect { callee } => check_external_call(scan, *callee, inst),
 
         // Everything else computes values, not addresses. A `Phi`, `Select`,
         // `Copy` or `BinaryOp` result is a fresh `ValueId` and therefore neither a
@@ -612,17 +711,88 @@ fn check_access(
     Ok(())
 }
 
+/// The handle objects an admitted external reads or writes through its pointer
+/// arguments, as `(operand index, bytes accessed)`, for a target with
+/// `ptr_width`-byte pointers (glibc on x86: `ILP32` for 4, `LP64` for 8). `None`
+/// for any other width — no handle size is then known, and every handle-taking
+/// call abstains.
+///
+/// The sizes are the RUNTIME library's, not the program's: `pthread_join` stores a
+/// `void *` through its out-parameter whatever the program declared the slot as,
+/// and `pthread_mutex_lock` touches `sizeof(pthread_mutex_t)` bytes of whatever
+/// object it is handed. A pointer cast that narrows the object is invisible under
+/// opaque pointers, so the object's own size is checked against these.
+///
+/// An admitted external absent from this table dereferences no program pointer
+/// (`pthread_self`, `exit`, `sleep`, …), or only reads the compiler-emitted,
+/// NUL-terminated string literals of the `assert` macro (`__assert_fail`). A null
+/// argument is accepted only where the runtime allows one (an attr, a join
+/// retval); a null required handle abstains (see [`check_external_call`]).
+fn handle_accesses(name: &str, ptr_width: u32) -> Option<Vec<(usize, u64)>> {
+    let lp64 = match ptr_width {
+        4 => false,
+        8 => true,
+        _ => return None,
+    };
+    // `sizeof` per ABI.
+    let abi = |ilp32: u64, lp: u64| if lp64 { lp } else { ilp32 };
+    // `pthread_t`, `thrd_t` (`unsigned long`) and `void *`.
+    let word = abi(4, 8);
+    let mutex = abi(24, 40);
+    let attr = abi(36, 56);
+    let rwlock = abi(32, 56);
+    let barrier = abi(20, 32);
+    let sem = abi(16, 32);
+    // `pthread_cond_t` is 48 bytes on both; every `*attr_t` but the rwlock one
+    // is 4, that one 8; `pthread_spinlock_t` is a `volatile int`.
+    let cond = 48;
+    Some(match name {
+        // pthread_create(pthread_t *, const pthread_attr_t *, start, arg)
+        "pthread_create" => vec![(0, word), (1, attr)],
+        // thrd_create(thrd_t *, start, arg)
+        "thrd_create" => vec![(0, word)],
+        // pthread_join(pthread_t, void **retval) — stores a `void *`.
+        "pthread_join" => vec![(1, word)],
+        // thrd_join(thrd_t, int *res)
+        "thrd_join" => vec![(1, 4)],
+        "pthread_mutex_lock"
+        | "pthread_mutex_unlock"
+        | "pthread_mutex_trylock"
+        | "pthread_mutex_destroy" => vec![(0, mutex)],
+        "pthread_mutex_init" => vec![(0, mutex), (1, 4)],
+        "pthread_rwlock_rdlock"
+        | "pthread_rwlock_wrlock"
+        | "pthread_rwlock_tryrdlock"
+        | "pthread_rwlock_trywrlock"
+        | "pthread_rwlock_unlock"
+        | "pthread_rwlock_destroy" => vec![(0, rwlock)],
+        "pthread_rwlock_init" => vec![(0, rwlock), (1, 8)],
+        "pthread_cond_wait" => vec![(0, cond), (1, mutex)],
+        "pthread_cond_signal" | "pthread_cond_broadcast" | "pthread_cond_destroy" => {
+            vec![(0, cond)]
+        }
+        "pthread_cond_init" => vec![(0, cond), (1, 4)],
+        "pthread_barrier_wait" | "pthread_barrier_destroy" => vec![(0, barrier)],
+        // The count is a scalar.
+        "pthread_barrier_init" => vec![(0, barrier), (1, 4)],
+        "pthread_spin_lock"
+        | "pthread_spin_unlock"
+        | "pthread_spin_init"
+        | "pthread_spin_destroy" => vec![(0, 4)],
+        "sem_wait" | "sem_post" | "sem_trywait" | "sem_init" | "sem_destroy" => vec![(0, sem)],
+        _ => Vec::new(),
+    })
+}
+
 /// Obligation 2: a reachable call must be to an admitted external or a defined
-/// function, and any global it is handed must be anchored.
+/// function, any object it is handed must be anchored, and any object it reads
+/// or writes through must be at least as large as the access.
 fn check_external_call(
-    module: &AirModule,
-    globals: &BTreeMap<ValueId, Option<u64>>,
-    fn_addrs: &BTreeSet<ValueId>,
-    stack_slots: &BTreeMap<ValueId, Option<u64>>,
-    defs: &BTreeMap<ValueId, TypeId>,
+    scan: &Scan<'_>,
     callee: FunctionId,
     inst: &saf_core::air::Instruction,
 ) -> Result<(), String> {
+    let module = scan.module;
     // A callee with no `AirFunction` is an `llvm.*` intrinsic mapped to
     // `External` — `llvm.masked.store.*` among them, which IS a real dereference.
     // A name-based screen fails OPEN on these, so resolve or reject.
@@ -640,7 +810,9 @@ fn check_external_call(
     // The remaining question is the one the allowlist cannot answer: an admitted
     // external like `pthread_mutex_lock` writes through its handle argument, so
     // that argument must name an object, not an address this prover cannot place.
-    // Require every pointer-shaped operand to be a global.
+    // Require every pointer-shaped operand to be a global or a stack slot, and
+    // every operand the callee dereferences to name one at least as large as the
+    // runtime's access.
     //
     // A pointer operand is one that is neither an inline constant nor a value of
     // known non-pointer width — a deliberately coarse test that errs towards
@@ -653,48 +825,68 @@ fn check_external_call(
         // taken for a possible pointer).
         return check_printf_format(module, inst);
     }
+    let accesses = handle_accesses(&f.name, scan.ptr_width)
+        .ok_or_else(|| format!("{}:pointer-width-unknown", f.name))?;
     let spawns = SPAWN_FUNCTIONS.contains(&f.name.as_str());
-    for &arg in &inst.operands {
-        if globals.contains_key(&arg) || stack_slots.contains_key(&arg) {
-            // A GLOBAL or a STACK SLOT. The stack is barred from ANCHORING a
-            // `Load`/`Store` because a local's C scope is absent from the IR, so
-            // an access through one could be a use-after-scope. That objection
-            // does not reach here: the write an admitted primitive performs
-            // happens DURING the call, when the frame holding the slot is
-            // unambiguously live. `pthread_t t; pthread_create(&t, ...);` is the
-            // overwhelmingly common idiom and is safe for exactly that reason.
-            //
-            // Neither case is size-checked, and that is the one obligation this
-            // prover discharges from the source's type discipline rather than
-            // from a layout computation: an admitted primitive writes
-            // `sizeof(handle_type)` bytes, and the argument's declared C type IS
-            // that type unless the program casts. An instruction cast is
-            // rejected and a constant-expression cast sets
-            // `collapsed_const_ptr_expr`; only LLVM 18's no-op pointer-to-pointer
-            // cast is invisible, and it is invisible identically for a global, so
-            // admitting the stack here adds no risk class that admitting globals
-            // did not already carry. Settled empirically: 0 PROVEs over all
-            // 10,087 expected-FALSE `valid-memsafety` tasks.
+    for (idx, &arg) in inst.operands.iter().enumerate() {
+        if matches!(module.constants.get(&arg), Some(Constant::Null)) {
+            // A null OPTIONAL argument (`pthread_create(&t, NULL, w, NULL)`, an
+            // `*_init` attr, a `pthread_join` retval) is not dereferenced. A null
+            // REQUIRED handle (`pthread_mutex_lock(NULL)`, `sem_wait(NULL)`, the
+            // `pthread_create` thread slot, `pthread_cond_wait`'s mutex) is a
+            // dereference of NULL inside the runtime: abstain.
+            let required = idx == 0 || f.name == "pthread_cond_wait";
+            if required && accesses.iter().any(|(i, _)| *i == idx) {
+                return Err(format!("{}:null-handle", f.name));
+            }
             continue;
         }
-        if value_width(module, defs, arg).is_some() {
+        if let Some(&(_, need)) = accesses.iter().find(|(i, _)| *i == idx) {
+            // A HANDLE the callee reads or writes `need` bytes of. It must be a
+            // global or a stack slot (offset 0 by construction: no GEP survives)
+            // whose data-layout size covers the access. `pthread_join(t, &st)`
+            // with `char st` stores a whole `void *` into one byte; with opaque
+            // pointers the `(void **)&st` cast is invisible, so only the object's
+            // own size can tell. Unknown size abstains.
+            //
+            // The stack is barred from ANCHORING a `Load`/`Store` because a
+            // local's C scope is absent from the IR; that objection does not reach
+            // here — the callee's access happens DURING the call, when the frame
+            // holding the slot is unambiguously live.
+            let Some(size) = scan.handle_sizes.get(&arg) else {
+                return Err(format!("{}:handle-unanchored", f.name));
+            };
+            match size {
+                Some(size) if *size >= need => continue,
+                Some(_) => return Err(format!("{}:handle-too-small", f.name)),
+                None => return Err(format!("{}:handle-size-unknown", f.name)),
+            }
+        }
+        if scan.globals.contains_key(&arg) || scan.stack_slots.contains_key(&arg) {
+            // A GLOBAL or a STACK SLOT the callee does NOT dereference (a
+            // `pthread_create` `arg`, a `pthread_exit` value): it is only passed
+            // on, and any later dereference of it is through a parameter or a
+            // loaded pointer, which never anchors.
+            continue;
+        }
+        if value_width(module, scan.defs, arg).is_some() {
             // A scalar of known width: not an address. `pthread_join(t, NULL)`
             // takes its handle BY VALUE, so this is the common case.
             continue;
         }
-        if matches!(module.constants.get(&arg), Some(Constant::Null)) {
-            // A null argument (`pthread_create(&t, NULL, w, NULL)`) is not
-            // dereferenced by any admitted external.
-            continue;
-        }
-        if spawns && fn_addrs.contains(&arg) {
-            // The thread entry handed to `pthread_create`. Admitted ONLY for a
-            // spawn primitive, because there the callee is not dereferenced as
-            // data — it is *called*, and MTA's PTA-driven discovery put its body
-            // into the universe, where it was scanned like any other function.
-            // For any other external a function pointer would be a callback into
-            // code the universe never judged, so it stays rejected.
-            continue;
+        if spawns {
+            if let Some(entry) = scan.fn_addrs.get(&arg) {
+                // The thread entry handed to `pthread_create`. Admitted ONLY for a
+                // spawn primitive, because there the callee is not dereferenced as
+                // data — it is *called* — and ONLY when its body is in the
+                // universe that was scanned. MTA reads `pthread_create`'s routine
+                // from operand 2, so a `thrd_create` routine (operand 1) or any
+                // entry discovery missed would otherwise run unjudged.
+                if scan.reachable.contains(entry) {
+                    continue;
+                }
+                return Err(format!("{}:thread-entry-not-in-universe", f.name));
+            }
         }
         return Err(format!("{}:handle-unanchored", f.name));
     }
@@ -773,16 +965,31 @@ fn check_printf_format(
 /// so a thread body is never missed — only possibly over-analysed, which costs
 /// recall and not soundness. Reached only when
 /// [`crate::fast_paths::reachable_spawns_threads`] says a spawn is reachable.
-fn discover_thread_entries(module: &AirModule, cg: &CallGraph) -> BTreeSet<FunctionId> {
+///
+/// That superset claim needs a CONVERGED points-to solve and a discovery walk
+/// that was not cut at its context-depth cap; either truncation can drop a real
+/// entry, so each abstains (`Err`).
+fn discover_thread_entries(
+    module: &AirModule,
+    cg: &CallGraph,
+) -> Result<BTreeSet<FunctionId>, String> {
     let pta = {
         let mut ctx = PtaContext::new(PtaConfig::default());
         let raw = ctx.analyze(module);
         PtaResult::new(raw.pts, Arc::new(raw.factory), raw.diagnostics)
     };
+    if pta.diagnostics().iteration_limit_hit {
+        return Err("pta-iteration-limit-hit".into());
+    }
     let icfg = Icfg::build(module, cg);
     let mta_config = MtaConfig {
         thread_create_funcs: SPAWN_FUNCTIONS.iter().map(|s| (*s).to_string()).collect(),
         thread_join_funcs: JOIN_FUNCTIONS.iter().map(|s| (*s).to_string()).collect(),
+        // Discovery is bounded by its (thread, function, call site) visited set,
+        // not by this cap; the cap only truncates, and a truncated discovery now
+        // abstains (`context_depth_limit_hit`). The default 10 is shallower than
+        // many drivers' call depth, so raise it to keep those provable.
+        max_context_depth: crate::race_true::MTA_MAX_CONTEXT_DEPTH,
         ..MtaConfig::default()
     };
     let mta = MtaAnalysis::with_pta(
@@ -794,9 +1001,188 @@ fn discover_thread_entries(module: &AirModule, cg: &CallGraph) -> BTreeSet<Funct
         pta.location_factory(),
     )
     .analyze();
-    mta.thread_graph
+    if mta.thread_graph.context_depth_limit_hit {
+        return Err("mta-context-depth-limit-hit".into());
+    }
+    Ok(mta
+        .thread_graph
         .threads
         .values()
         .map(|t| t.entry_function)
-        .collect()
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use saf_core::air::{AirFunction, Instruction};
+    use saf_core::id::make_id;
+    use saf_core::ids::{InstId, ModuleId};
+
+    fn fid(name: &str) -> FunctionId {
+        FunctionId(make_id("func", name.as_bytes()))
+    }
+
+    fn declared(name: &str) -> AirFunction {
+        let mut f = AirFunction::new(fid(name), name);
+        f.is_declaration = true;
+        f
+    }
+
+    fn call(callee: &str, operands: Vec<ValueId>) -> Instruction {
+        Instruction::new(
+            InstId(make_id("inst", callee.as_bytes())),
+            Operation::CallDirect {
+                callee: fid(callee),
+            },
+        )
+        .with_operands(operands)
+    }
+
+    /// Runs `check_external_call` for `inst` against one stack slot `slot` whose
+    /// data-layout size is `slot_size`, with `entry` the only reachable function.
+    fn check(
+        inst: &Instruction,
+        slot: ValueId,
+        slot_size: u64,
+        ptr_width: u32,
+    ) -> Result<(), String> {
+        let mut module = AirModule::new(ModuleId(make_id("module", b"memsafe_test")));
+        for name in [
+            "pthread_join",
+            "pthread_create",
+            "pthread_mutex_lock",
+            "pthread_mutex_init",
+            "entry",
+            "other",
+        ] {
+            let mut f = declared(name);
+            f.is_declaration = !matches!(name, "entry" | "other");
+            module.functions.push(f);
+        }
+        module
+            .constants
+            .insert(ValueId::new(0x10), Constant::Int { value: 1, bits: 64 });
+        module.constants.insert(ValueId::new(0x11), Constant::Null);
+        let globals = BTreeMap::new();
+        let fn_addrs: BTreeMap<ValueId, FunctionId> = ["entry", "other"]
+            .iter()
+            .map(|n| (ValueId::new(fid(n).raw()), fid(n)))
+            .collect();
+        let stack_slots: BTreeMap<ValueId, Option<u64>> = [(slot, Some(slot_size))].into();
+        let handle_sizes = stack_slots.clone();
+        let defs = BTreeMap::new();
+        let reachable: BTreeSet<FunctionId> = [fid("entry")].into();
+        let scan = Scan {
+            module: &module,
+            globals: &globals,
+            fn_addrs: &fn_addrs,
+            stack_slots: &stack_slots,
+            handle_sizes: &handle_sizes,
+            defs: &defs,
+            reachable: &reachable,
+            ptr_width,
+        };
+        let Operation::CallDirect { callee } = inst.op else {
+            return Err("not a call".into());
+        };
+        check_external_call(&scan, callee, inst)
+    }
+
+    /// m1: `char st; pthread_join(t, (void **)&st)` — the join stores a whole
+    /// `void *` into a one-byte slot.
+    #[test]
+    fn join_retval_into_a_too_small_slot_abstains() {
+        let st = ValueId::new(0x20);
+        let join = call("pthread_join", vec![ValueId::new(0x10), st]);
+        assert_eq!(
+            check(&join, st, 1, 4),
+            Err("pthread_join:handle-too-small".to_string())
+        );
+        assert_eq!(
+            check(&join, st, 4, 8),
+            Err("pthread_join:handle-too-small".to_string()),
+            "a 4-byte slot is too small on LP64"
+        );
+        assert_eq!(check(&join, st, 4, 4), Ok(()));
+        assert_eq!(check(&join, st, 8, 8), Ok(()));
+        // `pthread_join(t, NULL)` dereferences nothing.
+        let join_null = call("pthread_join", vec![ValueId::new(0x10), ValueId::new(0x11)]);
+        assert_eq!(check(&join_null, st, 1, 4), Ok(()));
+        // An unknown pointer width abstains.
+        assert!(check(&join, st, 8, 2).is_err());
+    }
+
+    /// `pthread_mutex_lock(NULL)` / `pthread_create(NULL, …)` dereference NULL
+    /// inside the runtime (`valid-deref`); an optional null attr does not.
+    #[test]
+    fn null_required_handle_abstains() {
+        let null = ValueId::new(0x11);
+        let lock = call("pthread_mutex_lock", vec![null]);
+        assert_eq!(
+            check(&lock, ValueId::new(0x30), 40, 8),
+            Err("pthread_mutex_lock:null-handle".to_string())
+        );
+        let m = ValueId::new(0x30);
+        let init = call("pthread_mutex_init", vec![m, null]);
+        assert_eq!(check(&init, m, 40, 8), Ok(()));
+    }
+
+    #[test]
+    fn mutex_handle_must_cover_the_runtime_mutex() {
+        let m = ValueId::new(0x30);
+        let lock = call("pthread_mutex_lock", vec![m]);
+        assert_eq!(check(&lock, m, 24, 4), Ok(()));
+        assert!(check(&lock, m, 24, 8).is_err(), "24 bytes < LP64 mutex");
+        assert!(check(&lock, m, 4, 4).is_err());
+        // An address that is neither a global nor a slot is unanchored.
+        let lock_unknown = call("pthread_mutex_lock", vec![ValueId::new(0x31)]);
+        assert_eq!(
+            check(&lock_unknown, m, 40, 8),
+            Err("pthread_mutex_lock:handle-unanchored".to_string())
+        );
+    }
+
+    /// M2: the thread entry handed to `pthread_create` must be in the scanned
+    /// universe.
+    #[test]
+    fn spawn_entry_must_be_reachable() {
+        let t = ValueId::new(0x40);
+        let null = ValueId::new(0x11);
+        let ok = call(
+            "pthread_create",
+            vec![t, null, ValueId::new(fid("entry").raw()), null],
+        );
+        assert_eq!(check(&ok, t, 4, 4), Ok(()));
+        let unscanned = call(
+            "pthread_create",
+            vec![t, null, ValueId::new(fid("other").raw()), null],
+        );
+        assert_eq!(
+            check(&unscanned, t, 4, 4),
+            Err("pthread_create:thread-entry-not-in-universe".to_string())
+        );
+        // The handle itself is size-checked too.
+        assert_eq!(
+            check(&ok, t, 4, 8),
+            Err("pthread_create:handle-too-small".to_string())
+        );
+    }
+
+    #[test]
+    fn data_model_width_mismatch_abstains() {
+        let mut module = AirModule::new(ModuleId(make_id("module", b"memsafe_dm")));
+        module.target_pointer_width = 8;
+        let proof = prove_memsafe_for_data_model(
+            &module,
+            IngestFidelity::default(),
+            &BTreeSet::new(),
+            crate::DataModel::ILP32,
+        );
+        assert_eq!(
+            proof,
+            MemSafeProof::Abstain("data-model-pointer-width-mismatch".into())
+        );
+    }
 }

@@ -1297,7 +1297,20 @@ fn convert_instruction(
                         // module. A bare barrier (`"" ::: "memory"`) writes
                         // nothing.
                         let constraints = inline_asm_constraints(val_ref);
+                        // `None` = template unavailable ⇒ treated as non-empty.
                         let asm_text = inline_asm_text(val_ref);
+                        let asm_nonempty = asm_text.as_deref().is_none_or(|t| !t.trim().is_empty());
+                        // Control flow inside the asm vanishes too: `1: jmp 1b`
+                        // never returns, yet the AIR shows straight-line code.
+                        // Record every asm that carries instructions so
+                        // whole-program provers (termination, unreachability)
+                        // can abstain. An empty template (`asm("" ::: "memory")`,
+                        // a compiler barrier) executes nothing and stays silent.
+                        // (`fidelity.dropped_instruction` is about lost MEMORY
+                        // effects and stays reserved for the case below.)
+                        if asm_nonempty {
+                            ctx.dropped_intrinsic_names.insert("inline-asm".to_string());
+                        }
                         let has_ptr_arg = (0..num_operands - 1).any(|k| {
                             inst.get_operand(k)
                                 .and_then(operand_as_value)
@@ -1307,8 +1320,7 @@ fn convert_instruction(
                         // global by name (`movl $1, g(%rip)`); only the empty
                         // barrier is known to write nothing.
                         if constraints.contains('*')
-                            || (constraints.contains("~{memory}")
-                                && (has_ptr_arg || !asm_text.trim().is_empty()))
+                            || (constraints.contains("~{memory}") && (has_ptr_arg || asm_nonempty))
                         {
                             ctx.fidelity.dropped_instruction = true;
                             ctx.dropped_intrinsic_names
@@ -2083,17 +2095,18 @@ fn convert_phi_instruction(
     Ok((Operation::Phi { incoming }, vec![], true))
 }
 
-/// The assembly text of an inline-asm callee (`""` when unavailable).
-fn inline_asm_text(asm: inkwell::llvm_sys::prelude::LLVMValueRef) -> String {
+/// The assembly text of an inline-asm callee (`None` when unavailable — callers
+/// must then assume it executes instructions).
+fn inline_asm_text(asm: inkwell::llvm_sys::prelude::LLVMValueRef) -> Option<String> {
     let mut len: usize = 0;
     // SAFETY: as in `inline_asm_constraints`.
     unsafe {
         let p = inkwell::llvm_sys::core::LLVMGetInlineAsmAsmString(asm, &raw mut len);
         if p.is_null() {
-            return String::new();
+            return None;
         }
         let bytes = std::slice::from_raw_parts(p.cast::<u8>(), len);
-        String::from_utf8_lossy(bytes).into_owned()
+        Some(String::from_utf8_lossy(bytes).into_owned())
     }
 }
 

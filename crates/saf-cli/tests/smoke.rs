@@ -916,6 +916,40 @@ fn verify_overflow_witness(
         .success()
 }
 
+/// Signed arithmetic only before an unbounded unsigned loop: paths inside the
+/// loop can reach no overflow check and end as safe -> `true`.
+#[test]
+#[ignore]
+fn verify_overflow_goal_free_loop_is_true() {
+    verify_overflow("overflow_true_goal_free_loop.c", "ILP32").stdout("true\n");
+}
+
+/// A signed overflow after a check-free loop (in `main`, or in the caller of
+/// a function holding the loop) is still reached -> never `true`.
+#[test]
+#[ignore]
+fn verify_overflow_after_goal_free_loop_is_not_true() {
+    for fx in [
+        "overflow_false_after_loop.c",
+        "overflow_false_after_callee_loop.c",
+    ] {
+        cargo_bin_cmd!("saf")
+            .env("SAF_AUDIT_TRUE_ONLY", "1")
+            .env("SAF_UNREACH_PROVE_BUDGET_S", "30")
+            .args([
+                "verify",
+                "--property",
+                overflow_prp().as_str(),
+                "--data-model",
+                "ILP32",
+                svcomp_fixture(fx).as_str(),
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::starts_with("true").not());
+    }
+}
+
 /// Threads that each bump a shared counter once, outside any loop: the
 /// interleaving-independent prover bounds the counter by its increments ->
 /// `true`.
@@ -1171,7 +1205,8 @@ fn verify_termination(fixture: &str, data_model: &str) -> assert_cmd::assert::As
 }
 
 /// A loop-header state that recurs (`x == -2` forever) => `false(termination)`,
-/// with a format-2.1 lasso witness (a `follow` then a `cycle` assumption).
+/// with a format-2.1 lasso witness: a `follow` then a `cycle` segment of
+/// branching waypoints (the lasso style `CPAchecker` confirms).
 #[test]
 #[ignore]
 fn verify_termination_recurrent_state_is_false_with_lasso_witness() {
@@ -1195,8 +1230,9 @@ fn verify_termination_recurrent_state_is_false_with_lasso_witness() {
         .stdout("false(termination)\n");
     let yaml = std::fs::read_to_string(&w).expect("lasso witness written");
     assert!(yaml.contains("format_version: '2.1'") || yaml.contains("format_version: \"2.1\""));
+    assert!(yaml.contains("action: follow"));
     assert!(yaml.contains("action: cycle"));
-    assert!(yaml.contains("x == -2"));
+    assert!(yaml.contains("type: branching"));
 }
 
 /// A countdown loop terminates on every input: never `false`.
@@ -1219,6 +1255,52 @@ fn verify_termination_straightline_is_true() {
 #[ignore]
 fn verify_termination_straightline_ilp32_is_true() {
     verify_termination("termination_true_straightline.c", "ILP32").stdout("true\n");
+}
+
+/// An unsigned counter loop whose bound is a constant-operand `sub` recomputed in
+/// the loop header (`m - 1`, `m = 0xffffffff`) is ranked => `true`.
+#[test]
+#[ignore]
+fn verify_termination_folded_constant_bound_is_true() {
+    verify_termination("termination_true_folded_bound.c", "ILP32").stdout("true\n");
+}
+
+/// A loop guard `z <= INT_MAX - y` whose subtraction cannot wrap under the
+/// other stay condition `y > 0` bounds the counter => `true`.
+#[test]
+#[ignore]
+fn verify_termination_overflow_guarded_bound_is_true() {
+    verify_termination("termination_true_overflow_guard.c", "ILP32").stdout("true\n");
+}
+
+/// `y = x | (x + 1)` makes `x` negative after one iteration; `x + 1` overflows
+/// only at `INT_MAX`, an execution a termination task does not have (no
+/// undefined behaviour) => `true`.
+#[test]
+#[ignore]
+fn verify_termination_defined_overflow_once_is_true() {
+    verify_termination("termination_true_defined_overflow_once.c", "LP64").stdout("true\n");
+}
+
+/// `x & (x - 1)` with `x > 0` is in `[0, x - 1]` => `true`.
+#[test]
+#[ignore]
+fn verify_termination_bitwise_and_is_true() {
+    verify_termination("termination_true_bitwise_and.c", "LP64").stdout("true\n");
+}
+
+/// `~x` is `-x - 1`, so `x + y` ranks the loop => `true`.
+#[test]
+#[ignore]
+fn verify_termination_bitwise_not_is_true() {
+    verify_termination("termination_true_bitwise_not.c", "LP64").stdout("true\n");
+}
+
+/// `y | 1` with `y >= 0` is in `[1, y + 1]` => `true`.
+#[test]
+#[ignore]
+fn verify_termination_bitwise_or_is_true() {
+    verify_termination("termination_true_bitwise_or.c", "LP64").stdout("true\n");
 }
 
 /// A loop-free `main` calling only known-terminating externals
@@ -1333,4 +1415,66 @@ fn verify_termination_dtor_loop_is_unknown() {
 #[ignore]
 fn verify_termination_computed_goto_is_unknown() {
     verify_termination("termination_unknown_computed_goto.c", "LP64").stdout("unknown\n");
+}
+
+// ---------------------------------------------------------------------------
+// Wrong-TRUE regressions (2026-11-13 TRUE-arm soundness audit). Each program
+// violates its property, and each was once "proved" by a TRUE arm: termination
+// ranking over unsigned/wrapping guards (f1, f1b, f2, f2s) and dropped inline
+// asm (f3); the interval no-overflow prover's unsigned shift and unchecked
+// `abs` (o1, o2); the Anchored-Object prover's unchecked pthread handle size
+// (m1); the race prover's empty points-to sets and collapsed mutex arrays
+// (r1, r2); the exhaustive engine's k-induction on a re-entered loop function,
+// merged recursion frames and `printf("%n")` (e1, e2, e3). Run with the TRUE
+// arms only (`SAF_AUDIT_TRUE_ONLY=1`), on both data models: none may say `true`.
+// ---------------------------------------------------------------------------
+
+/// `(fixture, property)` pairs of the wrong-TRUE regressions.
+const WRONG_TRUE_CASES: &[(&str, &str)] = &[
+    ("f1.c", "termination"),
+    ("f1b.c", "termination"),
+    ("f2.c", "termination"),
+    ("f2s.c", "termination"),
+    ("f3.c", "termination"),
+    ("f4.c", "termination"),
+    ("f5.c", "termination"),
+    ("f6.c", "termination"),
+    ("f7.c", "termination"),
+    ("f8.c", "termination"),
+    ("f9.c", "termination"),
+    ("f10.c", "termination"),
+    ("f11.c", "termination"),
+    ("o1.c", "no-overflow"),
+    ("o2.c", "no-overflow"),
+    ("m1.c", "valid-memsafety"),
+    ("r1.c", "no-data-race"),
+    ("r2.c", "no-data-race"),
+    ("e1.c", "unreach-call"),
+    ("e2.c", "unreach-call"),
+    ("e3.c", "unreach-call"),
+];
+
+#[test]
+#[ignore]
+fn verify_wrong_true_regressions_are_not_true() {
+    for (fixture, property) in WRONG_TRUE_CASES {
+        let prp = ws(&format!("tests/programs/c/svcomp/{property}.prp"));
+        let fx = svcomp_fixture(&format!("wrong_true/{fixture}"));
+        for dm in ["ILP32", "LP64"] {
+            cargo_bin_cmd!("saf")
+                .env("SAF_AUDIT_TRUE_ONLY", "1")
+                .env("SAF_UNREACH_PROVE_BUDGET_S", "30")
+                .args([
+                    "verify",
+                    "--property",
+                    prp.as_str(),
+                    "--data-model",
+                    dm,
+                    fx.as_str(),
+                ])
+                .assert()
+                .success()
+                .stdout(predicate::str::starts_with("true").not());
+        }
+    }
 }
